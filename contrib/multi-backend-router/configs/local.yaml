@@ -1,0 +1,74 @@
+environment_variables:
+  OLLAMA_API_BASE: http://127.0.0.1:11434
+
+model_list:
+  # --- haiku / small-fast -> hermes3:8b ---
+  - model_name: claude-haiku-4-5-20251001
+    litellm_params:
+      model: ollama/hermes3:8b
+      api_base: os.environ/OLLAMA_API_BASE
+  - model_name: claude-3-5-haiku-20241022
+    litellm_params:
+      model: ollama/hermes3:8b
+      api_base: os.environ/OLLAMA_API_BASE
+
+  # --- sonnet / main -> qwen3-coder:30b ---
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: ollama/qwen3-coder:30b
+      api_base: os.environ/OLLAMA_API_BASE
+  - model_name: claude-sonnet-4-5-20250929
+    litellm_params:
+      model: ollama/qwen3-coder:30b
+      api_base: os.environ/OLLAMA_API_BASE
+  - model_name: claude-sonnet-4-20250514
+    litellm_params:
+      model: ollama/qwen3-coder:30b
+      api_base: os.environ/OLLAMA_API_BASE
+  - model_name: claude-3-7-sonnet-20250219
+    litellm_params:
+      model: ollama/qwen3-coder:30b
+      api_base: os.environ/OLLAMA_API_BASE
+  - model_name: claude-3-5-sonnet-20241022
+    litellm_params:
+      model: ollama/qwen3-coder:30b
+      api_base: os.environ/OLLAMA_API_BASE
+
+  # --- opus / heavy -> qwen3-coder:30b-128k ---
+  - model_name: claude-opus-4-6
+    litellm_params:
+      model: ollama/qwen3-coder:30b-128k
+      api_base: os.environ/OLLAMA_API_BASE
+  - model_name: claude-opus-4-5-20251101
+    litellm_params:
+      model: ollama/qwen3-coder:30b-128k
+      api_base: os.environ/OLLAMA_API_BASE
+  - model_name: claude-opus-4-20250514
+    litellm_params:
+      model: ollama/qwen3-coder:30b-128k
+      api_base: os.environ/OLLAMA_API_BASE
+
+  - model_name: hermes3-8b
+    litellm_params:
+      model: ollama/hermes3:8b
+      api_base: os.environ/OLLAMA_API_BASE
+
+  - model_name: qwen3-coder-30b
+    litellm_params:
+      model: ollama/qwen3-coder:30b
+      api_base: os.environ/OLLAMA_API_BASE
+
+  - model_name: qwen3-coder-128k
+    litellm_params:
+      model: ollama/qwen3-coder:30b-128k
+      api_base: os.environ/OLLAMA_API_BASE
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 1800
+  set_verbose: false
+  telemetry: false
+
+general_settings:
+  # No master_key = LiteLLM accepts any API key value.
+  # Safe because the proxy is bound to 127.0.0.1 only.

@@ -1,0 +1,99 @@
+environment_variables:
+  OLLAMA_API_BASE: http://127.0.0.1:11434
+  DEEPSEEK_API_KEY: os.environ/DEEPSEEK_API_KEY
+  TOGETHER_API_KEY: os.environ/TOGETHER_API_KEY
+  GEMINI_API_KEY: os.environ/GEMINI_API_KEY
+
+model_list:
+  # --- haiku / small-fast -> hermes3:8b (fallback: deepseek) ---
+  - model_name: claude-haiku-4-5-20251001
+    litellm_params:
+      model: ollama/hermes3:8b
+      api_base: os.environ/OLLAMA_API_BASE
+  - model_name: claude-3-5-haiku-20241022
+    litellm_params:
+      model: ollama/hermes3:8b
+      api_base: os.environ/OLLAMA_API_BASE
+
+  # --- sonnet / main -> qwen3-coder:30b (fallback: deepseek) ---
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: ollama/qwen3-coder:30b
+      api_base: os.environ/OLLAMA_API_BASE
+  - model_name: claude-sonnet-4-5-20250929
+    litellm_params:
+      model: ollama/qwen3-coder:30b
+      api_base: os.environ/OLLAMA_API_BASE
+  - model_name: claude-sonnet-4-20250514
+    litellm_params:
+      model: ollama/qwen3-coder:30b
+      api_base: os.environ/OLLAMA_API_BASE
+  - model_name: claude-3-7-sonnet-20250219
+    litellm_params:
+      model: ollama/qwen3-coder:30b
+      api_base: os.environ/OLLAMA_API_BASE
+  - model_name: claude-3-5-sonnet-20241022
+    litellm_params:
+      model: ollama/qwen3-coder:30b
+      api_base: os.environ/OLLAMA_API_BASE
+
+  # --- opus / heavy -> deepseek-chat (local GPU busy; fallback: Together Qwen3) ---
+  - model_name: claude-opus-4-6
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+  - model_name: claude-opus-4-5-20251101
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+  - model_name: claude-opus-4-20250514
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+
+  - model_name: deepseek-chat
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+
+  - model_name: together-qwen3
+    litellm_params:
+      model: together_ai/Qwen/Qwen3-235B-A22B-Instruct-2507-tput
+      api_key: os.environ/TOGETHER_API_KEY
+
+  - model_name: gemini-flash
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+router_settings:
+  fallbacks:
+    - claude-haiku-4-5-20251001:
+        - deepseek-chat
+    - claude-3-5-haiku-20241022:
+        - deepseek-chat
+    - claude-sonnet-4-6:
+        - deepseek-chat
+    - claude-sonnet-4-5-20250929:
+        - deepseek-chat
+    - claude-sonnet-4-20250514:
+        - deepseek-chat
+    - claude-3-7-sonnet-20250219:
+        - deepseek-chat
+    - claude-3-5-sonnet-20241022:
+        - deepseek-chat
+    - claude-opus-4-6:
+        - together-qwen3
+    - claude-opus-4-5-20251101:
+        - together-qwen3
+    - claude-opus-4-20250514:
+        - together-qwen3
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 1800
+  set_verbose: false
+  telemetry: false
+
+general_settings:
+  # No master_key = accept any API key (safe, 127.0.0.1 only)

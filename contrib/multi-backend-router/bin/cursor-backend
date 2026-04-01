@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+STATE_DIR="${HOME}/.claude/litellm"
+SWITCH_BIN="${HOME}/.local/bin/claude-switch"
+
+usage() {
+  cat <<'EOF'
+Usage: cursor-backend [local|llamacpp|hybrid|cloud|moonshot|anthropic|start|stop|status]
+
+Convenience wrapper for Cursor terminals/tasks that reuses the shared Claude Code backend router.
+EOF
+}
+
+command_name="${1:-status}"
+
+case "${command_name}" in
+  local|llamacpp|hybrid|cloud|moonshot|anthropic|start|stop|status)
+    "${SWITCH_BIN}" "$@"
+    ;;
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+  *)
+    usage >&2
+    exit 1
+    ;;
+esac
+
+if [ "${command_name}" != "stop" ] && [ "${command_name}" != "status" ]; then
+  echo
+  echo "Cursor terminal/task commands:"
+  echo "  cursor-cc [claude args...]"
+  echo "  cursor-backend status"
+fi

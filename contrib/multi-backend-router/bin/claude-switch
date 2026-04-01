@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+STATE_DIR="${HOME}/.claude/litellm"
+CURRENT_FILE="${STATE_DIR}/current"
+
+mkdir -p "${STATE_DIR}"
+
+usage() {
+  cat <<'EOF'
+Usage: claude-switch [local|llamacpp|hybrid|cloud|moonshot|anthropic|start|stop|status]
+EOF
+}
+
+print_routing() {
+  case "$1" in
+    local)
+      cat <<'EOF'
+Routing:
+  haiku  -> ollama/hermes3:8b
+  sonnet -> ollama/qwen3-coder:30b
+  opus   -> ollama/qwen3-coder:30b-128k
+EOF
+      ;;
+    llamacpp)
+      cat <<'EOF'
+Routing:
+  haiku  -> llama.cpp qwen3-coder-30b
+  sonnet -> llama.cpp qwen3-coder-30b
+  opus   -> llama.cpp qwen3-coder-30b
+  note   -> port auto-selects if 8080 is busy
+EOF
+      ;;
+    hybrid)
+      cat <<'EOF'
+Routing:
+  haiku  -> ollama/hermes3:8b (fallback: deepseek/deepseek-chat)
+  sonnet -> ollama/qwen3-coder:30b (fallback: deepseek/deepseek-chat)
+  opus   -> deepseek/deepseek-chat (fallback: Together Qwen3 235B)
+EOF
+      ;;
+    cloud)
+      cat <<'EOF'
+Routing:
+  haiku  -> deepseek/deepseek-chat
+  sonnet -> deepseek/deepseek-chat
+  opus   -> deepseek/deepseek-reasoner
+  extras -> gemini-flash, together-qwen3, groq-scout
+EOF
+      ;;
+    moonshot)
+      cat <<'EOF'
+Routing:
+  direct -> Moonshot Anthropic-compatible endpoint
+  haiku  -> kimi-k2.5 (default)
+  sonnet -> kimi-k2.5 (default)
+  opus   -> kimi-k2.5 (default)
+  note   -> override per-tier models with MOONSHOT_HAIKU_MODEL / MOONSHOT_SONNET_MODEL / MOONSHOT_OPUS_MODEL
+EOF
+      ;;
+    anthropic)
+      cat <<'EOF'
+Routing:
+  direct Anthropic backend via the normal Claude Code auth flow
+EOF
+      ;;
+  esac
+}
+
+COMMAND="${1:-status}"
+case "${COMMAND}" in
+  local|llamacpp|hybrid|cloud)
+    echo "${COMMAND}" > "${CURRENT_FILE}"
+    "${STATE_DIR}/start.sh" "${COMMAND}"
+    echo
+    print_routing "${COMMAND}"
+    ;;
+  moonshot)
+    echo "moonshot" > "${CURRENT_FILE}"
+    "${STATE_DIR}/stop.sh"
+    echo
+    print_routing "moonshot"
+    echo
+    echo "Use 'cc' to run Claude Code against Moonshot's Anthropic-compatible endpoint."
+    echo "Set MOONSHOT_API_KEY in ~/.claude/litellm/env before use."
+    ;;
+  anthropic)
+    echo "anthropic" > "${CURRENT_FILE}"
+    "${STATE_DIR}/stop.sh"
+    echo
+    print_routing "anthropic"
+    echo
+    echo "Use 'cc' or 'claude' for direct Anthropic."
+    echo "If you manually exported ANTHROPIC_BASE_URL in this shell, run: unset ANTHROPIC_BASE_URL"
+    ;;
+  start)
+    if [ ! -f "${CURRENT_FILE}" ]; then
+      echo "local" > "${CURRENT_FILE}"
+    fi
+    MODE="$(cat "${CURRENT_FILE}")"
+    if [ "${MODE}" = "anthropic" ] || [ "${MODE}" = "moonshot" ]; then
+      echo "${MODE} mode does not need LiteLLM. Use 'cc' directly."
+      exit 0
+    fi
+    "${STATE_DIR}/start.sh" "${MODE}"
+    echo
+    print_routing "${MODE}"
+    ;;
+  stop)
+    "${STATE_DIR}/stop.sh"
+    ;;
+  status)
+    "${STATE_DIR}/status.sh"
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac

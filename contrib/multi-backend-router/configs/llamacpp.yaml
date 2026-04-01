@@ -1,0 +1,80 @@
+# Start example:
+# LLAMACPP_PORT=18080 llama-server -m ~/.ollama/models/blobs/<your-qwen3-coder-30b-gguf-blob> --port "$LLAMACPP_PORT" --host 127.0.0.1 --ctx-size 65536 -ngl 99 --jinja --alias qwen3-coder-30b
+environment_variables:
+  LLAMACPP_API_BASE: os.environ/LLAMACPP_API_BASE
+  LLAMACPP_API_KEY: os.environ/LLAMACPP_API_KEY
+
+model_list:
+  - model_name: claude-haiku-4-5-20251001
+    litellm_params:
+      model: openai/qwen3-coder-30b
+      api_base: os.environ/LLAMACPP_API_BASE
+      api_key: os.environ/LLAMACPP_API_KEY
+  - model_name: claude-3-5-haiku-20241022
+    litellm_params:
+      model: openai/qwen3-coder-30b
+      api_base: os.environ/LLAMACPP_API_BASE
+      api_key: os.environ/LLAMACPP_API_KEY
+
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: openai/qwen3-coder-30b
+      api_base: os.environ/LLAMACPP_API_BASE
+      api_key: os.environ/LLAMACPP_API_KEY
+  - model_name: claude-sonnet-4-5-20250929
+    litellm_params:
+      model: openai/qwen3-coder-30b
+      api_base: os.environ/LLAMACPP_API_BASE
+      api_key: os.environ/LLAMACPP_API_KEY
+  - model_name: claude-sonnet-4-20250514
+    litellm_params:
+      model: openai/qwen3-coder-30b
+      api_base: os.environ/LLAMACPP_API_BASE
+      api_key: os.environ/LLAMACPP_API_KEY
+  - model_name: claude-3-7-sonnet-20250219
+    litellm_params:
+      model: openai/qwen3-coder-30b
+      api_base: os.environ/LLAMACPP_API_BASE
+      api_key: os.environ/LLAMACPP_API_KEY
+  - model_name: claude-3-5-sonnet-20241022
+    litellm_params:
+      model: openai/qwen3-coder-30b
+      api_base: os.environ/LLAMACPP_API_BASE
+      api_key: os.environ/LLAMACPP_API_KEY
+
+  - model_name: claude-opus-4-6
+    litellm_params:
+      model: openai/qwen3-coder-30b
+      api_base: os.environ/LLAMACPP_API_BASE
+      api_key: os.environ/LLAMACPP_API_KEY
+  - model_name: claude-opus-4-5-20251101
+    litellm_params:
+      model: openai/qwen3-coder-30b
+      api_base: os.environ/LLAMACPP_API_BASE
+      api_key: os.environ/LLAMACPP_API_KEY
+  - model_name: claude-opus-4-20250514
+    litellm_params:
+      model: openai/qwen3-coder-30b
+      api_base: os.environ/LLAMACPP_API_BASE
+      api_key: os.environ/LLAMACPP_API_KEY
+
+  - model_name: qwen3-coder-30b
+    litellm_params:
+      model: openai/qwen3-coder-30b
+      api_base: os.environ/LLAMACPP_API_BASE
+      api_key: os.environ/LLAMACPP_API_KEY
+
+  - model_name: qwen3-coder-llama
+    litellm_params:
+      model: openai/qwen3-coder-30b
+      api_base: os.environ/LLAMACPP_API_BASE
+      api_key: os.environ/LLAMACPP_API_KEY
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 1800
+  set_verbose: false
+  telemetry: false
+
+general_settings:
+  # No master_key = accept any API key (safe, 127.0.0.1 only)

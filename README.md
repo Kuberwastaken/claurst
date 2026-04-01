@@ -25,6 +25,18 @@ Earlier today (March 31st, 2026) - Chaofan Shou on X discovered something that A
 
 This repository is a backup of that leaked source, and this README is a full breakdown of what's in it, how the leak happened and most importantly, the things we now know that were never meant to be public.
 
+## Bonus: Run It Against Local and Cheap Open Models
+
+This repo now also includes a packaged multi-backend router in [`contrib/multi-backend-router`](contrib/multi-backend-router/README.md) that lets the leaked Claude Code binary run against:
+
+- Ollama locally
+- `llama.cpp` locally
+- cheap cloud backends through LiteLLM
+- Moonshot / Kimi through an Anthropic-compatible endpoint
+- shared MCP routing for both Claude Code and Cursor
+
+It ships with installable scripts, LiteLLM configs, a shared MCP server, and Cursor-friendly wrappers.
+
 Let's get into it.
 
 ## How Did This Even Happen?

@@ -1,0 +1,86 @@
+environment_variables:
+  DEEPSEEK_API_KEY: os.environ/DEEPSEEK_API_KEY
+  GEMINI_API_KEY: os.environ/GEMINI_API_KEY
+  TOGETHER_API_KEY: os.environ/TOGETHER_API_KEY
+  GROQ_API_KEY: os.environ/GROQ_API_KEY
+
+model_list:
+  # --- haiku / small-fast -> deepseek-chat ---
+  - model_name: claude-haiku-4-5-20251001
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+  - model_name: claude-3-5-haiku-20241022
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+
+  # --- sonnet / main -> deepseek-chat ---
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+  - model_name: claude-sonnet-4-5-20250929
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+  - model_name: claude-sonnet-4-20250514
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+  - model_name: claude-3-7-sonnet-20250219
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+  - model_name: claude-3-5-sonnet-20241022
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+
+  # --- opus / heavy -> deepseek-reasoner (R1) ---
+  - model_name: claude-opus-4-6
+    litellm_params:
+      model: deepseek/deepseek-reasoner
+      api_key: os.environ/DEEPSEEK_API_KEY
+  - model_name: claude-opus-4-5-20251101
+    litellm_params:
+      model: deepseek/deepseek-reasoner
+      api_key: os.environ/DEEPSEEK_API_KEY
+  - model_name: claude-opus-4-20250514
+    litellm_params:
+      model: deepseek/deepseek-reasoner
+      api_key: os.environ/DEEPSEEK_API_KEY
+
+  - model_name: deepseek-chat
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+
+  - model_name: deepseek-reasoner
+    litellm_params:
+      model: deepseek/deepseek-reasoner
+      api_key: os.environ/DEEPSEEK_API_KEY
+
+  - model_name: gemini-flash
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+  - model_name: together-qwen3
+    litellm_params:
+      model: together_ai/Qwen/Qwen3-235B-A22B-Instruct-2507-tput
+      api_key: os.environ/TOGETHER_API_KEY
+
+  - model_name: groq-scout
+    litellm_params:
+      model: groq/meta-llama/llama-4-scout-17b-16e-instruct
+      api_key: os.environ/GROQ_API_KEY
+
+litellm_settings:
+  drop_params: true
+  request_timeout: 1800
+  set_verbose: false
+  telemetry: false
+
+general_settings:
+  # No master_key = accept any API key (safe, 127.0.0.1 only)
