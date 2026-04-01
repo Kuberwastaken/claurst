@@ -157,6 +157,8 @@ impl Tool for AgentTool {
             max_turns: params.max_turns.unwrap_or(10),
             system_prompt: Some(system_prompt),
             append_system_prompt: None,
+            output_style: cc_core::system_prompt::OutputStyle::Default,
+            working_directory: None,
             thinking_budget: None,
             temperature: None,
         };
