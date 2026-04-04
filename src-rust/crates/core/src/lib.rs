@@ -669,6 +669,8 @@ pub mod config {
         pub version: Option<u32>,
         #[serde(default)]
         pub projects: HashMap<String, ProjectSettings>,
+        #[serde(default)]
+        pub env: HashMap<String, String>,
         #[serde(default, rename = "remoteControlAtStartup")]
         pub remote_control_at_startup: bool,
         /// Persisted permission rules saved by the user across sessions.
@@ -813,7 +815,8 @@ pub mod config {
             }
         }
 
-        /// Resolve the API base URL, checking `ANTHROPIC_BASE_URL` first.
+        /// Resolve the API base URL, checking `ANTHROPIC_BASE_URL` env var first,
+        /// then the compile-time default.
         pub fn resolve_api_base(&self) -> String {
             std::env::var("ANTHROPIC_BASE_URL")
                 .unwrap_or_else(|_| crate::constants::ANTHROPIC_API_BASE.to_string())
@@ -838,10 +841,55 @@ pub mod config {
             let path = Self::global_settings_path();
             if path.exists() {
                 let content = tokio::fs::read_to_string(&path).await?;
-                Ok(serde_json::from_str(&content).unwrap_or_default())
+                let json: serde_json::Value = serde_json::from_str(&content)
+                    .map_err(|e| anyhow::anyhow!("parse raw JSON: {}", e))?;
+                // Extract env from the raw JSON before full deserialization.
+                // The JSON may contain extra fields (e.g. enabledPlugins as Map) that
+                // don't match our struct fields — so we pull env out separately and strip
+                // all unknown fields before deserializing the rest.
+                let env: HashMap<String, String> = json
+                    .get("env")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                // Only keep fields that exist in our Settings struct and have matching types.
+                // Fields whose types differ between JSON and our struct (e.g. enabledPlugins
+                // is a Map in JSON but HashSet<String> in Settings) must be stripped.
+                let mut filtered = json.clone();
+                if let serde_json::Value::Object(ref mut m) = filtered {
+                    m.remove("env");
+                    // Keep only struct fields; strip everything else.
+                    m.retain(|k, _| [
+                        "config", "version", "projects", "remoteControlAtStartup",
+                        "permissionRules", "hasCompletedOnboarding", "lastSeenVersion",
+                    ].contains(&k.as_str()));
+                }
+                let mut result: Self = serde_json::from_value(filtered)
+                    .map_err(|e| anyhow::anyhow!("parse Settings: {}", e))?;
+                result.env = env;
+                Ok(result)
             } else {
                 Ok(Self::default())
             }
+        }
+
+        /// Resolve the API key from the full settings hierarchy.
+        /// Priority: settings.env.ANTHROPIC_AUTH_TOKEN (cc-switch) > config.api_key >
+        /// ANTHROPIC_API_KEY env > OAuth tokens.
+        pub fn resolve_api_key(&self) -> Option<String> {
+            self.config
+                .api_key
+                .clone()
+                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                .or_else(|| self.env.get("ANTHROPIC_AUTH_TOKEN").cloned())
+        }
+
+        /// Resolve the API base URL.
+        /// Priority: ANTHROPIC_BASE_URL env > env.ANTHROPIC_BASE_URL (cc-switch) > default.
+        pub fn resolve_api_base(&self) -> String {
+            std::env::var("ANTHROPIC_BASE_URL")
+                .ok()
+                .or_else(|| self.env.get("ANTHROPIC_BASE_URL").cloned())
+                .unwrap_or(crate::constants::ANTHROPIC_API_BASE.to_string())
         }
 
         /// Persist settings to disk.

@@ -474,28 +474,32 @@ async fn main() -> anyhow::Result<()> {
     let is_headless = cli.print || cli.prompt.is_some();
 
     // Initialize API client.
-    // Try config/env first; fall back to saved OAuth tokens; finally prompt for login.
-    let (api_key, use_bearer_auth) = match config.resolve_auth_async().await {
-        Some(auth) => auth,
-        None => {
-            // No credential found — run interactive OAuth login (non-headless) or error.
-            if is_headless {
-                anyhow::bail!(
-                    "No API key found. Set ANTHROPIC_API_KEY, use --api-key, or run `claude login`."
-                );
+    // Try settings.env (cc-switch) > config/api_key > ANTHROPIC_API_KEY env > OAuth tokens.
+    let (api_key, use_bearer_auth) = if let Some(key) = settings.resolve_api_key() {
+        (key, false)
+    } else {
+        match config.resolve_auth_async().await {
+            Some(auth) => auth,
+            None => {
+                // No credential found — run interactive OAuth login (non-headless) or error.
+                if is_headless {
+                    anyhow::bail!(
+                        "No API key found. Set ANTHROPIC_API_KEY, use --api-key, or run `claude login`."
+                    );
+                }
+                eprintln!("No authentication found. Starting login flow...");
+                let result = oauth_flow::run_oauth_login_flow(true)
+                    .await
+                    .context("Login failed")?;
+                println!("Login successful!");
+                (result.credential, result.use_bearer_auth)
             }
-            eprintln!("No authentication found. Starting login flow...");
-            let result = oauth_flow::run_oauth_login_flow(true)
-                .await
-                .context("Login failed")?;
-            println!("Login successful!");
-            (result.credential, result.use_bearer_auth)
         }
     };
 
     let client_config = claurst_api::client::ClientConfig {
         api_key: api_key.clone(),
-        api_base: config.resolve_api_base(),
+        api_base: settings.resolve_api_base(),
         use_bearer_auth,
         ..Default::default()
     };
@@ -2118,14 +2122,20 @@ async fn handle_auth_command(args: &[String]) -> anyhow::Result<()> {
 async fn auth_status(json_output: bool) {
     // Gather auth state
     let env_api_key = std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty());
+    let env_auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN").ok().filter(|k| !k.is_empty());
     let settings = Settings::load().await.unwrap_or_default();
     let settings_api_key = settings.config.api_key.clone().filter(|k| !k.is_empty());
+    let settings_auth_token = settings.env.get("ANTHROPIC_AUTH_TOKEN").cloned().filter(|k| !k.is_empty());
     let oauth_tokens = claurst_core::oauth::OAuthTokens::load().await;
     let api_provider = "Anthropic";
     let api_key_source = if env_api_key.is_some() {
         Some("ANTHROPIC_API_KEY".to_string())
+    } else if env_auth_token.is_some() {
+        Some("ANTHROPIC_AUTH_TOKEN".to_string())
     } else if settings_api_key.is_some() {
         Some("settings".to_string())
+    } else if settings_auth_token.is_some() {
+        Some("settings.env.ANTHROPIC_AUTH_TOKEN".to_string())
     } else if oauth_tokens
         .as_ref()
         .is_some_and(|tokens| !tokens.uses_bearer_auth() && tokens.api_key.is_some())
@@ -2180,6 +2190,8 @@ async fn auth_status(json_output: bool) {
         ("api_key".to_string(), true)
     } else if settings_api_key.is_some() {
         ("api_key".to_string(), true)
+    } else if env_auth_token.is_some() || settings_auth_token.is_some() {
+        ("proxy_managed".to_string(), true)
     } else {
         ("none".to_string(), false)
     };
