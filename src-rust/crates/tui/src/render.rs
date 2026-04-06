@@ -44,6 +44,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
+use std::time::Instant;
 
 // Spinner frames matching the TypeScript SpinnerGlyph: platform-specific base
 // characters mirrored (forward + reverse) for a smooth pulse effect.
@@ -70,6 +71,13 @@ fn spinner_color(app: &App) -> Color {
         }
     }
     Color::Yellow
+}
+
+/// Global monotonic animation tick, capped to a fixed cadence.
+/// 200ms step = 5 animation updates/second, independent of render FPS.
+fn animation_tick_200ms() -> u64 {
+    let start = Instant::now();
+    (start.elapsed().as_millis() / 200) as u64
 }
 
 // -----------------------------------------------------------------------
@@ -1260,8 +1268,9 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
         )]
     } else if app.is_streaming {
         // Spinner glyph (turns red on stall)
+        let frame_count = animation_tick_200ms();
         let mut s = vec![Span::styled(
-            spinner_char(app.frame_count).to_string(),
+            spinner_char(frame_count).to_string(),
             Style::default().fg(spinner_color(app)).add_modifier(Modifier::BOLD),
         )];
 
