@@ -72,6 +72,21 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
 }
 
 pub fn runtime_provider_for(provider_id: &str) -> Option<Arc<dyn LlmProvider>> {
+    use crate::providers::openai_compat_providers as p;
+
+    // Local providers never require an API key — build them directly so that
+    // the auth-store bypass below doesn't silently drop them.
+    // Accept both the hyphenated canonical IDs ("llama-cpp", "lm-studio") and
+    // the non-hyphenated aliases ("llamacpp", "lmstudio") used throughout the
+    // TUI / connect dialog.
+    match provider_id {
+        "ollama" => return Some(Arc::new(p::ollama())),
+        "lmstudio" | "lm-studio" => return Some(Arc::new(p::lm_studio())),
+        // "llama-server" is the binary name for the modern llama.cpp server.
+        "llamacpp" | "llama-cpp" | "llama-server" => return Some(Arc::new(p::llama_cpp())),
+        _ => {}
+    }
+
     let auth_store = claurst_core::AuthStore::load();
     let key = auth_store.api_key_for(provider_id)?;
     if key.is_empty() {

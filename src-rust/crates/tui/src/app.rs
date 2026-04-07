@@ -477,11 +477,11 @@ pub fn try_copy_to_clipboard(text: &str) -> bool {
             return child.wait().map(|s| s.success()).unwrap_or(false);
         }
     }
-    // Linux / X11
+    // Linux / Wayland / X11
     #[cfg(target_os = "linux")]
     {
         use std::io::Write;
-        for cmd in &["xclip -selection clipboard", "xsel --clipboard --input"] {
+        for cmd in &["wl-copy", "xclip -selection clipboard", "xsel --clipboard --input"] {
             let parts: Vec<&str> = cmd.split_whitespace().collect();
             if let Some((prog, args)) = parts.split_first() {
                 if let Ok(mut child) = std::process::Command::new(prog)
@@ -1341,6 +1341,12 @@ impl App {
             duration: None,
             interrupted: false,
         });
+        // Start the latency timer now — at prompt-submission time — so it
+        // measures actual round-trip time even when the provider buffers its
+        // full response before yielding any stream events (e.g. Gemini flash).
+        self.turn_start = Some(std::time::Instant::now());
+        self.last_turn_elapsed = None;
+        self.last_turn_verb = None;
     }
 
     fn sync_turn_metadata_to_messages(&mut self) {
@@ -4834,15 +4840,12 @@ impl App {
                 if !self.is_streaming {
                     let seed = self.frame_count as usize ^ (self.messages.len() * 17);
                     self.spinner_verb = Some(sample_spinner_verb(seed).to_string());
-                    // Only set turn_start on the FIRST streaming event of a
-                    // turn.  MessageStop resets is_streaming between tool-use
-                    // cycles, but we must not reset the timer — the total turn
-                    // duration should cover the entire request, including all
-                    // tool-use rounds.
+                    // turn_start is set in begin_user_turn_snapshot (prompt
+                    // submission time).  Only fall back here if somehow no
+                    // user message was pushed before streaming began (e.g.
+                    // headless / programmatic callers).
                     if self.turn_start.is_none() {
                         self.turn_start = Some(std::time::Instant::now());
-                        self.last_turn_elapsed = None;
-                        self.last_turn_verb = None;
                     }
                     self.streaming_thinking.clear();
                 }

@@ -10,8 +10,10 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use claurst_core::oauth_config::CodexTokens;
 use claurst_core::codex_oauth::{CODEX_CLIENT_ID, CODEX_AUTHORIZE_URL, CODEX_OAUTH_PORT, CODEX_REDIRECT_URI, CODEX_SCOPES, CODEX_TOKEN_URL};
+use claurst_tui::DeviceAuthEvent;
 
 /// Generate a PKCE code verifier (random 64-byte base64url string).
 pub fn generate_code_verifier() -> String {
@@ -58,7 +60,11 @@ pub fn build_auth_url(code_challenge: &str, state: &str) -> String {
 
 /// Start local HTTP server on port 1455, open browser, wait for callback,
 /// exchange code for tokens, return CodexTokens.
-pub async fn run_oauth_flow() -> anyhow::Result<CodexTokens> {
+///
+/// `event_tx` is used to send the OAuth URL back to the TUI dialog so it can
+/// display it (and copy it to the clipboard) in case the automatic browser
+/// launch fails.
+pub async fn run_oauth_flow(event_tx: mpsc::Sender<DeviceAuthEvent>) -> anyhow::Result<CodexTokens> {
     let verifier = generate_code_verifier();
     let challenge = compute_code_challenge(&verifier);
     let state = generate_state();
@@ -70,9 +76,10 @@ pub async fn run_oauth_flow() -> anyhow::Result<CodexTokens> {
 
     let auth_url = build_auth_url(&challenge, &state);
 
-    // Try to open browser
-    eprintln!("\nOpening browser for OpenAI Codex login...");
-    eprintln!("If your browser doesn't open, visit:\n{}\n", auth_url);
+    // Send the URL to the TUI so it can display + clipboard-copy it.
+    let _ = event_tx.send(DeviceAuthEvent::GotBrowserUrl { url: auth_url.clone() }).await;
+
+    // Also try to open the browser (best-effort; may silently fail in headless envs).
     let _ = open::that(&auth_url);
 
     // Wait for OAuth callback

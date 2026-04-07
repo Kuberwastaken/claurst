@@ -1554,6 +1554,7 @@ async fn run_interactive(
         app.frame_count = app.frame_count.wrapping_add(1);
         app.tick_rustle_pose();
         app.tick_background_tasks();
+        app.notifications.tick();
 
         // Draw the UI
         terminal.draw(|f| render_app(f, &app))?;
@@ -2615,14 +2616,10 @@ async fn run_interactive(
                 }
                 "openai-codex" => {
                     let tx2 = device_auth_tx.clone();
-                    app.device_auth_dialog.set_code(
-                        "".to_string(),
-                        "Opening browser for OpenAI login...".to_string(),
-                        "".to_string(),
-                        0,
-                    );
+                    // Keep the dialog in WaitingForCode until GotBrowserUrl arrives.
+                    // (set_browser_url() transitions it to BrowserAuth with the URL.)
                     tokio::spawn(async move {
-                        match crate::codex_oauth_flow::run_oauth_flow().await {
+                        match crate::codex_oauth_flow::run_oauth_flow(tx2.clone()).await {
                             Ok(tokens) => {
                                 let _ = tx2.send(DeviceAuthEvent::TokenReceived(
                                     tokens.access_token,
@@ -2666,6 +2663,18 @@ async fn run_interactive(
                         claurst_tui::NotificationKind::Info,
                         "Code copied to clipboard & browser opened.".to_string(),
                         Some(4),
+                    );
+                }
+                DeviceAuthEvent::GotBrowserUrl { url } => {
+                    // Copy the URL to clipboard so the user can paste it even
+                    // when the automatic browser launch silently fails (headless
+                    // terminals, tty2, Wayland-without-xdg-open, etc.).
+                    let _ = claurst_tui::try_copy_to_clipboard(&url);
+                    app.device_auth_dialog.set_browser_url(url);
+                    app.notifications.push(
+                        claurst_tui::NotificationKind::Info,
+                        "Login URL copied to clipboard.".to_string(),
+                        Some(5),
                     );
                 }
                 DeviceAuthEvent::TokenReceived(token) => {

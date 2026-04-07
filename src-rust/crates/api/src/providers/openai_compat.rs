@@ -63,6 +63,12 @@ pub struct ProviderQuirks {
     /// reasoning / thinking text.  `None` means the provider does not expose
     /// reasoning output.  Example: `Some("reasoning_content")` for DeepSeek.
     pub reasoning_field: Option<String>,
+
+    /// Hard cap on `max_tokens` sent to this provider.  When the request
+    /// carries a higher value it is silently clamped down to this limit.
+    /// Use this for providers whose models have a lower output ceiling than
+    /// the default we request (e.g. DeepSeek Chat caps at 8 192).
+    pub max_tokens_cap: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -268,9 +274,13 @@ impl OpenAiCompatProvider {
         let messages = self.build_messages(request);
         let tools = OpenAiProvider::to_openai_tools_pub(&request.tools);
 
+        let max_tokens = match self.quirks.max_tokens_cap {
+            Some(cap) => request.max_tokens.min(cap),
+            None => request.max_tokens,
+        };
         let mut body = json!({
             "model": request.model,
-            "max_tokens": request.max_tokens,
+            "max_tokens": max_tokens,
             "messages": messages,
             "stream": false,
         });
@@ -342,9 +352,13 @@ impl OpenAiCompatProvider {
         let messages = self.build_messages(request);
         let tools = OpenAiProvider::to_openai_tools_pub(&request.tools);
 
+        let max_tokens = match self.quirks.max_tokens_cap {
+            Some(cap) => request.max_tokens.min(cap),
+            None => request.max_tokens,
+        };
         let mut body = json!({
             "model": request.model,
-            "max_tokens": request.max_tokens,
+            "max_tokens": max_tokens,
             "messages": messages,
             "stream": true,
         });
