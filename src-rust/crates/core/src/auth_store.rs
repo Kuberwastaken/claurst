@@ -89,9 +89,7 @@ impl AuthStore {
                     }
                 }
                 StoredCredential::OAuthToken {
-                    access,
-                    refresh,
-                    ..
+                    access, refresh, ..
                 } if provider_id == "github-copilot" => {
                     if !refresh.is_empty() {
                         return Some(refresh.clone());
@@ -123,6 +121,7 @@ impl AuthStore {
             "azure" => "AZURE_API_KEY",
             "huggingface" => "HF_TOKEN",
             "nvidia" => "NVIDIA_API_KEY",
+            "zai" => "ZAI_API_KEY",
             _ => return None,
         };
         std::env::var(env_var).ok().filter(|k| !k.is_empty())

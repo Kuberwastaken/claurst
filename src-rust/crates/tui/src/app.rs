@@ -161,6 +161,7 @@ fn get_env_var_for_provider(id: &str) -> &'static str {
         "venice" => "VENICE_API_KEY",
         "moonshotai" => "MOONSHOT_API_KEY",
         "zhipuai" => "ZHIPU_API_KEY",
+        "zai" => "ZAI_API_KEY",
         "siliconflow" => "SILICONFLOW_API_KEY",
         "nebius" => "NEBIUS_API_KEY",
         "novita" => "NOVITA_API_KEY",
@@ -202,6 +203,7 @@ fn get_url_for_provider(id: &str) -> &'static str {
         "huggingface" => "huggingface.co/settings/tokens",
         "nvidia" => "build.nvidia.com",
         "venice" => "venice.ai/settings/api",
+        "zai" => "z.ai/manage-apikey/apikey-list",
         _ => "the provider's website",
     }
 }
@@ -217,6 +219,7 @@ fn provider_picker_items() -> Vec<SelectItem> {
         SelectItem { id: "vercel".into(), title: "Vercel AI Gateway".into(), description: "Gateway for AI SDK models".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "groq".into(), title: "Groq".into(), description: "Fast hosted inference".into(), category: "Popular".into(), badge: Some("FREE".into()) },
         SelectItem { id: "ollama".into(), title: "Ollama".into(), description: "Run models locally".into(), category: "Popular".into(), badge: Some("LOCAL".into()) },
+        SelectItem { id: "zai".into(), title: "Z.AI".into(), description: "GLM-5.1 / GLM-5 / GLM-4.7 Coding Plan".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "cerebras".into(), title: "Cerebras".into(), description: "Fast hosted inference".into(), category: "Other".into(), badge: Some("FREE".into()) },
         SelectItem { id: "sambanova".into(), title: "SambaNova".into(), description: "Fast hosted inference".into(), category: "Other".into(), badge: Some("FREE".into()) },
         SelectItem { id: "lmstudio".into(), title: "LM Studio".into(), description: "Local model server".into(), category: "Other".into(), badge: Some("LOCAL".into()) },

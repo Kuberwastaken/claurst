@@ -56,6 +56,7 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
         "sambanova" => Some(Arc::new(p::sambanova().with_api_key(key))),
         "moonshot" => Some(Arc::new(p::moonshot().with_api_key(key))),
         "zhipu" => Some(Arc::new(p::zhipu().with_api_key(key))),
+        "zai" => Some(Arc::new(p::zai().with_api_key(key))),
         "qwen" => Some(Arc::new(p::qwen().with_api_key(key))),
         "nebius" => Some(Arc::new(p::nebius().with_api_key(key))),
         "novita" => Some(Arc::new(p::novita().with_api_key(key))),
@@ -374,6 +375,9 @@ impl ProviderRegistry {
         }
         if std::env::var("ZHIPU_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
             self.register(Arc::new(p::zhipu()));
+        }
+        if std::env::var("ZAI_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+            self.register(Arc::new(p::zai()));
         }
         if std::env::var("NEBIUS_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
             self.register(Arc::new(p::nebius()));

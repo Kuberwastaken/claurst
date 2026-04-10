@@ -240,6 +240,7 @@ fn is_openaiish_provider(provider_id: &str) -> bool {
             | "sambanova"
             | "moonshot"
             | "zhipu"
+            | "zai"
             | "qwen"
             | "nebius"
             | "novita"
@@ -389,7 +390,7 @@ fn build_provider_options(
         options.insert("enable_thinking".to_string(), serde_json::json!(true));
     }
 
-    if provider_id == "zhipu" && thinking_budget.is_some() {
+    if (provider_id == "zhipu" || provider_id == "zai") && thinking_budget.is_some() {
         options.insert(
             "thinking".to_string(),
             serde_json::json!({
