@@ -101,13 +101,6 @@ pub fn model_supports_max_effort(id: &str) -> bool {
     id.starts_with("claude-opus-4")
 }
 
-/// The model ID that fast-mode locks to.
-pub const FAST_MODE_MODEL: &str = "claude-haiku-4-5";
-
-pub fn is_fast_mode_model(id: &str) -> bool {
-    id == FAST_MODE_MODEL || id.starts_with("claude-haiku-4-5")
-}
-
 /// Returns a short description string based on the model family inferred from
 /// the model ID.  Used when converting API model entries to `ModelEntry`.
 pub fn model_family_description(id: &str) -> String {
@@ -332,6 +325,14 @@ pub fn models_for_provider(provider_id: &str) -> Vec<ModelEntry> {
             model_entry("google/gemini-2.5-pro", "Gemini 2.5 Pro", "via OpenRouter"),
             model_entry("meta-llama/llama-3.3-70b-instruct", "Llama 3.3 70B", "via OpenRouter"),
         ],
+        "codex" | "openai-codex" => vec![
+            model_entry("gpt-5.2-codex", "GPT-5.2 Codex", "OAuth-backed Codex default"),
+            model_entry("gpt-5.1-codex", "GPT-5.1 Codex", "Previous Codex generation"),
+            model_entry("gpt-5.1-codex-mini", "GPT-5.1 Codex Mini", "Smaller Codex model"),
+            model_entry("gpt-5.1-codex-max", "GPT-5.1 Codex Max", "Larger Codex model"),
+            model_entry("gpt-5.4", "GPT-5.4", "General frontier model via Codex auth"),
+            model_entry("gpt-5.2", "GPT-5.2", "General model via Codex auth"),
+        ],
         "github-copilot" => vec![
             model_entry("claude-sonnet-4.6", "Claude Sonnet 4.6", "via Copilot"),
             model_entry("claude-sonnet-4.5", "Claude Sonnet 4.5", "via Copilot"),
@@ -410,6 +411,8 @@ pub fn default_model_for_provider(provider_id: &str) -> String {
         "xai" => "xai/grok-2".to_string(),
         "openrouter" => "openrouter/anthropic/claude-sonnet-4".to_string(),
         "github-copilot" => "github-copilot/gpt-4o".to_string(),
+        "codex" => "codex/gpt-5.2-codex".to_string(),
+        "openai-codex" => "openai-codex/gpt-5.2-codex".to_string(),
         "cohere" => "cohere/command-r-plus".to_string(),
         "perplexity" => "perplexity/sonar-pro".to_string(),
         "togetherai" | "together-ai" => "togetherai/meta-llama/Llama-3.3-70B-Instruct-Turbo".to_string(),
@@ -434,8 +437,10 @@ pub struct ModelPickerState {
     pub filter: String,
     /// Current effort level for models that support extended thinking.
     pub effort_level: EffortLevel,
-    /// Whether fast mode is currently active (locks model to FAST_MODE_MODEL).
+    /// Whether fast mode is currently active.
     pub fast_mode: bool,
+    /// The currently locked fast-mode model, if fast mode is active.
+    pub fast_mode_model: Option<String>,
     /// `true` once the dynamic model list has been loaded from the API.
     pub models_loaded: bool,
     /// `true` while the background fetch is in flight.
@@ -457,6 +462,7 @@ impl ModelPickerState {
             filter: String::new(),
             effort_level: EffortLevel::Normal,
             fast_mode: false,
+            fast_mode_model: None,
             models_loaded: false,
             loading_models: false,
         }
@@ -495,6 +501,7 @@ impl ModelPickerState {
         self.filter.clear();
         self.effort_level = effort;
         self.fast_mode = fast_mode;
+        self.fast_mode_model = fast_mode.then_some(current_model.to_string());
         self.visible = true;
     }
 
@@ -502,6 +509,10 @@ impl ModelPickerState {
     pub fn close(&mut self) {
         self.visible = false;
         self.filter.clear();
+    }
+
+    pub fn is_selected_fast_mode_model(&self, model_id: &str) -> bool {
+        self.fast_mode_model.as_deref() == Some(model_id)
     }
 
     /// Move selection up one row (wraps to last if at top).
@@ -833,7 +844,10 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
 
     if state.fast_mode {
         lines.push(Line::from(vec![Span::styled(
-            format!(" \u{26a1} Fast mode ON ({})", FAST_MODE_MODEL),
+            format!(
+                " \u{26a1} Fast mode ON ({})",
+                state.fast_mode_model.as_deref().unwrap_or("current model")
+            ),
             Style::default().fg(Color::Yellow),
         )]));
     }
@@ -982,9 +996,12 @@ mod tests {
     }
 
     #[test]
-    fn fast_mode_aliases_include_dated_haiku() {
-        assert!(is_fast_mode_model("claude-haiku-4-5"));
-        assert!(is_fast_mode_model("claude-haiku-4-5-20251001"));
+    fn open_with_fast_mode_tracks_locked_model() {
+        let mut p = ModelPickerState::new();
+        p.open_with_state("gpt-4o-mini", EffortLevel::Normal, true);
+        assert_eq!(p.fast_mode_model.as_deref(), Some("gpt-4o-mini"));
+        assert!(p.is_selected_fast_mode_model("gpt-4o-mini"));
+        assert!(!p.is_selected_fast_mode_model("gpt-4o"));
     }
 
     // 3. open() with an unknown model ID marks none as current and sets idx=0.

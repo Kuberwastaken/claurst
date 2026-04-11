@@ -51,6 +51,7 @@ pub mod synthetic_output;
 pub mod team_tool;
 pub mod remote_trigger;
 pub mod formatter;
+pub mod monitor_tool;
 
 // Re-exports for convenience.
 pub use formatter::try_format_file;
@@ -88,6 +89,7 @@ pub use repl_tool::ReplTool;
 pub use synthetic_output::SyntheticOutputTool;
 pub use team_tool::{TeamCreateTool, TeamDeleteTool, register_agent_runner, AgentRunFn};
 pub use remote_trigger::RemoteTriggerTool;
+pub use monitor_tool::MonitorTool;
 
 // ---------------------------------------------------------------------------
 // Core trait & types
@@ -204,6 +206,20 @@ pub fn clear_session_snapshot(session_id: &str) {
     SNAPSHOT_REGISTRY.remove(session_id);
 }
 
+/// A cloneable handle for injecting notification messages into the next agent turn.
+/// Used by background tasks with `notify_on_complete` to signal completion without polling.
+#[derive(Clone)]
+pub struct CompletionNotifier(Arc<dyn Fn(String) + Send + Sync>);
+
+impl CompletionNotifier {
+    pub fn new(f: impl Fn(String) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+    pub fn notify(&self, msg: String) {
+        (self.0)(msg);
+    }
+}
+
 /// Shared context passed to every tool invocation.
 #[derive(Clone)]
 pub struct ToolContext {
@@ -220,6 +236,11 @@ pub struct ToolContext {
     pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
     /// Configured event hooks (PreToolUse, PostToolUse, etc.).
     pub config: claurst_core::config::Config,
+    /// Managed agent (manager-executor) configuration, if active.
+    pub managed_agent_config: Option<claurst_core::ManagedAgentConfig>,
+    /// Optional notifier for injecting completion messages into the next agent turn.
+    /// Set when the query loop has a command queue wired up.
+    pub completion_notifier: Option<CompletionNotifier>,
 }
 
 impl ToolContext {
@@ -380,6 +401,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(SyntheticOutputTool),
         Box::new(McpAuthTool),
         Box::new(RemoteTriggerTool),
+        Box::new(MonitorTool),
         // Computer Use is only available when compiled with the feature flag.
         #[cfg(feature = "computer-use")]
         Box::new(computer_use::ComputerUseTool),
@@ -532,6 +554,8 @@ mod tests {
             non_interactive: true,
             mcp_manager: None,
             config: Config::default(),
+            managed_agent_config: None,
+            completion_notifier: None,
         };
 
         // Absolute paths pass through unchanged
@@ -560,6 +584,8 @@ mod tests {
             non_interactive: true,
             mcp_manager: None,
             config: Config::default(),
+            managed_agent_config: None,
+            completion_notifier: None,
         };
 
         // Relative paths get joined with working_dir

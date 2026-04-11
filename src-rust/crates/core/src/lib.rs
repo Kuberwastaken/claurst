@@ -10,10 +10,6 @@ pub use provider_id::{ProviderId, ModelId};
 // Session transcript persistence (JSONL, matches TS sessionStorage.ts schema).
 pub mod session_storage;
 
-// Session sharing — HTTP upload to a share endpoint + local text export.
-pub mod session_share;
-pub use session_share::{share_session, export_session_text};
-
 // SQLite-backed session storage (faster alternative to JSONL).
 pub mod sqlite_storage;
 pub use sqlite_storage::{SqliteSessionStore, SessionSummary};
@@ -75,7 +71,7 @@ pub use types::{
     ContentBlock, ImageSource, DocumentSource, CitationsConfig, Message, MessageContent,
     MessageCost, Role, ToolDefinition, ToolResultContent, UsageInfo,
 };
-pub use config::{AgentDefinition, Config, CommandTemplate, FormatterConfig, McpServerConfig, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, default_agents, strip_jsonc_comments, substitute_env_vars};
+pub use config::{AgentDefinition, BudgetSplitPolicy, Config, CommandTemplate, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
 
 // Skill discovery: filesystem and git URL skill loading.
 pub mod skill_discovery;
@@ -625,6 +621,82 @@ pub mod config {
 
     /// Definition of a named agent with per-agent model, permissions,
     /// temperature, and system prompt.
+    pub fn api_key_env_vars_for_provider(provider_id: &str) -> &'static [&'static str] {
+        match provider_id {
+            "anthropic" => &["ANTHROPIC_API_KEY"],
+            "openai" => &["OPENAI_API_KEY"],
+            "google" | "google-vertex" => &["GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"],
+            "github-copilot" => &["GITHUB_TOKEN"],
+            "groq" => &["GROQ_API_KEY"],
+            "cerebras" => &["CEREBRAS_API_KEY"],
+            "sambanova" => &["SAMBANOVA_API_KEY"],
+            "deepseek" => &["DEEPSEEK_API_KEY"],
+            "mistral" => &["MISTRAL_API_KEY"],
+            "openrouter" => &["OPENROUTER_API_KEY"],
+            "togetherai" | "together-ai" => &["TOGETHER_API_KEY"],
+            "perplexity" => &["PERPLEXITY_API_KEY"],
+            "cohere" => &["COHERE_API_KEY"],
+            "xai" => &["XAI_API_KEY"],
+            "deepinfra" => &["DEEPINFRA_API_KEY"],
+            "azure" => &["AZURE_API_KEY"],
+            "gitlab" => &["GITLAB_TOKEN"],
+            "huggingface" => &["HF_TOKEN"],
+            "nvidia" => &["NVIDIA_API_KEY"],
+            "alibaba" | "qwen" => &["DASHSCOPE_API_KEY"],
+            "venice" => &["VENICE_API_KEY"],
+            "moonshot" | "moonshotai" => &["MOONSHOT_API_KEY"],
+            "zhipu" | "zhipuai" => &["ZHIPU_API_KEY"],
+            "zai" => &["ZAI_API_KEY"],
+            "siliconflow" => &["SILICONFLOW_API_KEY"],
+            "nebius" => &["NEBIUS_API_KEY"],
+            "novita" => &["NOVITA_API_KEY"],
+            "minimax" => &["MINIMAX_API_KEY"],
+            "ovhcloud" => &["OVHCLOUD_API_KEY"],
+            "scaleway" => &["SCALEWAY_API_KEY"],
+            "vultr" | "vultr-ai" => &["VULTR_API_KEY"],
+            "baseten" => &["BASETEN_API_KEY"],
+            "friendli" => &["FRIENDLI_TOKEN"],
+            "upstage" => &["UPSTAGE_API_KEY"],
+            "stepfun" => &["STEPFUN_API_KEY"],
+            "fireworks" => &["FIREWORKS_API_KEY"],
+            "cloudflare" | "cloudflare-ai-gateway" | "cloudflare-workers-ai" => {
+                &["CLOUDFLARE_API_TOKEN"]
+            }
+            "vercel" => &["AI_GATEWAY_API_KEY"],
+            "helicone" => &["HELICONE_API_KEY"],
+            "sap" | "sap-ai-core" => &["AICORE_SERVICE_KEY"],
+            _ => &[],
+        }
+    }
+
+    pub fn primary_api_key_env_var_for_provider(provider_id: &str) -> Option<&'static str> {
+        api_key_env_vars_for_provider(provider_id).first().copied()
+    }
+
+    pub fn api_base_env_var_for_provider(provider_id: &str) -> Option<&'static str> {
+        match provider_id {
+            "anthropic" => Some("ANTHROPIC_BASE_URL"),
+            "openai" => Some("OPENAI_BASE_URL"),
+            "minimax" => Some("MINIMAX_BASE_URL"),
+            "ollama" => Some("OLLAMA_HOST"),
+            "lmstudio" | "lm-studio" => Some("LM_STUDIO_HOST"),
+            "llamacpp" | "llama-cpp" | "llama-server" => Some("LLAMA_CPP_HOST"),
+            _ => None,
+        }
+    }
+
+    pub fn default_api_base_for_provider(provider_id: &str) -> Option<&'static str> {
+        match provider_id {
+            "anthropic" => Some(crate::constants::ANTHROPIC_API_BASE),
+            "openai" => Some("https://api.openai.com"),
+            "minimax" => Some("https://api.minimax.io/anthropic"),
+            "ollama" => Some("http://localhost:11434"),
+            "lmstudio" | "lm-studio" => Some("http://localhost:1234"),
+            "llamacpp" | "llama-cpp" | "llama-server" => Some("http://localhost:8080"),
+            _ => None,
+        }
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct AgentDefinition {
         /// Display name / description
@@ -660,6 +732,119 @@ pub mod config {
                 color: None,
             }
         }
+    }
+
+    // ---- ManagedAgentConfig ----------------------------------------------
+
+    /// Budget allocation strategy between manager and executor agents.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum BudgetSplitPolicy {
+        /// Shared pool — no split (default).
+        SharedPool,
+        /// Manager gets manager_pct% of total budget.
+        Percentage { manager_pct: u8 },
+        /// Hard USD caps per role.
+        FixedCaps { manager_usd: f64, executor_usd: f64 },
+    }
+
+    impl Default for BudgetSplitPolicy {
+        fn default() -> Self { BudgetSplitPolicy::SharedPool }
+    }
+
+    /// Configuration for manager-executor agent architecture.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ManagedAgentConfig {
+        pub enabled: bool,
+        /// "provider/model" string, e.g. "anthropic/claude-opus-4-6"
+        pub manager_model: String,
+        /// "provider/model" string, e.g. "anthropic/claude-sonnet-4-6"
+        pub executor_model: String,
+        #[serde(default = "default_executor_max_turns")]
+        pub executor_max_turns: u32,
+        #[serde(default = "default_max_concurrent_executors")]
+        pub max_concurrent_executors: u32,
+        #[serde(default)]
+        pub budget_split: BudgetSplitPolicy,
+        #[serde(default)]
+        pub total_budget_usd: Option<f64>,
+        #[serde(default)]
+        pub preset_name: Option<String>,
+        #[serde(default)]
+        pub executor_isolation: bool,
+    }
+
+    fn default_executor_max_turns() -> u32 { 10 }
+    fn default_max_concurrent_executors() -> u32 { 4 }
+
+    /// A named preset for common manager-executor configurations.
+    pub struct ManagedAgentPreset {
+        pub name: &'static str,
+        pub label: &'static str,
+        pub description: &'static str,
+        pub manager_model: &'static str,
+        pub executor_model: &'static str,
+        pub executor_max_turns: u32,
+        pub max_concurrent_executors: u32,
+    }
+
+    pub fn builtin_managed_agent_presets() -> Vec<ManagedAgentPreset> {
+        vec![
+            ManagedAgentPreset {
+                name: "anthropic-tiered",
+                label: "Anthropic Tiered",
+                description: "Opus 4.6 manages, Sonnet 4.6 executes (best quality)",
+                manager_model: "anthropic/claude-opus-4-6",
+                executor_model: "anthropic/claude-sonnet-4-6",
+                executor_max_turns: 10,
+                max_concurrent_executors: 4,
+            },
+            ManagedAgentPreset {
+                name: "anthropic-budget",
+                label: "Anthropic Budget",
+                description: "Sonnet 4.6 manages, Haiku 4.5 executes (cost-optimized)",
+                manager_model: "anthropic/claude-sonnet-4-6",
+                executor_model: "anthropic/claude-haiku-4-5-20251001",
+                executor_max_turns: 10,
+                max_concurrent_executors: 6,
+            },
+            ManagedAgentPreset {
+                name: "google-tiered",
+                label: "Google Tiered",
+                description: "Gemini 2.5 Pro manages, Flash executes",
+                manager_model: "google/gemini-2.5-pro",
+                executor_model: "google/gemini-2.5-flash",
+                executor_max_turns: 10,
+                max_concurrent_executors: 4,
+            },
+            ManagedAgentPreset {
+                name: "cross-opus-flash",
+                label: "Cross: Opus + Flash",
+                description: "Anthropic Opus manages, Google Flash executes (cheapest executors)",
+                manager_model: "anthropic/claude-opus-4-6",
+                executor_model: "google/gemini-2.5-flash",
+                executor_max_turns: 10,
+                max_concurrent_executors: 6,
+            },
+            ManagedAgentPreset {
+                name: "openai-tiered",
+                label: "OpenAI Tiered",
+                description: "o3 manages, gpt-4o executes",
+                manager_model: "openai/o3",
+                executor_model: "openai/gpt-4o",
+                executor_max_turns: 10,
+                max_concurrent_executors: 4,
+            },
+            ManagedAgentPreset {
+                name: "cross-openai-anthropic",
+                label: "Cross: OpenAI + Anthropic",
+                description: "o3 manages, Sonnet 4.6 executes",
+                manager_model: "openai/o3",
+                executor_model: "anthropic/claude-sonnet-4-6",
+                executor_max_turns: 10,
+                max_concurrent_executors: 4,
+            },
+        ]
     }
 
     // ---- ProviderConfig --------------------------------------------------
@@ -751,11 +936,9 @@ pub mod config {
         /// Skill-discovery configuration (copied from Settings on load).
         #[serde(default)]
         pub skills: SkillsConfig,
-        /// Optional URL for the session-share service.  When set, `/share`
-        /// POSTs the session to this endpoint and returns the resulting URL.
-        /// When absent, `/share` falls back to a local Markdown export.
-        #[serde(default, rename = "shareEndpoint")]
-        pub share_endpoint: Option<String>,
+        /// Managed agent (manager-executor) configuration.
+        #[serde(default)]
+        pub managed_agents: Option<ManagedAgentConfig>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -863,6 +1046,9 @@ pub mod config {
         /// Skill-discovery configuration (extra paths and git URLs).
         #[serde(default)]
         pub skills: SkillsConfig,
+        /// Managed agent (manager-executor) configuration.
+        #[serde(default)]
+        pub managed_agents: Option<ManagedAgentConfig>,
     }
 
     /// A user-defined slash command template.
@@ -943,6 +1129,17 @@ pub mod config {
     }
 
     impl Config {
+        pub fn selected_provider_id(&self) -> &str {
+            self.provider
+                .as_deref()
+                .or_else(|| {
+                    self.model
+                        .as_deref()
+                        .and_then(|model| model.split_once('/').map(|(provider, _)| provider))
+                })
+                .unwrap_or("anthropic")
+        }
+
         /// Resolve the effective model, falling back to a provider-appropriate default.
         ///
         /// When a non-Anthropic provider is active and no model is explicitly set,
@@ -1011,11 +1208,48 @@ pub mod config {
                 .filter(|prompt| !prompt.trim().is_empty())
         }
 
-        /// Resolve the API key from the config, then from `ANTHROPIC_API_KEY`.
-        pub fn resolve_api_key(&self) -> Option<String> {
+        pub fn resolve_provider_api_key(&self, provider_id: &str) -> Option<String> {
+            let provider_cfg = self.provider_configs.get(provider_id);
+            if provider_cfg.is_some_and(|provider| !provider.enabled) {
+                return None;
+            }
+
+            let top_level_key = if provider_id == self.selected_provider_id() {
+                self.api_key.clone()
+            } else {
+                None
+            };
+
+            top_level_key
+                .filter(|key| !key.is_empty())
+                .or_else(|| {
+                    provider_cfg
+                        .and_then(|provider| provider.api_key.clone())
+                        .filter(|key| !key.is_empty())
+                })
+                .or_else(|| crate::AuthStore::load().api_key_for(provider_id))
+        }
+
+        pub fn resolve_anthropic_api_key(&self) -> Option<String> {
             self.api_key
                 .clone()
-                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                .filter(|key| !key.is_empty())
+                .or_else(|| {
+                    self.provider_configs
+                        .get("anthropic")
+                        .and_then(|provider| provider.api_key.clone())
+                        .filter(|key| !key.is_empty())
+                })
+                .or_else(|| {
+                    api_key_env_vars_for_provider("anthropic")
+                        .iter()
+                        .find_map(|var| std::env::var(var).ok().filter(|v| !v.is_empty()))
+                })
+        }
+
+        /// Resolve the API key for the active provider.
+        pub fn resolve_api_key(&self) -> Option<String> {
+            self.resolve_provider_api_key(self.selected_provider_id())
         }
 
         /// Async variant: also checks `~/.claurst/oauth_tokens.json`.
@@ -1024,11 +1258,18 @@ pub mod config {
         /// - For Claude.ai OAuth flow: credential is the access token, bearer=true.
         /// Silently attempts token refresh when the access token is expired.
         pub async fn resolve_auth_async(&self) -> Option<(String, bool)> {
-            // Highest priority: explicit api_key or env var
-            if let Some(key) = self.resolve_api_key() {
+            if self.selected_provider_id() != "anthropic" {
+                return self.resolve_api_key().map(|key| (key, false));
+            }
+
+            self.resolve_anthropic_auth_async().await
+        }
+
+        pub async fn resolve_anthropic_auth_async(&self) -> Option<(String, bool)> {
+            if let Some(key) = self.resolve_anthropic_api_key() {
                 return Some((key, false));
             }
-            // Fall back to saved OAuth tokens
+
             let tokens = crate::oauth::OAuthTokens::load().await?;
 
             // If expired and we have a refresh token, attempt silent refresh.
@@ -1085,10 +1326,32 @@ pub mod config {
             }
         }
 
-        /// Resolve the API base URL, checking `ANTHROPIC_BASE_URL` first.
+        pub fn resolve_provider_api_base(&self, provider_id: &str) -> Option<String> {
+            let provider_cfg = self.provider_configs.get(provider_id);
+            if provider_cfg.is_some_and(|provider| !provider.enabled) {
+                return None;
+            }
+
+            provider_cfg
+                .and_then(|provider| provider.api_base.clone())
+                .filter(|base| !base.is_empty())
+                .or_else(|| {
+                    api_base_env_var_for_provider(provider_id)
+                        .and_then(|name| std::env::var(name).ok())
+                        .filter(|base| !base.is_empty())
+                })
+                .or_else(|| default_api_base_for_provider(provider_id).map(str::to_owned))
+        }
+
+        pub fn resolve_anthropic_api_base(&self) -> String {
+            self.resolve_provider_api_base("anthropic")
+                .unwrap_or_else(|| crate::constants::ANTHROPIC_API_BASE.to_string())
+        }
+
+        /// Resolve the API base URL for the active provider.
         pub fn resolve_api_base(&self) -> String {
-            std::env::var("ANTHROPIC_BASE_URL")
-                .unwrap_or_else(|_| crate::constants::ANTHROPIC_API_BASE.to_string())
+            self.resolve_provider_api_base(self.selected_provider_id())
+                .unwrap_or_else(|| self.resolve_anthropic_api_base())
         }
     }
 
@@ -1283,7 +1546,7 @@ pub mod config {
                     for u in over.config.skills.urls { if !urls.contains(&u) { urls.push(u); } }
                     SkillsConfig { paths, urls }
                 },
-                share_endpoint: over.config.share_endpoint.or(base.config.share_endpoint),
+                managed_agents: over.config.managed_agents.or(base.config.managed_agents),
             };
             Self {
                 config: merged_config,
@@ -1307,6 +1570,7 @@ pub mod config {
                     for u in over.skills.urls { if !urls.contains(&u) { urls.push(u); } }
                     SkillsConfig { paths, urls }
                 },
+                managed_agents: over.managed_agents.or(base.managed_agents),
             }
         }
     }
@@ -3800,5 +4064,42 @@ mod tests {
         assert_eq!(tracker.input_tokens(), 0);
         assert_eq!(tracker.output_tokens(), 0);
         assert_eq!(tracker.total_cost_usd(), 0.0);
+    }
+
+    #[test]
+    fn managed_agent_config_serde_round_trip() {
+        let cfg = ManagedAgentConfig {
+            enabled: true,
+            manager_model: "anthropic/claude-opus-4-6".to_string(),
+            executor_model: "anthropic/claude-sonnet-4-6".to_string(),
+            executor_max_turns: 10,
+            max_concurrent_executors: 4,
+            budget_split: BudgetSplitPolicy::Percentage { manager_pct: 30 },
+            total_budget_usd: Some(5.0),
+            preset_name: Some("anthropic-tiered".to_string()),
+            executor_isolation: false,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let decoded: ManagedAgentConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.manager_model, "anthropic/claude-opus-4-6");
+        assert_eq!(decoded.executor_max_turns, 10);
+    }
+
+    #[test]
+    fn budget_split_policy_defaults_to_shared_pool() {
+        let json = r#"{"enabled":true,"manager_model":"a/b","executor_model":"a/c"}"#;
+        let cfg: ManagedAgentConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.budget_split, BudgetSplitPolicy::SharedPool);
+        assert_eq!(cfg.executor_max_turns, 10);
+    }
+
+    #[test]
+    fn builtin_presets_all_have_valid_model_format() {
+        for preset in builtin_managed_agent_presets() {
+            assert!(preset.manager_model.contains('/'),
+                "Preset {} manager_model must be provider/model", preset.name);
+            assert!(preset.executor_model.contains('/'),
+                "Preset {} executor_model must be provider/model", preset.name);
+        }
     }
 }

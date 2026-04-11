@@ -24,7 +24,7 @@ use claurst_core::codex_oauth::{
 use claurst_core::oauth_config::{get_codex_tokens, save_codex_tokens, CodexTokens};
 use claurst_core::provider_id::{ModelId, ProviderId};
 use claurst_core::types::UsageInfo;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 use tracing::{debug, warn};
 
@@ -181,9 +181,7 @@ impl CodexProvider {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        let expires_in = json_val
-            .get("expires_in")
-            .and_then(|v| v.as_u64());
+        let expires_in = json_val.get("expires_in").and_then(|v| v.as_u64());
 
         let new_expires_at = expires_in.map(|secs| {
             SystemTime::now()
@@ -228,7 +226,7 @@ impl CodexProvider {
     ) -> reqwest::RequestBuilder {
         let builder = builder
             .bearer_auth(token)
-            .header("User-Agent", "claurst/0.0.8");
+            .header("User-Agent", "claurst/0.0.9");
 
         if let Some(id) = account_id {
             builder.header("ChatGPT-Account-Id", id)
@@ -241,10 +239,23 @@ impl CodexProvider {
         self.tokens.lock().unwrap().account_id.clone()
     }
 
+    fn system_prompt_to_text(request: &ProviderRequest) -> String {
+        match request.system_prompt.as_ref() {
+            Some(crate::provider_types::SystemPrompt::Text(text)) => text.clone(),
+            Some(crate::provider_types::SystemPrompt::Blocks(blocks)) => blocks
+                .iter()
+                .map(|b| b.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            None => String::new(),
+        }
+    }
+
     /// Build the Responses-API request body for Codex.
     fn build_responses_body(request: &ProviderRequest) -> Value {
         // Re-use the same message translation that the Copilot provider uses.
         let input = CopilotProvider::to_responses_input_pub(request);
+        let instructions = Self::system_prompt_to_text(request);
 
         let tools: Vec<Value> = request
             .tools
@@ -263,7 +274,7 @@ impl CodexProvider {
         let mut body = json!({
             "model": request.model,
             "input": input,
-            "max_output_tokens": request.max_tokens,
+            "instructions": instructions,
             "store": false,
         });
 
@@ -272,6 +283,72 @@ impl CodexProvider {
         }
 
         body
+    }
+
+    fn extract_stream_error_message(json_val: &Value) -> String {
+        json_val
+            .pointer("/error/message")
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                json_val
+                    .pointer("/response/error/message")
+                    .and_then(|value| value.as_str())
+            })
+            .or_else(|| {
+                json_val
+                    .pointer("/message")
+                    .and_then(|value| value.as_str())
+            })
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| json_val.to_string())
+    }
+
+    fn parse_stream_frame(
+        provider_id: &ProviderId,
+        event_name: &str,
+        data: &str,
+    ) -> Result<Option<ProviderResponse>, ProviderError> {
+        let trimmed = data.trim();
+        if trimmed.is_empty() || trimmed == "[DONE]" {
+            return Ok(None);
+        }
+
+        let json_val: Value =
+            serde_json::from_str(trimmed).map_err(|e| ProviderError::StreamError {
+                provider: provider_id.clone(),
+                message: format!("Failed to parse Codex stream JSON: {}", e),
+                partial_response: Some(trimmed.to_string()),
+            })?;
+
+        let effective_event = if event_name.is_empty() {
+            json_val
+                .get("type")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+        } else {
+            event_name
+        };
+
+        match effective_event {
+            "response.completed" => {
+                let response_json = json_val.get("response").unwrap_or(&json_val);
+                let response =
+                    Self::parse_responses_response(provider_id, response_json).map_err(|e| {
+                        ProviderError::StreamError {
+                            provider: provider_id.clone(),
+                            message: format!("Failed to parse Codex completed event: {}", e),
+                            partial_response: Some(trimmed.to_string()),
+                        }
+                    })?;
+                Ok(Some(response))
+            }
+            "response.failed" | "response.error" | "error" => Err(ProviderError::StreamError {
+                provider: provider_id.clone(),
+                message: Self::extract_stream_error_message(&json_val),
+                partial_response: Some(trimmed.to_string()),
+            }),
+            _ => Ok(None),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -324,7 +401,49 @@ impl CodexProvider {
             body: Some(text.clone()),
         })?;
 
-        self.parse_responses_response(&json_val)
+        Self::parse_responses_response(&self.id, &json_val)
+    }
+
+    async fn send_responses_streaming_request(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let token = self.access_token().await?;
+        let account_id = self.account_id();
+
+        let mut body = Self::build_responses_body(request);
+        body["stream"] = json!(true);
+
+        let builder = self
+            .http_client
+            .post(CODEX_API_ENDPOINT)
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream");
+        let builder = self.codex_headers(builder, &token, account_id.as_deref());
+
+        let resp = builder
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Other {
+                provider: self.id.clone(),
+                message: format!("HTTP request failed: {}", e),
+                status: None,
+                body: None,
+            })?;
+
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&(status as usize)) {
+            let text = resp.text().await.map_err(|e| ProviderError::Other {
+                provider: self.id.clone(),
+                message: format!("Failed to read response body: {}", e),
+                status: Some(status),
+                body: None,
+            })?;
+            return Err(parse_error_response(status, &text, &self.id));
+        }
+
+        Ok(resp)
     }
 
     // -----------------------------------------------------------------------
@@ -332,7 +451,7 @@ impl CodexProvider {
     // -----------------------------------------------------------------------
 
     fn parse_responses_response(
-        &self,
+        provider_id: &ProviderId,
         json_val: &Value,
     ) -> Result<ProviderResponse, ProviderError> {
         use claurst_core::types::ContentBlock;
@@ -352,7 +471,7 @@ impl CodexProvider {
             .get("output")
             .and_then(|v| v.as_array())
             .ok_or_else(|| ProviderError::Other {
-                provider: self.id.clone(),
+                provider: provider_id.clone(),
                 message: "No output in Codex Responses API response".to_string(),
                 status: None,
                 body: Some(json_val.to_string()),
@@ -368,9 +487,7 @@ impl CodexProvider {
                         for part in parts {
                             match part.get("type").and_then(|v| v.as_str()) {
                                 Some("output_text") | Some("text") => {
-                                    if let Some(text) =
-                                        part.get("text").and_then(|v| v.as_str())
-                                    {
+                                    if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
                                         if !text.is_empty() {
                                             content.push(ContentBlock::Text {
                                                 text: text.to_string(),
@@ -453,7 +570,13 @@ impl CodexProvider {
             }
         };
 
-        Ok(ProviderResponse { id, content, stop_reason, usage, model })
+        Ok(ProviderResponse {
+            id,
+            content,
+            stop_reason,
+            usage,
+            model,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -461,7 +584,6 @@ impl CodexProvider {
     // -----------------------------------------------------------------------
 
     fn stream_synthetic_response(
-        &self,
         response: ProviderResponse,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>> {
         use claurst_core::types::ContentBlock;
@@ -558,8 +680,335 @@ impl LlmProvider for CodexProvider {
         request: ProviderRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
     {
-        let response = self.send_responses_request(&request).await?;
-        Ok(self.stream_synthetic_response(response))
+        let resp = self.send_responses_streaming_request(&request).await?;
+        let provider_id = self.id.clone();
+
+        let s = stream! {
+            let mut byte_stream = resp.bytes_stream();
+            let mut leftover = String::new();
+            let mut current_event = String::new();
+            let mut current_data: Vec<String> = Vec::new();
+            let mut message_started = false;
+            let mut message_id = String::from("unknown");
+            let mut model_name = String::from(DEFAULT_CODEX_MODEL);
+            let mut saw_tool_call = false;
+            let mut open_blocks: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+            'outer: while let Some(chunk_result) = byte_stream.next().await {
+                let chunk = match chunk_result {
+                    Ok(chunk) => chunk,
+                    Err(e) => {
+                        yield Err(ProviderError::StreamError {
+                            provider: provider_id.clone(),
+                            message: format!("Stream read error: {}", e),
+                            partial_response: None,
+                        });
+                        return;
+                    }
+                };
+
+                let text = String::from_utf8_lossy(&chunk);
+                let combined = if leftover.is_empty() {
+                    text.to_string()
+                } else {
+                    let mut s = std::mem::take(&mut leftover);
+                    s.push_str(&text);
+                    s
+                };
+
+                let mut lines: Vec<&str> = combined.split('\n').collect();
+                if !combined.ends_with('\n') {
+                    leftover = lines.pop().unwrap_or("").to_string();
+                }
+
+                for raw_line in lines {
+                    let line = raw_line.trim_end_matches('\r');
+
+                    if line.is_empty() {
+                        if current_data.is_empty() {
+                            current_event.clear();
+                            continue;
+                        }
+
+                        let data = current_data.join("\n");
+                        current_data.clear();
+                        let trimmed = data.trim();
+                        if trimmed.is_empty() || trimmed == "[DONE]" {
+                            current_event.clear();
+                            continue;
+                        }
+
+                        let json_val: Value = match serde_json::from_str(trimmed) {
+                            Ok(value) => value,
+                            Err(e) => {
+                                yield Err(ProviderError::StreamError {
+                                    provider: provider_id.clone(),
+                                    message: format!("Failed to parse Codex stream JSON: {}", e),
+                                    partial_response: Some(trimmed.to_string()),
+                                });
+                                return;
+                            }
+                        };
+
+                        let event_name = if current_event.is_empty() {
+                            json_val
+                                .get("type")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("")
+                                .to_string()
+                        } else {
+                            current_event.clone()
+                        };
+
+                        match event_name.as_str() {
+                            "response.created" | "response.in_progress" => {
+                                if let Some(response) = json_val.get("response") {
+                                    if let Some(id) = response.get("id").and_then(|value| value.as_str()) {
+                                        message_id = id.to_string();
+                                    }
+                                    if let Some(model) = response.get("model").and_then(|value| value.as_str()) {
+                                        model_name = model.to_string();
+                                    }
+                                    if !message_started {
+                                        yield Ok(StreamEvent::MessageStart {
+                                            id: message_id.clone(),
+                                            model: model_name.clone(),
+                                            usage: UsageInfo::default(),
+                                        });
+                                        message_started = true;
+                                    }
+                                }
+                            }
+                            "response.output_item.added" => {
+                                let output_index = json_val
+                                    .get("output_index")
+                                    .and_then(|value| value.as_u64())
+                                    .unwrap_or(0) as usize;
+                                if let Some(item) = json_val.get("item") {
+                                    match item.get("type").and_then(|value| value.as_str()) {
+                                        Some("message") => {
+                                            if let Some(id) = item.get("id").and_then(|value| value.as_str()) {
+                                                message_id = id.to_string();
+                                            }
+                                            if !message_started {
+                                                yield Ok(StreamEvent::MessageStart {
+                                                    id: message_id.clone(),
+                                                    model: model_name.clone(),
+                                                    usage: UsageInfo::default(),
+                                                });
+                                                message_started = true;
+                                            }
+                                        }
+                                        Some("function_call") => {
+                                            saw_tool_call = true;
+                                            let call_id = item
+                                                .get("call_id")
+                                                .or_else(|| item.get("id"))
+                                                .and_then(|value| value.as_str())
+                                                .unwrap_or("")
+                                                .to_string();
+                                            let name = item
+                                                .get("name")
+                                                .and_then(|value| value.as_str())
+                                                .unwrap_or("")
+                                                .to_string();
+                                            if open_blocks.insert(output_index) {
+                                                yield Ok(StreamEvent::ContentBlockStart {
+                                                    index: output_index,
+                                                    content_block: claurst_core::types::ContentBlock::ToolUse {
+                                                        id: call_id,
+                                                        name,
+                                                        input: json!({}),
+                                                    },
+                                                });
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            "response.content_part.added" => {
+                                let output_index = json_val
+                                    .get("output_index")
+                                    .and_then(|value| value.as_u64())
+                                    .unwrap_or(0) as usize;
+                                if let Some(part) = json_val.get("part") {
+                                    if matches!(part.get("type").and_then(|value| value.as_str()), Some("output_text") | Some("text")) {
+                                        if !message_started {
+                                            yield Ok(StreamEvent::MessageStart {
+                                                id: message_id.clone(),
+                                                model: model_name.clone(),
+                                                usage: UsageInfo::default(),
+                                            });
+                                            message_started = true;
+                                        }
+                                        if open_blocks.insert(output_index) {
+                                            yield Ok(StreamEvent::ContentBlockStart {
+                                                index: output_index,
+                                                content_block: claurst_core::types::ContentBlock::Text {
+                                                    text: String::new(),
+                                                },
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            "response.output_text.delta" => {
+                                let output_index = json_val
+                                    .get("output_index")
+                                    .and_then(|value| value.as_u64())
+                                    .unwrap_or(0) as usize;
+                                let delta = json_val
+                                    .get("delta")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or("");
+                                if !message_started {
+                                    yield Ok(StreamEvent::MessageStart {
+                                        id: message_id.clone(),
+                                        model: model_name.clone(),
+                                        usage: UsageInfo::default(),
+                                    });
+                                    message_started = true;
+                                }
+                                if open_blocks.insert(output_index) {
+                                    yield Ok(StreamEvent::ContentBlockStart {
+                                        index: output_index,
+                                        content_block: claurst_core::types::ContentBlock::Text {
+                                            text: String::new(),
+                                        },
+                                    });
+                                }
+                                if !delta.is_empty() {
+                                    yield Ok(StreamEvent::TextDelta {
+                                        index: output_index,
+                                        text: delta.to_string(),
+                                    });
+                                }
+                            }
+                            "response.function_call_arguments.delta" => {
+                                let output_index = json_val
+                                    .get("output_index")
+                                    .and_then(|value| value.as_u64())
+                                    .unwrap_or(0) as usize;
+                                let delta = json_val
+                                    .get("delta")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or("");
+                                if !delta.is_empty() {
+                                    yield Ok(StreamEvent::InputJsonDelta {
+                                        index: output_index,
+                                        partial_json: delta.to_string(),
+                                    });
+                                }
+                            }
+                            "response.output_item.done" => {
+                                let output_index = json_val
+                                    .get("output_index")
+                                    .and_then(|value| value.as_u64())
+                                    .unwrap_or(0) as usize;
+                                if open_blocks.remove(&output_index) {
+                                    yield Ok(StreamEvent::ContentBlockStop { index: output_index });
+                                }
+                            }
+                            "response.completed" => {
+                                if let Some(response) = json_val.get("response") {
+                                    if let Some(id) = response.get("id").and_then(|value| value.as_str()) {
+                                        message_id = id.to_string();
+                                    }
+                                    if let Some(model) = response.get("model").and_then(|value| value.as_str()) {
+                                        model_name = model.to_string();
+                                    }
+
+                                    if !message_started {
+                                        yield Ok(StreamEvent::MessageStart {
+                                            id: message_id.clone(),
+                                            model: model_name.clone(),
+                                            usage: UsageInfo::default(),
+                                        });
+                                        message_started = true;
+                                    }
+
+                                    let mut remaining: Vec<usize> = open_blocks.drain().collect();
+                                    remaining.sort_unstable();
+                                    for index in remaining {
+                                        yield Ok(StreamEvent::ContentBlockStop { index });
+                                    }
+
+                                    let usage_json = response.get("usage");
+                                    let usage = UsageInfo {
+                                        input_tokens: usage_json
+                                            .and_then(|value| value.get("input_tokens"))
+                                            .and_then(|value| value.as_u64())
+                                            .unwrap_or(0),
+                                        output_tokens: usage_json
+                                            .and_then(|value| value.get("output_tokens"))
+                                            .and_then(|value| value.as_u64())
+                                            .unwrap_or(0),
+                                        cache_creation_input_tokens: 0,
+                                        cache_read_input_tokens: usage_json
+                                            .and_then(|value| value.get("input_tokens_details"))
+                                            .and_then(|value| value.get("cached_tokens"))
+                                            .and_then(|value| value.as_u64())
+                                            .unwrap_or(0),
+                                    };
+
+                                    let stop_reason = if saw_tool_call {
+                                        StopReason::ToolUse
+                                    } else {
+                                        match response
+                                            .get("incomplete_details")
+                                            .and_then(|value| value.get("reason"))
+                                            .and_then(|value| value.as_str())
+                                        {
+                                            Some("max_output_tokens") => StopReason::MaxTokens,
+                                            Some("content_filter") => StopReason::ContentFiltered,
+                                            Some(other) if !other.is_empty() => StopReason::Other(other.to_string()),
+                                            _ => StopReason::EndTurn,
+                                        }
+                                    };
+
+                                    yield Ok(StreamEvent::MessageDelta {
+                                        stop_reason: Some(stop_reason),
+                                        usage: Some(usage),
+                                    });
+                                    yield Ok(StreamEvent::MessageStop);
+                                    return;
+                                }
+                            }
+                            "response.failed" | "response.error" | "error" => {
+                                yield Err(ProviderError::StreamError {
+                                    provider: provider_id.clone(),
+                                    message: Self::extract_stream_error_message(&json_val),
+                                    partial_response: Some(trimmed.to_string()),
+                                });
+                                return;
+                            }
+                            _ => {}
+                        }
+
+                        current_event.clear();
+                        continue;
+                    }
+
+                    if let Some(rest) = line.strip_prefix("event:") {
+                        current_event = rest.trim().to_string();
+                        continue;
+                    }
+
+                    if let Some(rest) = line.strip_prefix("data:") {
+                        current_data.push(rest.trim_start().to_string());
+                    }
+                }
+            }
+
+            yield Err(ProviderError::StreamError {
+                provider: provider_id,
+                message: "Codex stream ended before response.completed".to_string(),
+                partial_response: None,
+            });
+        };
+
+        Ok(Box::pin(s))
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {

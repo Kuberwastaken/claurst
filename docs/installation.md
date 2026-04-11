@@ -82,30 +82,16 @@ sudo mv claurst-linux-aarch64 /usr/local/bin/claurst
 ### macOS (Intel)
 
 ```bash
-curl -L https://github.com/Kuberwastaken/claurst/releases/latest/download/claurst-macos-x86_64.tar.gz \
-  | tar -xz
-
-chmod +x claurst-macos-x86_64
-sudo mv claurst-macos-x86_64 /usr/local/bin/claurst
+curl -Lo claurst.tar.gz https://github.com/Kuberwastaken/claurst/releases/latest/download/claurst-macos-x86_64.tar.gz && tar xzf claurst.tar.gz && chmod +x claurst && xattr -rd com.apple.quarantine claurst
 ```
 
 ### macOS (Apple Silicon)
 
 ```bash
-curl -L https://github.com/Kuberwastaken/claurst/releases/latest/download/claurst-macos-aarch64.tar.gz \
-  | tar -xz
-
-chmod +x claurst-macos-aarch64
-sudo mv claurst-macos-aarch64 /usr/local/bin/claurst
+curl -Lo claurst.tar.gz https://github.com/Kuberwastaken/claurst/releases/latest/download/claurst-macos-aarch64.tar.gz && tar xzf claurst.tar.gz && chmod +x claurst && xattr -rd com.apple.quarantine claurst
 ```
 
-> **macOS Gatekeeper note:** On first run macOS may show a security warning
-> because the binary is not notarized. To dismiss it, right-click the binary in
-> Finder and choose **Open**, or run:
->
-> ```bash
-> xattr -dr com.apple.quarantine /usr/local/bin/claurst
-> ```
+> **macOS Gatekeeper note:** The `xattr -rd com.apple.quarantine claurst` step in the commands above clears the quarantine flag automatically, so macOS will not block the binary on first run.
 
 ---
 
@@ -135,7 +121,7 @@ claurst --version
 A successful installation prints the version string, for example:
 
 ```
-claude 0.0.8
+claude 0.0.9
 ```
 
 To confirm the binary is the one you installed:

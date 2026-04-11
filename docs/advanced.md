@@ -131,7 +131,6 @@ The transcript directory is derived from the working directory at session start.
 | `/rename <title>` | Rename the current session. Appends a custom-title entry to the JSONL file. |
 | `/export` | Export the current session transcript. |
 | `/rewind` | Step back to an earlier point in the conversation. |
-| `/share` | Generate a shareable link to the session transcript (requires authentication). |
 
 ### JSONL transcript format
 

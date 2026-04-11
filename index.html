@@ -62,11 +62,34 @@
             line-height: 1.6;
             overflow: hidden;
             height: 100vh;
+            min-height: 100dvh;
         }
 
         ::selection {
             background-color: var(--accent-shy);
             color: var(--text-primary);
+        }
+
+        ::-webkit-scrollbar {
+            width: 3px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--accent);
+            border-radius: 99px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #ff2a76;
+        }
+
+        * {
+            scrollbar-width: thin;
+            scrollbar-color: var(--accent) transparent;
         }
 
         .bg-grid {
@@ -205,7 +228,14 @@
 
         /* Hero */
         main.grid-section {
-            flex: 1;
+            flex: 3;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+
+        section.grid-section {
+            flex: 2;
             display: flex;
             flex-direction: column;
             justify-content: center;
@@ -403,22 +433,116 @@
         }
 
         @media (max-width: 768px) {
-            .hero-title {
-                font-size: 2rem;
+            body {
+                overflow-y: auto;
+                height: auto;
+                min-height: 100dvh;
             }
-            .nav-links {
-                gap: 1rem;
+
+            .container-wrapper {
+                height: auto;
+                min-height: 100dvh;
+                padding: 0.5rem;
+                align-items: stretch;
             }
+
+            .container {
+                height: auto;
+                max-height: none;
+                min-height: 100%;
+            }
+
+            nav {
+                padding: 1rem 1rem;
+            }
+
+            .nav-brand {
+                font-size: 1rem;
+            }
+
+            .nav-logo {
+                width: 26px;
+                height: 26px;
+            }
+
+            .hero-wrapper {
+                padding: 1rem 1rem 1.5rem;
+            }
+
+            h1.hero-title {
+                font-size: clamp(1.6rem, 7vw, 2.2rem);
+                margin-bottom: 1rem;
+            }
+
+            .hero-desc {
+                font-size: 0.9rem;
+            }
+
+            main.grid-section {
+                padding: 0.5rem 0;
+            }
+
+            .downloads-wrapper {
+                padding: 1rem;
+            }
+
+            .cmd-body {
+                padding: 1.25rem 1rem;
+                font-size: 0.78rem;
+            }
+
+            .cmd-comment {
+                margin-bottom: 0.75rem;
+            }
+
+            .cmd-copy {
+                top: 1rem;
+                right: 1rem;
+            }
+
+            /* Keep footer as 3-column row on mobile */
             .footer-grid {
-                grid-template-columns: 1fr;
+                grid-template-columns: repeat(3, 1fr);
             }
+
             .footer-item {
-                border-right: none;
-                border-bottom: 1px solid var(--surface-border);
-                padding: 1.5rem 1rem;
-            }
-            .footer-item:last-child {
+                border-right: 1px solid var(--surface-border);
                 border-bottom: none;
+                padding: 1rem 0.4rem;
+                font-size: 0.75rem;
+            }
+
+            a.footer-item {
+                font-size: 0.75rem;
+                font-weight: 500;
+            }
+
+            div.footer-item {
+                font-size: 0.7rem;
+            }
+
+            .footer-item:last-child {
+                border-right: none;
+            }
+        }
+
+        @media (max-width: 400px) {
+            h1.hero-title {
+                font-size: 1.4rem;
+            }
+
+            .nav-btn-pink {
+                font-size: 0.75rem;
+                padding: 0.4rem 0.75rem;
+            }
+
+            .cmd-tabs {
+                gap: 0.4rem;
+            }
+
+            .os-tab {
+                font-size: 0.72rem;
+                padding: 0.25rem 0.4rem;
             }
         }
     </style>
@@ -479,7 +603,7 @@
                             <span class="cmd-comment" id="cmd-comment-text"># macOS (Apple Silicon). Download and extract.</span>
                             <div class="cmd-line">
                                 <span class="cmd-prompt">$</span>
-                                <span class="cmd-code" id="cmd-code-text">curl -Lo claurst.tar.gz https://github.com/Kuberwastaken/claurst/releases/latest/download/claurst-macos-aarch64.tar.gz && tar xzf claurst.tar.gz && chmod +x claurst</span>
+                                <span class="cmd-code" id="cmd-code-text">curl -Lo claurst.tar.gz https://github.com/Kuberwastaken/claurst/releases/latest/download/claurst-macos-aarch64.tar.gz && tar xzf claurst.tar.gz && chmod +x claurst && xattr -rd com.apple.quarantine claurst</span>
                             </div>
                         </div>
                     </div>
@@ -509,11 +633,11 @@
             const commands = {
                 'mac-arm': {
                     comment: '# macOS (Apple Silicon). Download and extract.',
-                    code: 'curl -Lo claurst.tar.gz https://github.com/Kuberwastaken/claurst/releases/latest/download/claurst-macos-aarch64.tar.gz && tar xzf claurst.tar.gz && chmod +x claurst'
+                    code: 'curl -Lo claurst.tar.gz https://github.com/Kuberwastaken/claurst/releases/latest/download/claurst-macos-aarch64.tar.gz && tar xzf claurst.tar.gz && chmod +x claurst && xattr -rd com.apple.quarantine claurst'
                 },
                 'mac-intel': {
                     comment: '# macOS (Intel). Download and extract.',
-                    code: 'curl -Lo claurst.tar.gz https://github.com/Kuberwastaken/claurst/releases/latest/download/claurst-macos-x86_64.tar.gz && tar xzf claurst.tar.gz && chmod +x claurst'
+                    code: 'curl -Lo claurst.tar.gz https://github.com/Kuberwastaken/claurst/releases/latest/download/claurst-macos-x86_64.tar.gz && tar xzf claurst.tar.gz && chmod +x claurst && xattr -rd com.apple.quarantine claurst'
                 },
                 'linux-x64': {
                     comment: '# Linux (x86_64). Download and extract.',

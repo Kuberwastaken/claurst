@@ -6,7 +6,7 @@
 
 <p>
     <a href="https://github.com/kuberwastaken/claurst"><img src="https://img.shields.io/badge/Built_with-Rust-CE4D2B?style=for-the-badge&logo=rust&logoColor=white" alt="Built with Rust"></a>
-    <a href="https://github.com/kuberwastaken/claurst"><img src="https://img.shields.io/badge/Version-0.0.8-2E8B57?style=for-the-badge" alt="Version 0.0.8"></a>
+    <a href="https://github.com/kuberwastaken/claurst"><img src="https://img.shields.io/badge/Version-0.0.9-2E8B57?style=for-the-badge" alt="Version 0.0.9"></a>
     <a href="https://github.com/kuberwastaken/claurst/blob/main/LICENSE.md"><img src="https://img.shields.io/badge/License-GPL--3.0-blue?style=for-the-badge" alt="GPL-3.0 License"></a>
 </p>
 
@@ -25,9 +25,11 @@ It's fast, it's memory-efficient, it's yours to run however you want, and there'
 
 > [!NOTE]
 > **Recent Updates:**
-> - Speech modes: Try /Rocky and /Caveman to hear the difference! /Normal to go back. `[EXPERIMENTAL]`
+> - **Managed Agents Preview:** Run `/managed-agents` to create a better agentic loop with a Manager-Executor relation and dramatically improved performance for fractions of the cost from running a larger model. Choose from 6 pre-built templates or build your own.`[EXPERIMENTAL]`
 >
-> - Multi-Provider Support is here! Run /Connect to connect to the AI provider of your choice - Anthropic, OpenAI, Google, GitHub Copilot, Ollama, DeepSeek, Groq, Mistral, and [30+ more](#supported-providers). `[EXPERIMENTAL]`
+> - Speech modes: Try `/rocky` and `/caveman` to hear the difference! `/normal` to go back.
+>
+> - Multi-Provider Support is here! Run `/connect` to connect to the AI provider of your choice - Anthropic, OpenAI, Google, GitHub Copilot, Ollama, DeepSeek, Groq, Mistral, and [30+ more](#supported-providers).
 
 ---
 

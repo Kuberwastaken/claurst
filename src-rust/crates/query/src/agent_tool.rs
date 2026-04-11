@@ -261,10 +261,15 @@ impl Tool for AgentTool {
                 .collect()
         };
 
-        // Resolve model: explicit override > default.
+        // Resolve model: explicit override > managed config executor model > default.
         let model = params
             .model
             .filter(|m| !m.is_empty())
+            .or_else(|| {
+                ctx.managed_agent_config.as_ref()
+                    .map(|c| c.executor_model.clone())
+                    .filter(|m| !m.is_empty())
+            })
             .unwrap_or_else(|| claurst_core::constants::DEFAULT_MODEL.to_string());
 
         let system_prompt = params.system_prompt.unwrap_or_else(|| {
@@ -305,10 +310,26 @@ impl Tool for AgentTool {
             prompt
         });
 
+        // Resolve max_turns: explicit > managed config executor_max_turns > default.
+        let resolved_max_turns = params.max_turns.unwrap_or_else(|| {
+            ctx.managed_agent_config.as_ref()
+                .map(|c| c.executor_max_turns)
+                .unwrap_or(10)
+        });
+
+        // Resolve isolation: explicit param > managed config executor_isolation.
+        let resolved_isolation = params.isolation.clone().or_else(|| {
+            if ctx.managed_agent_config.as_ref().map(|c| c.executor_isolation).unwrap_or(false) {
+                Some("worktree".to_string())
+            } else {
+                None
+            }
+        });
+
         // -----------------------------------------------------------------------
         // Determine working directory - optionally isolate in a git worktree.
         // -----------------------------------------------------------------------
-        let use_isolation = params.isolation.as_deref() == Some("worktree");
+        let use_isolation = resolved_isolation.as_deref() == Some("worktree");
         let agent_id = uuid::Uuid::new_v4().to_string();
 
         let (working_dir_str, worktree_path, git_root): (String, Option<PathBuf>, Option<PathBuf>) =
@@ -339,7 +360,7 @@ impl Tool for AgentTool {
         let query_config = QueryConfig {
             model,
             max_tokens: claurst_core::constants::DEFAULT_MAX_TOKENS,
-            max_turns: params.max_turns.unwrap_or(10),
+            max_turns: resolved_max_turns,
             system_prompt: Some(system_prompt),
             append_system_prompt: None,
             output_style: ctx.config.effective_output_style(),
@@ -357,6 +378,7 @@ impl Tool for AgentTool {
             agent_name: None,
             agent_definition: None,
             model_registry: None,
+            managed_agents: None,
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.

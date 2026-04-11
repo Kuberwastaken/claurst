@@ -136,6 +136,16 @@ pub struct TranscriptMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_branch: Option<String>,
 
+    /// Agent role in the managed-agent architecture: "manager" | "executor".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub agent_role: Option<String>,
+
+    /// Managed session ID linking manager and executor transcripts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub managed_session_id: Option<String>,
+
     /// Catch-all for any other fields written by the TS CLI that we don't
     /// need to inspect.
     #[serde(flatten)]
@@ -525,6 +535,8 @@ pub fn make_user_entry(
         user_type: "external".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         git_branch: None,
+        agent_role: None,
+        managed_session_id: None,
         extra: Default::default(),
     })
 }
@@ -548,6 +560,8 @@ pub fn make_assistant_entry(
         user_type: "external".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         git_branch: None,
+        agent_role: None,
+        managed_session_id: None,
         extra: Default::default(),
     })
 }
@@ -568,6 +582,20 @@ pub fn messages_from_transcript(entries: &[TranscriptEntry]) -> Vec<Message> {
             _ => None,
         })
         .collect()
+}
+
+/// Filter transcript entries by agent role ("manager" or "executor").
+///
+/// Returns only User and Assistant entries whose `agent_role` matches `role`.
+pub fn filter_by_agent_role<'a>(entries: &'a [TranscriptEntry], role: &str) -> Vec<&'a TranscriptEntry> {
+    entries.iter().filter(|e| {
+        match e {
+            TranscriptEntry::User(msg) | TranscriptEntry::Assistant(msg) => {
+                msg.agent_role.as_deref() == Some(role)
+            }
+            _ => false,
+        }
+    }).collect()
 }
 
 // ---------------------------------------------------------------------------

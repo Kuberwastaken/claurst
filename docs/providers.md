@@ -257,7 +257,7 @@ Connects to a locally running Ollama instance. No API key required.
   "provider": "ollama",
   "providers": {
     "ollama": {
-      "api_base": "http://localhost:11434/v1"
+      "api_base": "http://localhost:11434"
     }
   }
 }

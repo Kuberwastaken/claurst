@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use claurst_core::config::{Config, Settings, Theme};
 use claurst_core::cost::CostTracker;
-use claurst_core::types::Message;
+use claurst_core::types::{ContentBlock, Message};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 #[allow(unused_imports)]
@@ -97,6 +97,78 @@ pub trait SlashCommand: Send + Sync {
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult;
 }
 
+fn stripped_model_for_provider<'a>(provider_id: &str, model_id: &'a str) -> &'a str {
+    model_id
+        .strip_prefix(&format!("{provider_id}/"))
+        .unwrap_or(model_id)
+}
+
+fn canonical_model_for_provider(provider_id: &str, model_id: &str) -> String {
+    if provider_id == "anthropic" || model_id.contains('/') {
+        model_id.to_string()
+    } else {
+        format!("{provider_id}/{model_id}")
+    }
+}
+
+fn provider_lookup_ids(provider_id: &str) -> Vec<&str> {
+    match provider_id {
+        "togetherai" | "together-ai" => vec!["togetherai", "together-ai"],
+        "lmstudio" | "lm-studio" => vec!["lmstudio", "lm-studio"],
+        "llamacpp" | "llama-cpp" | "llama-server" => {
+            vec!["llamacpp", "llama-cpp", "llama-server"]
+        }
+        "moonshot" | "moonshotai" => vec!["moonshot", "moonshotai"],
+        "zhipu" | "zhipuai" => vec!["zhipu", "zhipuai"],
+        "vultr" | "vultr-ai" => vec!["vultr", "vultr-ai"],
+        "google" | "google-vertex" => vec!["google", "google-vertex"],
+        _ => vec![provider_id],
+    }
+}
+
+fn resolve_fast_model_id(config: &Config) -> String {
+    let provider_id = config.selected_provider_id();
+    let registry = claurst_api::ModelRegistry::new();
+
+    provider_lookup_ids(provider_id)
+        .into_iter()
+        .find_map(|lookup_id| registry.best_small_model_for_provider(lookup_id))
+        .unwrap_or_else(|| stripped_model_for_provider(provider_id, config.effective_model()).to_string())
+}
+
+async fn provider_for_config(config: &Config) -> Option<std::sync::Arc<dyn claurst_api::LlmProvider>> {
+    let anthropic_auth = config.resolve_anthropic_auth_async().await;
+    let registry = claurst_api::ProviderRegistry::from_config(
+        config,
+        claurst_api::client::ClientConfig {
+            api_key: anthropic_auth
+                .as_ref()
+                .map(|(credential, _)| credential.clone())
+                .unwrap_or_default(),
+            api_base: config.resolve_anthropic_api_base(),
+            use_bearer_auth: anthropic_auth
+                .as_ref()
+                .is_some_and(|(_, use_bearer)| *use_bearer),
+            ..Default::default()
+        },
+    );
+
+    provider_lookup_ids(config.selected_provider_id())
+        .into_iter()
+        .find_map(|lookup_id| registry.get(&claurst_core::ProviderId::new(lookup_id)).cloned())
+}
+
+fn text_from_content_blocks(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 // ---------------------------------------------------------------------------
 // Built-in commands
 // ---------------------------------------------------------------------------
@@ -168,8 +240,7 @@ pub struct ThinkBackCommand;
 pub struct ThinkBackPlayCommand;
 pub struct FeedbackCommand;
 pub struct ColorSetCommand;
-// New commands: share, teleport, btw, ctx-viz, sandbox-toggle
-pub struct ShareCommand;
+// New commands: teleport, btw, ctx-viz, sandbox-toggle
 pub struct TeleportCommand;
 pub struct BtwCommand;
 pub struct CtxVizCommand;
@@ -185,6 +256,7 @@ pub struct ConnectCommand;
 pub struct AgentCommand;
 pub struct SearchCommand;
 pub struct ForkCommand;
+pub struct ManagedAgentsCommand;
 pub struct NamedCommandAdapter {
     pub slash_name: &'static str,
     pub target_name: &'static str,
@@ -400,7 +472,7 @@ fn command_category(name: &str) -> &'static str {
         | "security-review" => "Project",
         "mcp" | "hooks" | "ide" | "chrome" => "Integrations",
         "session" | "resume" | "remote-control" | "remote-env"
-        | "share" | "teleport" => "Sessions & Remote",
+        | "teleport" => "Sessions & Remote",
         "help" | "exit" | "feedback" | "bug" => "General",
         "think-back" | "thinkback-play" | "thinking" | "plan" | "tasks" => "AI & Thinking",
         "copy" | "skills" | "agents" | "plugin" | "reload-plugins"
@@ -669,7 +741,10 @@ impl SlashCommand for ModelCommand {
                 format!("Switched to {}", model_str)
             };
             let mut new_config = ctx.config.clone();
-            new_config.model = Some(model_str);
+            new_config.model = Some(model_str.clone());
+            if let Some((provider, _)) = model_str.split_once('/') {
+                new_config.provider = Some(provider.to_string());
+            }
             CommandResult::ConfigChangeMessage(new_config, confirmation)
         }
     }
@@ -807,8 +882,18 @@ impl SlashCommand for ConfigCommand {
             "model" => {
                 let mut new_config = ctx.config.clone();
                 new_config.model = Some(value.to_string());
+                let inferred_provider = value
+                    .split_once('/')
+                    .map(|(provider, _)| provider.to_string());
+                if let Some(ref provider) = inferred_provider {
+                    new_config.provider = Some(provider.clone());
+                }
                 if let Err(err) = save_settings_mutation(|settings| {
                     settings.config.model = Some(value.to_string());
+                    if let Some(ref provider) = inferred_provider {
+                        settings.provider = Some(provider.clone());
+                        settings.config.provider = Some(provider.clone());
+                    }
                 }) {
                     return CommandResult::Error(format!("Failed to save configuration: {}", err));
                 }
@@ -1861,48 +1946,40 @@ impl SlashCommand for DoctorCommand {
 
         // ── API / Auth ──────────────────────────────────────────────────────
         lines.push("Authentication".to_string());
-        // Try a real live call to GET /v1/models to validate the key.
-        let auth = ctx.config.resolve_auth_async().await;
-        match auth {
-            Some((credential, use_bearer)) => {
-                let base_url = ctx.config.resolve_api_base();
-                let models_url = format!("{}/v1/models", base_url.trim_end_matches('/'));
-                let http = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(8))
-                    .build()
-                    .unwrap_or_default();
-                let req = if use_bearer {
-                    http.get(&models_url)
-                        .header("Authorization", format!("Bearer {}", credential))
-                        .header("anthropic-version", "2023-06-01")
-                } else {
-                    http.get(&models_url)
-                        .header("x-api-key", &credential)
-                        .header("anthropic-version", "2023-06-01")
-                };
-                match req.send().await {
-                    Ok(resp) if resp.status().is_success() => {
-                        lines.push("  ✓ API key valid (GET /v1/models returned 200)".to_string());
-                    }
-                    Ok(resp) if resp.status() == 401 || resp.status() == 403 => {
-                        lines.push(format!(
-                            "  ✗ API key rejected ({}) — check ANTHROPIC_API_KEY or run /login",
-                            resp.status()
-                        ));
-                    }
-                    Ok(resp) => {
-                        lines.push(format!(
-                            "  ⚠ API reachable but returned {} — key may still be valid",
-                            resp.status()
-                        ));
-                    }
-                    Err(e) => {
-                        lines.push(format!("  ⚠ Could not reach API: {}", e));
-                    }
+        let anthropic_auth = ctx.config.resolve_anthropic_auth_async().await.unwrap_or((String::new(), false));
+        let client_config = claurst_api::client::ClientConfig {
+            api_key: anthropic_auth.0,
+            api_base: ctx.config.resolve_anthropic_api_base(),
+            use_bearer_auth: anthropic_auth.1,
+            ..Default::default()
+        };
+        let provider_registry = claurst_api::ProviderRegistry::from_config(&ctx.config, client_config);
+        let provider_id = claurst_core::ProviderId::new(ctx.config.selected_provider_id());
+        match provider_registry.get(&provider_id) {
+            Some(provider) => match provider.health_check().await {
+                Ok(claurst_api::provider_types::ProviderStatus::Healthy) => {
+                    lines.push(format!("  ✓ {} is healthy", provider.name()));
                 }
-            }
+                Ok(claurst_api::provider_types::ProviderStatus::Degraded { reason }) => {
+                    lines.push(format!("  ⚠ {} is degraded: {}", provider.name(), reason));
+                }
+                Ok(claurst_api::provider_types::ProviderStatus::Unavailable { reason }) => {
+                    lines.push(format!("  ✗ {} is unavailable: {}", provider.name(), reason));
+                }
+                Err(err) => {
+                    lines.push(format!("  ✗ {} health check failed: {}", provider.name(), err));
+                }
+            },
             None => {
-                lines.push("  ✗ No Anthropic API key found — set ANTHROPIC_API_KEY, run /login, or use a different provider".to_string());
+                let hint = claurst_core::config::primary_api_key_env_var_for_provider(
+                    ctx.config.selected_provider_id(),
+                )
+                .map(|env| format!("set {env}"))
+                .unwrap_or_else(|| "configure credentials".to_string());
+                lines.push(format!(
+                    "  ✗ No active provider runtime found — {} or use /connect",
+                    hint
+                ));
             }
         }
         // Show which model is active
@@ -2408,14 +2485,12 @@ impl SlashCommand for ReviewCommand {
         // 3. Call the LLM for a structured PR review
         // ------------------------------------------------------------------
         let model = ctx.config.effective_model().to_string();
-
-        let api_client = match claurst_api::AnthropicClient::from_config(&ctx.config) {
-            Ok(c) => c,
-            Err(e) => {
-                return CommandResult::Error(format!(
-                    "Cannot initialise API client (no API key?): {}",
-                    e
-                ));
+        let provider = match provider_for_config(&ctx.config).await {
+            Some(provider) => provider,
+            None => {
+                return CommandResult::Error(
+                    "Cannot initialise provider client for code review.".to_string(),
+                );
             }
         };
 
@@ -2440,39 +2515,32 @@ impl SlashCommand for ReviewCommand {
             file_summary, diff_for_llm
         );
 
-        let request = claurst_api::CreateMessageRequest::builder(&model, 4096)
-            .messages(vec![claurst_api::ApiMessage {
-                role: "user".to_string(),
-                content: serde_json::Value::String(review_prompt),
-            }])
-            .system_text(
+        let request = claurst_api::ProviderRequest {
+            model,
+            messages: vec![Message::user(review_prompt)],
+            system_prompt: Some(claurst_api::SystemPrompt::Text(
                 "You are a thorough, constructive code reviewer. \
-                 Be concise but precise. Focus on correctness, security, and maintainability.",
-            )
-            .build();
+                 Be concise but precise. Focus on correctness, security, and maintainability."
+                    .to_string(),
+            )),
+            tools: vec![],
+            max_tokens: 4096,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: vec![],
+            thinking: None,
+            provider_options: serde_json::Value::Object(Default::default()),
+        };
 
-        use std::sync::Arc;
-        let handler: Arc<dyn claurst_api::StreamHandler> =
-            Arc::new(claurst_api::streaming::NullStreamHandler);
-
-        let review_text = match api_client.create_message_stream(request, handler).await {
+        let review_text = match provider.create_message(request).await {
             Err(e) => {
                 return CommandResult::Error(format!("LLM call failed: {}", e));
             }
-            Ok(mut rx) => {
-                let mut acc = claurst_api::StreamAccumulator::new();
-                while let Some(evt) = rx.recv().await {
-                    acc.on_event(&evt);
-                    if matches!(evt, claurst_api::AnthropicStreamEvent::MessageStop) {
-                        break;
-                    }
-                }
-                let (msg, _usage, _stop) = acc.finish();
-                let text = msg.get_all_text();
-                if text.is_empty() {
-                    return CommandResult::Error(
-                        "LLM returned an empty review.".to_string(),
-                    );
+            Ok(response) => {
+                let text = text_from_content_blocks(&response.content);
+                if text.trim().is_empty() {
+                    return CommandResult::Error("LLM returned an empty review.".to_string());
                 }
                 text
             }
@@ -4194,46 +4262,43 @@ impl SlashCommand for RenameCommand {
             );
         }
 
-        // Try to build an API client from the current config.
-        let client = match claurst_api::AnthropicClient::from_config(&ctx.config) {
-            Ok(c) => c,
-            Err(e) => {
-                return CommandResult::Error(format!(
-                    "Could not create API client for auto-naming: {e}\n\
+        let provider = match provider_for_config(&ctx.config).await {
+            Some(provider) => provider,
+            None => {
+                return CommandResult::Error(
+                    "Could not create a provider client for auto-naming.\n\
                      Use /rename <name> to set the name manually."
-                ));
+                        .to_string(),
+                );
             }
         };
+        let rename_model = resolve_fast_model_id(&ctx.config);
 
         let system_prompt = "Generate a short kebab-case name (2-4 words) that captures the \
             main topic of this conversation. Use lowercase words separated by hyphens. \
             Examples: fix-login-bug, add-auth-feature, refactor-api-client. \
             Respond with ONLY the name, nothing else.";
 
-        let request = claurst_api::CreateMessageRequest::builder(
-            "claude-haiku-4-5".to_string(),
-            64,
-        )
-        .system_text(system_prompt)
-        .add_message(claurst_api::ApiMessage {
-            role: "user".to_string(),
-            content: serde_json::Value::String(
-                format!("Conversation to name:\n\n{}", &excerpt[..excerpt.len().min(2000)])
-            ),
-        })
-        .build();
+        let request = claurst_api::ProviderRequest {
+            model: rename_model,
+            messages: vec![Message::user(format!(
+                "Conversation to name:\n\n{}",
+                &excerpt[..excerpt.len().min(2000)]
+            ))],
+            system_prompt: Some(claurst_api::SystemPrompt::Text(system_prompt.to_string())),
+            tools: vec![],
+            max_tokens: 64,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: vec![],
+            thinking: None,
+            provider_options: serde_json::Value::Object(Default::default()),
+        };
 
-        match client.create_message(request).await {
+        match provider.create_message(request).await {
             Ok(response) => {
-                // Extract text from the response content blocks.
-                let raw_text: String = response.content.iter()
-                    .filter_map(|block| {
-                        block.get("text").and_then(|v| v.as_str()).map(str::to_string)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("")
-                    .trim()
-                    .to_string();
+                let raw_text = text_from_content_blocks(&response.content).trim().to_string();
 
                 let generated = raw_text
                     .to_lowercase()
@@ -6059,8 +6124,8 @@ impl SlashCommand for FastCommand {
     fn description(&self) -> &str { "Toggle fast mode (uses a faster/cheaper model)" }
     fn help(&self) -> &str {
         "Usage: /fast [on|off]\n\n\
-         Fast mode switches to a faster, more economical model variant\n\
-         (claude-haiku) for quick responses. Toggle without argument to switch.\n\
+         Fast mode switches to the active provider's smaller, faster model\n\
+         for quick responses. Toggle without argument to switch.\n\
          The setting is persisted to ~/.claurst/ui-settings.json."
     }
 
@@ -6084,13 +6149,17 @@ impl SlashCommand for FastCommand {
             return CommandResult::Error(format!("Failed to save setting: {}", e));
         }
 
-        let fast_model = "claude-haiku-4-5";
-        let normal_model = ctx.config.model.as_deref()
-            .unwrap_or(claurst_core::constants::DEFAULT_MODEL);
+        let provider_id = ctx.config.selected_provider_id();
+        let fast_model = resolve_fast_model_id(&ctx.config);
+        let normal_model = stripped_model_for_provider(
+            provider_id,
+            ctx.config.effective_model(),
+        )
+        .to_string();
 
         if enable {
             let mut new_config = ctx.config.clone();
-            new_config.model = Some(fast_model.to_string());
+            new_config.model = Some(canonical_model_for_provider(provider_id, &fast_model));
             CommandResult::ConfigChangeMessage(
                 new_config,
                 format!(
@@ -6103,11 +6172,16 @@ impl SlashCommand for FastCommand {
             let mut new_config = ctx.config.clone();
             // Restore default / saved model
             new_config.model = None;
+            let restored_model = stripped_model_for_provider(
+                provider_id,
+                new_config.effective_model(),
+            )
+            .to_string();
             CommandResult::ConfigChangeMessage(
                 new_config,
                 format!(
                     "Fast mode OFF. Restored to default model ({}).",
-                    claurst_core::constants::DEFAULT_MODEL
+                    restored_model
                 ),
             )
         }
@@ -6417,127 +6491,6 @@ impl SlashCommand for SearchCommand {
     }
 }
 
-// ---- /share --------------------------------------------------------------
-
-#[async_trait]
-impl SlashCommand for ShareCommand {
-    fn name(&self) -> &str { "share" }
-    fn description(&self) -> &str { "Create a shareable URL for the current session" }
-    fn help(&self) -> &str {
-        "Usage: /share\n\n\
-         Attempts to create a public share link for the current conversation\n\
-         by calling the Anthropic share API.\n\n\
-         Requires authentication with claude.ai OAuth. If you are not\n\
-         authenticated, use /login first."
-    }
-
-    async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
-        // Resolve auth credential
-        let auth = ctx.config.resolve_auth_async().await;
-
-        let Some((credential, use_bearer)) = auth else {
-            return CommandResult::Message(
-                "Session sharing is available when authenticated with claude.ai OAuth.\n\
-                 Use /login to sign in."
-                    .to_string(),
-            );
-        };
-
-        // Build the request body: serialize the message list as JSON
-        let messages_json = match serde_json::to_value(&ctx.messages) {
-            Ok(v) => v,
-            Err(e) => {
-                return CommandResult::Error(format!(
-                    "Failed to serialize session messages: {}",
-                    e
-                ))
-            }
-        };
-
-        let body = serde_json::json!({
-            "session_id": ctx.session_id,
-            "title": ctx.session_title,
-            "messages": messages_json,
-        });
-
-        let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                return CommandResult::Error(format!(
-                    "Failed to build HTTP client: {}",
-                    e
-                ))
-            }
-        };
-
-        let base_url = std::env::var("ANTHROPIC_BASE_URL")
-            .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
-        let url = format!("{}/api/claude_code/share_session", base_url);
-
-        let req = if use_bearer {
-            client
-                .post(&url)
-                .bearer_auth(&credential)
-        } else {
-            client
-                .post(&url)
-                .header("x-api-key", &credential)
-        };
-
-        let resp = req
-            .header("anthropic-version", "2023-06-01")
-            .json(&body)
-            .send()
-            .await;
-
-        match resp {
-            Ok(r) if r.status().is_success() => {
-                let json: serde_json::Value = match r.json().await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return CommandResult::Error(format!(
-                            "Failed to parse share API response: {}",
-                            e
-                        ))
-                    }
-                };
-                let share_url = json
-                    .get("share_url")
-                    .or_else(|| json.get("url"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                match share_url {
-                    Some(u) => CommandResult::Message(format!(
-                        "Session shared successfully!\nShare URL: {}",
-                        u
-                    )),
-                    None => CommandResult::Error(
-                        "Share API returned success but no URL was found in the response."
-                            .to_string(),
-                    ),
-                }
-            }
-            Ok(r) => {
-                let status = r.status();
-                let body_text = r.text().await.unwrap_or_default();
-                CommandResult::Error(format!(
-                    "Share API returned error {}: {}",
-                    status, body_text
-                ))
-            }
-            Err(e) => CommandResult::Error(format!(
-                "Failed to contact share API: {}\n\
-                 Session sharing is available when authenticated with claude.ai OAuth.",
-                e
-            )),
-        }
-    }
-}
-
 // ---- /teleport -----------------------------------------------------------
 
 /// Serialisable bundle written to / read from a `.teleport` file.
@@ -6560,7 +6513,7 @@ mod teleport_bundle {
         pub effort: Option<String>,
         /// Recently accessed file paths extracted from tool-use blocks.
         pub files: Vec<String>,
-        /// Environment variables — ANTHROPIC_API_KEY is excluded for security.
+        /// Environment variables — configured provider API key env vars are excluded for security.
         pub env: std::collections::HashMap<String, String>,
         pub exported_at: String,
     }
@@ -6691,9 +6644,26 @@ impl SlashCommand for TeleportCommand {
                     seen.into_iter().take(50).collect()
                 };
 
-                // ---- collect env vars (exclude ANTHROPIC_API_KEY) ----------
+                // ---- collect env vars (exclude configured provider secrets) --
+                let mut redacted_env_vars: std::collections::HashSet<String> = ctx
+                    .config
+                    .provider_configs
+                    .keys()
+                    .flat_map(|provider_id| {
+                        claurst_core::config::api_key_env_vars_for_provider(provider_id)
+                            .iter()
+                            .copied()
+                    })
+                    .map(str::to_string)
+                    .collect();
+                redacted_env_vars.extend(
+                    claurst_core::config::api_key_env_vars_for_provider(ctx.config.selected_provider_id())
+                        .iter()
+                        .copied()
+                        .map(str::to_string),
+                );
                 let env: std::collections::HashMap<String, String> = std::env::vars()
-                    .filter(|(k, _)| k != "ANTHROPIC_API_KEY")
+                    .filter(|(k, _)| !redacted_env_vars.contains(k))
                     .collect();
 
                 // ---- build permissions snapshot from config ----------------
@@ -7670,6 +7640,296 @@ impl SlashCommand for AgentCommand {
     }
 }
 
+// ---- /managed-agents -----------------------------------------------------
+
+#[async_trait]
+impl SlashCommand for ManagedAgentsCommand {
+    fn name(&self) -> &str { "managed-agents" }
+    fn description(&self) -> &str { "Configure and manage the manager-executor agent architecture" }
+    fn help(&self) -> &str {
+        "Usage: /managed-agents [subcommand]\n\n\
+         Subcommands:\n\
+           (none) | status                        — show current config\n\
+           presets                                — list built-in presets\n\
+           preset <name>                          — apply a named preset\n\
+           setup                                  — show setup instructions\n\
+           configure manager-model <value>        — set manager model\n\
+           configure executor-model <value>       — set executor model\n\
+           configure executor-turns <n>           — set executor max turns\n\
+           configure concurrent <n>               — set max concurrent executors\n\
+           configure isolation on|off             — set executor isolation\n\
+           configure budget-split shared|percentage:<pct>|fixed:<mgr>:<exe>\n\
+           budget <amount>                        — set total budget in USD (0 to clear)\n\
+           enable                                 — enable managed agents\n\
+           disable                                — disable managed agents\n\
+           reset                                  — remove config entirely"
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        use claurst_core::{BudgetSplitPolicy, ManagedAgentConfig, builtin_managed_agent_presets};
+
+        let args = args.trim();
+
+        // Helper to format current config as status string
+        fn format_status(cfg: &Option<ManagedAgentConfig>) -> String {
+            match cfg {
+                None => "Managed Agents: NOT CONFIGURED\n\nRun /managed-agents setup to get started.".to_string(),
+                Some(c) => {
+                    let state = if c.enabled { "ACTIVE" } else { "CONFIGURED but inactive" };
+                    let budget_str = match c.total_budget_usd {
+                        Some(b) => format!("${:.2} total", b),
+                        None => "no cap".to_string(),
+                    };
+                    let split_str = match &c.budget_split {
+                        BudgetSplitPolicy::SharedPool => "shared pool".to_string(),
+                        BudgetSplitPolicy::Percentage { manager_pct } => format!("{}% manager", manager_pct),
+                        BudgetSplitPolicy::FixedCaps { manager_usd, executor_usd } => {
+                            format!("${:.2} mgr / ${:.2} exe", manager_usd, executor_usd)
+                        }
+                    };
+                    let preset = c.preset_name.as_deref().unwrap_or("custom");
+                    let isolation = if c.executor_isolation { "on" } else { "off" };
+                    format!(
+                        "Managed Agents: {}\n  Manager:    {}\n  Executor:   {}\n  Preset:     {}\n  Budget:     {}  |  split: {}\n  Exec limits: {} turns, {} concurrent, isolation: {}\n\nRun /managed-agents <subcommand> — presets | setup | configure | enable | disable | budget | reset",
+                        state,
+                        c.manager_model,
+                        c.executor_model,
+                        preset,
+                        budget_str,
+                        split_str,
+                        c.executor_max_turns,
+                        c.max_concurrent_executors,
+                        isolation,
+                    )
+                }
+            }
+        }
+
+        if args.is_empty() || args == "status" {
+            return CommandResult::Message(format_status(&ctx.config.managed_agents));
+        }
+
+        if args == "presets" {
+            let presets = builtin_managed_agent_presets();
+            let mut out = "Built-in managed agent presets:\n\n".to_string();
+            for p in &presets {
+                out.push_str(&format!(
+                    "  {:<28} — {}\n    Manager:  {}\n    Executor: {}\n\n",
+                    p.name, p.description, p.manager_model, p.executor_model
+                ));
+            }
+            out.push_str("Use: /managed-agents preset <name> to apply a preset.");
+            return CommandResult::Message(out);
+        }
+
+        if args == "setup" {
+            let presets = builtin_managed_agent_presets();
+            let mut out = "Managed Agents Setup\n\nQuickstart — apply a preset:\n\n".to_string();
+            for p in &presets {
+                out.push_str(&format!("  /managed-agents preset {}\n    {}\n\n", p.name, p.description));
+            }
+            out.push_str("\nOr configure manually:\n  /managed-agents configure manager-model <provider/model>\n  /managed-agents configure executor-model <provider/model>\n  /managed-agents enable\n\nModel format: provider/model (e.g. anthropic/claude-opus-4-6, openai/gpt-4o, google/gemini-2.5-flash)\nAny provider registered in the ProviderRegistry can be used.");
+            return CommandResult::Message(out);
+        }
+
+        if let Some(preset_name) = args.strip_prefix("preset ").map(str::trim) {
+            let presets = builtin_managed_agent_presets();
+            let found = presets.iter().find(|p| p.name.eq_ignore_ascii_case(preset_name));
+            match found {
+                None => {
+                    let names: Vec<&str> = presets.iter().map(|p| p.name).collect();
+                    return CommandResult::Error(format!(
+                        "Unknown preset '{}'. Available: {}",
+                        preset_name,
+                        names.join(", ")
+                    ));
+                }
+                Some(p) => {
+                    let new_cfg = ManagedAgentConfig {
+                        enabled: true,
+                        manager_model: p.manager_model.to_string(),
+                        executor_model: p.executor_model.to_string(),
+                        executor_max_turns: p.executor_max_turns,
+                        max_concurrent_executors: p.max_concurrent_executors,
+                        budget_split: BudgetSplitPolicy::SharedPool,
+                        total_budget_usd: None,
+                        preset_name: Some(p.name.to_string()),
+                        executor_isolation: false,
+                    };
+                    let name = p.name.to_string();
+                    if let Err(e) = save_settings_mutation(|settings| {
+                        settings.managed_agents = Some(new_cfg.clone());
+                        settings.config.managed_agents = Some(new_cfg.clone());
+                    }) {
+                        return CommandResult::Error(format!("Failed to save: {}", e));
+                    }
+                    let mut new_config = ctx.config.clone();
+                    new_config.managed_agents = Some(new_cfg);
+                    return CommandResult::ConfigChangeMessage(
+                        new_config,
+                        format!("Applied preset '{}'. Managed agents ENABLED.", name),
+                    );
+                }
+            }
+        }
+
+        if let Some(rest) = args.strip_prefix("configure ").map(str::trim) {
+            let mut cfg = ctx.config.managed_agents.clone().unwrap_or(ManagedAgentConfig {
+                enabled: false,
+                manager_model: String::new(),
+                executor_model: String::new(),
+                executor_max_turns: 10,
+                max_concurrent_executors: 4,
+                budget_split: BudgetSplitPolicy::SharedPool,
+                total_budget_usd: None,
+                preset_name: None,
+                executor_isolation: false,
+            });
+
+            if let Some(val) = rest.strip_prefix("manager-model ").map(str::trim) {
+                cfg.manager_model = val.to_string();
+                cfg.preset_name = None;
+            } else if let Some(val) = rest.strip_prefix("executor-model ").map(str::trim) {
+                cfg.executor_model = val.to_string();
+                cfg.preset_name = None;
+            } else if let Some(val) = rest.strip_prefix("executor-turns ").map(str::trim) {
+                match val.parse::<u32>() {
+                    Ok(n) => cfg.executor_max_turns = n,
+                    Err(_) => return CommandResult::Error(format!("Invalid number: '{}'", val)),
+                }
+            } else if let Some(val) = rest.strip_prefix("concurrent ").map(str::trim) {
+                match val.parse::<u32>() {
+                    Ok(n) => cfg.max_concurrent_executors = n,
+                    Err(_) => return CommandResult::Error(format!("Invalid number: '{}'", val)),
+                }
+            } else if let Some(val) = rest.strip_prefix("isolation ").map(str::trim) {
+                match val {
+                    "on" => cfg.executor_isolation = true,
+                    "off" => cfg.executor_isolation = false,
+                    _ => return CommandResult::Error("Use 'on' or 'off'".to_string()),
+                }
+            } else if let Some(val) = rest.strip_prefix("budget-split ").map(str::trim) {
+                if val == "shared" {
+                    cfg.budget_split = BudgetSplitPolicy::SharedPool;
+                } else if let Some(pct_str) = val.strip_prefix("percentage:") {
+                    match pct_str.parse::<u8>() {
+                        Ok(pct) => cfg.budget_split = BudgetSplitPolicy::Percentage { manager_pct: pct },
+                        Err(_) => return CommandResult::Error(format!("Invalid percentage: '{}'", pct_str)),
+                    }
+                } else if let Some(caps_str) = val.strip_prefix("fixed:") {
+                    let parts: Vec<&str> = caps_str.splitn(2, ':').collect();
+                    if parts.len() == 2 {
+                        match (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
+                            (Ok(m), Ok(e)) => cfg.budget_split = BudgetSplitPolicy::FixedCaps { manager_usd: m, executor_usd: e },
+                            _ => return CommandResult::Error("Invalid fixed caps format. Use fixed:<manager>:<executor>".to_string()),
+                        }
+                    } else {
+                        return CommandResult::Error("Invalid fixed caps format. Use fixed:<manager>:<executor>".to_string());
+                    }
+                } else {
+                    return CommandResult::Error("Use: shared | percentage:<pct> | fixed:<manager>:<executor>".to_string());
+                }
+            } else {
+                return CommandResult::Error(format!(
+                    "Unknown configure option: '{}'\nOptions: manager-model, executor-model, executor-turns, concurrent, isolation, budget-split",
+                    rest
+                ));
+            }
+
+            if let Err(e) = save_settings_mutation(|settings| {
+                settings.managed_agents = Some(cfg.clone());
+                settings.config.managed_agents = Some(cfg.clone());
+            }) {
+                return CommandResult::Error(format!("Failed to save: {}", e));
+            }
+            let mut new_config = ctx.config.clone();
+            new_config.managed_agents = Some(cfg);
+            return CommandResult::ConfigChangeMessage(new_config, "Managed agents configuration updated.".to_string());
+        }
+
+        if let Some(amount_str) = args.strip_prefix("budget ").map(str::trim) {
+            match amount_str.parse::<f64>() {
+                Err(_) => return CommandResult::Error(format!("Invalid amount: '{}'", amount_str)),
+                Ok(amount) => {
+                    let mut cfg = match ctx.config.managed_agents.clone() {
+                        None => return CommandResult::Error("No managed agents config. Run /managed-agents setup first.".to_string()),
+                        Some(c) => c,
+                    };
+                    cfg.total_budget_usd = if amount <= 0.0 { None } else { Some(amount) };
+                    if let Err(e) = save_settings_mutation(|settings| {
+                        settings.managed_agents = Some(cfg.clone());
+                        settings.config.managed_agents = Some(cfg.clone());
+                    }) {
+                        return CommandResult::Error(format!("Failed to save: {}", e));
+                    }
+                    let mut new_config = ctx.config.clone();
+                    let msg = if amount <= 0.0 {
+                        "Budget cap cleared.".to_string()
+                    } else {
+                        format!("Budget set to ${:.2}.", amount)
+                    };
+                    new_config.managed_agents = Some(cfg);
+                    return CommandResult::ConfigChangeMessage(new_config, msg);
+                }
+            }
+        }
+
+        if args == "enable" {
+            let mut cfg = match ctx.config.managed_agents.clone() {
+                None => return CommandResult::Error("No managed agents config. Run /managed-agents setup first.".to_string()),
+                Some(c) => c,
+            };
+            if cfg.manager_model.is_empty() || cfg.executor_model.is_empty() {
+                return CommandResult::Error("manager_model and executor_model must be set before enabling.".to_string());
+            }
+            cfg.enabled = true;
+            if let Err(e) = save_settings_mutation(|settings| {
+                settings.managed_agents = Some(cfg.clone());
+                settings.config.managed_agents = Some(cfg.clone());
+            }) {
+                return CommandResult::Error(format!("Failed to save: {}", e));
+            }
+            let mut new_config = ctx.config.clone();
+            new_config.managed_agents = Some(cfg);
+            return CommandResult::ConfigChangeMessage(new_config, "Managed agents ENABLED.".to_string());
+        }
+
+        if args == "disable" {
+            let mut cfg = match ctx.config.managed_agents.clone() {
+                None => return CommandResult::Error("No managed agents config.".to_string()),
+                Some(c) => c,
+            };
+            cfg.enabled = false;
+            if let Err(e) = save_settings_mutation(|settings| {
+                settings.managed_agents = Some(cfg.clone());
+                settings.config.managed_agents = Some(cfg.clone());
+            }) {
+                return CommandResult::Error(format!("Failed to save: {}", e));
+            }
+            let mut new_config = ctx.config.clone();
+            new_config.managed_agents = Some(cfg);
+            return CommandResult::ConfigChangeMessage(new_config, "Managed agents disabled.".to_string());
+        }
+
+        if args == "reset" {
+            if let Err(e) = save_settings_mutation(|settings| {
+                settings.managed_agents = None;
+                settings.config.managed_agents = None;
+            }) {
+                return CommandResult::Error(format!("Failed to save: {}", e));
+            }
+            let mut new_config = ctx.config.clone();
+            new_config.managed_agents = None;
+            return CommandResult::ConfigChangeMessage(new_config, "Managed agents configuration removed.".to_string());
+        }
+
+        CommandResult::Error(format!(
+            "Unknown subcommand: '{}'\nRun /managed-agents to see usage.",
+            args
+        ))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
@@ -7829,8 +8089,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(ThinkBackPlayCommand),
         Box::new(FeedbackCommand),
         Box::new(ColorSetCommand),
-        // New commands: share, teleport, btw, ctx-viz, sandbox-toggle
-        Box::new(ShareCommand),
+        // New commands: teleport, btw, ctx-viz, sandbox-toggle
         Box::new(TeleportCommand),
         Box::new(BtwCommand),
         Box::new(CtxVizCommand),
@@ -7851,6 +8110,8 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(AgentCommand),
         // Session search (SQLite)
         Box::new(SearchCommand),
+        // Managed agent (manager-executor) architecture
+        Box::new(ManagedAgentsCommand),
     ]
 }
 

@@ -12,6 +12,7 @@ pub mod agent_tool;
 pub mod auto_dream;
 pub mod away_summary;
 pub mod command_queue;
+pub mod managed_orchestrator;
 pub mod compact;
 pub mod context_analyzer;
 pub mod coordinator;
@@ -121,6 +122,8 @@ pub struct QueryConfig {
     /// Optional shared model registry for dynamic provider and model resolution.
     /// When set, the query loop uses this instead of constructing a fresh registry.
     pub model_registry: Option<std::sync::Arc<claurst_api::ModelRegistry>>,
+    /// Managed agent (manager-executor) configuration.
+    pub managed_agents: Option<claurst_core::ManagedAgentConfig>,
 }
 
 impl Default for QueryConfig {
@@ -146,6 +149,7 @@ impl Default for QueryConfig {
             agent_name: None,
             agent_definition: None,
             model_registry: None,
+            managed_agents: None,
         }
     }
 }
@@ -161,6 +165,7 @@ impl QueryConfig {
                 .project_dir
                 .as_ref()
                 .map(|p| p.display().to_string()),
+            managed_agents: cfg.managed_agents.clone(),
             ..Default::default()
         }
     }
@@ -181,6 +186,7 @@ impl QueryConfig {
                 .project_dir
                 .as_ref()
                 .map(|p| p.display().to_string()),
+            managed_agents: cfg.managed_agents.clone(),
             ..Default::default()
         }
     }
@@ -240,6 +246,7 @@ fn is_openaiish_provider(provider_id: &str) -> bool {
             | "sambanova"
             | "moonshot"
             | "zhipu"
+            | "zai"
             | "qwen"
             | "nebius"
             | "novita"
@@ -253,6 +260,8 @@ fn is_openaiish_provider(provider_id: &str) -> bool {
             | "stepfun"
             | "fireworks"
             | "ollama"
+            | "codex"
+            | "openai-codex"
             | "lmstudio"
             | "lm-studio"
             | "llamacpp"
@@ -387,7 +396,7 @@ fn build_provider_options(
         options.insert("enable_thinking".to_string(), serde_json::json!(true));
     }
 
-    if provider_id == "zhipu" && thinking_budget.is_some() {
+    if (provider_id == "zhipu" || provider_id == "zai") && thinking_budget.is_some() {
         options.insert(
             "thinking".to_string(),
             serde_json::json!({
@@ -680,6 +689,14 @@ pub async fn run_query_loop(
     } else {
         config.model.clone()
     };
+
+    // If managed-agent mode is active, override the model to the manager model.
+    if let Some(ref ma_config) = config.managed_agents {
+        if ma_config.enabled && !ma_config.manager_model.is_empty() {
+            effective_model = ma_config.manager_model.clone();
+        }
+    }
+
     let mut used_fallback = false;
     // How many automatic retries remain when a stream stalls (no data for 45s).
     let mut retries_left: u32 = 2;
@@ -793,6 +810,17 @@ pub async fn run_query_loop(
                 }
             }
 
+            // If managed-agent mode is active, append orchestration instructions.
+            if let Some(ref ma_config) = config.managed_agents {
+                if ma_config.enabled {
+                    let ma_prompt = crate::managed_orchestrator::managed_agent_system_prompt(ma_config);
+                    patched.append_system_prompt = Some(match &patched.append_system_prompt {
+                        Some(existing) => format!("{}\n\n{}", existing, ma_prompt),
+                        None => ma_prompt,
+                    });
+                }
+            }
+
             // Apply todo nudge on turns > 2.
             if turn > 2 {
                 let nudge = build_todo_nudge(&tool_ctx.session_id);
@@ -880,7 +908,7 @@ pub async fn run_query_loop(
                     "anthropic", "openai", "google", "groq", "mistral",
                     "deepseek", "xai", "cohere", "perplexity", "cerebras",
                     "openrouter", "togetherai", "together-ai", "deepinfra",
-                    "venice", "github-copilot", "ollama", "lmstudio",
+                    "venice", "github-copilot", "codex", "openai-codex", "ollama", "lmstudio",
                     "llamacpp", "azure", "amazon-bedrock", "huggingface",
                     "nvidia", "fireworks", "sambanova",
                 ];
@@ -941,7 +969,7 @@ pub async fn run_query_loop(
                 let runtime_provider =
                     claurst_api::registry::runtime_provider_for(&provider_id_str);
 
-                let mut registry_provider = if runtime_provider.is_some() {
+                let registry_provider = if runtime_provider.is_some() {
                     // Fresh auth_store key available — use it instead of the
                     // (possibly stale) registry entry.
                     None
@@ -949,16 +977,24 @@ pub async fn run_query_loop(
                     registry.get(&pid).cloned()
                 };
 
-                // If the user supplied --api-base for a local provider (Ollama, LM Studio,
+                let mut provider = runtime_provider.or(registry_provider);
+
+                // If the user supplied api_base for a local provider (Ollama, LM Studio,
                 // llama.cpp), rebuild the provider with the override URL.  These providers
-                // are always pre-registered with a hardcoded default URL, so without this
-                // the --api-base flag would be silently ignored.
+                // are always constructed with a hardcoded default URL, so without this
+                // the api_base setting would be silently ignored.
                 if let Some(override_base) = tool_ctx.config.provider_configs
                     .get(&provider_id_str)
                     .and_then(|pc| pc.api_base.as_deref())
                 {
                     use claurst_api::providers::openai_compat_providers;
-                    let base_url = format!("{}/v1", override_base.trim_end_matches('/'));
+                    let trimmed = override_base.trim_end_matches('/');
+                    // Avoid double /v1 suffix: only append if not already present.
+                    let base_url = if trimmed.ends_with("/v1") {
+                        trimmed.to_string()
+                    } else {
+                        format!("{}/v1", trimmed)
+                    };
                     let overridden: Option<std::sync::Arc<dyn claurst_api::LlmProvider>> =
                         match provider_id_str.as_str() {
                             "ollama" => Some(std::sync::Arc::new(
@@ -967,17 +1003,15 @@ pub async fn run_query_loop(
                             "lmstudio" | "lm-studio" => Some(std::sync::Arc::new(
                                 openai_compat_providers::lm_studio().with_base_url(base_url),
                             )),
-                            "llamacpp" | "llama-cpp" => Some(std::sync::Arc::new(
+                            "llamacpp" | "llama-cpp" | "llama-server" => Some(std::sync::Arc::new(
                                 openai_compat_providers::llama_cpp().with_base_url(base_url),
                             )),
                             _ => None,
                         };
                     if overridden.is_some() {
-                        registry_provider = overridden;
+                        provider = overridden;
                     }
                 }
-
-                let provider = runtime_provider.or(registry_provider);
                 if let Some(provider) = provider {
                     debug!(provider = %provider_id_str, model = %model_id_str, "Dispatching to non-Anthropic provider");
 
@@ -2112,6 +2146,7 @@ mod tests {
             agent_name: None,
             agent_definition: None,
             model_registry: None,
+            managed_agents: None,
         }
     }
 

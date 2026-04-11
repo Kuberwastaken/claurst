@@ -21,7 +21,7 @@ pub use openai_compat_providers::{
     baseten, cerebras, deepinfra, deepseek, fireworks, friendli, groq, huggingface, llama_cpp,
     lm_studio, mistral, moonshot, nebius, novita, nvidia, ollama, openrouter, ovhcloud, perplexity,
     qwen, sambanova, scaleway, siliconflow, stepfun, together_ai, upstage, venice, vultr_ai, xai,
-    zhipu,
+    zai, zhipu,
 };
 
 pub mod cohere;

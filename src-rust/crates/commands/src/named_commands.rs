@@ -871,15 +871,28 @@ impl NamedCommand for InstallGithubAppCommand {
     fn description(&self) -> &str { "Set up Claurst GitHub Actions for a repository" }
     fn usage(&self) -> &str { "claude install-github-app" }
 
-    fn execute_named(&self, _args: &[&str], _ctx: &CommandContext) -> CommandResult {
+    fn execute_named(&self, _args: &[&str], ctx: &CommandContext) -> CommandResult {
+        let provider_id = ctx.config.selected_provider_id();
+        let provider_secret_step = claurst_core::config::primary_api_key_env_var_for_provider(provider_id)
+            .map(|provider_secret| {
+                format!(
+                    "3. Add your provider credential to repository secrets (for example {provider_secret})"
+                )
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "3. Configure any required provider credentials or connectivity for {provider_id} in your workflow environment"
+                )
+            });
+
         CommandResult::Message(
-            "To install the Claurst GitHub App:\n\
+            format!(
+                "To install the Claurst GitHub App:\n\
              1. Visit https://github.com/apps/claude-code-app and click Install\n\
              2. Select the repositories to enable\n\
-             3. Add your ANTHROPIC_API_KEY to repository secrets\n\n\
-             The app enables Claurst in GitHub Actions workflows.\n\
-             Docs: https://docs.anthropic.com/claude-code/github-actions"
-                .to_string(),
+             {provider_secret_step}\n\n\
+             The app enables Claurst in GitHub Actions workflows for the configured provider."
+            ),
         )
     }
 }
@@ -895,15 +908,36 @@ impl NamedCommand for RemoteSetupCommand {
     fn description(&self) -> &str { "Check and configure a remote Claurst environment" }
     fn usage(&self) -> &str { "claude remote-setup" }
 
-    fn execute_named(&self, _args: &[&str], _ctx: &CommandContext) -> CommandResult {
-        let mut steps = Vec::new();
+    fn execute_named(&self, _args: &[&str], ctx: &CommandContext) -> CommandResult {
+        use std::net::ToSocketAddrs;
 
-        // Step 1: Check ANTHROPIC_API_KEY
-        let has_api_key = std::env::var("ANTHROPIC_API_KEY").is_ok();
+        let mut steps = Vec::new();
+        let provider_id = ctx.config.selected_provider_id();
+        let provider_name = provider_id.replace('-', " ");
+        let credential_hint = claurst_core::config::api_key_env_vars_for_provider(provider_id);
+        let credentials_required = !matches!(
+            provider_id,
+            "ollama" | "lmstudio" | "lm-studio" | "llamacpp" | "llama-cpp" | "llama-server"
+        );
+        let credential_help = if credential_hint.is_empty() {
+            format!("configure an API key for {provider_name} in settings")
+        } else {
+            format!("set {} or configure apiKey in settings", credential_hint.join(" / "))
+        };
+
+        // Step 1: Check provider credentials
+        let has_api_key = !credentials_required || ctx.config.resolve_api_key().is_some();
         steps.push(format!(
-            "{} ANTHROPIC_API_KEY {}",
+            "{} {} credentials {}",
             if has_api_key { "\u{2713}" } else { "\u{2717}" },
-            if has_api_key { "is set".to_string() } else { "is NOT set \u{2014} run: export ANTHROPIC_API_KEY=sk-...".to_string() }
+            provider_name,
+            if !credentials_required {
+                "are not required for this provider".to_string()
+            } else if has_api_key {
+                "are configured".to_string()
+            } else {
+                format!("are NOT configured — {credential_help}")
+            }
         ));
 
         // Step 2: Check SSH agent forwarding (check SSH_AUTH_SOCK)
@@ -919,7 +953,7 @@ impl NamedCommand for RemoteSetupCommand {
         ));
 
         // Step 3: Check claude config dir exists
-        let config_dir = dirs::home_dir().map(|h| h.join(".claurst")).unwrap_or_default();
+        let config_dir = claurst_core::config::Settings::config_dir();
         let has_config = config_dir.exists();
         steps.push(format!(
             "{} Claurst config dir {}",
@@ -931,18 +965,30 @@ impl NamedCommand for RemoteSetupCommand {
             }
         ));
 
-        // Step 4: Check internet connectivity
-        let net_ok = std::net::TcpStream::connect_timeout(
-            &"api.anthropic.com:443".parse().unwrap_or_else(|_| "8.8.8.8:53".parse().unwrap()),
-            std::time::Duration::from_secs(3),
-        ).is_ok();
+        // Step 4: Check provider endpoint reachability
+        let api_base = ctx.config.resolve_api_base();
+        let (net_ok, net_target) = if let Ok(parsed) = reqwest::Url::parse(&api_base) {
+            if let Some(host) = parsed.host_str() {
+                let port = parsed.port_or_known_default().unwrap_or(443);
+                let target = format!("{host}:{port}");
+                let resolved = (host, port)
+                    .to_socket_addrs()
+                    .map(|mut addrs| addrs.next().is_some())
+                    .unwrap_or(false);
+                (resolved, target)
+            } else {
+                (false, api_base.clone())
+            }
+        } else {
+            (false, api_base.clone())
+        };
         steps.push(format!(
             "{} Network connectivity {}",
             if net_ok { "\u{2713}" } else { "\u{2717}" },
             if net_ok {
-                "to api.anthropic.com".to_string()
+                format!("to {net_target}")
             } else {
-                "FAILED \u{2014} check firewall/proxy".to_string()
+                format!("FAILED \u{2014} check access to {net_target}")
             }
         ));
 

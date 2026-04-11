@@ -752,16 +752,6 @@ Export the current session transcript. Supported formats include Markdown, JSON,
 
 ---
 
-### /share
-
-Generate a shareable link to the current session. Requires an active Anthropic account. The session is uploaded and a URL is returned.
-
-```
-/share
-```
-
----
-
 ## Advanced & Internal
 
 ### /thinking

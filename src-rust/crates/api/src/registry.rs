@@ -34,7 +34,7 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
         "openai" => Some(Arc::new(OpenAiProvider::new(key))),
         "google" => Some(Arc::new(GoogleProvider::new(key))),
         "github-copilot" => Some(Arc::new(CopilotProvider::new(key))),
-        "codex" => {
+        "codex" | "openai-codex" => {
             // The Codex provider is OAuth-based; the `key` field is not used.
             // Load from the stored token file instead.
             CodexProvider::from_stored().map(|p| Arc::new(p) as Arc<dyn LlmProvider>)
@@ -54,8 +54,9 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
         "nvidia" => Some(Arc::new(p::nvidia().with_api_key(key))),
         "siliconflow" => Some(Arc::new(p::siliconflow().with_api_key(key))),
         "sambanova" => Some(Arc::new(p::sambanova().with_api_key(key))),
-        "moonshot" => Some(Arc::new(p::moonshot().with_api_key(key))),
-        "zhipu" => Some(Arc::new(p::zhipu().with_api_key(key))),
+        "moonshot" | "moonshotai" => Some(Arc::new(p::moonshot().with_api_key(key))),
+        "zhipu" | "zhipuai" => Some(Arc::new(p::zhipu().with_api_key(key))),
+        "zai" => Some(Arc::new(p::zai().with_api_key(key))),
         "qwen" => Some(Arc::new(p::qwen().with_api_key(key))),
         "nebius" => Some(Arc::new(p::nebius().with_api_key(key))),
         "novita" => Some(Arc::new(p::novita().with_api_key(key))),
@@ -68,6 +69,126 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
         "stepfun" => Some(Arc::new(p::stepfun().with_api_key(key))),
         "fireworks" => Some(Arc::new(p::fireworks().with_api_key(key))),
         _ => None,
+    }
+}
+
+pub fn provider_from_config(
+    config: &claurst_core::config::Config,
+    provider_id: &str,
+) -> Option<Arc<dyn LlmProvider>> {
+    let provider_cfg = config.provider_configs.get(provider_id);
+    if provider_cfg.is_some_and(|provider| !provider.enabled) {
+        return None;
+    }
+
+    let api_key = config.resolve_provider_api_key(provider_id);
+    let api_base = config
+        .resolve_provider_api_base(provider_id)
+        .filter(|base| !base.is_empty());
+
+    use crate::providers;
+
+    match provider_id {
+        "anthropic" => None,
+        "openai" => {
+            let mut provider = OpenAiProvider::new(api_key.unwrap_or_default());
+            if let Some(base) = api_base {
+                provider = provider.with_base_url(base);
+            }
+            Some(Arc::new(provider))
+        }
+        "google" => api_key.map(|key| Arc::new(GoogleProvider::new(key)) as Arc<dyn LlmProvider>),
+        "minimax" => {
+            api_key.map(|key| Arc::new(MinimaxProvider::new(key)) as Arc<dyn LlmProvider>)
+        }
+        "azure" => {
+            let resource_name = provider_cfg
+                .and_then(|provider| provider.options.get("resource_name"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    std::env::var("AZURE_RESOURCE_NAME")
+                        .ok()
+                        .filter(|value| !value.is_empty())
+                });
+
+            match (resource_name, api_key) {
+                (Some(resource_name), Some(key)) => Some(
+                    Arc::new(AzureProvider::new(resource_name, key)) as Arc<dyn LlmProvider>
+                ),
+                _ => None,
+            }
+        }
+        "ollama" => {
+            let mut provider = providers::ollama();
+            if let Some(base) = api_base {
+                provider = provider.with_base_url(base);
+            }
+            Some(Arc::new(provider))
+        }
+        "lmstudio" | "lm-studio" => {
+            let mut provider = providers::lm_studio();
+            if let Some(base) = api_base {
+                provider = provider.with_base_url(base);
+            }
+            Some(Arc::new(provider))
+        }
+        "llamacpp" | "llama-cpp" | "llama-server" => {
+            let mut provider = providers::llama_cpp();
+            if let Some(base) = api_base {
+                provider = provider.with_base_url(base);
+            }
+            Some(Arc::new(provider))
+        }
+        "deepseek" => {
+            let mut provider = providers::deepseek();
+            if let Some(key) = api_key {
+                provider = provider.with_api_key(key);
+            }
+            if let Some(base) = api_base {
+                provider = provider.with_base_url(base);
+            }
+            Some(Arc::new(provider))
+        }
+        "groq" => {
+            let mut provider = providers::groq();
+            if let Some(key) = api_key {
+                provider = provider.with_api_key(key);
+            }
+            if let Some(base) = api_base {
+                provider = provider.with_base_url(base);
+            }
+            Some(Arc::new(provider))
+        }
+        "xai" => {
+            let mut provider = providers::xai();
+            if let Some(key) = api_key {
+                provider = provider.with_api_key(key);
+            }
+            if let Some(base) = api_base {
+                provider = provider.with_base_url(base);
+            }
+            Some(Arc::new(provider))
+        }
+        "openrouter" => {
+            let mut provider = providers::openrouter();
+            if let Some(key) = api_key {
+                provider = provider.with_api_key(key);
+            }
+            if let Some(base) = api_base {
+                provider = provider.with_base_url(base);
+            }
+            Some(Arc::new(provider))
+        }
+        "cohere" => api_key.map(|key| Arc::new(CohereProvider::new(key)) as Arc<dyn LlmProvider>),
+        "github-copilot" => {
+            api_key.map(|key| Arc::new(CopilotProvider::new(key)) as Arc<dyn LlmProvider>)
+        }
+        "codex" | "openai-codex" => {
+            CodexProvider::from_stored().map(|provider| Arc::new(provider) as Arc<dyn LlmProvider>)
+        }
+        _ => api_key.and_then(|key| provider_from_key(provider_id, key)),
     }
 }
 
@@ -84,6 +205,9 @@ pub fn runtime_provider_for(provider_id: &str) -> Option<Arc<dyn LlmProvider>> {
         "lmstudio" | "lm-studio" => return Some(Arc::new(p::lm_studio())),
         // "llama-server" is the binary name for the modern llama.cpp server.
         "llamacpp" | "llama-cpp" | "llama-server" => return Some(Arc::new(p::llama_cpp())),
+        "codex" | "openai-codex" => {
+            return CodexProvider::from_stored().map(|p| Arc::new(p) as Arc<dyn LlmProvider>);
+        }
         _ => {}
     }
 
@@ -170,6 +294,36 @@ impl ProviderRegistry {
         let mut registry = Self::new();
         let provider = Arc::new(AnthropicProvider::from_config(config));
         registry.register(provider);
+        registry
+    }
+
+    pub fn from_config(
+        config: &claurst_core::config::Config,
+        anthropic_config: ClientConfig,
+    ) -> Self {
+        let mut registry = Self::from_environment_with_auth_store(anthropic_config);
+        let active_provider = config.selected_provider_id();
+
+        let mut configured_provider_ids: Vec<String> = config
+            .provider_configs
+            .keys()
+            .cloned()
+            .collect();
+        if configured_provider_ids.iter().all(|id| id != active_provider) {
+            configured_provider_ids.push(active_provider.to_string());
+        }
+
+        for provider_id in configured_provider_ids {
+            if let Some(provider) = provider_from_config(config, &provider_id) {
+                registry.register(provider);
+            }
+        }
+
+        let default_provider_id = ProviderId::new(active_provider);
+        if registry.get(&default_provider_id).is_some() {
+            registry.set_default(default_provider_id);
+        }
+
         registry
     }
 
@@ -371,6 +525,9 @@ impl ProviderRegistry {
         }
         if std::env::var("ZHIPU_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
             self.register(Arc::new(p::zhipu()));
+        }
+        if std::env::var("ZAI_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+            self.register(Arc::new(p::zai()));
         }
         if std::env::var("NEBIUS_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
             self.register(Arc::new(p::nebius()));
