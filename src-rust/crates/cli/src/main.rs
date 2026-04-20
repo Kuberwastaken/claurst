@@ -397,6 +397,7 @@ async fn main() -> anyhow::Result<()> {
                     session_title: None,
                     remote_session_url: None,
                     mcp_manager: None,
+                    mcp_auth_runner: None,
                 };
                 // Collect remaining args after the command name
                 let rest: Vec<&str> = raw_args[2..].iter().map(|s| s.as_str()).collect();
@@ -425,11 +426,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Setup logging
     let log_level = if cli.verbose { "debug" } else { "warn" };
+    let base_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(log_level));
+    let log_filter = base_filter
+        .add_directive("rmcp::service::client=error".parse().expect("valid rmcp directive"));
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(log_level)),
-        )
+        .with_env_filter(log_filter)
         .with_target(false)
         .without_time()
         .init();
@@ -784,8 +786,9 @@ async fn connect_mcp_manager_arc(
     }
 
     info!(count = config.mcp_servers.len(), "Connecting to MCP servers");
-    let mcp_manager = claurst_mcp::McpManager::connect_all(&config.mcp_servers).await;
-    Some(Arc::new(mcp_manager))
+    let mcp_manager = Arc::new(claurst_mcp::McpManager::connect_all(&config.mcp_servers).await);
+    mcp_manager.clone().spawn_notification_poll_loop();
+    Some(mcp_manager)
 }
 
 fn build_tools_with_mcp(
@@ -1503,6 +1506,7 @@ async fn run_interactive(
         session_title: session.title.clone(),
         remote_session_url: session.remote_session_url.clone(),
         mcp_manager: tool_ctx.mcp_manager.clone(),
+        mcp_auth_runner: None,
     };
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
@@ -1532,6 +1536,31 @@ async fn run_interactive(
     // so the main loop can update the device_auth_dialog state.
     let (device_auth_tx, mut device_auth_rx) = mpsc::channel::<DeviceAuthEvent>(8);
 
+    // MCP OAuth auth channel — background tasks send events here so the main
+    // loop can update status and trigger a reconnect after browser auth finishes.
+    enum McpAuthEvent {
+        /// Browser auth completed and the token was persisted successfully.
+        Completed(claurst_mcp::oauth::McpAuthResult),
+        /// Browser auth or token exchange failed.
+        Failed(String),
+    }
+    let (mcp_auth_tx, mut mcp_auth_rx) = mpsc::channel::<McpAuthEvent>(8);
+    // Build a non-blocking runner so `/mcp auth` can return immediately while
+    // the browser flow continues in the background.
+    let mcp_auth_runner: Arc<dyn Fn(claurst_mcp::oauth::McpAuthSession) + Send + Sync> = {
+        let tx = mcp_auth_tx.clone();
+        Arc::new(move |session| {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let event = match claurst_mcp::oauth::run_mcp_auth_session(session).await {
+                    Ok(result) => McpAuthEvent::Completed(result),
+                    Err(err) => McpAuthEvent::Failed(err.to_string()),
+                };
+                let _ = tx.send(event).await;
+            });
+        })
+    };
+    cmd_ctx.mcp_auth_runner = Some(mcp_auth_runner.clone());
     'main: loop {
         app.frame_count = app.frame_count.wrapping_add(1);
         app.tick_rustle_pose();
@@ -1657,7 +1686,7 @@ async fn run_interactive(
                             let handled_by_tui = if skip_tui_for_args {
                                 false
                             } else {
-                                app.intercept_slash_command(&cmd_name)
+                                app.intercept_slash_command_with_args(&cmd_name, &cmd_args)
                             };
 
                             // Sync effort level when TUI cycled the visual indicator
@@ -1832,6 +1861,16 @@ async fn run_interactive(
                                     app.set_speech_mode(mode.as_deref(), &level);
                                     cmd_ctx.config = app.config.clone();
                                     tool_ctx.config = app.config.clone();
+                                }
+                                Some(CommandResult::McpAuthFlow {
+                                    server_name,
+                                    auth_url,
+                                    redirect_uri,
+                                }) => {
+                                    app.status_message = Some(format!(
+                                        "MCP OAuth — '{}' started. Complete authentication in your browser.\nURL: {}\nCallback URL: {}",
+                                        server_name, auth_url, redirect_uri
+                                    ));
                                 }
                                 Some(CommandResult::Message(msg)) => {
                                     // Suppress text output when TUI already opened an
@@ -2772,6 +2811,23 @@ async fn run_interactive(
             }
         }
 
+        while let Ok(evt) = mcp_auth_rx.try_recv() {
+            match evt {
+                McpAuthEvent::Completed(result) => {
+                    // Schedule a runtime rebuild so the newly persisted token is
+                    // picked up by the next MCP manager instance.
+                    app.pending_mcp_reconnect = true;
+                    app.status_message = Some(format!(
+                        "MCP OAuth — '{}' authentication completed; token saved to: {}",
+                        result.server_name,
+                        result.token_path.display()
+                    ));
+                }
+                McpAuthEvent::Failed(error) => {
+                    app.status_message = Some(format!("MCP OAuth failed: {}", error));
+                }
+            }
+        }
         // Check if query task is done; sync messages from the task
         let task_finished = current_query
             .as_ref()
@@ -2825,6 +2881,50 @@ async fn run_interactive(
                             let _ = store.save_message(&session.id, msg_id, role, &content_str, None);
                         }
                     }
+                }
+            }
+        }
+
+        if !app.is_streaming && current_query.is_none() {
+            if let Some(server_name) = app.take_pending_mcp_panel_auth() {
+                let server_config = cmd_ctx
+                    .config
+                    .mcp_servers
+                    .iter()
+                    .find(|server| server.name == server_name);
+                let supports_panel_auth = server_config.is_some_and(|server| {
+                    matches!(server.server_type.as_str(), "http" | "sse")
+                        && server.url.as_deref().is_some()
+                });
+
+                if !supports_panel_auth {
+                    app.status_message = Some(format!(
+                        "Selected MCP server '{}' does not support panel auth.",
+                        server_name
+                    ));
+                } else if let Some(manager) = app.mcp_manager.clone() {
+                    match manager.begin_auth(&server_name).await {
+                        Ok(session) => {
+                            let auth_url = session.auth_url.clone();
+                            let redirect_uri = session.redirect_uri.clone();
+                            mcp_auth_runner(session);
+                            app.status_message = Some(format!(
+                                "MCP auth — '{}' started. Complete authentication in your browser.\nURL: {}\nCallback URL: {}",
+                                server_name, auth_url, redirect_uri
+                            ));
+                        }
+                        Err(error) => {
+                            app.status_message = Some(format!(
+                                "MCP auth failed for '{}': {}",
+                                server_name, error
+                            ));
+                        }
+                    }
+                } else {
+                    app.status_message = Some(
+                        "MCP auth is unavailable because the MCP runtime is not connected."
+                            .to_string(),
+                    );
                 }
             }
         }
