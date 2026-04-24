@@ -141,17 +141,33 @@ impl OpenAiProvider {
                     Self::append_user_messages(&mut result, &msg.content);
                 }
                 Role::Assistant => {
-                    let (text_content, tool_calls) =
+                    let (text_content, tool_calls, reasoning_content) =
                         Self::assistant_content_to_openai(&msg.content);
                     let mut obj = serde_json::Map::new();
                     obj.insert("role".into(), json!("assistant"));
-                    if let Some(tc) = text_content {
-                        obj.insert("content".into(), json!(tc));
-                    } else {
-                        obj.insert("content".into(), Value::Null);
+                    // If the assistant turn has no visible content and no tool calls
+                    // but does carry reasoning, some OpenAI-compat servers (DeepSeek)
+                    // still require a non-null `content`.  Emit an empty string in
+                    // that case so the message passes validation.
+                    match (text_content, tool_calls.is_empty(), reasoning_content.is_some()) {
+                        (Some(tc), _, _) => {
+                            obj.insert("content".into(), json!(tc));
+                        }
+                        (None, true, true) => {
+                            obj.insert("content".into(), json!(""));
+                        }
+                        _ => {
+                            obj.insert("content".into(), Value::Null);
+                        }
                     }
                     if !tool_calls.is_empty() {
                         obj.insert("tool_calls".into(), json!(tool_calls));
+                    }
+                    // Preserve reasoning_content for providers that require it in
+                    // multi-turn thinking mode (e.g. DeepSeek V4).  Servers that
+                    // do not recognize the field will ignore it.
+                    if let Some(rc) = reasoning_content {
+                        obj.insert("reasoning_content".into(), json!(rc));
                     }
                     result.push(Value::Object(obj));
 
@@ -235,14 +251,15 @@ impl OpenAiProvider {
     /// Split assistant content blocks into (text_string, tool_calls_array).
     fn assistant_content_to_openai(
         content: &MessageContent,
-    ) -> (Option<String>, Vec<Value>) {
+    ) -> (Option<String>, Vec<Value>, Option<String>) {
         let blocks = match content {
-            MessageContent::Text(t) => return (Some(t.clone()), vec![]),
+            MessageContent::Text(t) => return (Some(t.clone()), vec![], None),
             MessageContent::Blocks(b) => b,
         };
 
         let mut text_parts: Vec<&str> = Vec::new();
         let mut tool_calls: Vec<Value> = Vec::new();
+        let mut thinking_parts: Vec<&str> = Vec::new();
 
         for block in blocks {
             match block {
@@ -260,7 +277,11 @@ impl OpenAiProvider {
                         }
                     }));
                 }
-                // Thinking is dropped — not supported by OpenAI.
+                // Preserve reasoning text so callers that require round-tripping
+                // it (DeepSeek V4 thinking mode) can emit it as `reasoning_content`.
+                ContentBlock::Thinking { thinking, .. } => {
+                    thinking_parts.push(thinking.as_str());
+                }
                 _ => {}
             }
         }
@@ -271,7 +292,13 @@ impl OpenAiProvider {
             Some(text_parts.join(""))
         };
 
-        (text_content, tool_calls)
+        let reasoning_content = if thinking_parts.is_empty() {
+            None
+        } else {
+            Some(thinking_parts.join(""))
+        };
+
+        (text_content, tool_calls, reasoning_content)
     }
 
     /// Collect any ToolResult blocks and emit them as `role: tool` messages.
