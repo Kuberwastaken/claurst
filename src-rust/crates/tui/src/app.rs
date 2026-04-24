@@ -207,56 +207,70 @@ fn get_url_for_provider(id: &str) -> &'static str {
     }
 }
 
-fn provider_picker_items() -> Vec<SelectItem> {
+fn provider_picker_items(auth_store: &claurst_core::AuthStore) -> Vec<SelectItem> {
+    fn item(id: &str, title: &str, desc: &str, category: &str, badge: Option<&str>, auth_store: &claurst_core::AuthStore) -> SelectItem {
+        let title = if auth_store.api_key_for(id).is_some() {
+            format!("✓ {title}")
+        } else {
+            title.into()
+        };
+        SelectItem {
+            id: id.into(),
+            title,
+            description: desc.into(),
+            category: category.into(),
+            badge: badge.map(|s| s.into()),
+        }
+    }
     vec![
-        SelectItem { id: "openai".into(), title: "OpenAI".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
-        SelectItem { id: "openai-codex".into(), title: "OpenAI Codex".into(), description: "(ChatGPT Plus/Pro — browser login)".into(), category: "Popular".into(), badge: None },
-        SelectItem { id: "github-copilot".into(), title: "GitHub Copilot".into(), description: "(GitHub subscription or token)".into(), category: "Popular".into(), badge: None },
-        SelectItem { id: "google".into(), title: "Google".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
-        SelectItem { id: "anthropic".into(), title: "Anthropic".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
-        SelectItem { id: "custom-openai".into(), title: "Custom OpenAI-Compatible".into(), description: "Custom URL + API key".into(), category: "Advanced".into(), badge: None },
-        SelectItem { id: "openrouter".into(), title: "OpenRouter".into(), description: "100+ models with one key".into(), category: "Popular".into(), badge: None },
-        SelectItem { id: "vercel".into(), title: "Vercel AI Gateway".into(), description: "Gateway for AI SDK models".into(), category: "Popular".into(), badge: None },
-        SelectItem { id: "groq".into(), title: "Groq".into(), description: "Fast hosted inference".into(), category: "Popular".into(), badge: Some("FREE".into()) },
-        SelectItem { id: "ollama".into(), title: "Ollama".into(), description: "Run models locally".into(), category: "Popular".into(), badge: Some("LOCAL".into()) },
-        SelectItem { id: "zai".into(), title: "Z.AI".into(), description: "GLM-5.1 / GLM-5 / GLM-4.7 Coding Plan".into(), category: "Popular".into(), badge: None },
-        SelectItem { id: "cerebras".into(), title: "Cerebras".into(), description: "Fast hosted inference".into(), category: "Other".into(), badge: Some("FREE".into()) },
-        SelectItem { id: "sambanova".into(), title: "SambaNova".into(), description: "Fast hosted inference".into(), category: "Other".into(), badge: Some("FREE".into()) },
-        SelectItem { id: "lmstudio".into(), title: "LM Studio".into(), description: "Local model server".into(), category: "Other".into(), badge: Some("LOCAL".into()) },
-        SelectItem { id: "llamacpp".into(), title: "llama.cpp".into(), description: "Local inference server".into(), category: "Other".into(), badge: Some("LOCAL".into()) },
-        SelectItem { id: "deepseek".into(), title: "DeepSeek".into(), description: "Reasoning and coding models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "mistral".into(), title: "Mistral".into(), description: "Hosted Mistral models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "togetherai".into(), title: "Together AI".into(), description: "Open model hosting".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "perplexity".into(), title: "Perplexity".into(), description: "Search-augmented models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "cohere".into(), title: "Cohere".into(), description: "Command models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "xai".into(), title: "xAI".into(), description: "Grok models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "deepinfra".into(), title: "DeepInfra".into(), description: "Hosted open models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "azure".into(), title: "Azure OpenAI".into(), description: "Enterprise OpenAI deployments".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "amazon-bedrock".into(), title: "AWS Bedrock".into(), description: "Enterprise foundation models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "google-vertex".into(), title: "Google Vertex AI".into(), description: "Enterprise Google models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "sap-ai-core".into(), title: "SAP AI Core".into(), description: "Enterprise AI platform".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "gitlab".into(), title: "GitLab Duo".into(), description: "AI in GitLab".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "cloudflare-ai-gateway".into(), title: "Cloudflare AI Gateway".into(), description: "Gateway for multiple providers".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "cloudflare-workers-ai".into(), title: "Cloudflare Workers AI".into(), description: "Edge AI inference".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "helicone".into(), title: "Helicone".into(), description: "AI gateway and observability".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "huggingface".into(), title: "Hugging Face".into(), description: "Hosted community models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "nvidia".into(), title: "NVIDIA".into(), description: "Hosted NVIDIA models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "alibaba".into(), title: "Alibaba".into(), description: "Qwen and hosted models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "venice".into(), title: "Venice AI".into(), description: "Privacy-first AI".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "moonshotai".into(), title: "Moonshot AI".into(), description: "Hosted Moonshot models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "zhipuai".into(), title: "Zhipu AI".into(), description: "Hosted GLM models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "siliconflow".into(), title: "SiliconFlow".into(), description: "Hosted open models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "nebius".into(), title: "Nebius".into(), description: "Cloud inference".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "novita".into(), title: "Novita".into(), description: "Cloud inference".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "minimax".into(), title: "MiniMax".into(), description: "Anthropic-compatible (M2.7)".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "ovhcloud".into(), title: "OVHcloud".into(), description: "EU-hosted AI".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "scaleway".into(), title: "Scaleway".into(), description: "EU cloud AI".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "vultr".into(), title: "Vultr".into(), description: "Cloud inference".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "baseten".into(), title: "Baseten".into(), description: "Model serving".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "friendli".into(), title: "Friendli".into(), description: "Serverless inference".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "upstage".into(), title: "Upstage".into(), description: "Hosted Upstage models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "stepfun".into(), title: "StepFun".into(), description: "Hosted reasoning models".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "fireworks".into(), title: "Fireworks AI".into(), description: "Fast inference".into(), category: "Other".into(), badge: None },
+        item("openai", "OpenAI", "(API key)", "Popular", None, auth_store),
+        item("openai-codex", "OpenAI Codex", "(ChatGPT Plus/Pro — browser login)", "Popular", None, auth_store),
+        item("github-copilot", "GitHub Copilot", "(GitHub subscription or token)", "Popular", None, auth_store),
+        item("google", "Google", "(API key)", "Popular", None, auth_store),
+        item("anthropic", "Anthropic", "(API key)", "Popular", None, auth_store),
+        item("custom-openai", "Custom OpenAI-Compatible", "Custom URL + API key", "Advanced", None, auth_store),
+        item("openrouter", "OpenRouter", "100+ models with one key", "Popular", None, auth_store),
+        item("vercel", "Vercel AI Gateway", "Gateway for AI SDK models", "Popular", None, auth_store),
+        item("groq", "Groq", "Fast hosted inference", "Popular", Some("FREE"), auth_store),
+        item("ollama", "Ollama", "Run models locally", "Popular", Some("LOCAL"), auth_store),
+        item("zai", "Z.AI", "GLM-5.1 / GLM-5 / GLM-4.7 Coding Plan", "Popular", None, auth_store),
+        item("cerebras", "Cerebras", "Fast hosted inference", "Other", Some("FREE"), auth_store),
+        item("sambanova", "SambaNova", "Fast hosted inference", "Other", Some("FREE"), auth_store),
+        item("lmstudio", "LM Studio", "Local model server", "Other", Some("LOCAL"), auth_store),
+        item("llamacpp", "llama.cpp", "Local inference server", "Other", Some("LOCAL"), auth_store),
+        item("deepseek", "DeepSeek", "Reasoning and coding models", "Other", None, auth_store),
+        item("mistral", "Mistral", "Hosted Mistral models", "Other", None, auth_store),
+        item("togetherai", "Together AI", "Open model hosting", "Other", None, auth_store),
+        item("perplexity", "Perplexity", "Search-augmented models", "Other", None, auth_store),
+        item("cohere", "Cohere", "Command models", "Other", None, auth_store),
+        item("xai", "xAI", "Grok models", "Other", None, auth_store),
+        item("deepinfra", "DeepInfra", "Hosted open models", "Other", None, auth_store),
+        item("azure", "Azure OpenAI", "Enterprise OpenAI deployments", "Other", None, auth_store),
+        item("amazon-bedrock", "AWS Bedrock", "Enterprise foundation models", "Other", None, auth_store),
+        item("google-vertex", "Google Vertex AI", "Enterprise Google models", "Other", None, auth_store),
+        item("sap-ai-core", "SAP AI Core", "Enterprise AI platform", "Other", None, auth_store),
+        item("gitlab", "GitLab Duo", "AI in GitLab", "Other", None, auth_store),
+        item("cloudflare-ai-gateway", "Cloudflare AI Gateway", "Gateway for multiple providers", "Other", None, auth_store),
+        item("cloudflare-workers-ai", "Cloudflare Workers AI", "Edge AI inference", "Other", None, auth_store),
+        item("helicone", "Helicone", "AI gateway and observability", "Other", None, auth_store),
+        item("huggingface", "Hugging Face", "Hosted community models", "Other", None, auth_store),
+        item("nvidia", "NVIDIA", "Hosted NVIDIA models", "Other", None, auth_store),
+        item("alibaba", "Alibaba", "Qwen and hosted models", "Other", None, auth_store),
+        item("venice", "Venice AI", "Privacy-first AI", "Other", None, auth_store),
+        item("moonshotai", "Moonshot AI", "Hosted Moonshot models", "Other", None, auth_store),
+        item("zhipuai", "Zhipu AI", "Hosted GLM models", "Other", None, auth_store),
+        item("siliconflow", "SiliconFlow", "Hosted open models", "Other", None, auth_store),
+        item("nebius", "Nebius", "Cloud inference", "Other", None, auth_store),
+        item("novita", "Novita", "Cloud inference", "Other", None, auth_store),
+        item("minimax", "MiniMax", "Anthropic-compatible (M2.7)", "Other", None, auth_store),
+        item("ovhcloud", "OVHcloud", "EU-hosted AI", "Other", None, auth_store),
+        item("scaleway", "Scaleway", "EU cloud AI", "Other", None, auth_store),
+        item("vultr", "Vultr", "Cloud inference", "Other", None, auth_store),
+        item("baseten", "Baseten", "Model serving", "Other", None, auth_store),
+        item("friendli", "Friendli", "Serverless inference", "Other", None, auth_store),
+        item("upstage", "Upstage", "Hosted Upstage models", "Other", None, auth_store),
+        item("stepfun", "StepFun", "Hosted reasoning models", "Other", None, auth_store),
+        item("fireworks", "Fireworks AI", "Fast inference", "Other", None, auth_store),
     ]
 }
 
@@ -1105,6 +1119,8 @@ impl App {
         let config = config;
         let model_name = config.effective_model().to_string();
         let user_keybindings = UserKeybindings::load(&Settings::config_dir());
+        let auth_store = claurst_core::AuthStore::load();
+        let connect_items = provider_picker_items(&auth_store);
         Self {
             config,
             cost_tracker,
@@ -1223,8 +1239,8 @@ impl App {
             model_picker_fetch_pending: false,
             session_list_pending: false,
             session_list_rx: None,
-            auth_store: claurst_core::AuthStore::load(),
-            connect_dialog: DialogSelectState::new("Connect a provider", provider_picker_items()),
+            auth_store,
+            connect_dialog: DialogSelectState::new("Connect a provider", connect_items),
             command_palette: {
                 let items: Vec<SelectItem> = PROMPT_SLASH_COMMANDS
                     .iter()
@@ -1483,6 +1499,33 @@ impl App {
         );
     }
 
+    /// Open the model picker showing models from *all* connected providers.
+    fn open_model_picker_for_all_connected(&mut self) {
+        let cache_path = dirs::cache_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("claurst")
+            .join("models.json");
+        if cache_path.exists() {
+            self.model_registry.load_cache(&cache_path);
+        }
+
+        let models = crate::model_picker::models_for_all_connected_providers(
+            &self.auth_store,
+            &self.model_registry,
+        );
+        self.model_picker.set_models(models);
+        // Background live fetch is disabled for multi-provider view
+        // because the fetch pipeline targets a single provider.
+        self.model_picker_fetch_pending = false;
+
+        self.model_picker.open_with_title(
+            "Select model",
+            &self.model_name,
+            self.effort_level,
+            self.fast_mode,
+        );
+    }
+
     fn activate_provider(&mut self, provider_id: String, provider_name: String, status_prefix: &str) {
         let picker_title = provider_name.clone();
         self.fast_mode = false;
@@ -1514,27 +1557,53 @@ impl App {
             let known = [
                 "anthropic",
                 "openai",
-                "google",
-                "groq",
-                "cerebras",
-                "deepseek",
-                "mistral",
-                "xai",
-                "openrouter",
+                "openai-codex",
                 "github-copilot",
-                "codex",
-                "cohere",
-                "perplexity",
-                "togetherai",
-                "together-ai",
-                "deepinfra",
-                "venice",
-                "minimax",
-                "ollama",
+                "google",
+                "custom-openai",
+                "openrouter",
+                "vercel",
+                "groq",
+                "zai",
+                "cerebras",
+                "sambanova",
                 "lmstudio",
                 "llamacpp",
+                "deepseek",
+                "mistral",
+                "togetherai",
+                "together-ai",
+                "perplexity",
+                "cohere",
+                "xai",
+                "deepinfra",
                 "azure",
                 "amazon-bedrock",
+                "google-vertex",
+                "sap-ai-core",
+                "gitlab",
+                "cloudflare-ai-gateway",
+                "cloudflare-workers-ai",
+                "helicone",
+                "huggingface",
+                "nvidia",
+                "alibaba",
+                "venice",
+                "moonshotai",
+                "zhipuai",
+                "siliconflow",
+                "nebius",
+                "novita",
+                "minimax",
+                "ovhcloud",
+                "scaleway",
+                "vultr",
+                "baseten",
+                "friendli",
+                "upstage",
+                "stepfun",
+                "fireworks",
+                "codex",
             ];
             if known.contains(&provider) {
                 return Some(provider.to_string());
@@ -1735,8 +1804,8 @@ impl App {
         self.config = config;
         self.provider_registry = provider_registry;
         self.model_registry = claurst_api::ModelRegistry::new();
+        self.connect_dialog = DialogSelectState::new("Connect a provider", provider_picker_items(&auth_store));
         self.auth_store = auth_store;
-        self.connect_dialog = DialogSelectState::new("Connect a provider", provider_picker_items());
         self.model_picker = ModelPickerState::new();
         self.key_input_dialog = crate::key_input_dialog::KeyInputDialogState::new();
         self.custom_provider_dialog = crate::custom_provider_dialog::CustomProviderDialogState::new();
@@ -1817,6 +1886,7 @@ impl App {
                 true
             }
             "connect" => {
+                self.connect_dialog.items = provider_picker_items(&self.auth_store);
                 self.connect_dialog.open();
                 true
             }
@@ -1826,12 +1896,7 @@ impl App {
                     self.status_message = Some("Connect a provider to choose a model.".to_string());
                     return true;
                 }
-                let provider = self
-                    .config
-                    .provider
-                    .clone()
-                    .unwrap_or_else(|| "anthropic".to_string());
-                self.open_model_picker_for_provider(&provider, None);
+                self.open_model_picker_for_all_connected();
                 true
             }
             "session" | "resume" => {
@@ -2877,18 +2942,12 @@ impl App {
                         if let Some(e) = effort {
                             self.effort_level = e;
                         }
-                        // Store explicit selections in the canonical
-                        // "provider/model" form for non-Anthropic providers.
-                        let provider = self.config.provider.as_deref().unwrap_or("anthropic");
-                        let full_model = if provider == "anthropic" {
-                            model_id.clone()
-                        } else {
-                            format!("{}/{}", provider, model_id)
-                        };
-                        self.set_model(full_model.clone());
+                        // model_id already carries the provider prefix when the
+                        // multi-provider picker is open (e.g. "openai/gpt-4o").
+                        self.set_model(model_id.clone());
                         self.persist_provider_and_model();
                         let effort_hint = effort.map(|e| format!(" [{}]", e.label())).unwrap_or_default();
-                        self.status_message = Some(format!("Model: {}{}", full_model, effort_hint));
+                        self.status_message = Some(format!("Model: {}{}", model_id, effort_hint));
                     }
                 }
                 KeyCode::Backspace => self.model_picker.pop_filter_char(),

@@ -151,6 +151,87 @@ pub fn format_model_line(model_str: &str, context_window: Option<u32>, cost_per_
     parts.join("  ")
 }
 
+/// Infer the provider ID from a model identifier.
+///
+/// If the id contains a slash (e.g. `openai/gpt-4o`) the prefix is the provider.
+/// Otherwise the provider is guessed from well-known model name patterns.
+pub fn provider_from_model_id(id: &str) -> &str {
+    if let Some((p, _)) = id.split_once('/') {
+        return p;
+    }
+    let lower = id.to_lowercase();
+    if lower.starts_with("claude") {
+        "anthropic"
+    } else if lower.starts_with("gpt") || lower.starts_with("o1") || lower.starts_with("o3") || lower.starts_with("o4") {
+        "openai"
+    } else if lower.contains("gemini") || lower.starts_with("gemma") {
+        "google"
+    } else if lower.contains("minimax") {
+        "minimax"
+    } else if lower.contains("grok") {
+        "xai"
+    } else if lower.contains("llama") && lower.contains("local") {
+        "ollama"
+    } else {
+        "other"
+    }
+}
+
+/// Human-readable provider name for the model picker group header.
+pub fn provider_display_name(provider_id: &str) -> String {
+    match provider_id {
+        "anthropic" => "Anthropic".to_string(),
+        "openai" => "OpenAI".to_string(),
+        "openai-codex" => "OpenAI Codex".to_string(),
+        "github-copilot" => "GitHub Copilot".to_string(),
+        "google" => "Google".to_string(),
+        "custom-openai" => "Custom OpenAI".to_string(),
+        "openrouter" => "OpenRouter".to_string(),
+        "vercel" => "Vercel AI Gateway".to_string(),
+        "groq" => "Groq".to_string(),
+        "zai" => "Z.AI".to_string(),
+        "cerebras" => "Cerebras".to_string(),
+        "sambanova" => "SambaNova".to_string(),
+        "lmstudio" => "LM Studio".to_string(),
+        "llamacpp" => "llama.cpp".to_string(),
+        "deepseek" => "DeepSeek".to_string(),
+        "mistral" => "Mistral".to_string(),
+        "togetherai" => "Together AI".to_string(),
+        "perplexity" => "Perplexity".to_string(),
+        "cohere" => "Cohere".to_string(),
+        "xai" => "xAI".to_string(),
+        "deepinfra" => "DeepInfra".to_string(),
+        "azure" => "Azure OpenAI".to_string(),
+        "amazon-bedrock" => "AWS Bedrock".to_string(),
+        "google-vertex" => "Google Vertex AI".to_string(),
+        "sap-ai-core" => "SAP AI Core".to_string(),
+        "gitlab" => "GitLab Duo".to_string(),
+        "cloudflare-ai-gateway" => "Cloudflare AI Gateway".to_string(),
+        "cloudflare-workers-ai" => "Cloudflare Workers AI".to_string(),
+        "helicone" => "Helicone".to_string(),
+        "huggingface" => "Hugging Face".to_string(),
+        "nvidia" => "NVIDIA".to_string(),
+        "alibaba" => "Alibaba".to_string(),
+        "venice" => "Venice AI".to_string(),
+        "moonshotai" => "Moonshot AI".to_string(),
+        "zhipuai" => "Zhipu AI".to_string(),
+        "siliconflow" => "SiliconFlow".to_string(),
+        "nebius" => "Nebius".to_string(),
+        "novita" => "Novita".to_string(),
+        "minimax" => "MiniMax".to_string(),
+        "ovhcloud" => "OVHcloud".to_string(),
+        "scaleway" => "Scaleway".to_string(),
+        "vultr" => "Vultr".to_string(),
+        "baseten" => "Baseten".to_string(),
+        "friendli" => "Friendli".to_string(),
+        "upstage" => "Upstage".to_string(),
+        "stepfun" => "StepFun".to_string(),
+        "fireworks" => "Fireworks AI".to_string(),
+        "ollama" => "Ollama".to_string(),
+        _ => provider_id.to_string(),
+    }
+}
+
 /// A group of models belonging to the same provider, for structured display.
 pub struct ProviderSection {
     pub provider_name: String,
@@ -274,6 +355,54 @@ pub fn models_for_provider_from_registry(
         // Fall back to hardcoded
         models_for_provider(provider_id)
     }
+}
+
+/// Return all provider IDs that have stored credentials or env vars.
+pub fn connected_providers(auth_store: &claurst_core::AuthStore) -> Vec<String> {
+    const ALL_PROVIDERS: &[&str] = &[
+        "anthropic", "openai", "openai-codex", "github-copilot", "google",
+        "custom-openai", "openrouter", "vercel", "groq", "zai", "cerebras",
+        "sambanova", "lmstudio", "llamacpp", "deepseek", "mistral",
+        "togetherai", "perplexity", "cohere", "xai", "deepinfra", "azure",
+        "amazon-bedrock", "google-vertex", "sap-ai-core", "gitlab",
+        "cloudflare-ai-gateway", "cloudflare-workers-ai", "helicone",
+        "huggingface", "nvidia", "alibaba", "venice", "moonshotai",
+        "zhipuai", "siliconflow", "nebius", "novita", "minimax", "ovhcloud",
+        "scaleway", "vultr", "baseten", "friendli", "upstage", "stepfun",
+        "fireworks",
+    ];
+    ALL_PROVIDERS
+        .iter()
+        .filter(|&&p| auth_store.api_key_for(p).is_some())
+        .map(|&p| p.to_string())
+        .collect()
+}
+
+/// Build a combined model list from all connected providers.
+///
+/// Model IDs are prefixed with `provider/` (except anthropic) so that
+/// `App::set_model()` can infer the correct provider on selection.
+pub fn models_for_all_connected_providers(
+    auth_store: &claurst_core::AuthStore,
+    registry: &claurst_api::ModelRegistry,
+) -> Vec<ModelEntry> {
+    let providers = connected_providers(auth_store);
+    if providers.is_empty() {
+        return ModelPickerState::default_models();
+    }
+
+    let mut all_models = Vec::new();
+    for provider_id in providers {
+        let mut models = models_for_provider_from_registry(&provider_id, registry);
+        for m in &mut models {
+            if provider_id != "anthropic" {
+                m.id = format!("{}/{}", provider_id, m.id);
+            }
+            // Provider is shown via the group header in the picker UI
+        }
+        all_models.extend(models);
+    }
+    all_models
 }
 
 /// Build the model list for a given provider.
@@ -898,58 +1027,83 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
             )]));
         }
     } else {
-        for (i, model) in filtered.iter().enumerate() {
-            let is_selected = i == state.selected_idx;
-            let supports_effort = model_supports_effort(&model.id);
-
-            if is_selected {
-                selected_line_idx = lines.len() as u16;
-            }
-
-            let (fg, bg) = if is_selected {
-                (highlight_fg, highlight_bg)
-            } else {
-                (Color::White, dialog_bg)
-            };
-
-            let mut spans: Vec<Span<'static>> = Vec::new();
-
-            // Current model indicator
-            if model.is_current {
-                spans.push(Span::styled(" \u{25cf} ", Style::default().fg(Color::Green).bg(bg)));
-            } else {
-                spans.push(Span::styled("   ", Style::default().bg(bg)));
-            }
-
-            spans.push(Span::styled(model.display_name.clone(), Style::default().fg(fg).bg(bg)));
-
-            // Effort indicator
-            if supports_effort && is_selected {
-                spans.push(Span::styled(
-                    format!("  {} {}", state.effort_level.symbol(), state.effort_level.label()),
-                    Style::default().fg(Color::Rgb(200, 255, 200)).bg(bg),
-                ));
-            }
-
-            // Description
-            if !model.description.is_empty() {
-                let desc_fg = if is_selected { Color::Rgb(200, 200, 200) } else { dim };
-                spans.push(Span::styled(
-                    format!("  {}", model.description),
-                    Style::default().fg(desc_fg).bg(bg),
-                ));
-            }
-
-            // Pad for full-width highlight
-            if is_selected {
-                let text_len: usize = spans.iter().map(|s| s.content.len()).sum();
-                let pad = inner.width.saturating_sub(text_len as u16) as usize;
-                if pad > 0 {
-                    spans.push(Span::styled(" ".repeat(pad), Style::default().bg(highlight_bg)));
+        // ── Group by provider ──
+        let mut groups: Vec<(&str, Vec<&ModelEntry>)> = Vec::new();
+        for model in &filtered {
+            let provider = provider_from_model_id(&model.id);
+            if let Some(last) = groups.last_mut() {
+                if last.0 == provider {
+                    last.1.push(model);
+                    continue;
                 }
             }
+            groups.push((provider, vec![model]));
+        }
 
-            lines.push(Line::from(spans));
+        let mut model_idx = 0usize;
+        for (provider_id, models) in groups {
+            // Provider header (not selectable)
+            lines.push(Line::from(vec![Span::styled(
+                format!(" {}", provider_display_name(provider_id)),
+                Style::default()
+                    .fg(Color::Rgb(233, 30, 99))
+                    .add_modifier(Modifier::BOLD),
+            )]));
+
+            for model in models {
+                let is_selected = model_idx == state.selected_idx;
+                let supports_effort = model_supports_effort(&model.id);
+
+                if is_selected {
+                    selected_line_idx = lines.len() as u16;
+                }
+
+                let (fg, bg) = if is_selected {
+                    (highlight_fg, highlight_bg)
+                } else {
+                    (Color::White, dialog_bg)
+                };
+
+                let mut spans: Vec<Span<'static>> = Vec::new();
+
+                // Indent + current model indicator
+                if model.is_current {
+                    spans.push(Span::styled("   \u{25cf} ", Style::default().fg(Color::Green).bg(bg)));
+                } else {
+                    spans.push(Span::styled("     ", Style::default().bg(bg)));
+                }
+
+                spans.push(Span::styled(model.display_name.clone(), Style::default().fg(fg).bg(bg)));
+
+                // Effort indicator
+                if supports_effort && is_selected {
+                    spans.push(Span::styled(
+                        format!("  {} {}", state.effort_level.symbol(), state.effort_level.label()),
+                        Style::default().fg(Color::Rgb(200, 255, 200)).bg(bg),
+                    ));
+                }
+
+                // Description
+                if !model.description.is_empty() {
+                    let desc_fg = if is_selected { Color::Rgb(200, 200, 200) } else { dim };
+                    spans.push(Span::styled(
+                        format!("  {}", model.description),
+                        Style::default().fg(desc_fg).bg(bg),
+                    ));
+                }
+
+                // Pad for full-width highlight
+                if is_selected {
+                    let text_len: usize = spans.iter().map(|s| s.content.len()).sum();
+                    let pad = inner.width.saturating_sub(text_len as u16) as usize;
+                    if pad > 0 {
+                        spans.push(Span::styled(" ".repeat(pad), Style::default().bg(highlight_bg)));
+                    }
+                }
+
+                lines.push(Line::from(spans));
+                model_idx += 1;
+            }
         }
     }
 
