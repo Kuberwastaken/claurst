@@ -715,6 +715,12 @@ impl LlmProvider for OpenAiCompatProvider {
             let mut message_started = false;
             let mut message_id = String::from("unknown");
             let mut model_name = String::new();
+            // Dedicated index for the Thinking content block emitted when a
+            // provider streams a `reasoning_content` field (DeepSeek V4, etc.).
+            // Chosen to avoid colliding with text (index 0) or tool calls
+            // (1 + tc_index).
+            const THINKING_BLOCK_INDEX: usize = usize::MAX - 100;
+            let mut thinking_open = false;
             let mut tool_call_buffers: std::collections::HashMap<
                 usize,
                 (String, String, String),
@@ -844,8 +850,28 @@ impl LlmProvider for OpenAiCompatProvider {
                         for field in &fields_to_check {
                             if let Some(reasoning) = delta.get(*field).and_then(|v| v.as_str()) {
                                 if !reasoning.is_empty() {
+                                    // Open a dedicated Thinking block on first
+                                    // reasoning delta so the accumulator has a
+                                    // partial to append into (see
+                                    // StreamAccumulator::on_event).  Without
+                                    // this start event the reasoning deltas
+                                    // would be dropped and the completed
+                                    // assistant message would not carry any
+                                    // ContentBlock::Thinking — which is what
+                                    // DeepSeek V4 thinking mode requires the
+                                    // client to echo back on subsequent turns.
+                                    if !thinking_open {
+                                        yield Ok(StreamEvent::ContentBlockStart {
+                                            index: THINKING_BLOCK_INDEX,
+                                            content_block: ContentBlock::Thinking {
+                                                thinking: String::new(),
+                                                signature: String::new(),
+                                            },
+                                        });
+                                        thinking_open = true;
+                                    }
                                     yield Ok(StreamEvent::ReasoningDelta {
-                                        index: 0,
+                                        index: THINKING_BLOCK_INDEX,
                                         reasoning: reasoning.to_string(),
                                     });
                                     break;
@@ -857,6 +883,15 @@ impl LlmProvider for OpenAiCompatProvider {
                     // Text content delta
                     if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
                         if !content.is_empty() {
+                            // Close any open thinking block before visible text
+                            // starts streaming, so the blocks land in order in
+                            // the final message: [Thinking, Text, ToolUse...].
+                            if thinking_open {
+                                yield Ok(StreamEvent::ContentBlockStop {
+                                    index: THINKING_BLOCK_INDEX,
+                                });
+                                thinking_open = false;
+                            }
                             yield Ok(StreamEvent::TextDelta {
                                 index: 0,
                                 text: content.to_string(),
@@ -868,6 +903,14 @@ impl LlmProvider for OpenAiCompatProvider {
                     if let Some(tool_calls) =
                         delta.get("tool_calls").and_then(|t| t.as_array())
                     {
+                        // Close any open thinking block before tool calls
+                        // start (same ordering guarantee as for text above).
+                        if thinking_open {
+                            yield Ok(StreamEvent::ContentBlockStop {
+                                index: THINKING_BLOCK_INDEX,
+                            });
+                            thinking_open = false;
+                        }
                         for tc in tool_calls {
                             let tc_index = tc
                                 .get("index")
@@ -922,6 +965,14 @@ impl LlmProvider for OpenAiCompatProvider {
                         choice.get("finish_reason").and_then(|v| v.as_str())
                     {
                         if !finish_reason.is_empty() && finish_reason != "null" {
+                            // Flush any still-open thinking block first so it
+                            // is finalized into the assistant message.
+                            if thinking_open {
+                                yield Ok(StreamEvent::ContentBlockStop {
+                                    index: THINKING_BLOCK_INDEX,
+                                });
+                                thinking_open = false;
+                            }
                             yield Ok(StreamEvent::ContentBlockStop { index: 0 });
                             let mut tc_indices: Vec<usize> =
                                 tool_call_buffers.keys().cloned().collect();

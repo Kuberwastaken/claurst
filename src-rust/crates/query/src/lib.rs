@@ -1096,6 +1096,14 @@ pub async fn run_query_loop(
 
                     // Accumulators for building the final assistant message.
                     let mut text_chunks: Vec<String> = Vec::new();
+                    // Reasoning/thinking chunks streamed by providers that
+                    // expose a reasoning channel (DeepSeek V4's
+                    // `reasoning_content`, Copilot's `reasoning_text`, etc.).
+                    // DeepSeek's docs require the caller to echo this content
+                    // back on subsequent turns when tools are involved, so we
+                    // must preserve it as a ContentBlock::Thinking on the
+                    // assistant message instead of discarding it.
+                    let mut reasoning_chunks: Vec<String> = Vec::new();
                     // tool_call_blocks: index → (id, name, accumulated_json)
                     let mut tool_call_blocks: std::collections::HashMap<usize, (String, String, String)> =
                         std::collections::HashMap::new();
@@ -1150,6 +1158,12 @@ pub async fn run_query_loop(
                                             claurst_api::StreamEvent::TextDelta { text, .. } => {
                                                 text_chunks.push(text.clone());
                                             }
+                                            claurst_api::StreamEvent::ReasoningDelta { reasoning, .. } => {
+                                                reasoning_chunks.push(reasoning.clone());
+                                            }
+                                            claurst_api::StreamEvent::ThinkingDelta { thinking, .. } => {
+                                                reasoning_chunks.push(thinking.clone());
+                                            }
                                             claurst_api::StreamEvent::InputJsonDelta { index, partial_json } => {
                                                 if let Some((_, _, buf)) = tool_call_blocks.get_mut(index) {
                                                     buf.push_str(partial_json);
@@ -1190,6 +1204,18 @@ pub async fn run_query_loop(
 
                     // Build the content blocks from accumulated stream data.
                     let mut content_blocks: Vec<ContentBlock> = Vec::new();
+
+                    // Emit reasoning as a Thinking block FIRST so it precedes
+                    // any text / tool-use blocks in the assistant turn.  This
+                    // ordering matches the shape DeepSeek expects when a
+                    // client echoes the reasoning back in multi-turn requests.
+                    let combined_reasoning = reasoning_chunks.join("");
+                    if !combined_reasoning.is_empty() {
+                        content_blocks.push(ContentBlock::Thinking {
+                            thinking: combined_reasoning,
+                            signature: String::new(),
+                        });
+                    }
 
                     let combined_text = text_chunks.join("");
                     if !combined_text.is_empty() {
