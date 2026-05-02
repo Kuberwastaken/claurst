@@ -4849,6 +4849,17 @@ impl App {
                     && mouse_event.column >= selectable_area.x
                     && mouse_event.column < selectable_area.x.saturating_add(selectable_area.width);
 
+                // Check for click on a thinking block header (takes priority over text selection).
+                if let Some(&hash) = self.thinking_row_map.borrow().get(&mouse_event.row) {
+                    if self.thinking_expanded.contains(&hash) {
+                        self.thinking_expanded.remove(&hash);
+                    } else {
+                        self.thinking_expanded.insert(hash);
+                    }
+                    self.invalidate_transcript();
+                    return;
+                }
+
                 if in_input {
                     self.focus = FocusTarget::Input;
                     self.clear_selection();

@@ -31,8 +31,9 @@ use crate::hooks_config_menu::render_hooks_config_menu;
 use crate::mcp_view::render_mcp_view;
 use crate::memory_file_selector::render_memory_file_selector;
 use crate::messages::{
-    render_transcript_assistant_message,
+    render_transcript_assistant_message_tagged,
     render_transcript_assistant_meta, render_transcript_live_text, render_transcript_user_message,
+    render_thinking_live_content,
     RenderContext,
 };
 use crate::notifications::render_notification_banner;
@@ -306,6 +307,8 @@ struct RenderedLineItem {
     search_text: String,
     is_header: bool,
     message_index: Option<usize>,
+    /// If this line is the clickable header of a thinking block, its hash.
+    thinking_hash: Option<u64>,
 }
 
 impl VirtualItem for RenderedLineItem {
@@ -894,6 +897,7 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     {
         app.last_msg_area.set(Rect::default());
         app.message_row_map.borrow_mut().clear();
+        app.thinking_row_map.borrow_mut().clear();
         render_welcome_box(frame, app, content_area);
         return;
     }
@@ -942,18 +946,19 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
         max_scroll.saturating_sub(app.scroll_offset)
     };
 
-    let visible_rows: std::collections::HashMap<u16, usize> = lines
-        .iter()
-        .enumerate()
-        .skip(scroll)
-        .take(msg_area.height as usize)
-        .filter_map(|(idx, item)| {
-            item.message_index.map(|message_index| {
-                (msg_area.y.saturating_add((idx.saturating_sub(scroll)) as u16), message_index)
-            })
-        })
-        .collect();
+    let mut visible_rows: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
+    let mut thinking_rows: std::collections::HashMap<u16, u64> = std::collections::HashMap::new();
+    for (idx, item) in lines.iter().enumerate().skip(scroll).take(msg_area.height as usize) {
+        let screen_row = msg_area.y.saturating_add((idx.saturating_sub(scroll)) as u16);
+        if let Some(message_index) = item.message_index {
+            visible_rows.insert(screen_row, message_index);
+        }
+        if let Some(hash) = item.thinking_hash {
+            thinking_rows.insert(screen_row, hash);
+        }
+    }
     *app.message_row_map.borrow_mut() = visible_rows;
+    *app.thinking_row_map.borrow_mut() = thinking_rows;
 
     // No border — messages render directly into the area.
     let mut list = VirtualList::new();
@@ -1022,6 +1027,25 @@ fn push_rendered_items(
             search_text: flatten_line_text(&line),
             is_header: mark_first_header && index == 0,
             message_index,
+            thinking_hash: None,
+            line,
+        });
+    }
+}
+
+/// Push tagged lines from `render_transcript_assistant_message_tagged`.
+/// Lines with `Some(hash)` become clickable thinking headers.
+fn push_rendered_items_tagged(
+    items: &mut Vec<RenderedLineItem>,
+    tagged: Vec<(Line<'static>, Option<u64>)>,
+    message_index: Option<usize>,
+) {
+    for (line, thinking_hash) in tagged {
+        items.push(RenderedLineItem {
+            search_text: flatten_line_text(&line),
+            is_header: false,
+            message_index,
+            thinking_hash,
             line,
         });
     }
@@ -1031,18 +1055,22 @@ fn push_blank_item(items: &mut Vec<RenderedLineItem>) {
     push_rendered_items(items, vec![Line::from("")], None, false);
 }
 
-fn render_live_thinking_line(turn: &TranscriptTurn<'_>, frame_count: u64) -> Line<'static> {
-    let mut spans = vec![Span::raw("  ")];
-    spans.extend(shimmer_spans("Thinking", frame_count));
+fn render_live_thinking_lines(turn: &TranscriptTurn<'_>, frame_count: u64, width: u16) -> Vec<Line<'static>> {
+    let mut header_spans = vec![Span::raw("  ▼ ")];
+    header_spans.extend(shimmer_spans("Thinking", frame_count));
     if let Some(heading) = turn.reasoning_heading() {
-        spans.push(Span::styled(
+        header_spans.push(Span::styled(
             format!(": {}", heading),
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC),
         ));
     }
-    Line::from(spans)
+    let mut lines = vec![Line::from(header_spans)];
+    if let Some(text) = turn.live_thinking {
+        lines.extend(render_thinking_live_content(text, width));
+    }
+    lines
 }
 
 fn append_turn_items(
@@ -1061,9 +1089,14 @@ fn append_turn_items(
         true,
     );
 
-    let mut sections: Vec<(Vec<Line<'static>>, Option<usize>)> = Vec::new();
+    enum SectionContent {
+        Plain(Vec<Line<'static>>),
+        Tagged(Vec<(Line<'static>, Option<u64>)>),
+    }
+
+    let mut sections: Vec<(SectionContent, Option<usize>)> = Vec::new();
     for (message_index, message) in &turn.assistant_messages {
-        let lines = render_transcript_assistant_message(
+        let tagged = render_transcript_assistant_message_tagged(
             message,
             &RenderContext {
                 width,
@@ -1073,8 +1106,8 @@ fn append_turn_items(
                 expanded_thinking: expanded_thinking.clone(),
             },
         );
-        if !lines.is_empty() {
-            sections.push((lines, Some(*message_index)));
+        if !tagged.is_empty() {
+            sections.push((SectionContent::Tagged(tagged), Some(*message_index)));
         }
     }
 
@@ -1082,13 +1115,13 @@ fn append_turn_items(
         let mut lines = Vec::new();
         render_tool_block_lines(&mut lines, block, frame_count);
         if !lines.is_empty() {
-            sections.push((lines, Some(turn.primary_message_index())));
+            sections.push((SectionContent::Plain(lines), Some(turn.primary_message_index())));
         }
     }
 
     if turn.active && turn.live_thinking.is_some() {
         sections.push((
-            vec![render_live_thinking_line(turn, frame_count)],
+            SectionContent::Plain(render_live_thinking_lines(turn, frame_count, width)),
             Some(turn.primary_message_index()),
         ));
     }
@@ -1104,7 +1137,7 @@ fn append_turn_items(
         let mut spans = vec![Span::raw("  ")];
         spans.extend(shimmer_spans("Thinking", frame_count));
         sections.push((
-            vec![Line::from(spans)],
+            SectionContent::Plain(vec![Line::from(spans)]),
             Some(turn.primary_message_index()),
         ));
     }
@@ -1112,14 +1145,14 @@ fn append_turn_items(
     if let Some(text) = turn.live_text {
         let lines = render_transcript_live_text(text, width);
         if !lines.is_empty() {
-            sections.push((lines, Some(turn.primary_message_index())));
+            sections.push((SectionContent::Plain(lines), Some(turn.primary_message_index())));
         }
     }
 
     if !turn.active {
         if let Some(meta_line) = render_transcript_assistant_meta(turn.metadata, accent) {
             if turn.has_visible_assistant_content() {
-                sections.push((vec![meta_line], Some(turn.primary_message_index())));
+                sections.push((SectionContent::Plain(vec![meta_line]), Some(turn.primary_message_index())));
             }
         }
     }
@@ -1127,8 +1160,11 @@ fn append_turn_items(
     if !sections.is_empty() {
         push_blank_item(items);
         let total_sections = sections.len();
-        for (index, (lines, message_index)) in sections.into_iter().enumerate() {
-            push_rendered_items(items, lines, message_index, false);
+        for (index, (content, message_index)) in sections.into_iter().enumerate() {
+            match content {
+                SectionContent::Plain(lines) => push_rendered_items(items, lines, message_index, false),
+                SectionContent::Tagged(tagged) => push_rendered_items_tagged(items, tagged, message_index),
+            }
             if index + 1 < total_sections {
                 push_blank_item(items);
             }
@@ -1216,7 +1252,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
                 }
             }
 
-            let lines = render_transcript_assistant_message(
+            let tagged = render_transcript_assistant_message_tagged(
                 message,
                 &RenderContext {
                     width,
@@ -1226,7 +1262,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
                     expanded_thinking: app.thinking_expanded.clone(),
                 },
             );
-            push_rendered_items(&mut items, lines, Some(index), true);
+            push_rendered_items_tagged(&mut items, tagged, Some(index));
             push_blank_item(&mut items);
             index += 1;
         }
