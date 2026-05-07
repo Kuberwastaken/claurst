@@ -404,9 +404,10 @@ pub fn render_transcript_reasoning_block(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let heading = reasoning_heading(text).unwrap_or_else(|| "Thinking".to_string());
+    let chevron = if expanded { "▼" } else { "▶" };
     lines.push(Line::from(vec![
         Span::styled(
-            "  Thinking: ",
+            format!("  {} Thinking: ", chevron),
             Style::default()
                 .fg(TRANSCRIPT_MUTED)
                 .add_modifier(Modifier::ITALIC),
@@ -430,6 +431,205 @@ pub fn render_transcript_reasoning_block(
     }
 
     lines
+}
+
+/// Render the thinking content body (without header) for live streaming display.
+pub fn render_thinking_live_content(text: &str, width: u16) -> Vec<Line<'static>> {
+    let rendered = render_markdown(text, width.saturating_sub(6));
+    indent_lines(rendered, "    ", Style::default(), TRANSCRIPT_MUTED)
+}
+
+/// Returns lines for each content block with an optional thinking hash tag.
+/// The hash is `Some(hash)` only for the header line of a Thinking block,
+/// enabling click-to-expand in the TUI.
+pub fn render_transcript_assistant_message_tagged(
+    msg: &Message,
+    ctx: &RenderContext,
+) -> Vec<(Line<'static>, Option<u64>)> {
+    let mut out: Vec<(Line<'static>, Option<u64>)> = Vec::new();
+    let mut pending_text = String::new();
+
+    let flush_text = |buffer: &mut String, target: &mut Vec<(Line<'static>, Option<u64>)>, width: u16| {
+        if buffer.is_empty() {
+            return;
+        }
+        for line in render_transcript_live_text(buffer, width) {
+            target.push((line, None));
+        }
+        buffer.clear();
+    };
+
+    for block in msg.content_blocks() {
+        match block {
+            ContentBlock::Text { text } => {
+                if !pending_text.is_empty() {
+                    pending_text.push('\n');
+                }
+                pending_text.push_str(&text);
+            }
+            ContentBlock::Thinking { thinking, .. } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                let thinking_hash = {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut h = DefaultHasher::new();
+                    thinking.hash(&mut h);
+                    h.finish()
+                };
+                let expanded = ctx.show_thinking || ctx.expanded_thinking.contains(&thinking_hash);
+                let block_lines = render_transcript_reasoning_block(&thinking, expanded, ctx.width);
+                for (i, line) in block_lines.into_iter().enumerate() {
+                    // Tag only the header line (index 0) with the hash so it's clickable.
+                    out.push((line, if i == 0 { Some(thinking_hash) } else { None }));
+                }
+            }
+            ContentBlock::RedactedThinking { .. } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                out.push((
+                    Line::from(vec![Span::styled(
+                        "  Thinking hidden".to_string(),
+                        Style::default()
+                            .fg(TRANSCRIPT_MUTED)
+                            .add_modifier(Modifier::ITALIC),
+                    )]),
+                    None,
+                ));
+            }
+            ContentBlock::ToolUse { name, input, .. } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                for line in indent_lines(
+                    render_tool_use_inner(&name, &input),
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ) {
+                    out.push((line, None));
+                }
+            }
+            ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                let text = tool_result_text(&content);
+                let tool_name = ctx.tool_names.get(&tool_use_id).map(|name| name.as_str());
+                let rendered = if is_error.unwrap_or(false) {
+                    render_tool_result_error(&text)
+                } else {
+                    match tool_name {
+                        Some("Bash") | Some("PowerShell") => render_bash_output_block(&text, TOOL_RESULT_MAX_LINES),
+                        Some("Read") => render_file_read_result(&text),
+                        Some("Edit") => render_file_op_result(false),
+                        Some("Write") => render_file_op_result(true),
+                        _ => render_tool_result_success(&text, false),
+                    }
+                };
+                for line in indent_lines(rendered, "   ", Style::default(), TRANSCRIPT_TEXT) {
+                    out.push((line, None));
+                }
+            }
+            ContentBlock::Image { source } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                let label = render_image(&source).unwrap_or_else(|| {
+                    source
+                        .media_type
+                        .or(source.url)
+                        .unwrap_or_else(|| "assistant image".to_string())
+                });
+                for line in indent_lines(
+                    vec![render_attachment_chip("img", label)],
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ) {
+                    out.push((line, None));
+                }
+            }
+            ContentBlock::Document { title, context, source, .. } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                let label = title
+                    .or(context)
+                    .or(source.url)
+                    .or(source.media_type)
+                    .unwrap_or_else(|| "attached document".to_string());
+                for line in indent_lines(
+                    vec![render_attachment_chip("doc", label)],
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ) {
+                    out.push((line, None));
+                }
+            }
+            ContentBlock::UserLocalCommandOutput { command, output } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                for line in indent_lines(
+                    render_user_local_command_output(&command, &output, 30),
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ) {
+                    out.push((line, None));
+                }
+            }
+            ContentBlock::UserCommand { name, args } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                for line in indent_lines(
+                    render_user_command(&name, &args),
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ) {
+                    out.push((line, None));
+                }
+            }
+            ContentBlock::UserMemoryInput { key, value } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                for line in indent_lines(
+                    render_user_memory_input(&key, &value),
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ) {
+                    out.push((line, None));
+                }
+            }
+            ContentBlock::SystemAPIError { message, retry_secs } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                for line in indent_lines(
+                    render_system_api_error(&message, retry_secs),
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ) {
+                    out.push((line, None));
+                }
+            }
+            ContentBlock::CollapsedReadSearch { tool_name, paths, n_hidden } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                let path_refs: Vec<&str> = paths.iter().map(|path| path.as_str()).collect();
+                for line in indent_lines(
+                    render_collapsed_read_search(&tool_name, &path_refs, n_hidden),
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ) {
+                    out.push((line, None));
+                }
+            }
+            ContentBlock::TaskAssignment { id, subject, description } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                for line in indent_lines(
+                    render_task_assignment(&id, &subject, &description),
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ) {
+                    out.push((line, None));
+                }
+            }
+        }
+    }
+
+    flush_text(&mut pending_text, &mut out, ctx.width);
+    out
 }
 
 pub fn render_transcript_assistant_message(

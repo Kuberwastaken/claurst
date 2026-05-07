@@ -299,7 +299,9 @@ fn platform_no_mic_message() -> String {
     } else if cfg!(target_os = "macos") {
         "No microphone found. Check System Settings \u{2192} Privacy & Security \u{2192} Microphone.".to_string()
     } else {
-        "No microphone found. Connect a microphone and ensure your audio system is configured correctly.".to_string()
+        "No microphone found. Check that a microphone is connected and ALSA/PulseAudio is configured. \
+         On Debian/Ubuntu run: sudo apt install libasound2-dev && arecord -l (to list devices). \
+         Set ALSA_CARD or PULSE_SERVER if needed.".to_string()
     }
 }
 
@@ -325,12 +327,21 @@ async fn record_and_transcribe(
             return Ok(());
         }
 
-        let api_key = match &config.api_key {
-            Some(k) if !k.is_empty() => k.clone(),
-            _ => {
-                let msg = "Voice transcription requires an API key. \
-                           Set OPENAI_API_KEY or configure voice.api_key."
-                    .to_string();
+        // Resolve API key: explicit config first, then OPENAI_API_KEY, then ANTHROPIC_API_KEY.
+        let api_key_opt = config
+            .api_key
+            .as_deref()
+            .filter(|k| !k.is_empty())
+            .map(|k| k.to_string())
+            .or_else(|| std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.is_empty()))
+            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty()));
+
+        let api_key = match api_key_opt {
+            Some(k) => k,
+            None => {
+                let msg = "No API key found for voice transcription. \
+                           Set OPENAI_API_KEY, or point WHISPER_ENDPOINT_URL to a \
+                           local Whisper server (e.g. whisper.cpp or faster-whisper).".to_string();
                 let _ = event_tx.send(VoiceEvent::Error(msg.clone())).await;
                 return Err(anyhow::anyhow!(msg));
             }
@@ -391,6 +402,8 @@ async fn record_audio(
     let samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
     let samples_clone = samples.clone();
 
+    let err_tx = event_tx.clone();
+    let is_recording_for_err = is_recording.clone();
     let stream = {
         let config: cpal::StreamConfig = supported_config.into();
         device.build_input_stream(
@@ -410,6 +423,10 @@ async fn record_audio(
             },
             move |err| {
                 tracing::error!("Audio stream error: {}", err);
+                // Stop the recording loop so the thread exits cleanly.
+                is_recording_for_err.store(false, Ordering::SeqCst);
+                let msg = format!("Audio capture error: {}. Check your microphone and ALSA/PulseAudio configuration.", err);
+                let _ = err_tx.try_send(VoiceEvent::Error(msg));
             },
             None,
         )?

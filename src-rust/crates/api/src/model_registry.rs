@@ -85,6 +85,8 @@ impl ModelRegistry {
         self.add_anthropic_models();
         self.add_openai_models();
         self.add_google_models();
+        self.add_deepseek_models();
+        self.add_zai_models();
     }
 
     fn add_anthropic_models(&mut self) {
@@ -172,6 +174,82 @@ impl ModelRegistry {
         }
     }
 
+    // DeepSeek V4 pricing per api-docs.deepseek.com — CNY converted to USD (~7.2 CNY/USD).
+    fn add_deepseek_models(&mut self) {
+        let pid = ProviderId::new(ProviderId::DEEPSEEK);
+        for (id, name, ctx, out, cost_in, cost_out, cost_cache_read) in [
+            (
+                "deepseek-v4-pro",
+                "DeepSeek V4 Pro",
+                1_048_576,
+                393_216,
+                1.75,
+                3.51,
+                0.14,
+            ),
+            (
+                "deepseek-v4-flash",
+                "DeepSeek V4 Flash",
+                1_048_576,
+                393_216,
+                0.14,
+                0.28,
+                0.02,
+            ),
+        ] {
+            self.insert(ModelEntry {
+                info: ModelInfo {
+                    id: ModelId::new(id),
+                    provider_id: pid.clone(),
+                    name: name.to_string(),
+                    context_window: ctx,
+                    max_output_tokens: out,
+                },
+                cost_input: Some(cost_in),
+                cost_output: Some(cost_out),
+                cost_cache_read: Some(cost_cache_read),
+                cost_cache_write: None,
+                tool_calling: true,
+                reasoning: true,
+                vision: false,
+                family: Some("deepseek".to_string()),
+                status: "active".to_string(),
+            });
+        }
+    }
+
+    // Z.AI pricing per docs.z.ai/guides/overview/pricing — USD per 1M tokens.
+    // cost_cache_write is None because cached input storage is currently a
+    // limited-time free promotion; update when promotion ends.
+    fn add_zai_models(&mut self) {
+        let pid = ProviderId::new(ProviderId::ZAI);
+        for (id, name, ctx, out, cost_in, cost_out, cost_cache_read) in [
+            ("glm-5.1",     "GLM-5.1",      200_000u32, 128_000u32, 1.4f64,  4.4f64, 0.26f64),
+            ("glm-5",       "GLM-5",        200_000,    128_000,    1.0,     3.2,    0.20),
+            ("glm-5-turbo", "GLM-5-Turbo",  200_000,    128_000,    1.2,     4.0,    0.24),
+            ("glm-4.7",     "GLM-4.7",      200_000,    128_000,    0.6,     2.2,    0.11),
+        ] {
+            self.insert(ModelEntry {
+                info: ModelInfo {
+                    id: ModelId::new(id),
+                    provider_id: pid.clone(),
+                    name: name.to_string(),
+                    context_window: ctx,
+                    max_output_tokens: out,
+                },
+                cost_input: Some(cost_in),
+                cost_output: Some(cost_out),
+                cost_cache_read: Some(cost_cache_read),
+                cost_cache_write: None,
+                tool_calling: true,
+                reasoning: true,
+                vision: false,
+                family: Some("glm".to_string()),
+                status: "active".to_string(),
+            });
+        }
+    }
+
     fn insert(&mut self, entry: ModelEntry) {
         let key = format!("{}/{}", entry.info.provider_id, entry.info.id);
         self.entries.insert(key, entry);
@@ -231,6 +309,8 @@ impl ModelRegistry {
             Some("cohere")
         } else if model_name.starts_with("sonar") {
             Some("perplexity")
+        } else if model_name.starts_with("glm-") {
+            Some("zai")
         } else {
             None
         };
@@ -290,12 +370,14 @@ impl ModelRegistry {
             "gpt-4o",
             "gemini-2.5-pro",
             "gemini-2.5-flash",
-            "deepseek-chat",
+            "deepseek-v4-pro",
             "mistral-large",
             "grok-2",
             "command-r-plus",
             "llama-3.3-70b",
             "sonar-pro",
+            "glm-5.1",
+            "glm-5-turbo",
         ];
 
         // Score each model: lower is better.
@@ -344,12 +426,13 @@ impl ModelRegistry {
             "gpt-4o-mini",
             "gemini-2.5-flash",
             "gemini-2.0-flash",
-            "deepseek-chat",
+            "deepseek-v4-flash",
             "mistral-small",
             "grok-2-mini",
             "command-r",
             "llama-3.3-8b",
             "sonar",
+            "glm-5-turbo",
         ];
 
         models.sort_by(|a, b| {
@@ -557,7 +640,7 @@ impl Default for ModelRegistry {
 ///     (scored by flagship priority -> "latest" preference -> ID desc).
 ///  3. Fall back to the hardcoded table in [`Config::effective_model()`].
 pub fn effective_model_for_config(
-    config: &claurst_core::Config,
+    config: &claurst_core::config::Config,
     registry: &ModelRegistry,
 ) -> String {
     // Explicit user override — always wins.

@@ -109,12 +109,16 @@ pub mod onboarding_dialog;
 pub mod dialog_select;
 /// Masked text input overlay for entering API keys.
 pub mod key_input_dialog;
+/// Modal dialog for entering custom provider URL + API key.
+pub mod custom_provider_dialog;
 /// Device code / browser-based auth overlay (GitHub Copilot, Anthropic OAuth).
 pub mod device_auth_dialog;
 /// Push-to-talk voice capture and Whisper transcription.
 pub mod voice_capture;
 /// Task progress overlay (Ctrl+T) — shows task status with inline toggle.
 pub mod tasks_overlay;
+/// Import-config preview and confirmation dialog.
+pub mod import_config_dialog;
 /// Session branching overlay (Ctrl+B) — create and switch between conversation branches.
 pub mod session_branching;
 
@@ -140,12 +144,14 @@ pub use mcp_view::{McpViewState, McpServerView, McpToolView, McpViewStatus, rend
 pub use prompt_input::{PromptInputState, VimMode, VimPendingState, VimOperator, VimFindKind, InputMode, render_prompt_input, handle_paste, compute_typeahead};
 pub use model_picker::{ModelPickerState, ModelEntry, EffortLevel, render_model_picker, model_supports_effort};
 pub use session_browser::{SessionBrowserState, SessionBrowserMode, SessionEntry, render_session_browser};
+pub use import_config_dialog::{ImportConfigDialogState, render_import_config_dialog};
 pub use session_branching::{SessionBranchingState, BranchBrowserMode, BranchInfo, render_session_branching};
 pub use invalid_config_dialog::{InvalidConfigDialogState, InvalidConfigKind, render_invalid_config_dialog};
 pub use bypass_permissions_dialog::{BypassPermissionsDialogState, render_bypass_permissions_dialog};
 pub use onboarding_dialog::{OnboardingDialogState, render_onboarding_dialog};
 pub use dialog_select::{DialogSelectState, SelectItem, render_dialog_select};
 pub use key_input_dialog::{KeyInputDialogState, render_key_input_dialog};
+pub use custom_provider_dialog::{CustomProviderDialogState, CustomProviderField, render_custom_provider_dialog};
 pub use device_auth_dialog::{DeviceAuthDialogState, DeviceAuthStatus, DeviceAuthEvent, render_device_auth_dialog};
 
 // ---------------------------------------------------------------------------
@@ -902,6 +908,85 @@ mod tests {
 
         assert!(rendered.contains("2 res"));
         assert!(rendered.contains("1 prompts"));
+    }
+
+    #[test]
+    fn test_mcp_view_auth_key_queues_selected_server_panel_auth() {
+        let mut app = make_app();
+        app.mcp_view.open(vec![McpServerView {
+            name: "mcphub".to_string(),
+            transport: "http".to_string(),
+            status: McpViewStatus::Connected,
+            tool_count: 1,
+            resource_count: 0,
+            prompt_count: 0,
+            resources: vec![],
+            prompts: vec![],
+            error_message: None,
+            tools: vec![McpToolView {
+                name: "read_file".to_string(),
+                server: "mcphub".to_string(),
+                description: "Read a file".to_string(),
+                input_schema: None,
+            }],
+        }]);
+
+        let submit = app.handle_key_event(key(KeyCode::Char('a')));
+        assert!(!submit);
+        assert_eq!(app.prompt_input.text, "");
+        assert_eq!(app.take_pending_mcp_panel_auth().as_deref(), Some("mcphub"));
+        assert!(!app.mcp_view.open);
+        assert_eq!(app.mcp_view.tool_search, "");
+    }
+
+    #[test]
+    fn test_mcp_view_auth_key_with_no_servers_is_safe_noop() {
+        let mut app = make_app();
+        app.mcp_view.open(vec![]);
+
+        let submit = app.handle_key_event(key(KeyCode::Char('a')));
+        assert!(!submit);
+        assert!(app.mcp_view.open);
+        assert_eq!(app.prompt_input.text, "");
+        assert!(app.take_pending_mcp_panel_auth().is_none());
+    }
+
+    #[test]
+    fn test_mcp_view_auth_key_only_works_in_servers_pane() {
+        let mut app = make_app();
+        app.mcp_view.open(vec![McpServerView {
+            name: "mcphub".to_string(),
+            transport: "http".to_string(),
+            status: McpViewStatus::Connected,
+            tool_count: 1,
+            resource_count: 0,
+            prompt_count: 0,
+            resources: vec![],
+            prompts: vec![],
+            error_message: None,
+            tools: vec![McpToolView {
+                name: "read_file".to_string(),
+                server: "mcphub".to_string(),
+                description: "Read a file".to_string(),
+                input_schema: None,
+            }],
+        }]);
+        app.mcp_view.switch_pane();
+
+        let submit = app.handle_key_event(key(KeyCode::Char('a')));
+        assert!(!submit);
+        assert!(app.mcp_view.open);
+        assert_eq!(app.mcp_view.tool_search, "a");
+        assert!(app.take_pending_mcp_panel_auth().is_none());
+    }
+
+    #[test]
+    fn test_take_pending_mcp_panel_auth_clears_after_read() {
+        let mut app = make_app();
+        app.pending_mcp_panel_auth = Some("mcphub".to_string());
+
+        assert_eq!(app.take_pending_mcp_panel_auth().as_deref(), Some("mcphub"));
+        assert!(app.take_pending_mcp_panel_auth().is_none());
     }
 
     #[test]

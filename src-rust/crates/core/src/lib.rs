@@ -10,10 +10,6 @@ pub use provider_id::{ProviderId, ModelId};
 // Session transcript persistence (JSONL, matches TS sessionStorage.ts schema).
 pub mod session_storage;
 
-// Session sharing — HTTP upload to a share endpoint + local text export.
-pub mod session_share;
-pub use session_share::{share_session, export_session_text};
-
 // SQLite-backed session storage (faster alternative to JSONL).
 pub mod sqlite_storage;
 pub use sqlite_storage::{SqliteSessionStore, SessionSummary};
@@ -75,7 +71,8 @@ pub use types::{
     ContentBlock, ImageSource, DocumentSource, CitationsConfig, Message, MessageContent,
     MessageCost, Role, ToolDefinition, ToolResultContent, UsageInfo,
 };
-pub use config::{AgentDefinition, Config, CommandTemplate, FormatterConfig, McpServerConfig, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, default_agents, strip_jsonc_comments, substitute_env_vars};
+pub use config::{AgentDefinition, BudgetSplitPolicy, Config, CommandTemplate, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
+pub use import_config::{ClaudeMdPreview, ImportExecutionResult, ImportPaths, ImportPreview, ImportSelection, PreviewAction, PreviewField, SettingsPreview, build_import_preview, execute_import, summarize_import_result};
 
 // Skill discovery: filesystem and git URL skill loading.
 pub mod skill_discovery;
@@ -625,6 +622,82 @@ pub mod config {
 
     /// Definition of a named agent with per-agent model, permissions,
     /// temperature, and system prompt.
+    pub fn api_key_env_vars_for_provider(provider_id: &str) -> &'static [&'static str] {
+        match provider_id {
+            "anthropic" => &["ANTHROPIC_API_KEY"],
+            "openai" => &["OPENAI_API_KEY"],
+            "google" | "google-vertex" => &["GOOGLE_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"],
+            "github-copilot" => &["GITHUB_TOKEN"],
+            "groq" => &["GROQ_API_KEY"],
+            "cerebras" => &["CEREBRAS_API_KEY"],
+            "sambanova" => &["SAMBANOVA_API_KEY"],
+            "deepseek" => &["DEEPSEEK_API_KEY"],
+            "mistral" => &["MISTRAL_API_KEY"],
+            "openrouter" => &["OPENROUTER_API_KEY"],
+            "togetherai" | "together-ai" => &["TOGETHER_API_KEY"],
+            "perplexity" => &["PERPLEXITY_API_KEY"],
+            "cohere" => &["COHERE_API_KEY"],
+            "xai" => &["XAI_API_KEY"],
+            "deepinfra" => &["DEEPINFRA_API_KEY"],
+            "azure" => &["AZURE_API_KEY"],
+            "gitlab" => &["GITLAB_TOKEN"],
+            "huggingface" => &["HF_TOKEN"],
+            "nvidia" => &["NVIDIA_API_KEY"],
+            "alibaba" | "qwen" => &["DASHSCOPE_API_KEY"],
+            "venice" => &["VENICE_API_KEY"],
+            "moonshot" | "moonshotai" => &["MOONSHOT_API_KEY"],
+            "zhipu" | "zhipuai" => &["ZHIPU_API_KEY"],
+            "zai" => &["ZAI_API_KEY"],
+            "siliconflow" => &["SILICONFLOW_API_KEY"],
+            "nebius" => &["NEBIUS_API_KEY"],
+            "novita" => &["NOVITA_API_KEY"],
+            "minimax" => &["MINIMAX_API_KEY"],
+            "ovhcloud" => &["OVHCLOUD_API_KEY"],
+            "scaleway" => &["SCALEWAY_API_KEY"],
+            "vultr" | "vultr-ai" => &["VULTR_API_KEY"],
+            "baseten" => &["BASETEN_API_KEY"],
+            "friendli" => &["FRIENDLI_TOKEN"],
+            "upstage" => &["UPSTAGE_API_KEY"],
+            "stepfun" => &["STEPFUN_API_KEY"],
+            "fireworks" => &["FIREWORKS_API_KEY"],
+            "cloudflare" | "cloudflare-ai-gateway" | "cloudflare-workers-ai" => {
+                &["CLOUDFLARE_API_TOKEN"]
+            }
+            "vercel" => &["AI_GATEWAY_API_KEY"],
+            "helicone" => &["HELICONE_API_KEY"],
+            "sap" | "sap-ai-core" => &["AICORE_SERVICE_KEY"],
+            _ => &[],
+        }
+    }
+
+    pub fn primary_api_key_env_var_for_provider(provider_id: &str) -> Option<&'static str> {
+        api_key_env_vars_for_provider(provider_id).first().copied()
+    }
+
+    pub fn api_base_env_var_for_provider(provider_id: &str) -> Option<&'static str> {
+        match provider_id {
+            "anthropic" => Some("ANTHROPIC_BASE_URL"),
+            "openai" => Some("OPENAI_BASE_URL"),
+            "minimax" => Some("MINIMAX_BASE_URL"),
+            "ollama" => Some("OLLAMA_HOST"),
+            "lmstudio" | "lm-studio" => Some("LM_STUDIO_HOST"),
+            "llamacpp" | "llama-cpp" | "llama-server" => Some("LLAMA_CPP_HOST"),
+            _ => None,
+        }
+    }
+
+    pub fn default_api_base_for_provider(provider_id: &str) -> Option<&'static str> {
+        match provider_id {
+            "anthropic" => Some(crate::constants::ANTHROPIC_API_BASE),
+            "openai" => Some("https://api.openai.com"),
+            "minimax" => Some("https://api.minimax.io/anthropic"),
+            "ollama" => Some("http://localhost:11434"),
+            "lmstudio" | "lm-studio" => Some("http://localhost:1234"),
+            "llamacpp" | "llama-cpp" | "llama-server" => Some("http://localhost:8080"),
+            _ => None,
+        }
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct AgentDefinition {
         /// Display name / description
@@ -660,6 +733,119 @@ pub mod config {
                 color: None,
             }
         }
+    }
+
+    // ---- ManagedAgentConfig ----------------------------------------------
+
+    /// Budget allocation strategy between manager and executor agents.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum BudgetSplitPolicy {
+        /// Shared pool — no split (default).
+        SharedPool,
+        /// Manager gets manager_pct% of total budget.
+        Percentage { manager_pct: u8 },
+        /// Hard USD caps per role.
+        FixedCaps { manager_usd: f64, executor_usd: f64 },
+    }
+
+    impl Default for BudgetSplitPolicy {
+        fn default() -> Self { BudgetSplitPolicy::SharedPool }
+    }
+
+    /// Configuration for manager-executor agent architecture.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ManagedAgentConfig {
+        pub enabled: bool,
+        /// "provider/model" string, e.g. "anthropic/claude-opus-4-6"
+        pub manager_model: String,
+        /// "provider/model" string, e.g. "anthropic/claude-sonnet-4-6"
+        pub executor_model: String,
+        #[serde(default = "default_executor_max_turns")]
+        pub executor_max_turns: u32,
+        #[serde(default = "default_max_concurrent_executors")]
+        pub max_concurrent_executors: u32,
+        #[serde(default)]
+        pub budget_split: BudgetSplitPolicy,
+        #[serde(default)]
+        pub total_budget_usd: Option<f64>,
+        #[serde(default)]
+        pub preset_name: Option<String>,
+        #[serde(default)]
+        pub executor_isolation: bool,
+    }
+
+    fn default_executor_max_turns() -> u32 { 10 }
+    fn default_max_concurrent_executors() -> u32 { 4 }
+
+    /// A named preset for common manager-executor configurations.
+    pub struct ManagedAgentPreset {
+        pub name: &'static str,
+        pub label: &'static str,
+        pub description: &'static str,
+        pub manager_model: &'static str,
+        pub executor_model: &'static str,
+        pub executor_max_turns: u32,
+        pub max_concurrent_executors: u32,
+    }
+
+    pub fn builtin_managed_agent_presets() -> Vec<ManagedAgentPreset> {
+        vec![
+            ManagedAgentPreset {
+                name: "anthropic-tiered",
+                label: "Anthropic Tiered",
+                description: "Opus 4.6 manages, Sonnet 4.6 executes (best quality)",
+                manager_model: "anthropic/claude-opus-4-6",
+                executor_model: "anthropic/claude-sonnet-4-6",
+                executor_max_turns: 10,
+                max_concurrent_executors: 4,
+            },
+            ManagedAgentPreset {
+                name: "anthropic-budget",
+                label: "Anthropic Budget",
+                description: "Sonnet 4.6 manages, Haiku 4.5 executes (cost-optimized)",
+                manager_model: "anthropic/claude-sonnet-4-6",
+                executor_model: "anthropic/claude-haiku-4-5-20251001",
+                executor_max_turns: 10,
+                max_concurrent_executors: 6,
+            },
+            ManagedAgentPreset {
+                name: "google-tiered",
+                label: "Google Tiered",
+                description: "Gemini 2.5 Pro manages, Flash executes",
+                manager_model: "google/gemini-2.5-pro",
+                executor_model: "google/gemini-2.5-flash",
+                executor_max_turns: 10,
+                max_concurrent_executors: 4,
+            },
+            ManagedAgentPreset {
+                name: "cross-opus-flash",
+                label: "Cross: Opus + Flash",
+                description: "Anthropic Opus manages, Google Flash executes (cheapest executors)",
+                manager_model: "anthropic/claude-opus-4-6",
+                executor_model: "google/gemini-2.5-flash",
+                executor_max_turns: 10,
+                max_concurrent_executors: 6,
+            },
+            ManagedAgentPreset {
+                name: "openai-tiered",
+                label: "OpenAI Tiered",
+                description: "o3 manages, gpt-4o executes",
+                manager_model: "openai/o3",
+                executor_model: "openai/gpt-4o",
+                executor_max_turns: 10,
+                max_concurrent_executors: 4,
+            },
+            ManagedAgentPreset {
+                name: "cross-openai-anthropic",
+                label: "Cross: OpenAI + Anthropic",
+                description: "o3 manages, Sonnet 4.6 executes",
+                manager_model: "openai/o3",
+                executor_model: "anthropic/claude-sonnet-4-6",
+                executor_max_turns: 10,
+                max_concurrent_executors: 4,
+            },
+        ]
     }
 
     // ---- ProviderConfig --------------------------------------------------
@@ -751,11 +937,9 @@ pub mod config {
         /// Skill-discovery configuration (copied from Settings on load).
         #[serde(default)]
         pub skills: SkillsConfig,
-        /// Optional URL for the session-share service.  When set, `/share`
-        /// POSTs the session to this endpoint and returns the resulting URL.
-        /// When absent, `/share` falls back to a local Markdown export.
-        #[serde(default, rename = "shareEndpoint")]
-        pub share_endpoint: Option<String>,
+        /// Managed agent (manager-executor) configuration.
+        #[serde(default)]
+        pub managed_agents: Option<ManagedAgentConfig>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -863,6 +1047,9 @@ pub mod config {
         /// Skill-discovery configuration (extra paths and git URLs).
         #[serde(default)]
         pub skills: SkillsConfig,
+        /// Managed agent (manager-executor) configuration.
+        #[serde(default)]
+        pub managed_agents: Option<ManagedAgentConfig>,
     }
 
     /// A user-defined slash command template.
@@ -943,6 +1130,17 @@ pub mod config {
     }
 
     impl Config {
+        pub fn selected_provider_id(&self) -> &str {
+            self.provider
+                .as_deref()
+                .or_else(|| {
+                    self.model
+                        .as_deref()
+                        .and_then(|model| model.split_once('/').map(|(provider, _)| provider))
+                })
+                .unwrap_or("anthropic")
+        }
+
         /// Resolve the effective model, falling back to a provider-appropriate default.
         ///
         /// When a non-Anthropic provider is active and no model is explicitly set,
@@ -957,7 +1155,7 @@ pub mod config {
                 Some("google") => "gemini-2.5-flash",
                 Some("groq") => "llama-3.3-70b-versatile",
                 Some("cerebras") => "llama-3.3-70b",
-                Some("deepseek") => "deepseek-chat",
+                Some("deepseek") => "deepseek-v4-pro",
                 Some("mistral") => "mistral-large-latest",
                 Some("xai") => "grok-2",
                 Some("openrouter") => "anthropic/claude-sonnet-4",
@@ -969,6 +1167,7 @@ pub mod config {
                 Some("ollama") => "llama3.2",
                 Some("lmstudio") => "default",
                 Some("llamacpp") => "default",
+                Some("custom-openai") => "default",
                 Some("azure") => "gpt-4o",
                 Some("amazon-bedrock") => "anthropic.claude-sonnet-4-6-v1",
                 Some("venice") => "llama-3.3-70b",
@@ -1011,11 +1210,53 @@ pub mod config {
                 .filter(|prompt| !prompt.trim().is_empty())
         }
 
-        /// Resolve the API key from the config, then from `ANTHROPIC_API_KEY`.
-        pub fn resolve_api_key(&self) -> Option<String> {
+        pub fn resolve_provider_api_key(&self, provider_id: &str) -> Option<String> {
+            let provider_cfg = self.provider_configs.get(provider_id);
+            if provider_cfg.is_some_and(|provider| !provider.enabled) {
+                return None;
+            }
+
+            let top_level_key = if provider_id == self.selected_provider_id() {
+                self.api_key.clone()
+            } else {
+                None
+            };
+
+            top_level_key
+                .filter(|key| !key.is_empty())
+                .or_else(|| {
+                    provider_cfg
+                        .and_then(|provider| provider.api_key.clone())
+                        .filter(|key| !key.is_empty())
+                })
+                .or_else(|| {
+                    api_key_env_vars_for_provider(provider_id)
+                        .iter()
+                        .find_map(|var| std::env::var(var).ok().filter(|v| !v.is_empty()))
+                })
+                .or_else(|| crate::AuthStore::load().api_key_for(provider_id))
+        }
+
+        pub fn resolve_anthropic_api_key(&self) -> Option<String> {
             self.api_key
                 .clone()
-                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                .filter(|key| !key.is_empty())
+                .or_else(|| {
+                    self.provider_configs
+                        .get("anthropic")
+                        .and_then(|provider| provider.api_key.clone())
+                        .filter(|key| !key.is_empty())
+                })
+                .or_else(|| {
+                    api_key_env_vars_for_provider("anthropic")
+                        .iter()
+                        .find_map(|var| std::env::var(var).ok().filter(|v| !v.is_empty()))
+                })
+        }
+
+        /// Resolve the API key for the active provider.
+        pub fn resolve_api_key(&self) -> Option<String> {
+            self.resolve_provider_api_key(self.selected_provider_id())
         }
 
         /// Async variant: also checks `~/.claurst/oauth_tokens.json`.
@@ -1024,11 +1265,18 @@ pub mod config {
         /// - For Claude.ai OAuth flow: credential is the access token, bearer=true.
         /// Silently attempts token refresh when the access token is expired.
         pub async fn resolve_auth_async(&self) -> Option<(String, bool)> {
-            // Highest priority: explicit api_key or env var
-            if let Some(key) = self.resolve_api_key() {
+            if self.selected_provider_id() != "anthropic" {
+                return self.resolve_api_key().map(|key| (key, false));
+            }
+
+            self.resolve_anthropic_auth_async().await
+        }
+
+        pub async fn resolve_anthropic_auth_async(&self) -> Option<(String, bool)> {
+            if let Some(key) = self.resolve_anthropic_api_key() {
                 return Some((key, false));
             }
-            // Fall back to saved OAuth tokens
+
             let tokens = crate::oauth::OAuthTokens::load().await?;
 
             // If expired and we have a refresh token, attempt silent refresh.
@@ -1085,10 +1333,32 @@ pub mod config {
             }
         }
 
-        /// Resolve the API base URL, checking `ANTHROPIC_BASE_URL` first.
+        pub fn resolve_provider_api_base(&self, provider_id: &str) -> Option<String> {
+            let provider_cfg = self.provider_configs.get(provider_id);
+            if provider_cfg.is_some_and(|provider| !provider.enabled) {
+                return None;
+            }
+
+            provider_cfg
+                .and_then(|provider| provider.api_base.clone())
+                .filter(|base| !base.is_empty())
+                .or_else(|| {
+                    api_base_env_var_for_provider(provider_id)
+                        .and_then(|name| std::env::var(name).ok())
+                        .filter(|base| !base.is_empty())
+                })
+                .or_else(|| default_api_base_for_provider(provider_id).map(str::to_owned))
+        }
+
+        pub fn resolve_anthropic_api_base(&self) -> String {
+            self.resolve_provider_api_base("anthropic")
+                .unwrap_or_else(|| crate::constants::ANTHROPIC_API_BASE.to_string())
+        }
+
+        /// Resolve the API base URL for the active provider.
         pub fn resolve_api_base(&self) -> String {
-            std::env::var("ANTHROPIC_BASE_URL")
-                .unwrap_or_else(|_| crate::constants::ANTHROPIC_API_BASE.to_string())
+            self.resolve_provider_api_base(self.selected_provider_id())
+                .unwrap_or_else(|| self.resolve_anthropic_api_base())
         }
     }
 
@@ -1283,7 +1553,7 @@ pub mod config {
                     for u in over.config.skills.urls { if !urls.contains(&u) { urls.push(u); } }
                     SkillsConfig { paths, urls }
                 },
-                share_endpoint: over.config.share_endpoint.or(base.config.share_endpoint),
+                managed_agents: over.config.managed_agents.or(base.config.managed_agents),
             };
             Self {
                 config: merged_config,
@@ -1307,6 +1577,7 @@ pub mod config {
                     for u in over.skills.urls { if !urls.contains(&u) { urls.push(u); } }
                     SkillsConfig { paths, urls }
                 },
+                managed_agents: over.managed_agents.or(base.managed_agents),
             }
         }
     }
@@ -1775,13 +2046,7 @@ pub mod permissions {
         level: PermissionLevel,
     ) -> String {
         match level {
-            PermissionLevel::Execute => {
-                let cmd = path.unwrap_or(description);
-                format!(
-                    "Bash wants to run: `{}`\nThis will execute a shell command.",
-                    cmd
-                )
-            }
+            PermissionLevel::Execute => description.to_string(),
             PermissionLevel::Write => {
                 let target = path.unwrap_or(description);
                 let extra = if target.contains("/etc/") || target.contains("\\etc\\") {
@@ -1814,6 +2079,28 @@ pub mod permissions {
     // -----------------------------------------------------------------------
     // PermissionManager
     // -----------------------------------------------------------------------
+
+    /// Returns true when `path` falls under the active workspace roots.
+    fn is_path_within_allowed_roots(
+        path: &str,
+        working_dir: Option<&std::path::Path>,
+        allowed_roots: &[std::path::PathBuf],
+    ) -> bool {
+        let canonical_path = std::fs::canonicalize(path)
+            .unwrap_or_else(|_| std::path::PathBuf::from(path));
+
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(root) = working_dir {
+            roots.push(std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()));
+        }
+        roots.extend(
+            allowed_roots
+                .iter()
+                .map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.clone())),
+        );
+
+        roots.iter().any(|root| canonical_path.starts_with(root))
+    }
 
     /// Pending permission request waiting for resolution (e.g. from a bridge
     /// remote peer or the interactive TUI dialog).
@@ -1875,6 +2162,8 @@ pub mod permissions {
             tool_name: &str,
             description: &str,
             path: Option<&str>,
+            working_dir: Option<&std::path::Path>,
+            allowed_roots: &[std::path::PathBuf],
         ) -> PermissionDecision {
             use crate::config::PermissionMode;
 
@@ -1915,25 +2204,41 @@ pub mod permissions {
                 return PermissionDecision::Allow;
             }
 
-            // Step 4 — AcceptEdits auto-allows everything
-            if self.mode == PermissionMode::AcceptEdits {
+            let level = match PermissionLevel::for_tool(tool_name) {
+                PermissionLevel::Read
+                    if !matches!(
+                        tool_name,
+                        "Read" | "Glob" | "Grep" | "ListMcpResources" | "ReadMcpResource" | "LSP" | "Skill"
+                    ) => PermissionLevel::Execute,
+                other => other,
+            };
+            let read_in_workspace = path.is_some_and(|target| {
+                is_path_within_allowed_roots(target, working_dir, allowed_roots)
+            });
+            let should_ask_read = match tool_name {
+                "ListMcpResources" | "ReadMcpResource" => true,
+                _ if matches!(level, PermissionLevel::Read) && path.is_some() => !read_in_workspace,
+                _ => false,
+            };
+
+            // Step 4 — AcceptEdits: only auto-allow Edit; everything else keeps normal checks.
+            if self.mode == PermissionMode::AcceptEdits && tool_name == "Edit" {
                 return PermissionDecision::Allow;
             }
 
             // Step 5 — Plan mode: reads only
             if self.mode == PermissionMode::Plan {
-                let level = PermissionLevel::for_tool(tool_name);
                 return match level {
                     PermissionLevel::Read => PermissionDecision::Allow,
                     _ => PermissionDecision::Deny,
                 };
             }
 
-            // Step 6 — Default: derive from tool danger level
-            let level = PermissionLevel::for_tool(tool_name);
+            // Step 6 — Default / remaining AcceptEdits behavior.
             match level {
-                PermissionLevel::Read => PermissionDecision::Allow,
-                PermissionLevel::Write
+                PermissionLevel::Read if !should_ask_read => PermissionDecision::Allow,
+                PermissionLevel::Read
+                | PermissionLevel::Write
                 | PermissionLevel::Execute
                 | PermissionLevel::Network => {
                     let reason =
@@ -1984,6 +2289,28 @@ pub mod permissions {
             let rule = PermissionRule {
                 tool_name: Some(tool_name.to_string()),
                 path_pattern: None,
+                action: PermissionAction::Allow,
+                scope: PermissionScope::Persistent,
+            };
+            let serialized = SerializedPermissionRule::from(&rule);
+            settings.permission_rules.push(serialized);
+            settings
+                .save_sync()
+                .map_err(|e| crate::error::ClaudeError::Config(e.to_string()))?;
+            self.persistent_rules.push(rule);
+            Ok(())
+        }
+
+        /// Allow `tool_name` persistently on `path` and save settings.
+        pub fn add_persistent_allow_path(
+            &mut self,
+            tool_name: &str,
+            path: &str,
+            settings: &mut crate::config::Settings,
+        ) -> crate::error::Result<()> {
+            let rule = PermissionRule {
+                tool_name: Some(tool_name.to_string()),
+                path_pattern: Some(path.to_string()),
                 action: PermissionAction::Allow,
                 scope: PermissionScope::Persistent,
             };
@@ -2061,6 +2388,12 @@ pub mod permissions {
         pub description: String,
         pub details: Option<String>,
         pub is_read_only: bool,
+        /// Canonical or resolved target path when the permission decision is path-sensitive.
+        pub path: Option<String>,
+        /// Current workspace root used for path-boundary checks.
+        pub working_dir: Option<std::path::PathBuf>,
+        /// Additional workspace roots considered in-bounds for file access.
+        pub allowed_roots: Vec<std::path::PathBuf>,
         /// Context-aware description showing user WHY the tool needs permission.
         /// E.g. "bash: execute `ls -la /home`", "write file: /path/to/.bashrc", "fetch: https://example.com"
         pub context_description: Option<String>,
@@ -2089,7 +2422,15 @@ pub mod permissions {
             use crate::config::PermissionMode;
             match self.mode {
                 PermissionMode::BypassPermissions => PermissionDecision::Allow,
-                PermissionMode::AcceptEdits => PermissionDecision::Allow,
+                    PermissionMode::AcceptEdits => {
+                        if request.tool_name == "Edit" {
+                            PermissionDecision::Allow
+                        } else if request.is_read_only {
+                            PermissionDecision::Allow
+                        } else {
+                            PermissionDecision::Deny
+                        }
+                    }
                 PermissionMode::Plan => {
                     if request.is_read_only {
                         PermissionDecision::Allow
@@ -2164,7 +2505,9 @@ pub mod permissions {
                 let decision = m.evaluate(
                     &request.tool_name,
                     &request.description,
-                    request.details.as_deref(),
+                    request.path.as_deref(),
+                    request.working_dir.as_deref(),
+                    &request.allowed_roots,
                 );
                 return match decision {
                     PermissionDecision::Ask { .. } => PermissionDecision::Deny,
@@ -2199,7 +2542,9 @@ pub mod permissions {
                 return m.evaluate(
                     &request.tool_name,
                     &request.description,
-                    request.details.as_deref(),
+                    request.path.as_deref(),
+                    request.working_dir.as_deref(),
+                    &request.allowed_roots,
                 );
             }
             // If the lock is poisoned fall back to allow (user is watching)
@@ -2246,14 +2591,57 @@ pub mod permissions {
         #[test]
         fn bypass_always_allows() {
             let m = mgr(PermissionMode::BypassPermissions);
-            assert_eq!(m.evaluate("Bash", "rm -rf /", None), PermissionDecision::Allow);
+            assert_eq!(
+                m.evaluate("Bash", "rm -rf /", None, None, &[]),
+                PermissionDecision::Allow
+            );
         }
 
         #[test]
-        fn default_read_allows() {
+        fn default_read_allows_workspace_paths() {
             let m = mgr(PermissionMode::Default);
+            let cwd = std::path::Path::new("/workspace");
             assert_eq!(
-                m.evaluate("Read", "read file", None),
+                m.evaluate(
+                    "Read",
+                    "read file",
+                    Some("/workspace/src/lib.rs"),
+                    Some(cwd),
+                    &[],
+                ),
+                PermissionDecision::Allow
+            );
+        }
+
+        #[test]
+        fn default_read_asks_outside_workspace() {
+            let m = mgr(PermissionMode::Default);
+            let cwd = std::path::Path::new("/workspace");
+            match m.evaluate(
+                "Read",
+                "read file",
+                Some("/tmp/outside.txt"),
+                Some(cwd),
+                &[],
+            ) {
+                PermissionDecision::Ask { .. } => {}
+                other => panic!("Expected Ask, got {:?}", other),
+            }
+        }
+
+        #[test]
+        fn default_read_allows_additional_workspace_roots() {
+            let m = mgr(PermissionMode::Default);
+            let cwd = std::path::Path::new("/workspace");
+            let extra = vec![std::path::PathBuf::from("/external")];
+            assert_eq!(
+                m.evaluate(
+                    "Read",
+                    "read file",
+                    Some("/external/notes.txt"),
+                    Some(cwd),
+                    &extra,
+                ),
                 PermissionDecision::Allow
             );
         }
@@ -2261,7 +2649,7 @@ pub mod permissions {
         #[test]
         fn default_bash_asks() {
             let m = mgr(PermissionMode::Default);
-            match m.evaluate("Bash", "echo hello", None) {
+            match m.evaluate("Bash", "echo hello", None, None, &[]) {
                 PermissionDecision::Ask { .. } => {}
                 other => panic!("Expected Ask, got {:?}", other),
             }
@@ -2272,7 +2660,7 @@ pub mod permissions {
             let mut m = mgr(PermissionMode::Default);
             m.add_session_allow("Bash");
             assert_eq!(
-                m.evaluate("Bash", "echo hi", None),
+                m.evaluate("Bash", "echo hi", None, None, &[]),
                 PermissionDecision::Allow
             );
         }
@@ -2287,14 +2675,14 @@ pub mod permissions {
                 action: PermissionAction::Deny,
                 scope: PermissionScope::Session,
             });
-            assert_eq!(m.evaluate("Bash", "echo hi", None), PermissionDecision::Deny);
+            assert_eq!(m.evaluate("Bash", "echo hi", None, None, &[]), PermissionDecision::Deny);
         }
 
         #[test]
         fn plan_denies_writes() {
             let m = mgr(PermissionMode::Plan);
             assert_eq!(
-                m.evaluate("Write", "write file", Some("/tmp/foo")),
+                m.evaluate("Write", "write file", Some("/tmp/foo"), None, &[]),
                 PermissionDecision::Deny
             );
         }
@@ -2303,18 +2691,22 @@ pub mod permissions {
         fn plan_allows_reads() {
             let m = mgr(PermissionMode::Plan);
             assert_eq!(
-                m.evaluate("Read", "read file", Some("/tmp/foo")),
+                m.evaluate("Read", "read file", Some("/tmp/foo"), None, &[]),
                 PermissionDecision::Allow
             );
         }
 
         #[test]
-        fn accept_edits_allows_all() {
+        fn accept_edits_only_allows_edit() {
             let m = mgr(PermissionMode::AcceptEdits);
             assert_eq!(
-                m.evaluate("Bash", "rm -rf /tmp", None),
+                m.evaluate("Edit", "edit file", Some("/workspace/src/lib.rs"), None, &[]),
                 PermissionDecision::Allow
             );
+            match m.evaluate("Bash", "rm -rf /tmp", None, None, &[]) {
+                PermissionDecision::Ask { .. } => {}
+                other => panic!("Expected Ask, got {:?}", other),
+            }
         }
 
         #[test]
@@ -2327,7 +2719,7 @@ pub mod permissions {
                 scope: PermissionScope::Session,
             });
             assert_eq!(
-                m.evaluate("Write", "write", Some("/tmp/foo/bar.txt")),
+                m.evaluate("Write", "write", Some("/tmp/foo/bar.txt"), None, &[]),
                 PermissionDecision::Allow
             );
         }
@@ -2341,7 +2733,7 @@ pub mod permissions {
                 action: PermissionAction::Allow,
                 scope: PermissionScope::Session,
             });
-            match m.evaluate("Write", "write", Some("/etc/hosts")) {
+            match m.evaluate("Write", "write", Some("/etc/hosts"), None, &[]) {
                 PermissionDecision::Ask { .. } => {}
                 other => panic!("Expected Ask, got {:?}", other),
             }
@@ -2350,9 +2742,19 @@ pub mod permissions {
         #[test]
         fn format_reason_bash() {
             let s =
-                format_permission_reason("Bash", "ls -la", None, PermissionLevel::Execute);
-            assert!(s.contains("Bash wants to run"));
-            assert!(s.contains("ls -la"));
+                format_permission_reason("Bash", "This will execute a shell command.", None, PermissionLevel::Execute);
+            assert_eq!(s, "This will execute a shell command.");
+        }
+
+        #[test]
+        fn format_reason_powershell() {
+            let s = format_permission_reason(
+                "PowerShell",
+                "[High risk] This may modify system-wide security policy.",
+                None,
+                PermissionLevel::Execute,
+            );
+            assert_eq!(s, "[High risk] This may modify system-wide security policy.");
         }
 
         #[test]
@@ -3171,6 +3573,7 @@ pub mod feature_gates;
 pub mod tips;
 pub mod remote_settings;
 pub mod settings_sync;
+pub mod import_config;
 pub mod effort;
 pub mod prompt_history;
 pub mod bash_classifier;
@@ -3658,6 +4061,9 @@ mod tests {
             description: format!("{} operation", tool_name),
             details: None,
             is_read_only,
+            path: None,
+            working_dir: None,
+            allowed_roots: Vec::new(),
             context_description: None,
         }
     }
@@ -3696,35 +4102,23 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_handler_accept_edits_allows_writes() {
+    fn test_auto_handler_accept_edits_only_allows_edit() {
         let handler = crate::permissions::AutoPermissionHandler {
             mode: crate::config::PermissionMode::AcceptEdits,
         };
         assert_eq!(
+            handler.check_permission(&make_req("Edit", false)),
+            crate::permissions::PermissionDecision::Allow
+        );
+        assert_eq!(
             handler.check_permission(&make_req("FileWrite", false)),
-            crate::permissions::PermissionDecision::Allow
-        );
-    }
-
-    #[test]
-    fn test_auto_handler_plan_denies_writes() {
-        let handler = crate::permissions::AutoPermissionHandler {
-            mode: crate::config::PermissionMode::Plan,
-        };
-        assert_eq!(
-            handler.check_permission(&make_req("Bash", false)),
             crate::permissions::PermissionDecision::Deny
-        );
-        assert_eq!(
-            handler.check_permission(&make_req("FileRead", true)),
-            crate::permissions::PermissionDecision::Allow
         );
     }
 
     #[test]
     fn test_interactive_handler_default_allows_writes() {
-        // InteractivePermissionHandler allows writes in Default mode
-        // (user is watching the TUI)
+        // Legacy InteractivePermissionHandler still allows everything outside Plan.
         let handler = crate::permissions::InteractivePermissionHandler {
             mode: crate::config::PermissionMode::Default,
         };
@@ -3735,17 +4129,35 @@ mod tests {
     }
 
     #[test]
-    fn test_interactive_handler_plan_allows_reads_denies_writes() {
-        let handler = crate::permissions::InteractivePermissionHandler {
-            mode: crate::config::PermissionMode::Plan,
-        };
+    fn test_managed_interactive_default_asks_for_write() {
+        let manager = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::permissions::PermissionManager::new(
+                crate::config::PermissionMode::Default,
+                &crate::config::Settings::default(),
+            ),
+        ));
+        let handler = crate::permissions::InteractivePermissionHandler::with_manager(manager);
+        match handler.check_permission(&make_req("FileWrite", false)) {
+            crate::permissions::PermissionDecision::Ask { .. } => {}
+            other => panic!("Expected Ask, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_managed_interactive_default_allows_workspace_read() {
+        let manager = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::permissions::PermissionManager::new(
+                crate::config::PermissionMode::Default,
+                &crate::config::Settings::default(),
+            ),
+        ));
+        let handler = crate::permissions::InteractivePermissionHandler::with_manager(manager);
+        let mut req = make_req("Read", true);
+        req.path = Some("/workspace/src/lib.rs".to_string());
+        req.working_dir = Some(std::path::PathBuf::from("/workspace"));
         assert_eq!(
-            handler.check_permission(&make_req("FileRead", true)),
+            handler.check_permission(&req),
             crate::permissions::PermissionDecision::Allow
-        );
-        assert_eq!(
-            handler.check_permission(&make_req("FileWrite", false)),
-            crate::permissions::PermissionDecision::Deny
         );
     }
 
@@ -3793,5 +4205,42 @@ mod tests {
         assert_eq!(tracker.input_tokens(), 0);
         assert_eq!(tracker.output_tokens(), 0);
         assert_eq!(tracker.total_cost_usd(), 0.0);
+    }
+
+    #[test]
+    fn managed_agent_config_serde_round_trip() {
+        let cfg = ManagedAgentConfig {
+            enabled: true,
+            manager_model: "anthropic/claude-opus-4-6".to_string(),
+            executor_model: "anthropic/claude-sonnet-4-6".to_string(),
+            executor_max_turns: 10,
+            max_concurrent_executors: 4,
+            budget_split: BudgetSplitPolicy::Percentage { manager_pct: 30 },
+            total_budget_usd: Some(5.0),
+            preset_name: Some("anthropic-tiered".to_string()),
+            executor_isolation: false,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let decoded: ManagedAgentConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.manager_model, "anthropic/claude-opus-4-6");
+        assert_eq!(decoded.executor_max_turns, 10);
+    }
+
+    #[test]
+    fn budget_split_policy_defaults_to_shared_pool() {
+        let json = r#"{"enabled":true,"manager_model":"a/b","executor_model":"a/c"}"#;
+        let cfg: ManagedAgentConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.budget_split, BudgetSplitPolicy::SharedPool);
+        assert_eq!(cfg.executor_max_turns, 10);
+    }
+
+    #[test]
+    fn builtin_presets_all_have_valid_model_format() {
+        for preset in builtin_managed_agent_presets() {
+            assert!(preset.manager_model.contains('/'),
+                "Preset {} manager_model must be provider/model", preset.name);
+            assert!(preset.executor_model.contains('/'),
+                "Preset {} executor_model must be provider/model", preset.name);
+        }
     }
 }

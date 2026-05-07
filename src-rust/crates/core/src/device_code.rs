@@ -5,7 +5,7 @@
 
 use serde::Deserialize;
 
-const DEVICE_FLOW_USER_AGENT: &str = "claurst/0.0.8";
+const DEVICE_FLOW_USER_AGENT: &str = "claurst/0.0.9";
 
 /// Response from the device authorization endpoint.
 #[derive(Debug, Deserialize)]

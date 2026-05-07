@@ -36,7 +36,7 @@ use claurst_core::{
     constants::APP_VERSION,
     context::ContextBuilder,
     cost::CostTracker,
-    permissions::{AutoPermissionHandler, InteractivePermissionHandler},
+    permissions::{AutoPermissionHandler, InteractivePermissionHandler, PermissionManager},
 };
 use async_trait::async_trait;
 use claurst_core::types::ToolDefinition;
@@ -76,7 +76,12 @@ impl Tool for McpToolWrapper {
         self.tool_def.input_schema.clone()
     }
 
-    async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        let desc = format!("Run MCP tool {}", self.tool_def.name);
+        if let Err(e) = ctx.check_permission(self.name(), &desc, false) {
+            return ToolResult::error(e.to_string());
+        }
+
         // Strip the server-name prefix to get the bare tool name.
         let prefix = format!("{}_", self.server_name);
         let bare_name = self
@@ -156,7 +161,7 @@ struct Cli {
     #[arg(long = "verbose", short = 'v', action = ArgAction::SetTrue)]
     verbose: bool,
 
-    /// API key (overrides ANTHROPIC_API_KEY env var)
+    /// API key for the active provider (overrides provider-specific env vars)
     #[arg(long = "api-key")]
     api_key: Option<String>,
 
@@ -397,6 +402,7 @@ async fn main() -> anyhow::Result<()> {
                     session_title: None,
                     remote_session_url: None,
                     mcp_manager: None,
+                    mcp_auth_runner: None,
                 };
                 // Collect remaining args after the command name
                 let rest: Vec<&str> = raw_args[2..].iter().map(|s| s.as_str()).collect();
@@ -425,11 +431,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Setup logging
     let log_level = if cli.verbose { "debug" } else { "warn" };
+    let base_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(log_level));
+    let log_filter = base_filter
+        .add_directive("rmcp::service::client=error".parse().expect("valid rmcp directive"));
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(log_level)),
-        )
+        .with_env_filter(log_filter)
         .with_target(false)
         .without_time()
         .init();
@@ -535,63 +542,33 @@ async fn main() -> anyhow::Result<()> {
     // configured (OpenAI, Google, Ollama, Groq, etc.) — if so, proceed without
     // requiring Anthropic auth. Only launch the OAuth flow when Anthropic is
     // explicitly the intended provider and no key exists at all.
-    let other_provider_configured = {
-        let active_provider = config.provider.as_deref().unwrap_or("anthropic");
-        let has_non_anthropic_env =
-            std::env::var("OPENAI_API_KEY").is_ok()
-            || std::env::var("GOOGLE_API_KEY").is_ok()
-            || std::env::var("GOOGLE_GENERATIVE_AI_API_KEY").is_ok()
-            || std::env::var("GROQ_API_KEY").is_ok()
-            || std::env::var("XAI_API_KEY").is_ok()
-            || std::env::var("MISTRAL_API_KEY").is_ok()
-            || std::env::var("OPENROUTER_API_KEY").is_ok()
-            || std::env::var("DEEPSEEK_API_KEY").is_ok()
-            || std::env::var("COHERE_API_KEY").is_ok()
-            || std::env::var("TOGETHER_API_KEY").is_ok()
-            || std::env::var("PERPLEXITY_API_KEY").is_ok()
-            || std::env::var("CEREBRAS_API_KEY").is_ok()
-            || std::env::var("DEEPINFRA_API_KEY").is_ok()
-            || std::env::var("VENICE_API_KEY").is_ok()
-            || std::env::var("DASHSCOPE_API_KEY").is_ok()
-            || std::env::var("AZURE_API_KEY").is_ok()
-            || std::env::var("GITHUB_TOKEN").is_ok()
-            || std::env::var("AWS_BEARER_TOKEN_BEDROCK").is_ok()
-            || std::env::var("AWS_ACCESS_KEY_ID").is_ok()
-            // Local providers are always available
-            || true; // Ollama/LM Studio don't require keys
-        active_provider != "anthropic" || has_non_anthropic_env
-    };
-
-    let (api_key, use_bearer_auth) = match config.resolve_auth_async().await {
-        Some(auth) => auth,
-        None if other_provider_configured && config.provider.as_deref().unwrap_or("anthropic") != "anthropic" => {
-            // Non-Anthropic provider selected — no Anthropic key needed.
-            (String::new(), false)
-        }
-        None => {
-            // No Anthropic credential found.
-
-            if is_headless {
-                anyhow::bail!(
-                    "No API key found. Options:\n\
-                     - Set ANTHROPIC_API_KEY for Anthropic\n\
-                     - Set OPENAI_API_KEY for OpenAI\n\
-                     - Set GOOGLE_API_KEY for Google Gemini\n\
-                     - Set GROQ_API_KEY for Groq (fast, free tier available)\n\
-                     - Run `claurst --provider ollama` for local models (no key needed)\n\
-                     - Run `claurst auth login` for Anthropic OAuth"
-                );
-            } else {
-                // Interactive mode: start the TUI anyway — the provider setup
-                // dialog will be shown inside the TUI, just like OpenCode does.
-                (String::new(), false)
+    let active_provider = config.selected_provider_id();
+    let (api_key, use_bearer_auth) = if active_provider == "anthropic" {
+        match config.resolve_anthropic_auth_async().await {
+            Some(auth) => auth,
+            None => {
+                if is_headless {
+                    anyhow::bail!(
+                        "No API key found. Options:\n\
+                         - Set ANTHROPIC_API_KEY for Anthropic\n\
+                         - Set OPENAI_API_KEY for OpenAI\n\
+                         - Set GOOGLE_API_KEY for Google Gemini\n\
+                         - Set GROQ_API_KEY for Groq (fast, free tier available)\n\
+                         - Run `claurst --provider ollama` for local models (no key needed)\n\
+                         - Run `claurst auth login` for Anthropic OAuth"
+                    );
+                } else {
+                    (String::new(), false)
+                }
             }
         }
+    } else {
+        (String::new(), false)
     };
 
     let client_config = claurst_api::client::ClientConfig {
         api_key: api_key.clone(),
-        api_base: config.resolve_api_base(),
+        api_base: config.resolve_anthropic_api_base(),
         use_bearer_auth,
         ..Default::default()
     };
@@ -605,8 +582,7 @@ async fn main() -> anyhow::Result<()> {
     // Anthropic is always the default; additional providers (OpenAI, Google,
     // Bedrock, Azure, Copilot, Cohere, local providers) are registered when
     // their respective environment variables or auth store entries are found.
-    let provider_registry =
-        claurst_api::ProviderRegistry::from_environment_with_auth_store(client_config);
+    let provider_registry = claurst_api::ProviderRegistry::from_config(&config, client_config);
 
     let bridge_config = resolve_bridge_config(&settings, &api_key, use_bearer_auth, is_headless);
     if let Some(cfg) = bridge_config.as_ref() {
@@ -617,18 +593,15 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Build tools
-    // Interactive mode uses InteractivePermissionHandler which allows writes in Default mode
-    // (the user is watching the TUI so they can intervene). Headless/print mode uses
-    // AutoPermissionHandler which denies writes in Default mode for safety.
+    let permission_manager = Arc::new(std::sync::Mutex::new(PermissionManager::new(
+        config.permission_mode.clone(),
+        &settings,
+    )));
+
     let permission_handler: Arc<dyn claurst_core::PermissionHandler> = if is_headless {
-        Arc::new(AutoPermissionHandler {
-            mode: config.permission_mode.clone(),
-        })
+        Arc::new(AutoPermissionHandler::with_manager(permission_manager.clone()))
     } else {
-        Arc::new(InteractivePermissionHandler {
-            mode: config.permission_mode.clone(),
-        })
+        Arc::new(InteractivePermissionHandler::with_manager(permission_manager.clone()))
     };
     let cost_tracker = CostTracker::new();
     // Use --session-id if provided, otherwise generate a fresh UUID.
@@ -644,6 +617,8 @@ async fn main() -> anyhow::Result<()> {
     // Initialize MCP servers first (needed for ToolContext.mcp_manager).
     let mcp_manager_arc = connect_mcp_manager_arc(&config).await;
 
+    let pending_permissions = Arc::new(ParkingMutex::new(claurst_tools::PendingPermissionStore::default()));
+
     let tool_ctx = ToolContext {
         working_dir: cwd.clone(),
         permission_mode: config.permission_mode.clone(),
@@ -655,6 +630,10 @@ async fn main() -> anyhow::Result<()> {
         non_interactive: cli.print || cli.prompt.is_some(),
         mcp_manager: mcp_manager_arc.clone(),
         config: config.clone(),
+        managed_agent_config: config.managed_agents.clone(),
+        completion_notifier: None,
+        pending_permissions: Some(pending_permissions.clone()),
+        permission_manager: Some(permission_manager.clone()),
     };
 
     // Register the cc-query-backed agent runner so TeamCreateTool can spawn real
@@ -779,7 +758,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .await
     } else {
+        let auth_store = claurst_core::AuthStore::load();
+        let has_saved_credentials = !auth_store.credentials.is_empty()
+            || claurst_core::oauth_config::get_codex_tokens().is_some();
         let has_credentials = !api_key.is_empty()
+            || has_saved_credentials
             || config.provider.as_deref().is_some_and(|p| p != "anthropic");
         run_interactive(
             config,
@@ -809,8 +792,9 @@ async fn connect_mcp_manager_arc(
     }
 
     info!(count = config.mcp_servers.len(), "Connecting to MCP servers");
-    let mcp_manager = claurst_mcp::McpManager::connect_all(&config.mcp_servers).await;
-    Some(Arc::new(mcp_manager))
+    let mcp_manager = Arc::new(claurst_mcp::McpManager::connect_all(&config.mcp_servers).await);
+    mcp_manager.clone().spawn_notification_poll_loop();
+    Some(mcp_manager)
 }
 
 fn build_tools_with_mcp(
@@ -868,7 +852,7 @@ fn spawn_models_cache_refresh() {
             .unwrap_or_else(|_| "https://models.dev/api.json".to_string());
         if let Ok(resp) = client
             .get(&url)
-            .header("User-Agent", "Claurst/0.0.8")
+            .header("User-Agent", "Claurst/0.0.9")
             .send()
             .await
         {
@@ -937,12 +921,12 @@ async fn refresh_provider_runtime_state(
     config.model = None;
 
     let (api_key, use_bearer_auth) = config
-        .resolve_auth_async()
+        .resolve_anthropic_auth_async()
         .await
         .unwrap_or((String::new(), false));
     let client_config = claurst_api::client::ClientConfig {
         api_key,
-        api_base: config.resolve_api_base(),
+        api_base: config.resolve_anthropic_api_base(),
         use_bearer_auth,
         ..Default::default()
     };
@@ -950,9 +934,8 @@ async fn refresh_provider_runtime_state(
         claurst_api::AnthropicClient::new(client_config.clone())
             .context("Failed to rebuild Anthropic client")?,
     );
-    let provider_registry = Arc::new(
-        claurst_api::ProviderRegistry::from_environment_with_auth_store(client_config),
-    );
+    let provider_registry =
+        Arc::new(claurst_api::ProviderRegistry::from_config(&config, client_config));
     let model_registry = load_cached_model_registry();
 
     spawn_models_cache_refresh();
@@ -964,6 +947,14 @@ async fn refresh_provider_runtime_state(
         model_registry,
         auth_store: claurst_core::AuthStore::default(),
     })
+}
+
+fn normalize_provider_from_model(config: &mut Config) {
+    if let Some(model) = config.model.as_deref() {
+        if let Some((provider, _)) = model.split_once('/') {
+            config.provider = Some(provider.to_string());
+        }
+    }
 }
 
 /// Filter the tool list based on the agent's access level.
@@ -1260,6 +1251,53 @@ async fn run_headless(
 // Interactive REPL mode
 // ---------------------------------------------------------------------------
 
+fn permission_request_from_core(
+    pending: &claurst_tools::PendingPermissionRequest,
+) -> claurst_tui::dialogs::PermissionRequest {
+    let reason = pending.reason.clone();
+    let tool_name = pending.request.tool_name.clone();
+    let tool_use_id = pending.tool_use_id.clone();
+
+    match (tool_name.as_str(), pending.request.path.clone()) {
+        ("Bash", Some(command)) => {
+            let suggested_prefix = command
+                .split_whitespace()
+                .next()
+                .filter(|prefix| !prefix.is_empty())
+                .map(|prefix| format!("{} ", prefix));
+            claurst_tui::dialogs::PermissionRequest::bash(
+                tool_use_id,
+                tool_name,
+                reason,
+                command,
+                suggested_prefix,
+            )
+        },
+        ("PowerShell", Some(command)) => claurst_tui::dialogs::PermissionRequest::powershell(
+            tool_use_id,
+            tool_name,
+            reason,
+            command,
+        ),
+        ("Read", Some(path)) => claurst_tui::dialogs::PermissionRequest::file_read(
+            tool_use_id,
+            tool_name,
+            reason,
+            path,
+        ),
+        (_, Some(path)) if matches!(tool_name.as_str(), "Write" | "Edit" | "NotebookEdit") => {
+            claurst_tui::dialogs::PermissionRequest::file_write(tool_use_id, tool_name, reason, path)
+        }
+        _ => claurst_tui::dialogs::PermissionRequest::from_reason(
+            tool_use_id,
+            tool_name,
+            reason,
+            pending.request.path.clone(),
+        ),
+    }
+}
+
+
 async fn run_interactive(
     config: Config,
     settings: claurst_core::config::Settings,
@@ -1328,7 +1366,11 @@ async fn run_interactive(
     if !session.model.is_empty() {
         live_config.model = Some(session.model.clone());
     }
-    tool_ctx.config = live_config.clone();
+    let pending_permissions = tool_ctx
+        .pending_permissions
+        .clone()
+        .unwrap_or_else(|| Arc::new(ParkingMutex::new(claurst_tools::PendingPermissionStore::default())));
+
 
     // Set up terminal
     let mut terminal = setup_terminal()?;
@@ -1521,6 +1563,7 @@ async fn run_interactive(
         session_title: session.title.clone(),
         remote_session_url: session.remote_session_url.clone(),
         mcp_manager: tool_ctx.mcp_manager.clone(),
+        mcp_auth_runner: None,
     };
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
@@ -1550,9 +1593,35 @@ async fn run_interactive(
     // so the main loop can update the device_auth_dialog state.
     let (device_auth_tx, mut device_auth_rx) = mpsc::channel::<DeviceAuthEvent>(8);
 
+    // MCP OAuth auth channel — background tasks send events here so the main
+    // loop can update status and trigger a reconnect after browser auth finishes.
+    enum McpAuthEvent {
+        /// Browser auth completed and the token was persisted successfully.
+        Completed(claurst_mcp::oauth::McpAuthResult),
+        /// Browser auth or token exchange failed.
+        Failed(String),
+    }
+    let (mcp_auth_tx, mut mcp_auth_rx) = mpsc::channel::<McpAuthEvent>(8);
+    // Build a non-blocking runner so `/mcp auth` can return immediately while
+    // the browser flow continues in the background.
+    let mcp_auth_runner: Arc<dyn Fn(claurst_mcp::oauth::McpAuthSession) + Send + Sync> = {
+        let tx = mcp_auth_tx.clone();
+        Arc::new(move |session| {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let event = match claurst_mcp::oauth::run_mcp_auth_session(session).await {
+                    Ok(result) => McpAuthEvent::Completed(result),
+                    Err(err) => McpAuthEvent::Failed(err.to_string()),
+                };
+                let _ = tx.send(event).await;
+            });
+        })
+    };
+    cmd_ctx.mcp_auth_runner = Some(mcp_auth_runner.clone());
     'main: loop {
         app.frame_count = app.frame_count.wrapping_add(1);
         app.tick_rustle_pose();
+        app.notifications.tick();
 
         // Draw the UI
         terminal.draw(|f| render_app(f, &app))?;
@@ -1604,7 +1673,10 @@ async fn run_interactive(
                     // Enter => submit input (but NOT when ANY dialog/overlay is open —
                     // dialogs handle their own Enter in handle_key_event).
                     let any_dialog_open = app.connect_dialog.visible
+                        || app.import_config_picker.visible
+                        || app.import_config_dialog.visible
                         || app.key_input_dialog.visible
+                        || app.custom_provider_dialog.visible
                         || app.device_auth_dialog.visible
                         || app.command_palette.visible
                         || app.model_picker.visible
@@ -1673,7 +1745,7 @@ async fn run_interactive(
                             let handled_by_tui = if skip_tui_for_args {
                                 false
                             } else {
-                                app.intercept_slash_command(&cmd_name)
+                                app.intercept_slash_command_with_args(&cmd_name, &cmd_args)
                             };
 
                             // Sync effort level when TUI cycled the visual indicator
@@ -1746,6 +1818,11 @@ async fn run_interactive(
                                     app.hooks_config_menu.open();
                                     app.status_message =
                                         Some("Hooks configuration browser".to_string());
+                                }
+                                Some(CommandResult::OpenImportConfigOverlay) => {
+                                    app.open_import_config_picker();
+                                    app.status_message =
+                                        Some("Select what to import from ~/.claude.".to_string());
                                 }
                                 Some(CommandResult::ResumeSession(resumed_session)) => {
                                     session = resumed_session;
@@ -1849,6 +1926,16 @@ async fn run_interactive(
                                     cmd_ctx.config = app.config.clone();
                                     tool_ctx.config = app.config.clone();
                                 }
+                                Some(CommandResult::McpAuthFlow {
+                                    server_name,
+                                    auth_url,
+                                    redirect_uri,
+                                }) => {
+                                    app.status_message = Some(format!(
+                                        "MCP OAuth — '{}' started. Complete authentication in your browser.\nURL: {}\nCallback URL: {}",
+                                        server_name, auth_url, redirect_uri
+                                    ));
+                                }
                                 Some(CommandResult::Message(msg)) => {
                                     // Suppress text output when TUI already opened an
                                     // overlay for this command (e.g. /stats opens dialog
@@ -1860,38 +1947,50 @@ async fn run_interactive(
                                     }
                                 }
                                 Some(CommandResult::ConfigChange(new_cfg)) => {
-                                    cmd_ctx.config = new_cfg.clone();
-                                    tool_ctx.config = new_cfg.clone();
-                                    app.config = new_cfg.clone();
-                                    // Sync model name shown in the TUI header.
-                                    if let Some(ref model) = new_cfg.model {
-                                        app.model_name = model.clone();
+                                    let mut applied_cfg = new_cfg;
+                                    normalize_provider_from_model(&mut applied_cfg);
+                                    cmd_ctx.config = applied_cfg.clone();
+                                    tool_ctx.config = applied_cfg.clone();
+                                    app.config = applied_cfg.clone();
+                                    // Sync model/provider shown in the TUI header.
+                                    if let Some(ref model) = applied_cfg.model {
+                                        app.set_model(model.clone());
                                     }
                                     // Sync fast_mode visual indicator.
-                                    app.fast_mode = new_cfg.model
+                                    app.fast_mode = applied_cfg.model
                                         .as_deref()
                                         .map(|m| m.contains("haiku"))
                                         .unwrap_or(false);
                                     // Sync plan_mode visual indicator.
                                     app.plan_mode = matches!(
-                                        new_cfg.permission_mode,
+                                        applied_cfg.permission_mode,
                                         claurst_core::config::PermissionMode::Plan
+                                    );
+                                    session.model = claurst_api::effective_model_for_config(
+                                        &cmd_ctx.config,
+                                        &model_registry,
                                     );
                                     app.status_message =
                                         Some("Configuration updated.".to_string());
                                 }
                                 Some(CommandResult::ConfigChangeMessage(new_cfg, msg)) => {
-                                    cmd_ctx.config = new_cfg.clone();
-                                    tool_ctx.config = new_cfg.clone();
-                                    // Sync model name + fast_mode visual indicator.
-                                    if let Some(ref model) = new_cfg.model {
-                                        app.model_name = model.clone();
+                                    let mut applied_cfg = new_cfg;
+                                    normalize_provider_from_model(&mut applied_cfg);
+                                    cmd_ctx.config = applied_cfg.clone();
+                                    tool_ctx.config = applied_cfg.clone();
+                                    // Sync model/provider + fast_mode visual indicator.
+                                    if let Some(ref model) = applied_cfg.model {
+                                        app.set_model(model.clone());
                                         app.fast_mode = model.contains("haiku");
                                     } else {
                                         // model reset to None means fast mode off.
                                         app.fast_mode = false;
                                     }
-                                    app.config = new_cfg;
+                                    app.config = applied_cfg.clone();
+                                    session.model = claurst_api::effective_model_for_config(
+                                        &cmd_ctx.config,
+                                        &model_registry,
+                                    );
                                     app.status_message = Some(msg);
                                 }
                                 Some(CommandResult::UserMessage(msg)) => {
@@ -2050,7 +2149,7 @@ async fn run_interactive(
 
                         // Share the Arc so the spawned task can access all tools (incl. MCP).
                         let tools_arc_clone = tools_arc.clone();
-                        let ctx_clone = tool_ctx.clone();
+                        let mut ctx_clone = tool_ctx.clone();
                         let mut qcfg = base_query_config.clone();
                         qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                         qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
@@ -2062,6 +2161,16 @@ async fn run_interactive(
                         // Apply active effort level (set via /effort command).
                         if let Some(level) = current_effort {
                             qcfg.effort_level = Some(level);
+                        }
+                        // Wire completion_notifier if a command queue is available.
+                        if let Some(ref cq) = qcfg.command_queue {
+                            let cq = cq.clone();
+                            ctx_clone.completion_notifier = Some(claurst_tools::CompletionNotifier::new(move |msg| {
+                                cq.push(
+                                    claurst_query::QueuedCommand::InjectSystemMessage(msg),
+                                    claurst_query::CommandPriority::Normal,
+                                );
+                            }));
                         }
                         let tracker = cost_tracker.clone();
                         let tx = event_tx.clone();
@@ -2090,10 +2199,84 @@ async fn run_interactive(
                         current_query = Some((handle, msgs_arc));
                         continue;
                     }
+                    if let Some(pr) = app.permission_request.as_mut() {
+                        if claurst_tui::dialogs::handle_permission_key(pr, key) {
+                            let tool_use_id = pr.tool_use_id.clone();
+                            let selected_option = pr.selected_option;
+                            let selected_key = pr.options.get(selected_option).map(|o| o.key);
+                            let should_record_bash_prefix = selected_key == Some('P');
+                            let selected_path = pending_permissions
+                                .lock()
+                                .waiting
+                                .get(&tool_use_id)
+                                .and_then(|p| p.request.path.clone());
+                            let bash_prefix = if should_record_bash_prefix {
+                                match &pr.kind {
+                                    claurst_tui::dialogs::PermissionDialogKind::Bash { command, .. } => {
+                                        let first_word = command.split_whitespace().next().unwrap_or("").to_string();
+                                        if first_word.is_empty() { None } else { Some(first_word) }
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
+                            app.permission_request = None;
+
+                            if let Some(prefix) = bash_prefix {
+                                app.bash_prefix_allowlist.insert(prefix);
+                            }
+
+                            if let Some(mut pending) = pending_permissions.lock().waiting.remove(&tool_use_id) {
+                                let decision = match selected_key {
+                                    Some('n') => claurst_core::permissions::PermissionDecision::Deny,
+                                    _ => claurst_core::permissions::PermissionDecision::Allow,
+                                };
+
+                                if let Some(manager) = tool_ctx.permission_manager.as_ref() {
+                                    if let Ok(mut manager) = manager.lock() {
+                                        match selected_key {
+                                            Some('Y') => {
+                                                if let Some(path) = selected_path.as_deref() {
+                                                    manager.add_session_allow_path(&pending.request.tool_name, path);
+                                                } else {
+                                                    manager.add_session_allow(&pending.request.tool_name);
+                                                }
+                                            }
+                                            Some('p') => {
+                                                let mut settings = match claurst_core::config::Settings::load_sync() {
+                                                    Ok(s) => s,
+                                                    Err(_) => claurst_core::config::Settings::default(),
+                                                };
+                                                if let Some(path) = selected_path.as_deref() {
+                                                    let pattern = format!("{}*", path);
+                                                    let _ = manager.add_persistent_allow_path(&pending.request.tool_name, &pattern, &mut settings);
+                                                } else {
+                                                    let _ = manager.add_persistent_allow(&pending.request.tool_name, &mut settings);
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+
+                                if let Some(tx) = pending.decision_tx.take() {
+                                    let _ = tx.send(decision);
+                                }
+                            }
+                            continue;
+                        }
+                        continue;
+                    }
 
                     app.handle_key_event(key);
                     cmd_ctx.config = app.config.clone();
                     tool_ctx.config = app.config.clone();
+                    if let Some(manager) = tool_ctx.permission_manager.as_ref() {
+                        if let Ok(mut manager) = manager.lock() {
+                            manager.mode = tool_ctx.config.permission_mode.clone();
+                        }
+                    }
                     if !app.model_name.is_empty() {
                         session.model = app.model_name.clone();
                     }
@@ -2130,6 +2313,55 @@ async fn run_interactive(
                     // Terminal resize - will be handled on next draw
                 }
                 _ => {}
+            }
+        }
+
+        if app.permission_request.is_none() {
+            loop {
+                let next_pending = pending_permissions.lock().queue.pop_front();
+                let Some(mut pending) = next_pending else {
+                    break;
+                };
+
+                let prefix_allowed = pending.request.tool_name == "Bash"
+                    && pending
+                        .request
+                        .path
+                        .as_deref()
+                        .map(|command| app.bash_command_allowed_by_prefix(command))
+                        .unwrap_or(false);
+
+                let reevaluated = if prefix_allowed {
+                    Some(claurst_core::permissions::PermissionDecision::Allow)
+                } else {
+                    tool_ctx
+                        .permission_manager
+                        .as_ref()
+                        .and_then(|manager| manager.lock().ok())
+                        .map(|manager| {
+                            manager.evaluate(
+                                &pending.request.tool_name,
+                                &pending.request.description,
+                                pending.request.path.as_deref(),
+                                pending.request.working_dir.as_deref(),
+                                &pending.request.allowed_roots,
+                            )
+                        })
+                };
+
+                match reevaluated {
+                    Some(claurst_core::permissions::PermissionDecision::Ask { .. }) | None => {
+                        let tool_use_id = pending.tool_use_id.clone();
+                        app.permission_request = Some(permission_request_from_core(&pending));
+                        pending_permissions.lock().waiting.insert(tool_use_id, pending);
+                        break;
+                    }
+                    Some(decision) => {
+                        if let Some(tx) = pending.decision_tx.take() {
+                            let _ = tx.send(decision);
+                        }
+                    }
+                }
             }
         }
 
@@ -2546,6 +2778,88 @@ async fn run_interactive(
             }
         }
 
+        // Sync cost/token counters and expire transient UI state.
+        app.cost_usd = app.cost_tracker.total_cost_usd();
+        app.token_count = app.cost_tracker.total_tokens() as u32;
+        app.notifications.tick();
+        app.memory_update_notification.tick();
+
+        // Drain background model-fetch results (non-blocking).
+        if let Some(ref mut rx) = app.model_fetch_rx {
+            match rx.try_recv() {
+                Ok(Ok(entries)) => {
+                    let provider = app
+                        .config
+                        .provider
+                        .clone()
+                        .unwrap_or_else(|| "anthropic".to_string());
+                    let provider_prefix = format!("{}/", provider);
+                    let current = app
+                        .model_name
+                        .strip_prefix(&provider_prefix)
+                        .unwrap_or(app.model_name.as_str())
+                        .to_string();
+                    app.model_picker.set_models(entries);
+                    for m in &mut app.model_picker.models {
+                        m.is_current = m.id == current;
+                    }
+                    app.model_picker.loading_models = false;
+                    app.model_fetch_rx = None;
+                }
+                Ok(Err(()))
+                | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    app.model_picker.loading_models = false;
+                    app.model_fetch_rx = None;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            }
+        }
+
+        // Spawn async provider model-list fetch when requested.
+        if app.model_picker_fetch_pending {
+            app.model_picker_fetch_pending = false;
+            let provider_id_str = app
+                .config
+                .provider
+                .clone()
+                .unwrap_or_else(|| "anthropic".to_string());
+            if let Some(ref registry) = app.provider_registry {
+                let pid = claurst_core::ProviderId::new(&provider_id_str);
+                if let Some(provider) = registry.get(&pid) {
+                    let provider = provider.clone();
+                    let (tx, rx) = tokio::sync::mpsc::channel(1);
+                    app.model_fetch_rx = Some(rx);
+                    app.model_picker.loading_models = true;
+                    tokio::spawn(async move {
+                        match provider.list_models().await {
+                            Ok(models) => {
+                                let entries: Vec<claurst_tui::model_picker::ModelEntry> = models
+                                    .into_iter()
+                                    .map(|m| claurst_tui::model_picker::ModelEntry {
+                                        id: m.id.to_string(),
+                                        display_name: m.name.clone(),
+                                        description: claurst_tui::model_picker::format_context_window(
+                                            m.context_window,
+                                        ),
+                                        is_current: false,
+                                    })
+                                    .collect();
+                                let _ = tx.send(Ok(entries)).await;
+                            }
+                            Err(_) => {
+                                let _ = tx.send(Err(())).await;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+
+        // Refresh task list if the overlay is visible.
+        if app.tasks_overlay.visible {
+            app.tasks_overlay.refresh_tasks(&claurst_tools::TASK_STORE);
+        }
+
         // Check if the background update task has reported a result.
         if app.update_available.is_none() {
             if let Ok(Some(version)) = update_rx.try_recv() {
@@ -2612,16 +2926,12 @@ async fn run_interactive(
                         )).await;
                     });
                 }
-                "openai-codex" => {
+                "codex" | "openai-codex" => {
                     let tx2 = device_auth_tx.clone();
-                    app.device_auth_dialog.set_code(
-                        "".to_string(),
-                        "Opening browser for OpenAI login...".to_string(),
-                        "".to_string(),
-                        0,
-                    );
+                    // Keep the dialog in WaitingForCode until GotBrowserUrl arrives.
+                    // (set_browser_url() transitions it to BrowserAuth with the URL.)
                     tokio::spawn(async move {
-                        match crate::codex_oauth_flow::run_oauth_flow().await {
+                        match crate::codex_oauth_flow::run_oauth_flow(tx2.clone()).await {
                             Ok(tokens) => {
                                 let _ = tx2.send(DeviceAuthEvent::TokenReceived(
                                     tokens.access_token,
@@ -2667,6 +2977,18 @@ async fn run_interactive(
                         Some(4),
                     );
                 }
+                DeviceAuthEvent::GotBrowserUrl { url } => {
+                    // Copy the URL to clipboard so the user can paste it even
+                    // when the automatic browser launch silently fails (headless
+                    // terminals, tty2, Wayland-without-xdg-open, etc.).
+                    let _ = claurst_tui::try_copy_to_clipboard(&url);
+                    app.device_auth_dialog.set_browser_url(url);
+                    app.notifications.push(
+                        claurst_tui::NotificationKind::Info,
+                        "Login URL copied to clipboard.".to_string(),
+                        Some(5),
+                    );
+                }
                 DeviceAuthEvent::TokenReceived(token) => {
                     app.device_auth_dialog.set_success(token);
                 }
@@ -2676,6 +2998,23 @@ async fn run_interactive(
             }
         }
 
+        while let Ok(evt) = mcp_auth_rx.try_recv() {
+            match evt {
+                McpAuthEvent::Completed(result) => {
+                    // Schedule a runtime rebuild so the newly persisted token is
+                    // picked up by the next MCP manager instance.
+                    app.pending_mcp_reconnect = true;
+                    app.status_message = Some(format!(
+                        "MCP OAuth — '{}' authentication completed; token saved to: {}",
+                        result.server_name,
+                        result.token_path.display()
+                    ));
+                }
+                McpAuthEvent::Failed(error) => {
+                    app.status_message = Some(format!("MCP OAuth failed: {}", error));
+                }
+            }
+        }
         // Check if query task is done; sync messages from the task
         let task_finished = current_query
             .as_ref()
@@ -2729,6 +3068,50 @@ async fn run_interactive(
                             let _ = store.save_message(&session.id, msg_id, role, &content_str, None);
                         }
                     }
+                }
+            }
+        }
+
+        if !app.is_streaming && current_query.is_none() {
+            if let Some(server_name) = app.take_pending_mcp_panel_auth() {
+                let server_config = cmd_ctx
+                    .config
+                    .mcp_servers
+                    .iter()
+                    .find(|server| server.name == server_name);
+                let supports_panel_auth = server_config.is_some_and(|server| {
+                    matches!(server.server_type.as_str(), "http" | "sse")
+                        && server.url.as_deref().is_some()
+                });
+
+                if !supports_panel_auth {
+                    app.status_message = Some(format!(
+                        "Selected MCP server '{}' does not support panel auth.",
+                        server_name
+                    ));
+                } else if let Some(manager) = app.mcp_manager.clone() {
+                    match manager.begin_auth(&server_name).await {
+                        Ok(session) => {
+                            let auth_url = session.auth_url.clone();
+                            let redirect_uri = session.redirect_uri.clone();
+                            mcp_auth_runner(session);
+                            app.status_message = Some(format!(
+                                "MCP auth — '{}' started. Complete authentication in your browser.\nURL: {}\nCallback URL: {}",
+                                server_name, auth_url, redirect_uri
+                            ));
+                        }
+                        Err(error) => {
+                            app.status_message = Some(format!(
+                                "MCP auth failed for '{}': {}",
+                                server_name, error
+                            ));
+                        }
+                    }
+                } else {
+                    app.status_message = Some(
+                        "MCP auth is unavailable because the MCP runtime is not connected."
+                            .to_string(),
+                    );
                 }
             }
         }
@@ -2838,26 +3221,103 @@ async fn handle_auth_command(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn provider_status_lookup_keys(provider_id: &str) -> Vec<&str> {
+    match provider_id {
+        "togetherai" | "together-ai" => vec!["togetherai", "together-ai"],
+        "lmstudio" | "lm-studio" => vec!["lmstudio", "lm-studio"],
+        "llamacpp" | "llama-cpp" | "llama-server" => vec!["llamacpp", "llama-cpp", "llama-server"],
+        "moonshot" | "moonshotai" => vec!["moonshot", "moonshotai"],
+        "zhipu" | "zhipuai" => vec!["zhipu", "zhipuai"],
+        "vultr" | "vultr-ai" => vec!["vultr", "vultr-ai"],
+        "google" | "google-vertex" => vec!["google", "google-vertex"],
+        _ => vec![provider_id],
+    }
+}
+
+fn format_provider_name(provider_id: &str) -> String {
+    match provider_id {
+        "anthropic" => "Anthropic".to_string(),
+        "openai" => "OpenAI".to_string(),
+        "google" => "Google".to_string(),
+        "google-vertex" => "Google Vertex".to_string(),
+        "github-copilot" => "GitHub Copilot".to_string(),
+        "xai" => "xAI".to_string(),
+        "lmstudio" | "lm-studio" => "LM Studio".to_string(),
+        "llamacpp" | "llama-cpp" | "llama-server" => "llama.cpp".to_string(),
+        other => other
+            .split('-')
+            .map(|part| {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
 /// Print current auth status, then exit with code 0 (logged in) or 1 (not logged in).
 async fn auth_status(json_output: bool) {
-    // Gather auth state
-    let env_api_key = std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty());
     let settings = Settings::load().await.unwrap_or_default();
-    let settings_api_key = settings.config.api_key.clone().filter(|k| !k.is_empty());
-    let oauth_tokens = claurst_core::oauth::OAuthTokens::load().await;
-    let api_provider = "Anthropic";
-    let api_key_source = if env_api_key.is_some() {
-        Some("ANTHROPIC_API_KEY".to_string())
-    } else if settings_api_key.is_some() {
-        Some("settings".to_string())
-    } else if oauth_tokens
-        .as_ref()
-        .is_some_and(|tokens| !tokens.uses_bearer_auth() && tokens.api_key.is_some())
-    {
-        Some("/login managed key".to_string())
+    let config = &settings.config;
+    let active_provider = config.selected_provider_id();
+    let provider_cfg = config
+        .provider_configs
+        .get(active_provider)
+        .filter(|provider| provider.enabled);
+    let auth_store = claurst_core::AuthStore::load();
+    let oauth_tokens = if active_provider == "anthropic" {
+        claurst_core::oauth::OAuthTokens::load().await
     } else {
         None
     };
+
+    let env_api_key_source = claurst_core::config::api_key_env_vars_for_provider(active_provider)
+        .iter()
+        .find_map(|env_var| {
+            std::env::var(env_var)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|_| (*env_var).to_string())
+        });
+    let stored_api_key_source = provider_status_lookup_keys(active_provider)
+        .into_iter()
+        .find_map(|provider_id| match auth_store.get(provider_id) {
+            Some(claurst_core::StoredCredential::ApiKey { key }) if !key.is_empty() => {
+                Some("stored credential".to_string())
+            }
+            Some(claurst_core::StoredCredential::OAuthToken {
+                access, refresh, ..
+            }) if active_provider == "github-copilot"
+                && (!access.is_empty() || !refresh.is_empty()) =>
+            {
+                Some("stored token".to_string())
+            }
+            _ => None,
+        });
+
+    let api_provider = format_provider_name(active_provider);
+    let api_key_source = config
+        .api_key
+        .as_ref()
+        .filter(|key| !key.is_empty())
+        .map(|_| "settings.api_key".to_string())
+        .or_else(|| {
+            provider_cfg
+                .and_then(|provider| provider.api_key.as_ref())
+                .filter(|key| !key.is_empty())
+                .map(|_| format!("settings.provider_configs.{active_provider}.api_key"))
+        })
+        .or(stored_api_key_source)
+        .or(env_api_key_source)
+        .or_else(|| {
+            oauth_tokens
+                .as_ref()
+                .filter(|tokens| !tokens.uses_bearer_auth() && tokens.api_key.is_some())
+                .map(|_| "/login managed key".to_string())
+        });
     let token_source = oauth_tokens.as_ref().map(|tokens| {
         if tokens.uses_bearer_auth() {
             "claude.ai".to_string()
@@ -2895,21 +3355,20 @@ async fn auth_status(json_output: bool) {
         },
     );
 
-    // Determine auth method (mirrors TypeScript authStatus())
     let (auth_method, logged_in) = if let Some(ref tokens) = oauth_tokens {
-        let uses_bearer = tokens.uses_bearer_auth();
-        let method = if uses_bearer { "claude.ai" } else { "oauth_token" };
+        let method = if tokens.uses_bearer_auth() {
+            "claude.ai"
+        } else {
+            "oauth_token"
+        };
         (method.to_string(), true)
-    } else if env_api_key.is_some() {
-        ("api_key".to_string(), true)
-    } else if settings_api_key.is_some() {
+    } else if api_key_source.is_some() {
         ("api_key".to_string(), true)
     } else {
         ("none".to_string(), false)
     };
 
     if json_output {
-        // JSON output (used by SDK + scripts)
         let mut obj = serde_json::json!({
             "loggedIn": logged_in,
             "authMethod": auth_method,
@@ -2917,7 +3376,6 @@ async fn auth_status(json_output: bool) {
             "billing": billing_mode,
         });
 
-        // Include API key source if known
         if let Some(ref source) = api_key_source {
             obj["apiKeySource"] = serde_json::Value::String(source.clone());
         }
@@ -2936,9 +3394,17 @@ async fn auth_status(json_output: bool) {
 
         println!("{}", serde_json::to_string_pretty(&obj).unwrap_or_default());
     } else {
-        // Human-readable text output
         if !logged_in {
-            println!("Not logged in. Run `claude auth login` to authenticate.");
+            let hint = if active_provider == "anthropic" {
+                "Run `claude auth login` or set ANTHROPIC_API_KEY.".to_string()
+            } else if let Some(env_var) =
+                claurst_core::config::primary_api_key_env_var_for_provider(active_provider)
+            {
+                format!("Set {} or store a credential for {}.", env_var, api_provider)
+            } else {
+                format!("Configure credentials for {}.", api_provider)
+            };
+            println!("Not logged in for {}. {}", api_provider, hint);
         } else {
             println!("Logged in.");
             println!("  API provider: {}", api_provider);

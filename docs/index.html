@@ -1,0 +1,831 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Claurst Docs</title>
+  <meta name="description" content="Claurst documentation — terminal coding agent in Rust.">
+  <meta name="theme-color" content="#E91E63">
+
+  <!-- Open Graph -->
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://claurst.kuber.studio/docs/">
+  <meta property="og:title" content="Claurst Docs">
+  <meta property="og:description" content="Claurst documentation — terminal coding agent in Rust.">
+  <meta property="og:image" content="https://claurst.kuber.studio/public/social-image.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:url" content="https://claurst.kuber.studio/docs/">
+  <meta name="twitter:title" content="Claurst Docs">
+  <meta name="twitter:description" content="Claurst documentation — terminal coding agent in Rust.">
+  <meta name="twitter:image" content="https://claurst.kuber.studio/public/social-image.png">
+
+  <link rel="icon" href="../public/Rustle.png">
+
+  <!-- Markdown renderer -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+  <!-- Syntax highlighting -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/github-dark.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"></script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:      #000000;
+      --bg1:     #080808;
+      --bg2:     #101010;
+      --bg3:     #161616;
+      --bg4:     #1c1c1c;
+      --border:  #1e1e1e;
+      --border2: #282828;
+      --accent:  #E91E63;
+      --accent-d:#b0003a;
+      --accent-l:#ff5f8c;
+      --glow:    rgba(233,30,99,0.15);
+      --glow-s:  rgba(233,30,99,0.07);
+      --text:    #ebebf0;
+      --text2:   #9999a8;
+      --text3:   #555560;
+      --green:   #4caf50;
+      --blue:    #4287f5;
+      --sidebar: 260px;
+      --nav-h:   52px;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    /* ── Scrollbars ───────────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: var(--bg1); }
+    ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+    * { scrollbar-width: thin; scrollbar-color: var(--border2) var(--bg1); }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      height: 100vh; overflow: hidden;
+    }
+
+    /* ── Top bar ──────────────────────────────────────────────── */
+    .topbar {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 200;
+      height: var(--nav-h);
+      display: flex; align-items: center;
+      padding: 0 1.25rem;
+      background: rgba(0,0,0,0.9);
+      backdrop-filter: blur(20px);
+      border-bottom: 1px solid var(--border);
+      gap: 1rem;
+    }
+
+    .topbar-logo {
+      text-decoration: none; white-space: nowrap; display: flex; align-items: center;
+    }
+    .topbar-logo img { height: 28px; width: auto; display: block; }
+
+    .topbar-sep { width: 1px; height: 20px; background: var(--border2); }
+
+    .topbar-breadcrumb {
+      font-size: 0.8rem; color: var(--text3);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .topbar-breadcrumb .current { color: var(--text2); }
+
+    .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 0.75rem; }
+
+    .search-box {
+      display: flex; align-items: center; gap: 0.5rem;
+      background: var(--bg2); border: 1px solid var(--border2);
+      border-radius: 6px; padding: 0.35rem 0.75rem;
+      width: 200px; transition: border-color 0.15s, width 0.2s;
+    }
+    .search-box:focus-within { border-color: var(--accent); width: 260px; }
+    .search-box svg { color: var(--text3); flex-shrink: 0; }
+    .search-box input {
+      background: none; border: none; outline: none;
+      color: var(--text); font-size: 0.8rem; width: 100%;
+    }
+    .search-box input::placeholder { color: var(--text3); }
+
+    .topbar-gh {
+      display: flex; align-items: center; gap: 0.4rem;
+      background: var(--bg2); border: 1px solid var(--border2);
+      color: var(--text2); padding: 0.35rem 0.75rem;
+      border-radius: 6px; font-size: 0.75rem; font-weight: 500;
+      text-decoration: none; transition: border-color 0.15s, color 0.15s;
+    }
+    .topbar-gh:hover { border-color: var(--accent); color: var(--text); }
+
+    .menu-btn {
+      display: none; background: none; border: none; cursor: pointer;
+      color: var(--text2); padding: 0.25rem;
+    }
+
+    /* ── Layout ───────────────────────────────────────────────── */
+    .layout {
+      display: flex;
+      height: calc(100vh - var(--nav-h));
+      margin-top: var(--nav-h);
+    }
+
+    /* ── Sidebar ──────────────────────────────────────────────── */
+    .sidebar {
+      width: var(--sidebar);
+      flex-shrink: 0;
+      height: 100%;
+      overflow-y: auto;
+      border-right: 1px solid var(--border);
+      background: var(--bg);
+      padding: 1rem 0 2rem;
+    }
+    .sidebar::-webkit-scrollbar { width: 4px; }
+    .sidebar::-webkit-scrollbar-track { background: transparent; }
+    .sidebar::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+
+    .sidebar-section {
+      padding: 0.5rem 1rem 0.25rem;
+      font-size: 0.65rem; font-weight: 700; letter-spacing: 0.12em;
+      text-transform: uppercase; color: var(--text3);
+      margin-top: 0.5rem;
+    }
+
+    .sidebar-link {
+      display: flex; align-items: center; gap: 0.6rem;
+      padding: 0.4rem 1rem;
+      font-size: 0.82rem; color: var(--text2);
+      text-decoration: none; cursor: pointer;
+      border-left: 2px solid transparent;
+      transition: color 0.12s, background 0.12s, border-color 0.12s;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .sidebar-link:hover { color: var(--text); background: var(--bg1); }
+    .sidebar-link.active {
+      color: var(--accent-l);
+      border-left-color: var(--accent);
+      background: var(--glow-s);
+    }
+    .sidebar-link svg { flex-shrink: 0; color: var(--text3); }
+    .sidebar-link.active svg { color: var(--accent); }
+
+    /* ── Main content ─────────────────────────────────────────── */
+    .main {
+      flex: 1; min-width: 0;
+      height: 100%;
+      overflow-y: auto;
+      background: var(--bg);
+    }
+    .main::-webkit-scrollbar { width: 6px; }
+    .main::-webkit-scrollbar-track { background: transparent; }
+    .main::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+
+    .content-wrap {
+      max-width: 820px;
+      margin: 0 auto;
+      padding: 2.5rem 2.5rem 6rem;
+    }
+
+    /* Loading / error states */
+    .state-box {
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      height: 60vh; text-align: center; gap: 1rem;
+    }
+    .state-box .icon { font-size: 2.5rem; }
+    .state-box h3 { font-size: 1.1rem; font-weight: 600; }
+    .state-box p { font-size: 0.875rem; color: var(--text2); max-width: 360px; }
+
+    .spinner {
+      width: 32px; height: 32px;
+      border: 2px solid var(--border2);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Search results ───────────────────────────────────────── */
+    .search-results {
+      position: absolute;
+      top: calc(var(--nav-h) + 4px); right: 1.25rem;
+      width: 340px;
+      background: var(--bg2);
+      border: 1px solid var(--border2);
+      border-radius: 8px;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+      z-index: 300;
+      max-height: 400px; overflow-y: auto;
+    }
+    .search-results:empty { display: none; }
+    .search-result-item {
+      padding: 0.6rem 1rem; cursor: pointer;
+      border-bottom: 1px solid var(--border);
+      transition: background 0.1s;
+    }
+    .search-result-item:last-child { border-bottom: none; }
+    .search-result-item:hover { background: var(--bg3); }
+    .search-result-item .r-title { font-size: 0.85rem; font-weight: 600; }
+    .search-result-item .r-preview { font-size: 0.75rem; color: var(--text2); margin-top: 0.15rem; }
+    .search-result-item .r-page { font-size: 0.7rem; color: var(--accent); margin-top: 0.1rem; }
+    .search-result-item mark { background: var(--glow); color: var(--accent-l); border-radius: 2px; }
+
+    /* ── Markdown styles ──────────────────────────────────────── */
+    .md-body { font-size: 0.925rem; }
+
+    .md-body h1 {
+      font-size: 2rem; font-weight: 900; letter-spacing: -0.02em;
+      color: var(--text); margin-bottom: 0.5rem; line-height: 1.2;
+      padding-bottom: 0.75rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .md-body h2 {
+      font-size: 1.35rem; font-weight: 700; margin-top: 2.5rem; margin-bottom: 0.75rem;
+      padding-bottom: 0.5rem; border-bottom: 1px solid var(--border);
+      color: var(--text); letter-spacing: -0.01em;
+    }
+    .md-body h3 {
+      font-size: 1.05rem; font-weight: 700; margin-top: 1.75rem; margin-bottom: 0.5rem;
+      color: var(--text);
+    }
+    .md-body h4 {
+      font-size: 0.9rem; font-weight: 700; margin-top: 1.25rem; margin-bottom: 0.4rem;
+      color: var(--text2); text-transform: uppercase; letter-spacing: 0.05em;
+    }
+
+    .md-body p { margin-bottom: 1rem; color: var(--text2); }
+    .md-body p code { color: var(--text); }
+
+    .md-body a { color: var(--accent-l); text-decoration: none; }
+    .md-body a:hover { text-decoration: underline; }
+
+    .md-body ul, .md-body ol {
+      padding-left: 1.5rem; margin-bottom: 1rem;
+    }
+    .md-body li { color: var(--text2); margin-bottom: 0.3rem; }
+    .md-body li code { color: var(--text); }
+    .md-body li > ul, .md-body li > ol { margin-top: 0.3rem; margin-bottom: 0; }
+
+    .md-body strong { color: var(--text); font-weight: 600; }
+
+    .md-body blockquote {
+      border-left: 3px solid var(--accent);
+      padding: 0.5rem 1rem;
+      background: var(--glow-s);
+      border-radius: 0 6px 6px 0;
+      margin: 1.25rem 0;
+    }
+    .md-body blockquote p { color: var(--text2); margin-bottom: 0; }
+
+    .md-body hr {
+      border: none; border-top: 1px solid var(--border);
+      margin: 2rem 0;
+    }
+
+    /* Inline code */
+    .md-body :not(pre) > code {
+      background: var(--bg3);
+      border: 1px solid var(--border2);
+      border-radius: 4px;
+      padding: 0.1em 0.45em;
+      font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+      font-size: 0.82em;
+      color: var(--accent-l);
+    }
+
+    /* Code blocks */
+    .md-body pre {
+      background: var(--bg1) !important;
+      border: 1px solid var(--border2);
+      border-radius: 8px;
+      overflow-x: auto;
+      margin: 1.25rem 0;
+      position: relative;
+    }
+    .md-body pre code {
+      background: none !important;
+      border: none !important;
+      padding: 1.1rem 1.25rem !important;
+      font-size: 0.82rem !important;
+      line-height: 1.7 !important;
+      color: var(--text) !important;
+      display: block;
+    }
+
+    /* Copy button on code blocks */
+    .copy-btn {
+      position: absolute; top: 0.5rem; right: 0.5rem;
+      background: var(--bg3); border: 1px solid var(--border2);
+      color: var(--text3); border-radius: 5px;
+      padding: 0.25rem 0.6rem; font-size: 0.7rem;
+      cursor: pointer; font-family: inherit;
+      transition: border-color 0.15s, color 0.15s;
+      opacity: 0;
+    }
+    .md-body pre:hover .copy-btn { opacity: 1; }
+    .copy-btn:hover { border-color: var(--accent); color: var(--accent-l); }
+    .copy-btn.copied { color: var(--green); border-color: var(--green); }
+
+    /* Tables */
+    .md-body table {
+      width: 100%; border-collapse: collapse;
+      margin: 1.25rem 0; font-size: 0.875rem;
+      overflow: hidden; border-radius: 6px;
+      border: 1px solid var(--border);
+    }
+    .md-body th {
+      background: var(--bg2); color: var(--text);
+      padding: 0.6rem 1rem; text-align: left;
+      font-size: 0.78rem; font-weight: 700;
+      letter-spacing: 0.04em; text-transform: uppercase;
+      border-bottom: 1px solid var(--border2);
+    }
+    .md-body td {
+      padding: 0.6rem 1rem; color: var(--text2);
+      border-bottom: 1px solid var(--border);
+    }
+    .md-body tr:last-child td { border-bottom: none; }
+    .md-body tr:nth-child(even) td { background: var(--bg1); }
+
+    /* Page nav (prev/next) */
+    .page-nav {
+      display: flex; gap: 1rem; margin-top: 4rem;
+      padding-top: 1.5rem; border-top: 1px solid var(--border);
+    }
+    .page-nav-btn {
+      flex: 1; display: flex; flex-direction: column;
+      padding: 1rem 1.25rem;
+      background: var(--bg1); border: 1px solid var(--border2);
+      border-radius: 8px; text-decoration: none;
+      cursor: pointer;
+      transition: border-color 0.15s;
+    }
+    .page-nav-btn:hover { border-color: var(--accent); }
+    .page-nav-btn.next { text-align: right; }
+    .page-nav-btn .pnb-label { font-size: 0.7rem; color: var(--text3); margin-bottom: 0.25rem; }
+    .page-nav-btn .pnb-title { font-size: 0.875rem; font-weight: 600; color: var(--text); }
+
+    /* TOC (right column) */
+    .toc-col {
+      width: 200px; flex-shrink: 0;
+      border-left: 1px solid var(--border);
+      height: 100%; overflow-y: auto;
+      padding: 2.5rem 1rem 2rem;
+      display: none;
+    }
+    @media (min-width: 1300px) { .toc-col { display: block; } }
+    .toc-title { font-size: 0.7rem; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text3); margin-bottom: 0.75rem; }
+    .toc-link {
+      display: block; font-size: 0.78rem; color: var(--text3);
+      text-decoration: none; padding: 0.2rem 0;
+      transition: color 0.12s;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .toc-link:hover { color: var(--text2); }
+    .toc-link.active { color: var(--accent-l); }
+    .toc-link.h3 { padding-left: 0.75rem; font-size: 0.73rem; }
+
+    /* ── Responsive ───────────────────────────────────────────── */
+    @media (max-width: 768px) {
+      body { overflow: auto; }
+      .layout { flex-direction: column; height: auto; }
+      .sidebar {
+        position: fixed; top: var(--nav-h); left: -100%; bottom: 0;
+        z-index: 150; width: 280px;
+        transition: left 0.25s;
+        background: var(--bg);
+        border-right: 1px solid var(--border);
+        height: calc(100vh - var(--nav-h));
+      }
+      .sidebar.open { left: 0; }
+      .main { height: auto; overflow: visible; }
+      .content-wrap { padding: 1.5rem 1.25rem 4rem; }
+      .menu-btn { display: flex; }
+      .search-box { width: 36px; padding: 0.35rem; }
+      .search-box:focus-within { width: 180px; padding: 0.35rem 0.75rem; }
+      .search-box input { display: none; }
+      .search-box:focus-within input { display: block; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ── Top bar ────────────────────────────────────────────────── -->
+<div class="topbar">
+  <button class="menu-btn" onclick="toggleSidebar()" aria-label="Toggle menu">
+    <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5">
+      <line x1="2" y1="5" x2="16" y2="5"/><line x1="2" y1="9" x2="16" y2="9"/><line x1="2" y1="13" x2="16" y2="13"/>
+    </svg>
+  </button>
+
+  <a href="/" class="topbar-logo"><img src="../public/Rustle.png" alt="Claurst"></a>
+  <div class="topbar-sep"></div>
+  <div class="topbar-breadcrumb">Docs · <span class="current" id="breadcrumb-current">Getting Started</span></div>
+
+  <div class="topbar-right">
+    <div class="search-box" id="search-box">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+        <circle cx="6.5" cy="6.5" r="4.5"/><path d="M11 11l3.5 3.5"/>
+      </svg>
+      <input type="text" id="search-input" placeholder="Search docs…" oninput="onSearch(this.value)" onblur="scheduleHideResults()" onfocus="onSearch(this.value)">
+    </div>
+    <a href="https://github.com/Kuberwastaken/claurst" class="topbar-gh">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+        <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+      </svg>
+      GitHub
+    </a>
+  </div>
+</div>
+
+<div id="search-results-panel" class="search-results"></div>
+
+<!-- ── Layout ─────────────────────────────────────────────────── -->
+<div class="layout">
+
+  <!-- Sidebar -->
+  <nav class="sidebar" id="sidebar">
+    <div class="sidebar-section">Getting Started</div>
+    <a class="sidebar-link" data-page="index" onclick="loadPage('index')">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 9l5-5 5 5M5 14h6"/></svg>
+      Overview
+    </a>
+    <a class="sidebar-link" data-page="installation" onclick="loadPage('installation')">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 12L3 7h3V1h4v6h3z"/><path d="M1 14h14"/></svg>
+      Installation
+    </a>
+    <a class="sidebar-link" data-page="auth" onclick="loadPage('auth')">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="7" width="10" height="7" rx="1"/><path d="M5 7V4a3 3 0 016 0v3"/></svg>
+      Authentication
+    </a>
+    <a class="sidebar-link" data-page="configuration" onclick="loadPage('configuration')">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="2"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.2 3.2l1.4 1.4M11.4 11.4l1.4 1.4M3.2 12.8l1.4-1.4M11.4 4.6l1.4-1.4"/></svg>
+      Configuration
+    </a>
+
+    <div class="sidebar-section">Reference</div>
+    <a class="sidebar-link" data-page="commands" onclick="loadPage('commands')">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4h12M2 8h8M2 12h10"/></svg>
+      Slash Commands
+    </a>
+    <a class="sidebar-link" data-page="tools" onclick="loadPage('tools')">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2l2 2-8 8-2 2H2v-2l2-2 8-8z"/></svg>
+      Tools Reference
+    </a>
+    <a class="sidebar-link" data-page="keybindings" onclick="loadPage('keybindings')">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="4" width="14" height="8" rx="1.5"/><path d="M4 8h1M7 8h2M11 8h1M4 11h8"/></svg>
+      Keybindings
+    </a>
+
+    <div class="sidebar-section">Integrations</div>
+    <a class="sidebar-link" data-page="providers" onclick="loadPage('providers')">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6"/><path d="M8 2a5 5 0 010 12M2 8h12"/></svg>
+      Providers
+    </a>
+    <a class="sidebar-link" data-page="mcp" onclick="loadPage('mcp')">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="6" width="5" height="4" rx="1"/><rect x="9" y="6" width="5" height="4" rx="1"/><path d="M7 8h2"/></svg>
+      MCP Integration
+    </a>
+    <a class="sidebar-link" data-page="plugins" onclick="loadPage('plugins')">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M6 2v3H3l5 5 5-5h-3V2zM3 12h10"/></svg>
+      Plugins
+    </a>
+
+    <div class="sidebar-section">Advanced</div>
+    <a class="sidebar-link" data-page="agents" onclick="loadPage('agents')">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="5" cy="5" r="2.5"/><circle cx="11" cy="5" r="2.5"/><circle cx="8" cy="11" r="2.5"/><path d="M7 7l1 2M9 7l-1 2"/></svg>
+      Agents
+    </a>
+    <a class="sidebar-link" data-page="hooks" onclick="loadPage('hooks')">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 1v6l3 3M8 7a4 4 0 100 8"/></svg>
+      Hooks
+    </a>
+    <a class="sidebar-link" data-page="advanced" onclick="loadPage('advanced')">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 8h3l2-5 2 10 2-5 1 3 2-3h2"/></svg>
+      Advanced Features
+    </a>
+  </nav>
+
+  <!-- Main -->
+  <main class="main" id="main-content">
+    <div class="content-wrap">
+      <div id="doc-content">
+        <div class="state-box">
+          <div class="spinner"></div>
+          <p>Loading documentation…</p>
+        </div>
+      </div>
+      <div class="page-nav" id="page-nav" style="display:none">
+        <div class="page-nav-btn prev" id="prev-btn" onclick="navPage(-1)" style="display:none">
+          <div class="pnb-label">← Previous</div>
+          <div class="pnb-title" id="prev-title"></div>
+        </div>
+        <div class="page-nav-btn next" id="next-btn" onclick="navPage(1)" style="display:none">
+          <div class="pnb-label">Next →</div>
+          <div class="pnb-title" id="next-title"></div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- TOC -->
+  <aside class="toc-col" id="toc-col">
+    <div class="toc-title">On this page</div>
+    <div id="toc-links"></div>
+  </aside>
+</div>
+
+<script>
+// ── Page registry ──────────────────────────────────────────────
+const PAGES = [
+  { id: 'index',         title: 'Overview' },
+  { id: 'installation',  title: 'Installation' },
+  { id: 'auth',          title: 'Authentication' },
+  { id: 'configuration', title: 'Configuration' },
+  { id: 'commands',      title: 'Slash Commands' },
+  { id: 'tools',         title: 'Tools Reference' },
+  { id: 'keybindings',   title: 'Keybindings' },
+  { id: 'providers',     title: 'Providers' },
+  { id: 'mcp',           title: 'MCP Integration' },
+  { id: 'plugins',       title: 'Plugins' },
+  { id: 'agents',        title: 'Agents' },
+  { id: 'hooks',         title: 'Hooks' },
+  { id: 'advanced',      title: 'Advanced Features' },
+];
+
+// ── Search index ───────────────────────────────────────────────
+let searchIndex = [];  // [{ page, title, heading, text }]
+
+function addToIndex(pageId, pageTitle, md) {
+  // Break by headings
+  const sections = md.split(/\n(?=#{1,3} )/);
+  for (const sec of sections) {
+    const headingMatch = sec.match(/^(#{1,3}) (.+)/);
+    const heading = headingMatch ? headingMatch[2].trim() : pageTitle;
+    const text = sec.replace(/^#{1,3} .+\n/, '').replace(/```[\s\S]*?```/g, '').replace(/[#*`\[\]]/g, '').slice(0, 400);
+    if (text.trim().length > 20) {
+      searchIndex.push({ page: pageId, pageTitle, heading, text });
+    }
+  }
+}
+
+// ── Markdown cache ─────────────────────────────────────────────
+const mdCache = {};
+
+async function fetchMd(pageId) {
+  if (mdCache[pageId]) return mdCache[pageId];
+  const res = await fetch(`./${pageId}.md`);
+  if (!res.ok) throw new Error(`${res.status}`);
+  const text = await res.text();
+  mdCache[pageId] = text;
+  const page = PAGES.find(p => p.id === pageId);
+  if (page) addToIndex(pageId, page.title, text);
+  return text;
+}
+
+// ── Marked config ──────────────────────────────────────────────
+// Override renderer to add IDs and copy buttons
+// marked@9+ passes a token object as the first argument to renderer functions
+const renderer = new marked.Renderer();
+renderer.heading = (text, level) => {
+  const id = 'h-' + text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+  return `<h${level} id="${id}">${text}</h${level}>`;
+};
+renderer.link = (href, title, text) => {
+  if (href && href.startsWith('#') && !href.startsWith('#h-')) {
+    href = '#h-' + href.slice(1);
+  }
+  const titleAttr = title ? ` title="${title}"` : '';
+  return `<a href="${href}"${titleAttr}>${text}</a>`;
+};
+renderer.code = (code, lang) => {
+  if (typeof hljs === 'undefined') {
+    return `<pre><button class="copy-btn" onclick="copyCode(this)">Copy</button><code>${code}</code></pre>`;
+  }
+  const highlighted = lang && hljs.getLanguage(lang)
+    ? hljs.highlight(code, { language: lang }).value
+    : hljs.highlightAuto(code).value;
+  return `<pre><button class="copy-btn" onclick="copyCode(this)">Copy</button><code class="hljs">${highlighted}</code></pre>`;
+};
+marked.use({ renderer });
+
+// ── Load page ──────────────────────────────────────────────────
+let currentPage = null;
+
+async function loadPage(pageId, pushState = true) {
+  // Update active link
+  document.querySelectorAll('.sidebar-link').forEach(a => {
+    a.classList.toggle('active', a.dataset.page === pageId);
+  });
+
+  // Update breadcrumb
+  const page = PAGES.find(p => p.id === pageId);
+  document.getElementById('breadcrumb-current').textContent = page ? page.title : pageId;
+  document.title = `${page ? page.title + ' — ' : ''}Claurst Docs`;
+
+  // Push history
+  if (pushState) {
+    const url = pageId === 'index' ? location.pathname : `#${pageId}`;
+    history.pushState({ pageId }, '', url);
+  }
+
+  // Close mobile sidebar
+  document.getElementById('sidebar').classList.remove('open');
+
+  currentPage = pageId;
+
+  const el = document.getElementById('doc-content');
+  el.innerHTML = '<div class="state-box"><div class="spinner"></div><p>Loading…</p></div>';
+  document.getElementById('toc-links').innerHTML = '';
+
+  try {
+    const md = await fetchMd(pageId);
+    el.className = 'md-body';
+    el.innerHTML = marked.parse(md);
+
+    // Build TOC
+    buildToc(el);
+
+    // Prev/next
+    buildPageNav(pageId);
+
+    // Scroll to top
+    document.getElementById('main-content').scrollTo({ top: 0 });
+
+    // Handle anchor from URL
+    const hash = location.hash.slice(1);
+    if (hash && hash !== pageId) {
+      setTimeout(() => {
+        const target = document.getElementById(hash) || document.getElementById('h-' + hash);
+        if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }, 80);
+    }
+  } catch (e) {
+    el.className = '';
+    el.innerHTML = `
+      <div class="state-box">
+        <div class="icon">📄</div>
+        <h3>Page not found</h3>
+        <p>The documentation for <strong>${pageId}</strong> hasn't been written yet, or failed to load.</p>
+        <p style="margin-top:.5rem;font-size:.75rem;color:var(--text3)">${e.message}</p>
+      </div>`;
+    document.getElementById('page-nav').style.display = 'none';
+  }
+}
+
+function buildToc(contentEl) {
+  const headings = contentEl.querySelectorAll('h2, h3');
+  const tocEl = document.getElementById('toc-links');
+  tocEl.innerHTML = '';
+  if (headings.length < 2) return;
+
+  headings.forEach(h => {
+    const a = document.createElement('a');
+    a.href = '#' + h.id;
+    a.className = 'toc-link' + (h.tagName === 'H3' ? ' h3' : '');
+    a.textContent = h.textContent;
+    a.onclick = (e) => {
+      e.preventDefault();
+      h.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    };
+    tocEl.appendChild(a);
+  });
+
+  // Highlight active section on scroll
+  const main = document.getElementById('main-content');
+  main.onscroll = () => {
+    const scrollTop = main.scrollTop;
+    let active = null;
+    headings.forEach(h => {
+      if (h.offsetTop - 80 <= scrollTop) active = h.id;
+    });
+    tocEl.querySelectorAll('.toc-link').forEach(a => {
+      a.classList.toggle('active', a.getAttribute('href') === '#' + active);
+    });
+  };
+}
+
+function buildPageNav(pageId) {
+  const idx = PAGES.findIndex(p => p.id === pageId);
+  const nav = document.getElementById('page-nav');
+  const prev = document.getElementById('prev-btn');
+  const next = document.getElementById('next-btn');
+
+  if (idx < 0) { nav.style.display = 'none'; return; }
+  nav.style.display = 'flex';
+
+  if (idx > 0) {
+    document.getElementById('prev-title').textContent = PAGES[idx - 1].title;
+    prev.style.display = 'flex';
+  } else { prev.style.display = 'none'; }
+
+  if (idx < PAGES.length - 1) {
+    document.getElementById('next-title').textContent = PAGES[idx + 1].title;
+    next.style.display = 'flex';
+  } else { next.style.display = 'none'; }
+}
+
+function navPage(dir) {
+  const idx = PAGES.findIndex(p => p.id === currentPage);
+  const target = PAGES[idx + dir];
+  if (target) loadPage(target.id);
+}
+
+// ── Copy code ──────────────────────────────────────────────────
+function copyCode(btn) {
+  const code = btn.nextElementSibling.textContent;
+  navigator.clipboard.writeText(code).then(() => {
+    btn.textContent = 'Copied!';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1800);
+  });
+}
+
+// ── Search ─────────────────────────────────────────────────────
+let hideTimer = null;
+
+function scheduleHideResults() {
+  hideTimer = setTimeout(() => {
+    document.getElementById('search-results-panel').innerHTML = '';
+  }, 200);
+}
+
+function onSearch(query) {
+  if (hideTimer) clearTimeout(hideTimer);
+  const panel = document.getElementById('search-results-panel');
+  const q = query.trim().toLowerCase();
+  if (q.length < 2) { panel.innerHTML = ''; return; }
+
+  // Pre-fetch all pages to build index
+  PAGES.forEach(p => { if (!mdCache[p.id]) fetchMd(p.id).catch(() => {}); });
+
+  const hits = [];
+  for (const entry of searchIndex) {
+    const inHeading = entry.heading.toLowerCase().includes(q);
+    const inText = entry.text.toLowerCase().includes(q);
+    if (inHeading || inText) {
+      hits.push({ ...entry, score: inHeading ? 2 : 1 });
+      if (hits.length >= 8) break;
+    }
+  }
+
+  if (hits.length === 0) {
+    panel.innerHTML = '<div class="search-result-item"><div class="r-preview">No results for "' + escHtml(query) + '"</div></div>';
+    return;
+  }
+
+  panel.innerHTML = hits.map(h => {
+    const preview = h.text.slice(0, 100).replace(new RegExp(escRx(q), 'gi'), m => `<mark>${m}</mark>`);
+    const title = h.heading.replace(new RegExp(escRx(q), 'gi'), m => `<mark>${m}</mark>`);
+    return `<div class="search-result-item" onmousedown="goResult('${h.page}','${h.heading}')">
+      <div class="r-title">${title}</div>
+      <div class="r-preview">${preview}</div>
+      <div class="r-page">${h.pageTitle}</div>
+    </div>`;
+  }).join('');
+}
+
+function goResult(pageId, heading) {
+  document.getElementById('search-results-panel').innerHTML = '';
+  document.getElementById('search-input').value = '';
+  loadPage(pageId).then(() => {
+    const id = 'h-' + heading.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+    setTimeout(() => {
+      const el = document.getElementById(id);
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 100);
+  });
+}
+
+function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+function escRx(s)   { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// ── Sidebar toggle (mobile) ────────────────────────────────────
+function toggleSidebar() {
+  document.getElementById('sidebar').classList.toggle('open');
+}
+
+// ── Router ─────────────────────────────────────────────────────
+function getInitialPage() {
+  const hash = location.hash.slice(1);
+  if (hash) {
+    const found = PAGES.find(p => p.id === hash);
+    if (found) return found.id;
+  }
+  return 'index';
+}
+
+window.onpopstate = (e) => {
+  if (e.state && e.state.pageId) loadPage(e.state.pageId, false);
+};
+
+// ── Init ───────────────────────────────────────────────────────
+loadPage(getInitialPage(), false);
+</script>
+</body>
+</html>

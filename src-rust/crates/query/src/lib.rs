@@ -12,6 +12,7 @@ pub mod agent_tool;
 pub mod auto_dream;
 pub mod away_summary;
 pub mod command_queue;
+pub mod managed_orchestrator;
 pub mod compact;
 pub mod context_analyzer;
 pub mod coordinator;
@@ -121,6 +122,8 @@ pub struct QueryConfig {
     /// Optional shared model registry for dynamic provider and model resolution.
     /// When set, the query loop uses this instead of constructing a fresh registry.
     pub model_registry: Option<std::sync::Arc<claurst_api::ModelRegistry>>,
+    /// Managed agent (manager-executor) configuration.
+    pub managed_agents: Option<claurst_core::ManagedAgentConfig>,
 }
 
 impl Default for QueryConfig {
@@ -146,6 +149,7 @@ impl Default for QueryConfig {
             agent_name: None,
             agent_definition: None,
             model_registry: None,
+            managed_agents: None,
         }
     }
 }
@@ -161,6 +165,7 @@ impl QueryConfig {
                 .project_dir
                 .as_ref()
                 .map(|p| p.display().to_string()),
+            managed_agents: cfg.managed_agents.clone(),
             ..Default::default()
         }
     }
@@ -181,6 +186,7 @@ impl QueryConfig {
                 .project_dir
                 .as_ref()
                 .map(|p| p.display().to_string()),
+            managed_agents: cfg.managed_agents.clone(),
             ..Default::default()
         }
     }
@@ -240,6 +246,7 @@ fn is_openaiish_provider(provider_id: &str) -> bool {
             | "sambanova"
             | "moonshot"
             | "zhipu"
+            | "zai"
             | "qwen"
             | "nebius"
             | "novita"
@@ -253,6 +260,8 @@ fn is_openaiish_provider(provider_id: &str) -> bool {
             | "stepfun"
             | "fireworks"
             | "ollama"
+            | "codex"
+            | "openai-codex"
             | "lmstudio"
             | "lm-studio"
             | "llamacpp"
@@ -367,6 +376,36 @@ fn build_provider_options(
                 "textVerbosity".to_string(),
                 serde_json::json!("low"),
             );
+
+            // DeepSeek V4 thinking mode: map effort level to thinking/reasoning_effort params.
+            // DeepSeek docs: thinking={"type":"enabled/disabled"}, reasoning_effort="high"|"max"
+            // low/medium are mapped to "high" by the API; xhigh mapped to "max".
+            if provider_id == "deepseek" {
+                match effort_level {
+                    None
+                    | Some(claurst_core::effort::EffortLevel::Medium)
+                    | Some(claurst_core::effort::EffortLevel::High) => {
+                        options.insert(
+                            "thinking".to_string(),
+                            serde_json::json!({"type": "enabled"}),
+                        );
+                        options.insert("reasoningEffort".to_string(), serde_json::json!("high"));
+                    }
+                    Some(claurst_core::effort::EffortLevel::Max) => {
+                        options.insert(
+                            "thinking".to_string(),
+                            serde_json::json!({"type": "enabled"}),
+                        );
+                        options.insert("reasoningEffort".to_string(), serde_json::json!("max"));
+                    }
+                    Some(claurst_core::effort::EffortLevel::Low) => {
+                        options.insert(
+                            "thinking".to_string(),
+                            serde_json::json!({"type": "disabled"}),
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -387,7 +426,7 @@ fn build_provider_options(
         options.insert("enable_thinking".to_string(), serde_json::json!(true));
     }
 
-    if provider_id == "zhipu" && thinking_budget.is_some() {
+    if (provider_id == "zhipu" || provider_id == "zai") && thinking_budget.is_some() {
         options.insert(
             "thinking".to_string(),
             serde_json::json!({
@@ -680,6 +719,14 @@ pub async fn run_query_loop(
     } else {
         config.model.clone()
     };
+
+    // If managed-agent mode is active, override the model to the manager model.
+    if let Some(ref ma_config) = config.managed_agents {
+        if ma_config.enabled && !ma_config.manager_model.is_empty() {
+            effective_model = ma_config.manager_model.clone();
+        }
+    }
+
     let mut used_fallback = false;
     // How many automatic retries remain when a stream stalls (no data for 45s).
     let mut retries_left: u32 = 2;
@@ -793,6 +840,17 @@ pub async fn run_query_loop(
                 }
             }
 
+            // If managed-agent mode is active, append orchestration instructions.
+            if let Some(ref ma_config) = config.managed_agents {
+                if ma_config.enabled {
+                    let ma_prompt = crate::managed_orchestrator::managed_agent_system_prompt(ma_config);
+                    patched.append_system_prompt = Some(match &patched.append_system_prompt {
+                        Some(existing) => format!("{}\n\n{}", existing, ma_prompt),
+                        None => ma_prompt,
+                    });
+                }
+            }
+
             // Apply todo nudge on turns > 2.
             if turn > 2 {
                 let nudge = build_todo_nudge(&tool_ctx.session_id);
@@ -877,12 +935,25 @@ pub async fn run_query_loop(
                 // Check whether `p` is a known provider or just a model
                 // namespace (e.g. "meta-llama/Llama-3" on OpenRouter).
                 let known_providers = [
-                    "anthropic", "openai", "google", "groq", "mistral",
-                    "deepseek", "xai", "cohere", "perplexity", "cerebras",
-                    "openrouter", "togetherai", "together-ai", "deepinfra",
-                    "venice", "github-copilot", "ollama", "lmstudio",
-                    "llamacpp", "azure", "amazon-bedrock", "huggingface",
-                    "nvidia", "fireworks", "sambanova",
+                    // Native (non-OpenAI-compat) providers
+                    "anthropic", "openai", "google", "azure", "amazon-bedrock",
+                    "github-copilot", "codex", "openai-codex", "cohere", "minimax",
+                    // Local / self-hosted
+                    "ollama",
+                    "lmstudio", "lm-studio",
+                    "llamacpp", "llama-cpp", "llama-server",
+                    // OpenAI-compat cloud providers
+                    "groq", "mistral", "deepseek", "xai", "perplexity", "cerebras",
+                    "openrouter", "togetherai", "together-ai", "deepinfra", "venice",
+                    "huggingface", "nvidia", "fireworks", "sambanova",
+                    // Additional OpenAI-compat providers
+                    "qwen", "siliconflow",
+                    "moonshot", "moonshotai",
+                    "zhipu", "zhipuai",
+                    "zai",
+                    "nebius", "novita", "ovhcloud", "scaleway",
+                    "vultr", "vultr-ai",
+                    "baseten", "friendli", "upstage", "stepfun",
                 ];
                 if known_providers.contains(&p) {
                     (p.to_string(), m.to_string())
@@ -941,7 +1012,7 @@ pub async fn run_query_loop(
                 let runtime_provider =
                     claurst_api::registry::runtime_provider_for(&provider_id_str);
 
-                let mut registry_provider = if runtime_provider.is_some() {
+                let registry_provider = if runtime_provider.is_some() {
                     // Fresh auth_store key available — use it instead of the
                     // (possibly stale) registry entry.
                     None
@@ -949,35 +1020,21 @@ pub async fn run_query_loop(
                     registry.get(&pid).cloned()
                 };
 
-                // If the user supplied --api-base for a local provider (Ollama, LM Studio,
-                // llama.cpp), rebuild the provider with the override URL.  These providers
-                // are always pre-registered with a hardcoded default URL, so without this
-                // the --api-base flag would be silently ignored.
-                if let Some(override_base) = tool_ctx.config.provider_configs
-                    .get(&provider_id_str)
-                    .and_then(|pc| pc.api_base.as_deref())
-                {
-                    use claurst_api::providers::openai_compat_providers;
-                    let base_url = format!("{}/v1", override_base.trim_end_matches('/'));
-                    let overridden: Option<std::sync::Arc<dyn claurst_api::LlmProvider>> =
-                        match provider_id_str.as_str() {
-                            "ollama" => Some(std::sync::Arc::new(
-                                openai_compat_providers::ollama().with_base_url(base_url),
-                            )),
-                            "lmstudio" | "lm-studio" => Some(std::sync::Arc::new(
-                                openai_compat_providers::lm_studio().with_base_url(base_url),
-                            )),
-                            "llamacpp" | "llama-cpp" => Some(std::sync::Arc::new(
-                                openai_compat_providers::llama_cpp().with_base_url(base_url),
-                            )),
-                            _ => None,
-                        };
-                    if overridden.is_some() {
-                        registry_provider = overridden;
+                let mut provider = runtime_provider.or(registry_provider);
+
+                // Rebuild providers using the unified base resolver so overrides
+                // from settings/env/defaults are applied consistently.
+                if let Some(_) = claurst_api::registry::resolve_provider_api_base(
+                    &tool_ctx.config,
+                    &provider_id_str,
+                ) {
+                    if let Some(overridden) = claurst_api::registry::provider_from_config(
+                        &tool_ctx.config,
+                        &provider_id_str,
+                    ) {
+                        provider = Some(overridden);
                     }
                 }
-
-                let provider = runtime_provider.or(registry_provider);
                 if let Some(provider) = provider {
                     debug!(provider = %provider_id_str, model = %model_id_str, "Dispatching to non-Anthropic provider");
 
@@ -1069,6 +1126,9 @@ pub async fn run_query_loop(
 
                     // Accumulators for building the final assistant message.
                     let mut text_chunks: Vec<String> = Vec::new();
+                    // Accumulate reasoning/thinking content for providers like
+                    // DeepSeek that require reasoning_content to be sent back.
+                    let mut thinking_chunks: Vec<String> = Vec::new();
                     // tool_call_blocks: index → (id, name, accumulated_json)
                     let mut tool_call_blocks: std::collections::HashMap<usize, (String, String, String)> =
                         std::collections::HashMap::new();
@@ -1123,6 +1183,12 @@ pub async fn run_query_loop(
                                             claurst_api::StreamEvent::TextDelta { text, .. } => {
                                                 text_chunks.push(text.clone());
                                             }
+                                            claurst_api::StreamEvent::ThinkingDelta { thinking, .. } => {
+                                                thinking_chunks.push(thinking.clone());
+                                            }
+                                            claurst_api::StreamEvent::ReasoningDelta { reasoning, .. } => {
+                                                thinking_chunks.push(reasoning.clone());
+                                            }
                                             claurst_api::StreamEvent::InputJsonDelta { index, partial_json } => {
                                                 if let Some((_, _, buf)) = tool_call_blocks.get_mut(index) {
                                                     buf.push_str(partial_json);
@@ -1163,6 +1229,16 @@ pub async fn run_query_loop(
 
                     // Build the content blocks from accumulated stream data.
                     let mut content_blocks: Vec<ContentBlock> = Vec::new();
+
+                    // Thinking / reasoning block — must come first so that
+                    // inject_reasoning_for_tool_turns can find it later.
+                    let combined_thinking = thinking_chunks.join("");
+                    if !combined_thinking.is_empty() {
+                        content_blocks.push(ContentBlock::Thinking {
+                            thinking: combined_thinking,
+                            signature: String::new(),
+                        });
+                    }
 
                     let combined_text = text_chunks.join("");
                     if !combined_text.is_empty() {
@@ -2112,6 +2188,7 @@ mod tests {
             agent_name: None,
             agent_definition: None,
             model_registry: None,
+            managed_agents: None,
         }
     }
 

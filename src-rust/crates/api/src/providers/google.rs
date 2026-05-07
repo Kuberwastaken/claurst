@@ -249,6 +249,14 @@ impl GoogleProvider {
     fn sanitize_schema(schema: Value) -> Value {
         match schema {
             Value::Object(mut map) => {
+                // Strip keywords that Gemini's function-declaration schema does
+                // not understand and will reject with a 400 error.
+                map.remove("additionalProperties");
+                map.remove("$schema");
+                map.remove("default");
+                map.remove("examples");
+                map.remove("title");
+
                 // Recurse into nested schemas first.
                 let schema_type = map
                     .get("type")

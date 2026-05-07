@@ -1,0 +1,753 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CLAURST</title>
+    <meta name="description" content="Your favorite Terminal Coding Agent, now in Rust.">
+
+    <!-- Open Graph -->
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://claurst.kuber.studio/">
+    <meta property="og:title" content="CLAURST">
+    <meta property="og:description" content="Your favorite Terminal Coding Agent, now in Rust.">
+    <meta property="og:image" content="https://claurst.kuber.studio/public/social-image.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+
+    <!-- Twitter Card -->
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:url" content="https://claurst.kuber.studio/">
+    <meta name="twitter:title" content="CLAURST">
+    <meta name="twitter:description" content="Your favorite Terminal Coding Agent, now in Rust.">
+    <meta name="twitter:image" content="https://claurst.kuber.studio/public/social-image.png">
+
+    <link rel="icon" type="image/png" href="public/Rustle.png">
+    
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet">
+    
+    <style>
+        :root {
+            --bg: #030303;
+            --surface: #0a0a0a;
+            --surface-border: rgba(255, 255, 255, 0.12);
+            --crosshair: rgba(255, 255, 255, 0.4);
+            --text-primary: #ffffff;
+            --text-secondary: #a3a3a3;
+            --text-muted: #525252;
+            --accent: #e91e63;
+            --accent-shy: rgba(233, 30, 99, 0.2);
+            --font-mono: 'JetBrains Mono', monospace;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        html {
+            /* 10% explicit zoom/scale out */
+            font-size: 90%; 
+        }
+
+        body {
+            background-color: var(--bg);
+            color: var(--text-primary);
+            font-family: var(--font-mono);
+            line-height: 1.6;
+            overflow: hidden;
+            height: 100vh;
+            min-height: 100dvh;
+        }
+
+        ::selection {
+            background-color: var(--accent-shy);
+            color: var(--text-primary);
+        }
+
+        ::-webkit-scrollbar {
+            width: 3px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--accent);
+            border-radius: 99px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #ff2a76;
+        }
+
+        * {
+            scrollbar-width: thin;
+            scrollbar-color: var(--accent) transparent;
+        }
+
+        .bg-grid {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background-image: 
+                linear-gradient(to right, rgba(255,255,255,0.02) 1px, transparent 1px),
+                linear-gradient(to bottom, rgba(255,255,255,0.02) 1px, transparent 1px);
+            background-size: 40px 40px;
+            z-index: -2;
+            pointer-events: none;
+        }
+
+        .bg-glow {
+            position: fixed;
+            top: 0vw;
+            left: 20vw;
+            width: 60vw;
+            height: 60vh;
+            background: radial-gradient(ellipse at center, var(--accent-shy) 0%, transparent 70%);
+            opacity: 0.15;
+            z-index: -1;
+            pointer-events: none;
+            filter: blur(100px);
+        }
+
+        .container-wrapper {
+            height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1rem;
+        }
+
+        .container {
+            max-width: 900px;
+            width: 100%;
+            height: 100%;
+            max-height: 900px;
+            margin: 0 auto;
+            position: relative;
+            border-left: 1px solid var(--surface-border);
+            border-right: 1px solid var(--surface-border);
+            display: flex;
+            flex-direction: column;
+        }
+
+        .grid-section {
+            border-bottom: 1px solid var(--surface-border);
+            position: relative;
+        }
+        
+        .grid-section.top-border {
+            border-top: 1px solid var(--surface-border);
+        }
+
+        .grid-section::after, .grid-section::before, 
+        .grid-section.top-border .cross-top-left, .grid-section.top-border .cross-top-right {
+            content: '';
+            position: absolute;
+            width: 9px;
+            height: 9px;
+            background: 
+              linear-gradient(var(--crosshair), var(--crosshair)) center/1px 100% no-repeat,
+              linear-gradient(var(--crosshair), var(--crosshair)) center/100% 1px no-repeat;
+            z-index: 10;
+        }
+
+        .grid-section::before { bottom: -5px; left: -5px; } 
+        .grid-section::after { bottom: -5px; right: -5px; } 
+        
+        .cross-top-left { top: -5px; left: -5px; }
+        .cross-top-right { top: -5px; right: -5px; }
+
+        /* Navigation */
+        nav {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 2rem 2rem;
+            z-index: 100;
+        }
+
+        .nav-left {
+            display: flex;
+            align-items: center;
+            gap: 0.8rem;
+        }
+
+        .nav-logo {
+            width: 32px;
+            height: 32px;
+        }
+
+        .nav-brand {
+            font-size: 1.25rem;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            color: var(--text-primary);
+        }
+
+        .nav-links {
+            display: flex;
+            align-items: center;
+            gap: 2rem;
+            font-size: 0.85rem;
+        }
+
+        .nav-links a, .footer-links a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            transition: color 0.2s ease;
+        }
+
+        .nav-links a:hover.plain-link, .footer-links a:hover.plain-link {
+            color: var(--text-primary);
+        }
+
+        .nav-btn-pink {
+            background: var(--accent);
+            color: var(--text-primary) !important;
+            padding: 0.5rem 1rem;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-weight: 500;
+            transition: all 0.2s ease;
+        }
+
+        .nav-btn-pink:hover {
+            background: #ff2a76;
+            color: #fff !important;
+            box-shadow: 0 0 15px var(--accent-shy);
+        }
+
+        /* Hero */
+        main.grid-section {
+            flex: 3;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+
+        section.grid-section {
+            flex: 2;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+
+        .hero-wrapper {
+            padding: 0 2rem;
+        }
+
+        h1.hero-title {
+            font-size: clamp(2.5rem, 6vw, 4rem);
+            font-weight: 500;
+            line-height: 1.2;
+            letter-spacing: -0.02em;
+            margin-bottom: 1.5rem;
+            color: var(--text-primary);
+        }
+
+        .hero-desc {
+            font-size: clamp(1rem, 2vw, 1.15rem);
+            color: var(--text-secondary);
+            line-height: 1.6;
+            max-width: 650px;
+        }
+
+        /* Downloads List */
+        .downloads-wrapper {
+            padding: 2rem;
+            display: flex;
+            justify-content: center;
+            flex-direction: column;
+        }
+        /* Quick Install Terminal Box */
+        .cmd-box {
+            background: rgba(0, 0, 0, 0.4);
+            border: 1px solid var(--surface-border);
+            border-radius: 6px;
+            margin-top: 1rem;
+            backdrop-filter: blur(10px);
+            position: relative;
+        }
+
+        .cmd-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.75rem 1.25rem;
+            border-bottom: 1px solid var(--surface-border);
+            background: rgba(255, 255, 255, 0.02);
+        }
+
+        .cmd-dots {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .cmd-dots span {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+        
+        .cmd-dots span:nth-child(1) { background: #ff5f56; }
+        .cmd-dots span:nth-child(2) { background: #ffbd2e; }
+        .cmd-dots span:nth-child(3) { background: #27c93f; }
+
+        .cmd-tabs {
+            display: flex;
+            gap: 0.75rem;
+        }
+
+        .os-tab {
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            font-size: 0.8rem;
+            font-family: var(--font-mono);
+            cursor: pointer;
+            padding: 0.3rem 0.6rem;
+            border-radius: 4px;
+            transition: all 0.2s;
+        }
+
+        .os-tab:hover {
+            color: var(--text-primary);
+        }
+
+        .os-tab.active {
+            color: var(--bg);
+            background: var(--text-primary);
+        }
+
+        .cmd-body {
+            padding: 1.5rem 1.25rem;
+            font-size: 0.85rem;
+            color: var(--text-primary);
+            position: relative;
+            overflow-x: auto;
+        }
+
+        .cmd-comment {
+            color: var(--text-secondary);
+            margin-bottom: 1rem;
+            display: block;
+            opacity: 0.7;
+        }
+
+        .cmd-line {
+            display: flex;
+            align-items: flex-start;
+            font-family: var(--font-mono);
+            line-height: 1.6;
+        }
+
+        .cmd-prompt {
+            color: var(--accent);
+            margin-right: 1.25rem;
+            user-select: none;
+        }
+
+        .cmd-code {
+            color: var(--text-primary);
+            flex: 1;
+            word-break: break-all;
+        }
+
+        .cmd-copy {
+            position: absolute;
+            top: 1.25rem;
+            right: 1.25rem;
+            background: rgba(255,255,255,0.03);
+            border: 1px solid var(--surface-border);
+            color: var(--text-muted);
+            padding: 0.4rem;
+            border-radius: 4px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+        }
+
+        .cmd-copy:hover {
+            color: var(--text-primary);
+            background: rgba(255,255,255,0.1);
+        }
+        /* Footer Grid */
+        .footer-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            color: var(--text-muted);
+        }
+
+        .footer-item {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1.5rem 1rem;
+            border-right: 1px solid var(--surface-border);
+            text-decoration: none;
+            transition: all 0.2s ease;
+        }
+
+        div.footer-item {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+
+        a.footer-item {
+            font-size: 1rem;
+            font-weight: 500;
+            color: #d4d4d4;
+        }
+
+        .footer-item:last-child {
+            border-right: none;
+        }
+
+        a.footer-item:hover {
+            color: #ffffff;
+            background: #ff2a76;
+        }
+
+        .fade-in {
+            opacity: 0;
+            animation: fadeIn 0.8s ease forwards;
+        }
+        .d-1 { animation-delay: 0.1s; }
+        .d-2 { animation-delay: 0.2s; }
+        .d-3 { animation-delay: 0.3s; }
+
+        @keyframes fadeIn {
+            to { opacity: 1; }
+        }
+
+        @media (max-width: 768px) {
+            body {
+                overflow-y: auto;
+                height: auto;
+                min-height: 100dvh;
+            }
+
+            .container-wrapper {
+                height: auto;
+                min-height: 100dvh;
+                padding: 0.5rem;
+                align-items: stretch;
+            }
+
+            .container {
+                height: auto;
+                max-height: none;
+                min-height: 100%;
+            }
+
+            nav {
+                padding: 1rem 1rem;
+            }
+
+            .nav-brand {
+                font-size: 1rem;
+            }
+
+            .nav-logo {
+                width: 26px;
+                height: 26px;
+            }
+
+            .hero-wrapper {
+                padding: 1rem 1rem 1.5rem;
+            }
+
+            h1.hero-title {
+                font-size: clamp(1.6rem, 7vw, 2.2rem);
+                margin-bottom: 1rem;
+            }
+
+            .hero-desc {
+                font-size: 0.9rem;
+            }
+
+            main.grid-section {
+                padding: 0.5rem 0;
+            }
+
+            .downloads-wrapper {
+                padding: 1rem;
+            }
+
+            .cmd-body {
+                padding: 1.25rem 1rem;
+                font-size: 0.78rem;
+            }
+
+            .cmd-comment {
+                margin-bottom: 0.75rem;
+            }
+
+            .cmd-copy {
+                top: 1rem;
+                right: 1rem;
+            }
+
+            /* Keep footer as 3-column row on mobile */
+            .footer-grid {
+                grid-template-columns: repeat(3, 1fr);
+            }
+
+            .footer-item {
+                border-right: 1px solid var(--surface-border);
+                border-bottom: none;
+                padding: 1rem 0.4rem;
+                font-size: 0.75rem;
+            }
+
+            a.footer-item {
+                font-size: 0.75rem;
+                font-weight: 500;
+            }
+
+            div.footer-item {
+                font-size: 0.7rem;
+            }
+
+            .footer-item:last-child {
+                border-right: none;
+            }
+        }
+
+        @media (max-width: 400px) {
+            h1.hero-title {
+                font-size: 1.4rem;
+            }
+
+            .nav-btn-pink {
+                font-size: 0.75rem;
+                padding: 0.4rem 0.75rem;
+            }
+
+            .cmd-tabs {
+                gap: 0.4rem;
+            }
+
+            .os-tab {
+                font-size: 0.72rem;
+                padding: 0.25rem 0.4rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="bg-grid"></div>
+    <div class="bg-glow"></div>
+
+    <div class="container-wrapper">
+        <div class="container">
+            
+            <header class="grid-section top-border">
+                <div class="cross-top-left"></div>
+                <div class="cross-top-right"></div>
+                <nav>
+                    <div class="nav-left">
+                        <img src="public/Rustle.png" alt="Rustle" class="nav-logo">
+                        <div class="nav-brand">CLAURST</div>
+                    </div>
+                    <div class="nav-links">
+                        <a href="https://github.com/Kuberwastaken/claurst/releases" class="nav-btn-pink">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                                <polyline points="7 10 12 15 17 10"></polyline>
+                                <line x1="12" y1="15" x2="12" y2="3"></line>
+                            </svg>
+                            Download
+                        </a>
+                    </div>
+                </nav>
+            </header>
+
+            <main class="grid-section">
+                <div class="hero-wrapper">
+                    <h1 class="hero-title fade-in d-1">Your favorite Terminal Coding Agent,<br>now in Rust.</h1>
+                    <p class="hero-desc fade-in d-2">
+                        Fast, efficient, and native.
+                    </p>
+                </div>
+            </main>
+            <section class="grid-section">
+                <div class="downloads-wrapper fade-in d-3">
+                    <div class="cmd-box">
+                        <div class="cmd-header">
+                            <div class="cmd-dots">
+                                <span></span><span></span><span></span>
+                            </div>
+                            <div class="cmd-tabs">
+                                <button class="os-tab active" data-os="macOS">macOS</button>
+                                <button class="os-tab" data-os="Linux">Linux</button>
+                                <button class="os-tab" data-os="Windows">Windows</button>
+                            </div>
+                        </div>
+                        <div class="cmd-body">
+                            <button class="cmd-copy" id="cmd-copy-btn" title="Copy to clipboard">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                            </button>
+                            <span class="cmd-comment" id="cmd-comment-text"># macOS (Apple Silicon). Download and extract.</span>
+                            <div class="cmd-line">
+                                <span class="cmd-prompt">$</span>
+                                <span class="cmd-code" id="cmd-code-text">curl -Lo claurst.tar.gz https://github.com/Kuberwastaken/claurst/releases/latest/download/claurst-macos-aarch64.tar.gz && tar xzf claurst.tar.gz && chmod +x claurst && xattr -rd com.apple.quarantine claurst</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <footer class="grid-section footer-grid">
+                <a href="docs/" class="footer-item">Docs</a>
+                <div class="footer-item">&copy; 2026 Claurst</div>
+                <a href="https://github.com/Kuberwastaken/claurst" target="_blank" rel="noopener" class="footer-item">GitHub [<span id="star-count">--</span>]</a>
+            </footer>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener("DOMContentLoaded", () => {
+            // Live Stars
+            fetch('https://api.github.com/repos/Kuberwastaken/claurst')
+                .then(res => res.json())
+                .then(data => {
+                    if (data.stargazers_count !== undefined) {
+                        document.getElementById('star-count').innerText = data.stargazers_count;
+                    }
+                })
+                .catch(err => console.error(err));
+            // OS Detection and Command UI Setup
+            const commands = {
+                'mac-arm': {
+                    comment: '# macOS (Apple Silicon). Download and extract.',
+                    code: 'curl -Lo claurst.tar.gz https://github.com/Kuberwastaken/claurst/releases/latest/download/claurst-macos-aarch64.tar.gz && tar xzf claurst.tar.gz && chmod +x claurst && xattr -rd com.apple.quarantine claurst'
+                },
+                'mac-intel': {
+                    comment: '# macOS (Intel). Download and extract.',
+                    code: 'curl -Lo claurst.tar.gz https://github.com/Kuberwastaken/claurst/releases/latest/download/claurst-macos-x86_64.tar.gz && tar xzf claurst.tar.gz && chmod +x claurst && xattr -rd com.apple.quarantine claurst'
+                },
+                'linux-x64': {
+                    comment: '# Linux (x86_64). Download and extract.',
+                    code: 'curl -Lo claurst.tar.gz https://github.com/Kuberwastaken/claurst/releases/latest/download/claurst-linux-x86_64.tar.gz && tar xzf claurst.tar.gz && chmod +x claurst'
+                },
+                'linux-arm': {
+                    comment: '# Linux (aarch64). Download and extract.',
+                    code: 'curl -Lo claurst.tar.gz https://github.com/Kuberwastaken/claurst/releases/latest/download/claurst-linux-aarch64.tar.gz && tar xzf claurst.tar.gz && chmod +x claurst'
+                },
+                'windows': {
+                    comment: '# Windows. Download and extract.',
+                    code: 'Invoke-WebRequest -Uri "https://github.com/Kuberwastaken/claurst/releases/latest/download/claurst-windows-x86_64.zip" -OutFile "claurst.zip"; Expand-Archive claurst.zip -DestinationPath .'
+                }
+            };
+
+            function detectMacArch() {
+                // The macOS UA string lies — Apple Silicon browsers still report "Intel Mac OS X"
+                // for compat. Use the WebGL renderer instead: Apple Silicon GPUs identify as
+                // "Apple GPU" / "Apple M*" / "ANGLE (Apple, ...)", Intel Macs report Intel/AMD/NVIDIA.
+                try {
+                    const canvas = document.createElement('canvas');
+                    const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+                    if (gl) {
+                        const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+                        const renderer = (dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)) || '';
+                        if (/apple/i.test(renderer)) return 'arm';
+                        if (/(intel|amd|radeon|nvidia|geforce)/i.test(renderer)) return 'intel';
+                    }
+                } catch (_) {}
+                if (navigator.userAgentData && navigator.userAgentData.architecture) {
+                    return navigator.userAgentData.architecture === 'arm' ? 'arm' : 'intel';
+                }
+                return 'arm';
+            }
+
+            function detectOS() {
+                const ua = navigator.userAgent || '';
+                const platform = navigator.platform || '';
+
+                if (/Win/i.test(platform) || /Win/i.test(ua)) return 'windows';
+                if (/Mac/i.test(platform) || /Mac/i.test(ua)) {
+                    return detectMacArch() === 'intel' ? 'mac-intel' : 'mac-arm';
+                }
+                if (/Linux/i.test(platform) || /Linux/i.test(ua)) {
+                    if (/aarch64|arm/i.test(ua) || /aarch64|arm/i.test(platform)) return 'linux-arm';
+                    return 'linux-x64';
+                }
+                return 'mac-arm';
+            }
+
+            let currentOsKey = detectOS();
+            
+            const baseTabMap = {
+                'windows': 'Windows',
+                'mac-arm': 'macOS',
+                'mac-intel': 'macOS',
+                'linux-x64': 'Linux',
+                'linux-arm': 'Linux'
+            };
+            
+            const fallbackMap = {
+                'Windows': 'windows',
+                'macOS': 'mac-arm',
+                'Linux': 'linux-x64'
+            };
+
+            function updateCmdUI(osKey) {
+                const data = commands[osKey];
+                if (!data) return;
+                
+                document.getElementById('cmd-comment-text').innerText = data.comment;
+                document.getElementById('cmd-code-text').innerText = data.code;
+                
+                const expectedTab = baseTabMap[osKey];
+                document.querySelectorAll('.os-tab').forEach(tab => {
+                    if(tab.getAttribute('data-os') === expectedTab) {
+                        tab.classList.add('active');
+                    } else {
+                        tab.classList.remove('active');
+                    }
+                });
+            }
+
+            updateCmdUI(currentOsKey);
+
+            document.querySelectorAll('.os-tab').forEach(tab => {
+                tab.addEventListener('click', (e) => {
+                    const tabName = e.target.getAttribute('data-os');
+                    let targetOsKey = fallbackMap[tabName];
+                    if (baseTabMap[currentOsKey] === tabName) {
+                        targetOsKey = currentOsKey;
+                    }
+                    updateCmdUI(targetOsKey);
+                });
+            });
+
+            const copyBtn = document.getElementById('cmd-copy-btn');
+            if (copyBtn) {
+                copyBtn.addEventListener('click', () => {
+                    const code = document.getElementById('cmd-code-text').innerText;
+                    navigator.clipboard.writeText(code).then(() => {
+                        const originalHtml = copyBtn.innerHTML;
+                        copyBtn.innerHTML = '<span style="color:var(--text-primary); font-size:0.75rem; font-family:var(--font-mono);">Copied</span>';
+                        setTimeout(() => {
+                            copyBtn.innerHTML = originalHtml;
+                        }, 2000);
+                    });
+                });
+            }
+        });
+    </script>
+</body>
+</html>

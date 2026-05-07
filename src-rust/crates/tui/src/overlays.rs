@@ -420,6 +420,7 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
         ("Ctrl+C",          "Cancel / quit"),
         ("Ctrl+D",          "Quit (empty input)"),
         ("Ctrl+L",          "Clear screen"),
+        ("t",               "Expand/collapse thinking"),
     ] {
         left_lines.push(kb_line(key, desc));
     }

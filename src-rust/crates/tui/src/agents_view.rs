@@ -19,6 +19,18 @@ use crate::overlays::{
 // Data types
 // ---------------------------------------------------------------------------
 
+/// The role of an agent in the manager-executor architecture.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgentRole {
+    Normal,
+    Manager,
+    Executor { parent_id: String },
+}
+
+impl Default for AgentRole {
+    fn default() -> Self { AgentRole::Normal }
+}
+
 /// The current status of a sub-agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentStatus {
@@ -68,6 +80,13 @@ pub struct AgentInfo {
     pub is_coordinator: bool,
     /// Brief description or last output snippet.
     pub last_output: Option<String>,
+    /// Role in the managed agent architecture.
+    #[allow(dead_code)]
+    pub agent_role: AgentRole,
+    /// Model name used by this agent.
+    pub model_name: Option<String>,
+    /// Cost in USD accumulated by this agent.
+    pub cost_usd: f64,
 }
 
 /// A defined agent (from .claurst/agents/*.md or plugin).
@@ -879,16 +898,44 @@ pub fn render_coordinator_status(agents: &[AgentInfo], area: Rect, buf: &mut Buf
             height: 1,
         };
 
-        let prefix = if agent.is_coordinator { "● " } else { "  ○ " };
+        let (prefix, role_badge, role_color, indent) = match &agent.agent_role {
+            AgentRole::Manager => ("● ", "[MGR]", Color::Magenta, ""),
+            AgentRole::Executor { .. } => ("  ○ ", "[EXE]", Color::Cyan, "  "),
+            AgentRole::Normal => {
+                if agent.is_coordinator {
+                    ("● ", "", Color::Green, "")
+                } else {
+                    ("  ○ ", "", Color::DarkGray, "  ")
+                }
+            }
+        };
         let tool_str = agent
             .current_tool
             .as_deref()
             .map(|t| format!(" → {}", t))
             .unwrap_or_default();
+        let model_str = agent.model_name.as_deref()
+            .map(|m| format!(" ({})", m))
+            .unwrap_or_default();
+        let cost_str = if agent.cost_usd > 0.0 {
+            format!("  ${:.4}", agent.cost_usd)
+        } else {
+            String::new()
+        };
 
-        let line = Line::from(vec![
+        let mut spans = vec![
+            Span::styled(indent.to_string(), Style::default()),
             Span::styled(prefix, Style::default().fg(agent.status.color())),
+        ];
+        if !role_badge.is_empty() {
+            spans.push(Span::styled(
+                format!("{} ", role_badge),
+                Style::default().fg(role_color).add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans.extend(vec![
             Span::styled(agent.name.clone(), Style::default().fg(Color::White)),
+            Span::styled(model_str, Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format!(" [{}]", agent.status.label()),
                 Style::default().fg(agent.status.color()),
@@ -898,8 +945,10 @@ pub fn render_coordinator_status(agents: &[AgentInfo], area: Rect, buf: &mut Buf
                 Style::default().fg(Color::DarkGray),
             ),
             Span::styled(tool_str, Style::default().fg(Color::Yellow)),
+            Span::styled(cost_str, Style::default().fg(Color::DarkGray)),
         ]);
 
+        let line = Line::from(spans);
         Paragraph::new(line).render(row_area, buf);
     }
 }

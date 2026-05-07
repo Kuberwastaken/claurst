@@ -5,8 +5,8 @@
 // name is expected (and vice-versa).
 
 use serde::{Deserialize, Serialize};
-use std::ops::Deref;
 use std::fmt;
+use std::ops::Deref;
 
 // ---------------------------------------------------------------------------
 // ProviderId
@@ -59,6 +59,7 @@ impl ProviderId {
     pub const SILICONFLOW: &'static str = "siliconflow";
     pub const MOONSHOT: &'static str = "moonshotai";
     pub const ZHIPU: &'static str = "zhipuai";
+    pub const ZAI: &'static str = "zai";
     pub const NEBIUS: &'static str = "nebius";
     pub const OVHCLOUD: &'static str = "ovhcloud";
     pub const SCALEWAY: &'static str = "scaleway";
@@ -69,7 +70,9 @@ impl ProviderId {
     pub const STEPFUN: &'static str = "stepfun";
     pub const FIREWORKS: &'static str = "fireworks";
     pub const NOVITA: &'static str = "novita";
+    pub const MINIMAX: &'static str = "minimax";
     pub const CODEX: &'static str = "codex";
+    pub const OPENCODE_GO: &'static str = "opencode-go";
 }
 
 impl fmt::Display for ProviderId {

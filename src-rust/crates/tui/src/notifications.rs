@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 use crate::overlays::{
-    CLAURST_ACCENT, CLAURST_MUTED, CLAURST_PANEL_BG, CLAURST_PANEL_BORDER, CLAURST_TEXT,
+    CLAURST_ACCENT, CLAURST_MUTED, CLAURST_PANEL_BORDER, CLAURST_TEXT,
 };
 
 /// Severity / visual style of a notification.
@@ -125,80 +125,146 @@ impl NotificationKind {
     }
 }
 
-/// Render the topmost notification as a floating banner at the top of `area`.
+/// Render the topmost notification as a floating toast at the top-right of `area`.
+///
+/// Layout (3 rows):
+///   row 0: ▐ [icon] [message truncated]          [Esc] ▌
+///   row 1: ▐ [progress bar for timed notifs]            ▌
+///   row 2: (bottom border row, blank)
 pub fn render_notification_banner(frame: &mut Frame, queue: &NotificationQueue, area: Rect) {
     let notif = match queue.current() {
         Some(n) => n,
         None => return,
     };
 
-    // One-line banner across the top of the provided area, inset slightly.
-    let banner_width = area.width.saturating_sub(6);
-    let banner_area = Rect {
-        x: area.x + 3,
-        y: area.y + 1,
-        width: banner_width,
-        height: 1,
-    };
-
-    // Only draw if there's room
-    if area.height < 3 || banner_width < 16 {
+    // Toast width: 48 cols max, right-aligned with a 2-col right margin.
+    let toast_width = 52u16.min(area.width.saturating_sub(4));
+    if area.height < 4 || toast_width < 20 {
         return;
     }
+    let toast_height = 3u16;
+    let toast_area = Rect {
+        x: area.x + area.width.saturating_sub(toast_width + 2),
+        y: area.y + 1,
+        width: toast_width,
+        height: toast_height,
+    };
 
     let color = notif.kind.color();
     let icon = notif.kind.icon();
+    let bg = Color::Rgb(18, 18, 22); // slightly elevated from terminal bg
 
-    let mut spans = vec![
+    // Clear the area so the toast has a distinct background.
+    frame.render_widget(Clear, toast_area);
+
+    // ── Row 0: icon + message + optional "Esc" hint ──
+    let inner_w = toast_width.saturating_sub(4) as usize; // 2 side bars + 1 pad each side
+    let esc_hint = "  esc";
+    let esc_len = if notif.dismissible { esc_hint.len() } else { 0 };
+    let msg_budget = inner_w.saturating_sub(3 + esc_len); // 3 = " X " icon+spaces
+    let message = if notif.message.chars().count() > msg_budget {
+        format!(
+            "{}…",
+            notif.message.chars().take(msg_budget.saturating_sub(1)).collect::<String>()
+        )
+    } else {
+        notif.message.clone()
+    };
+
+    let mut row0_spans = vec![
         Span::styled(format!(" {} ", icon), Style::default().fg(color).add_modifier(Modifier::BOLD)),
-        Span::styled(notif.message.clone(), Style::default().fg(CLAURST_TEXT).add_modifier(Modifier::BOLD)),
+        Span::styled(message, Style::default().fg(CLAURST_TEXT)),
     ];
     if notif.dismissible {
-        spans.push(Span::styled("  Esc dismiss", Style::default().fg(CLAURST_MUTED)));
+        row0_spans.push(Span::styled(esc_hint, Style::default().fg(CLAURST_MUTED)));
     }
 
-    let content_width = spans.iter().map(|span| span.content.len()).sum::<usize>();
-    if content_width > banner_width.saturating_sub(2) as usize {
-        spans = vec![
-            Span::styled(format!(" {} ", icon), Style::default().fg(color).add_modifier(Modifier::BOLD)),
-            Span::styled(
-                format!(
-                    "{}…",
-                    notif.message
-                        .chars()
-                        .take(banner_width.saturating_sub(6) as usize)
-                        .collect::<String>()
-                ),
-                Style::default().fg(CLAURST_TEXT).add_modifier(Modifier::BOLD),
-            ),
-        ];
-    }
-    let line = Line::from(spans);
+    // ── Row 1: thin progress bar for timed notifications ──
+    let progress_line = if let Some(exp) = notif.expires_at {
+        let now = Instant::now();
+        let remaining = if exp > now { (exp - now).as_millis() } else { 0 };
+        // We don't store total duration, so derive from a fixed 5s assumption.
+        // Clamp to [0,1] so the bar can't overflow.
+        let frac = (remaining as f64 / 5_000.0).min(1.0);
+        let bar_w = (inner_w as f64 * frac) as usize;
+        let bar_w = bar_w.min(inner_w);
+        let filled: String = "─".repeat(bar_w);
+        let empty: String = " ".repeat(inner_w.saturating_sub(bar_w));
+        Line::from(vec![
+            Span::styled(format!(" {}", filled), Style::default().fg(color)),
+            Span::styled(empty, Style::default().fg(CLAURST_MUTED)),
+            Span::raw(" "),
+        ])
+    } else {
+        Line::from(Span::styled(
+            format!(" {}", "─".repeat(inner_w)),
+            Style::default().fg(CLAURST_PANEL_BORDER),
+        ))
+    };
 
-    frame.render_widget(Clear, banner_area);
-    let para = Paragraph::new(line).style(
-        Style::default()
-            .bg(CLAURST_PANEL_BG)
-            .fg(CLAURST_TEXT)
-            .add_modifier(Modifier::BOLD),
-    );
-    frame.render_widget(para, banner_area);
+    // Render rows
+    let buf = frame.buffer_mut();
 
-    if banner_area.width >= 3 {
-        if let Some(cell) = frame.buffer_mut().cell_mut((banner_area.x, banner_area.y)) {
-            cell.set_bg(CLAURST_PANEL_BG);
-            cell.set_fg(CLAURST_PANEL_BORDER);
+    // Helper: paint a full row with bg color
+    let paint_row = |buf: &mut ratatui::buffer::Buffer, row: u16| {
+        for col in 0..toast_width {
+            if let Some(cell) = buf.cell_mut((toast_area.x + col, toast_area.y + row)) {
+                cell.set_bg(bg);
+            }
+        }
+    };
+    paint_row(buf, 0);
+    paint_row(buf, 1);
+    paint_row(buf, 2);
+
+    // Left accent bar (all 3 rows)
+    for row in 0..toast_height {
+        if let Some(cell) = buf.cell_mut((toast_area.x, toast_area.y + row)) {
+            cell.set_bg(bg);
+            cell.set_fg(color);
             cell.set_char('▌');
         }
-        if let Some(cell) = frame
-            .buffer_mut()
-            .cell_mut((banner_area.x.saturating_add(banner_area.width - 1), banner_area.y))
-        {
-            cell.set_bg(CLAURST_PANEL_BG);
+    }
+    // Right border bar (all 3 rows)
+    for row in 0..toast_height {
+        if let Some(cell) = buf.cell_mut((toast_area.x + toast_width - 1, toast_area.y + row)) {
+            cell.set_bg(bg);
             cell.set_fg(CLAURST_PANEL_BORDER);
             cell.set_char('▐');
         }
     }
+
+    // Row 0: message
+    let msg_rect = Rect {
+        x: toast_area.x + 1,
+        y: toast_area.y,
+        width: toast_width.saturating_sub(2),
+        height: 1,
+    };
+    let para0 = Paragraph::new(Line::from(row0_spans)).style(Style::default().bg(bg));
+    frame.render_widget(para0, msg_rect);
+
+    // Row 1: progress / divider
+    let prog_rect = Rect {
+        x: toast_area.x + 1,
+        y: toast_area.y + 1,
+        width: toast_width.saturating_sub(2),
+        height: 1,
+    };
+    let para1 = Paragraph::new(progress_line).style(Style::default().bg(bg));
+    frame.render_widget(para1, prog_rect);
+
+    // Row 2: blank bottom padding
+    let pad_rect = Rect {
+        x: toast_area.x + 1,
+        y: toast_area.y + 2,
+        width: toast_width.saturating_sub(2),
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new("").style(Style::default().bg(bg)),
+        pad_rect,
+    );
 }
 
 #[cfg(test)]

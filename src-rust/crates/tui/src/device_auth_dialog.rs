@@ -49,6 +49,9 @@ pub struct DeviceAuthDialogState {
     pub verification_uri: String,
     pub device_code: String,
     pub interval: u64,
+    /// OAuth URL for browser-based flows (Codex). Shown in the dialog so the
+    /// user can copy-paste it when automatic browser launch fails.
+    pub auth_url: String,
 }
 
 impl DeviceAuthDialogState {
@@ -62,6 +65,7 @@ impl DeviceAuthDialogState {
             verification_uri: String::new(),
             device_code: String::new(),
             interval: 5,
+            auth_url: String::new(),
         }
     }
 
@@ -80,6 +84,14 @@ impl DeviceAuthDialogState {
     pub fn close(&mut self) {
         self.visible = false;
         self.status = DeviceAuthStatus::Idle;
+        self.auth_url.clear();
+    }
+
+    /// Switch to BrowserAuth status and store the URL so the dialog can
+    /// display it as a copy-paste fallback.
+    pub fn set_browser_url(&mut self, url: String) {
+        self.auth_url = url;
+        self.status = DeviceAuthStatus::BrowserAuth;
     }
 
     /// Set the device code information received from the authorization server.
@@ -128,6 +140,11 @@ pub enum DeviceAuthEvent {
         device_code: String,
         interval: u64,
     },
+    /// Browser-based OAuth URL is ready — display it so the user can open it
+    /// manually if the automatic browser launch failed.
+    GotBrowserUrl {
+        url: String,
+    },
     /// Access token obtained — auth succeeded.
     TokenReceived(String),
     /// Something went wrong.
@@ -157,9 +174,14 @@ pub fn render_device_auth_dialog(
     // ── Darken the entire background ──
     render_dark_overlay(frame, area);
 
-    // ── Dialog size ──
-    let width = 56u16.min(area.width.saturating_sub(4));
-    let height = 14u16;
+    // ── Dialog size — taller when showing a browser URL ──
+    let width = 64u16.min(area.width.saturating_sub(4));
+    let height = if matches!(state.status, DeviceAuthStatus::BrowserAuth) && !state.auth_url.is_empty() {
+        let url_lines = (state.auth_url.len() as u16).saturating_add(width.saturating_sub(4) - 1) / width.saturating_sub(4).max(1);
+        (14 + url_lines + 2).min(area.height.saturating_sub(4))
+    } else {
+        14u16
+    };
     let dialog_area = centered_rect(width, height, area);
 
     // ── Fill dialog background (no border) ──
@@ -238,15 +260,40 @@ pub fn render_device_auth_dialog(
                 " Opening browser for authentication...",
                 Style::default().fg(Color::Yellow),
             )));
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                " Complete the login in your browser.",
-                Style::default().fg(dim),
-            )));
-            lines.push(Line::from(Span::styled(
-                " This dialog will update when done.",
-                Style::default().fg(dim),
-            )));
+            if !state.auth_url.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    " If browser didn't open, visit:",
+                    Style::default().fg(Color::Rgb(180, 180, 180)),
+                )));
+                lines.push(Line::from(""));
+                // Wrap URL to dialog width
+                let max_w = inner.width.saturating_sub(2) as usize;
+                for chunk in state.auth_url.as_bytes().chunks(max_w.max(1)) {
+                    let s = String::from_utf8_lossy(chunk).into_owned();
+                    lines.push(Line::from(Span::styled(
+                        format!(" {}", s),
+                        Style::default()
+                            .fg(pink)
+                            .add_modifier(Modifier::UNDERLINED),
+                    )));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    " (URL copied to clipboard)",
+                    Style::default().fg(dim),
+                )));
+            } else {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    " Complete the login in your browser.",
+                    Style::default().fg(dim),
+                )));
+                lines.push(Line::from(Span::styled(
+                    " This dialog will update when done.",
+                    Style::default().fg(dim),
+                )));
+            }
         }
         DeviceAuthStatus::Success(_) => {
             lines.push(Line::from(""));

@@ -1,0 +1,38 @@
+{
+  "name": "claurst-rust",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": false,
+      "username": "vscode",
+      "uid": "1000",
+      "gid": "1000"
+    },
+    "ghcr.io/devcontainers/features/git:1": {},
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+      "moby": false
+    }
+  },
+  "remoteUser": "vscode",
+  "mounts": [
+    "source=claurst-cargo-registry,target=/usr/local/cargo/registry,type=volume",
+    "source=claurst-cargo-git,target=/usr/local/cargo/git,type=volume",
+    "source=${localWorkspaceFolder}/.claurst,target=/home/vscode/.claurst,type=bind"
+  ],
+  "remoteEnv": {
+    "GNUPGHOME": "/home/vscode/.gnupg",
+    "PATH": "${containerWorkspaceFolder}/src-rust/target/debug:${containerWorkspaceFolder}/src-rust/target/release:${containerEnv:PATH}"
+  },
+  "postCreateCommand": "mkdir -p /home/vscode/.gnupg && chmod 700 /home/vscode/.gnupg && sudo chown -R vscode:vscode /usr/local/cargo",
+  "customizations": {
+    "vscode": {
+      "extensions": [],
+      "settings": {
+        "terminal.integrated.inheritEnv": true
+      }
+    }
+  }
+}

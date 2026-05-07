@@ -998,7 +998,14 @@ impl LlmProvider for OpenAiProvider {
                     id: ModelId::new(id),
                     provider_id: provider_id.clone(),
                     name: id.to_string(),
-                    context_window: 128_000,
+                    context_window: match id {
+                        "gpt-5" | "gpt-5.4" | "gpt-5.2" | "gpt-5-mini" | "gpt-5-nano"
+                        | "gpt-5-chat-latest"
+                        | "gpt-5.2-codex" | "gpt-5.1-codex" | "gpt-5.1-codex-mini"
+                        | "gpt-5.1-codex-max" => 400_000,
+                        "o3" | "o3-mini" | "o4-mini" => 200_000,
+                        _ => 128_000,
+                    },
                     max_output_tokens: 16_384,
                 })
             })

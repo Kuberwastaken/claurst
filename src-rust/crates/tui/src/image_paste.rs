@@ -49,6 +49,18 @@ pub fn read_clipboard_text() -> Option<String> {
     }
 }
 
+/// Read text from the primary selection when supported (Linux/X11/Wayland).
+pub fn read_primary_text() -> Option<String> {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        None
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        read_primary_text_linux()
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn read_text_macos() -> Option<String> {
     let out = Command::new("pbpaste").output().ok()?;
@@ -61,13 +73,32 @@ fn read_text_macos() -> Option<String> {
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn read_text_linux() -> Option<String> {
-    // Try xclip first, then wl-paste (Wayland)
-    for (prog, args) in &[
-        ("xclip", vec!["-selection", "clipboard", "-o"]),
-        ("xsel", vec!["--clipboard", "--output"]),
-        ("wl-paste", vec!["--no-newline"]),
-    ] {
-        if let Ok(out) = Command::new(prog).args(args).output() {
+    read_text_linux_selection(false)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn read_primary_text_linux() -> Option<String> {
+    read_text_linux_selection(true)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn read_text_linux_selection(primary: bool) -> Option<String> {
+    let commands: &[(&str, &[&str])] = if primary {
+        &[
+            ("wl-paste", &["--primary", "--no-newline"]),
+            ("xclip", &["-selection", "primary", "-o"]),
+            ("xsel", &["--primary", "--output"]),
+        ]
+    } else {
+        &[
+            ("wl-paste", &["--no-newline"]),
+            ("xclip", &["-selection", "clipboard", "-o"]),
+            ("xsel", &["--clipboard", "--output"]),
+        ]
+    };
+
+    for (prog, args) in commands {
+        if let Ok(out) = Command::new(prog).args(*args).output() {
             if out.status.success() && !out.stdout.is_empty() {
                 return Some(String::from_utf8_lossy(&out.stdout).into_owned());
             }
@@ -326,14 +357,32 @@ fn write_text_windows_w(text: &str) -> bool {
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn write_text_linux_w(text: &str) -> bool {
+    let clipboard_ok = write_text_linux_selection(text, false);
+    let primary_ok = write_text_linux_selection(text, true);
+    clipboard_ok || primary_ok
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn write_text_linux_selection(text: &str, primary: bool) -> bool {
     use std::io::Write;
     use std::process::Stdio;
-    for (prog, args) in &[
-        ("xclip", vec!["-selection", "clipboard"]),
-        ("xsel", vec!["--clipboard", "--input"]),
-        ("wl-copy", vec![]),
-    ] {
-        if let Ok(mut child) = Command::new(prog).args(args).stdin(Stdio::piped()).spawn() {
+
+    let commands: &[(&str, &[&str])] = if primary {
+        &[
+            ("wl-copy", &["--primary"]),
+            ("xclip", &["-selection", "primary"]),
+            ("xsel", &["--primary", "--input"]),
+        ]
+    } else {
+        &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ]
+    };
+
+    for (prog, args) in commands {
+        if let Ok(mut child) = Command::new(prog).args(*args).stdin(Stdio::piped()).spawn() {
             if let Some(mut stdin) = child.stdin.take() {
                 let _ = stdin.write_all(text.as_bytes());
             }

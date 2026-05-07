@@ -203,7 +203,25 @@ pub fn load_memory_file(path: &Path, scope: MemoryScope) -> Option<MemoryFileInf
     })
 }
 
-/// Load all AGENTS.md files for the given project root, in priority order.
+/// Load memory files from a directory for a given scope.
+///
+/// Loads `AGENTS.md` first (primary/universal standard), then `CLAUDE.md` if
+/// present (Claude-specific additions or overrides). Either file may be absent.
+fn load_scope_files(dir: &Path, scope: MemoryScope, files: &mut Vec<MemoryFileInfo>) {
+    for name in &["AGENTS.md", "CLAUDE.md"] {
+        let path = dir.join(name);
+        if path.exists() {
+            if let Some(f) = load_memory_file(&path, scope) {
+                files.push(f);
+            }
+        }
+    }
+}
+
+/// Load all memory files for the given project root, in priority order.
+///
+/// At each scope `AGENTS.md` is loaded first (universal standard), followed by
+/// `CLAUDE.md` if present (Claude-specific context). Either or both may exist.
 ///
 /// Returned list is ordered: Managed (highest) → User → Project → Local.
 pub fn load_all_memory_files(project_root: &Path) -> Vec<MemoryFileInfo> {
@@ -228,30 +246,15 @@ pub fn load_all_memory_files(project_root: &Path) -> Vec<MemoryFileInfo> {
             }
         }
 
-        // 2. User: ~/.claurst/AGENTS.md
-        let user_claude = home.join(".claurst/AGENTS.md");
-        if user_claude.exists() {
-            if let Some(f) = load_memory_file(&user_claude, MemoryScope::User) {
-                files.push(f);
-            }
-        }
+        // 2. User: ~/.claurst/AGENTS.md then ~/.claurst/CLAUDE.md
+        load_scope_files(&home.join(".claurst"), MemoryScope::User, &mut files);
     }
 
-    // 3. Project: {project_root}/AGENTS.md
-    let project_claude = project_root.join("AGENTS.md");
-    if project_claude.exists() {
-        if let Some(f) = load_memory_file(&project_claude, MemoryScope::Project) {
-            files.push(f);
-        }
-    }
+    // 3. Project: {project_root}/AGENTS.md then {project_root}/CLAUDE.md
+    load_scope_files(project_root, MemoryScope::Project, &mut files);
 
-    // 4. Local: {project_root}/.claurst/AGENTS.md
-    let local_claude = project_root.join(".claurst/AGENTS.md");
-    if local_claude.exists() {
-        if let Some(f) = load_memory_file(&local_claude, MemoryScope::Local) {
-            files.push(f);
-        }
-    }
+    // 4. Local: {project_root}/.claurst/AGENTS.md then {project_root}/.claurst/CLAUDE.md
+    load_scope_files(&project_root.join(".claurst"), MemoryScope::Local, &mut files);
 
     files
 }
@@ -285,6 +288,31 @@ mod tests {
         let (fm, body) = parse_frontmatter(content);
         assert!(fm.memory_type.is_none());
         assert_eq!(body, content);
+    }
+
+    #[test]
+    fn load_scope_prefers_agents_then_claude() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "agents content").unwrap();
+        std::fs::write(tmp.path().join("CLAUDE.md"), "claude content").unwrap();
+
+        let files = load_all_memory_files(tmp.path());
+        // Filter to just the project-scope files from our temp dir.
+        let project: Vec<_> = files.iter().filter(|f| f.path.starts_with(tmp.path())).collect();
+        assert_eq!(project.len(), 2, "both AGENTS.md and CLAUDE.md should be loaded");
+        assert!(project[0].path.ends_with("AGENTS.md"), "AGENTS.md must come first");
+        assert!(project[1].path.ends_with("CLAUDE.md"), "CLAUDE.md must follow");
+    }
+
+    #[test]
+    fn load_scope_claudemd_only_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("CLAUDE.md"), "claude only").unwrap();
+
+        let files = load_all_memory_files(tmp.path());
+        let project: Vec<_> = files.iter().filter(|f| f.path.starts_with(tmp.path())).collect();
+        assert_eq!(project.len(), 1);
+        assert!(project[0].path.ends_with("CLAUDE.md"));
     }
 
     #[test]

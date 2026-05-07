@@ -813,16 +813,64 @@ fn build_advanced_lines(screen: &SettingsScreen) -> Vec<Line<'static>> {
     lines.push(Line::from(""));
 
     // API key source
-    let key_source = if cfg.api_key.is_some() {
-        "config file (masked)"
-    } else if std::env::var("ANTHROPIC_API_KEY").is_ok() {
-        "environment variable (ANTHROPIC_API_KEY)"
-    } else {
-        "not set"
+    let active_provider = cfg.selected_provider_id();
+    let env_source = claurst_core::config::api_key_env_vars_for_provider(active_provider)
+        .iter()
+        .find_map(|env_var| {
+            std::env::var(env_var)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|_| *env_var)
+        });
+    let stored_key = {
+        let auth_store = claurst_core::AuthStore::load();
+        let lookup_keys: Vec<&str> = match active_provider {
+            "togetherai" | "together-ai" => vec!["togetherai", "together-ai"],
+            "lmstudio" | "lm-studio" => vec!["lmstudio", "lm-studio"],
+            "llamacpp" | "llama-cpp" | "llama-server" => {
+                vec!["llamacpp", "llama-cpp", "llama-server"]
+            }
+            "moonshot" | "moonshotai" => vec!["moonshot", "moonshotai"],
+            "zhipu" | "zhipuai" => vec!["zhipu", "zhipuai"],
+            "vultr" | "vultr-ai" => vec!["vultr", "vultr-ai"],
+            "google" | "google-vertex" => vec!["google", "google-vertex"],
+            _ => vec![active_provider],
+        };
+        lookup_keys.iter().any(|provider_id| match auth_store.get(provider_id) {
+            Some(claurst_core::StoredCredential::ApiKey { key }) => !key.is_empty(),
+            Some(claurst_core::StoredCredential::OAuthToken {
+                access, refresh, ..
+            }) if active_provider == "github-copilot" => {
+                !access.is_empty() || !refresh.is_empty()
+            }
+            _ => false,
+        })
     };
-    lines.push(label_value_line("API Key Source", key_source));
-    if cfg.api_key.is_some() {
-        lines.push(indent_line("  sk-ant-api03-***...***", Color::DarkGray));
+    let key_source = if cfg.api_key.as_ref().is_some_and(|key| !key.is_empty()) {
+        "settings.api_key (masked)".to_string()
+    } else if cfg
+        .provider_configs
+        .get(active_provider)
+        .and_then(|provider| provider.api_key.as_ref())
+        .is_some_and(|key| !key.is_empty())
+    {
+        format!("settings.provider_configs.{active_provider}.api_key (masked)")
+    } else if let Some(env_var) = env_source {
+        format!("environment variable ({env_var})")
+    } else if stored_key {
+        "stored credential".to_string()
+    } else {
+        "not set".to_string()
+    };
+    lines.push(label_value_line("API Key Source", &key_source));
+    if cfg.api_key.is_some()
+        || cfg
+            .provider_configs
+            .get(active_provider)
+            .and_then(|provider| provider.api_key.as_ref())
+            .is_some()
+    {
+        lines.push(indent_line("  ***...***", Color::DarkGray));
     }
     lines.push(Line::from(""));
 

@@ -4,9 +4,10 @@ use crate::bridge_state::BridgeConnectionState;
 use crate::context_viz::ContextVizState;
 use crate::dialog_select::{DialogSelectState, SelectItem};
 use crate::export_dialog::{ExportDialogState, ExportFormat};
+use crate::import_config_dialog::ImportConfigDialogState;
 use crate::dialogs::PermissionRequest;
 use crate::diff_viewer::{DiffViewerState, build_turn_diff};
-use crate::model_picker::{EffortLevel, ModelPickerState, is_fast_mode_model};
+use crate::model_picker::{EffortLevel, ModelPickerState};
 use crate::session_browser::SessionBrowserState;
 use crate::tasks_overlay::TasksOverlay;
 use crate::dialogs::McpApprovalDialogState;
@@ -32,7 +33,6 @@ use claurst_core::keybindings::{
 };
 use claurst_core::types::{ContentBlock, Message, Role};
 use claurst_query::QueryEvent;
-use claurst_tools;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::backend::CrosstermBackend;
 use ratatui::style::Color;
@@ -65,6 +65,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("heapdump", "Show process memory and diagnostic information"),
     ("help", "Show help"),
     ("hooks", "Browse configured hooks (read-only)"),
+    ("import-config", "Import CLAUDE.md and settings.json from ~/.claude"),
     ("init", "Initialize AGENTS.md for this project"),
     ("insights", "Generate a session analysis report with conversation statistics"),
     ("install-slack-app", "Install the Claurst Slack integration"),
@@ -102,7 +103,7 @@ fn help_command_category(name: &str) -> &'static str {
         "connect" | "model" | "providers" | "refresh" | "fast" | "effort" | "voice" => "Model & Provider",
         "changes" | "diff" | "review" | "rewind" | "export" | "copy" => "Review & History",
         "stats" | "cost" | "context" | "insights" | "heapdump" | "doctor" => "Diagnostics",
-        "config" | "settings" | "theme" | "privacy" | "keybindings" | "hooks" | "mcp" => {
+        "config" | "settings" | "theme" | "privacy" | "keybindings" | "hooks" | "mcp" | "import-config" => {
             "Workspace"
         }
         "agent" | "agents" | "memory" | "plugin" | "feedback" | "survey" => "Tools",
@@ -161,9 +162,11 @@ fn get_env_var_for_provider(id: &str) -> &'static str {
         "venice" => "VENICE_API_KEY",
         "moonshotai" => "MOONSHOT_API_KEY",
         "zhipuai" => "ZHIPU_API_KEY",
+        "zai" => "ZAI_API_KEY",
         "siliconflow" => "SILICONFLOW_API_KEY",
         "nebius" => "NEBIUS_API_KEY",
         "novita" => "NOVITA_API_KEY",
+        "minimax" => "MINIMAX_API_KEY",
         "ovhcloud" => "OVHCLOUD_API_KEY",
         "scaleway" => "SCALEWAY_API_KEY",
         "vultr" => "VULTR_API_KEY",
@@ -197,11 +200,40 @@ fn get_url_for_provider(id: &str) -> &'static str {
         "deepinfra" => "deepinfra.com/dash/api_keys",
         "azure" => "portal.azure.com",
         "amazon-bedrock" => "console.aws.amazon.com/bedrock",
+        "minimax" => "platform.minimaxi.com",
         "huggingface" => "huggingface.co/settings/tokens",
         "nvidia" => "build.nvidia.com",
         "venice" => "venice.ai/settings/api",
+        "zai" => "z.ai/manage-apikey/apikey-list",
         _ => "the provider's website",
     }
+}
+
+
+fn import_config_picker_items() -> Vec<SelectItem> {
+    vec![
+        SelectItem {
+            id: "claude-md".into(),
+            title: "CLAUDE.md".into(),
+            description: "Import ~/.claude/CLAUDE.md".into(),
+            category: "Import".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "settings".into(),
+            title: "settings.json".into(),
+            description: "Import ~/.claude/settings.json".into(),
+            category: "Import".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "both".into(),
+            title: "Both".into(),
+            description: "Import both CLAUDE.md and settings.json".into(),
+            category: "Import".into(),
+            badge: Some("SAFE".into()),
+        },
+    ]
 }
 
 fn provider_picker_items() -> Vec<SelectItem> {
@@ -211,10 +243,13 @@ fn provider_picker_items() -> Vec<SelectItem> {
         SelectItem { id: "github-copilot".into(), title: "GitHub Copilot".into(), description: "(GitHub subscription or token)".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "google".into(), title: "Google".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "anthropic".into(), title: "Anthropic".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "custom-openai".into(), title: "Custom OpenAI-Compatible".into(), description: "Custom URL + API key".into(), category: "Advanced".into(), badge: None },
         SelectItem { id: "openrouter".into(), title: "OpenRouter".into(), description: "100+ models with one key".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "vercel".into(), title: "Vercel AI Gateway".into(), description: "Gateway for AI SDK models".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "groq".into(), title: "Groq".into(), description: "Fast hosted inference".into(), category: "Popular".into(), badge: Some("FREE".into()) },
         SelectItem { id: "ollama".into(), title: "Ollama".into(), description: "Run models locally".into(), category: "Popular".into(), badge: Some("LOCAL".into()) },
+        SelectItem { id: "zai".into(), title: "Z.AI".into(), description: "GLM-5.1 / GLM-5 / GLM-4.7 Coding Plan".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "opencode-go".into(), title: "OpenCode Go".into(), description: "$10/mo flat-rate · Kimi · DeepSeek · GLM · MiniMax".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "cerebras".into(), title: "Cerebras".into(), description: "Fast hosted inference".into(), category: "Other".into(), badge: Some("FREE".into()) },
         SelectItem { id: "sambanova".into(), title: "SambaNova".into(), description: "Fast hosted inference".into(), category: "Other".into(), badge: Some("FREE".into()) },
         SelectItem { id: "lmstudio".into(), title: "LM Studio".into(), description: "Local model server".into(), category: "Other".into(), badge: Some("LOCAL".into()) },
@@ -243,6 +278,7 @@ fn provider_picker_items() -> Vec<SelectItem> {
         SelectItem { id: "siliconflow".into(), title: "SiliconFlow".into(), description: "Hosted open models".into(), category: "Other".into(), badge: None },
         SelectItem { id: "nebius".into(), title: "Nebius".into(), description: "Cloud inference".into(), category: "Other".into(), badge: None },
         SelectItem { id: "novita".into(), title: "Novita".into(), description: "Cloud inference".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "minimax".into(), title: "MiniMax".into(), description: "Anthropic-compatible (M2.7)".into(), category: "Other".into(), badge: None },
         SelectItem { id: "ovhcloud".into(), title: "OVHcloud".into(), description: "EU-hosted AI".into(), category: "Other".into(), badge: None },
         SelectItem { id: "scaleway".into(), title: "Scaleway".into(), description: "EU cloud AI".into(), category: "Other".into(), badge: None },
         SelectItem { id: "vultr".into(), title: "Vultr".into(), description: "Cloud inference".into(), category: "Other".into(), badge: None },
@@ -473,11 +509,11 @@ pub fn try_copy_to_clipboard(text: &str) -> bool {
             return child.wait().map(|s| s.success()).unwrap_or(false);
         }
     }
-    // Linux / X11
+    // Linux / Wayland / X11
     #[cfg(target_os = "linux")]
     {
         use std::io::Write;
-        for cmd in &["xclip -selection clipboard", "xsel --clipboard --input"] {
+        for cmd in &["wl-copy", "xclip -selection clipboard", "xsel --clipboard --input"] {
             let parts: Vec<&str> = cmd.split_whitespace().collect();
             if let Some((prog, args)) = parts.split_first() {
                 if let Ok(mut child) = std::process::Command::new(prog)
@@ -723,6 +759,8 @@ pub struct App {
     pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
     /// Queued request for a real MCP reconnect from the interactive loop.
     pub pending_mcp_reconnect: bool,
+    /// Pending MCP panel-auth request for the interactive loop.
+    pub pending_mcp_panel_auth: Option<String>,
     /// Shared file-history service used for turn diff reconstruction.
     pub file_history: Option<Arc<parking_lot::Mutex<FileHistory>>>,
     /// Shared query-loop turn counter for turn-local diff reconstruction.
@@ -795,6 +833,8 @@ pub struct App {
     pub onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState,
     /// API key input dialog (opened from /connect for key-based providers).
     pub key_input_dialog: crate::key_input_dialog::KeyInputDialogState,
+    /// Custom provider dialog for URL + API key input.
+    pub custom_provider_dialog: crate::custom_provider_dialog::CustomProviderDialogState,
     /// Device code / browser auth dialog (GitHub Copilot device flow, Anthropic OAuth).
     pub device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState,
     /// When set, the main loop should spawn the async auth task for this provider.
@@ -817,6 +857,10 @@ pub struct App {
     pub auth_store: claurst_core::AuthStore,
     /// Connect-a-provider dialog (/connect command).
     pub connect_dialog: DialogSelectState,
+    /// Import-config source picker (/import-config command).
+    pub import_config_picker: DialogSelectState,
+    /// Import-config preview and confirmation dialog.
+    pub import_config_dialog: ImportConfigDialogState,
     /// Ctrl+K command palette overlay.
     pub command_palette: DialogSelectState,
     /// Whether Claurst was launched from the user's home directory.
@@ -929,6 +973,10 @@ pub struct App {
     /// If a newer version was found during background update check, this holds
     /// the latest version string (e.g. "0.1.0"). Shown in the footer status bar.
     pub update_available: Option<String>,
+    /// Cost breakdown for managed agent sessions: (manager_usd, executors_usd, total_usd).
+    pub managed_agent_cost_breakdown: Option<(f64, f64, f64)>,
+    /// Whether managed agent mode is currently active.
+    pub managed_agents_active: bool,
 }
 
 const SPINNER_VERBS: &[&str] = &[
@@ -1162,6 +1210,7 @@ impl App {
             remote_session_url: None,
             mcp_manager: None,
             pending_mcp_reconnect: false,
+            pending_mcp_panel_auth: None,
             file_history: None,
             current_turn: None,
             plan_mode: false,
@@ -1194,6 +1243,7 @@ impl App {
             bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState::new(),
             onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState::new(),
             key_input_dialog: crate::key_input_dialog::KeyInputDialogState::new(),
+            custom_provider_dialog: crate::custom_provider_dialog::CustomProviderDialogState::new(),
             device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState::new(),
             device_auth_pending: None,
             provider_registry: None,
@@ -1212,6 +1262,8 @@ impl App {
             session_list_rx: None,
             auth_store: claurst_core::AuthStore::load(),
             connect_dialog: DialogSelectState::new("Connect a provider", provider_picker_items()),
+            import_config_picker: DialogSelectState::new("Import config", import_config_picker_items()),
+            import_config_dialog: ImportConfigDialogState::new(),
             command_palette: {
                 let items: Vec<SelectItem> = PROMPT_SLASH_COMMANDS
                     .iter()
@@ -1292,6 +1344,8 @@ impl App {
             scroll_last_time: None,
             bash_prefix_allowlist: std::collections::HashSet::new(),
             update_available: None,
+            managed_agent_cost_breakdown: None,
+            managed_agents_active: false,
         }
     }
 
@@ -1313,6 +1367,72 @@ impl App {
     #[cfg(not(feature = "token_budget"))]
     fn load_token_budget() -> Option<u32> {
         None
+    }
+
+    pub fn open_import_config_picker(&mut self) {
+        self.import_config_picker = DialogSelectState::new("Import config", import_config_picker_items());
+        self.import_config_picker.open();
+    }
+
+    fn import_selection_from_picker(id: &str) -> Option<claurst_core::ImportSelection> {
+        match id {
+            "claude-md" => Some(claurst_core::ImportSelection::ClaudeMd),
+            "settings" => Some(claurst_core::ImportSelection::Settings),
+            "both" => Some(claurst_core::ImportSelection::Both),
+            _ => None,
+        }
+    }
+
+    fn open_import_config_preview(&mut self, selection: claurst_core::ImportSelection) {
+        match claurst_core::build_import_preview(selection) {
+            Ok(preview) => {
+                self.import_config_dialog.open(preview);
+            }
+            Err(err) => {
+                self.status_message = Some(format!("Import failed: {}", err));
+            }
+        }
+    }
+
+    fn perform_import_config(&mut self) {
+        let Some(selection) = self.import_config_dialog.selection else {
+            self.import_config_dialog.close();
+            return;
+        };
+        match claurst_core::execute_import(selection) {
+            Ok(result) => {
+                let paths = claurst_core::ImportPaths::detect();
+                let new_settings = Settings::load_sync().unwrap_or_default();
+                let new_config = new_settings.effective_config();
+                let result_message = claurst_core::summarize_import_result(&result, &paths);
+                let imported_mcp = result.imported_fields.iter().any(|f| f == "mcpServers");
+                self.config = new_config.clone();
+                self.model_name = self.config.effective_model().to_string();
+                self.cost_tracker.set_model(&self.model_name);
+                self.refresh_context_window_size();
+                self.context_used_tokens = 0;
+                self.has_credentials = self.config.resolve_api_key().is_some();
+                self.auth_store = claurst_core::AuthStore::load();
+                self.plan_mode = matches!(
+                    self.config.permission_mode,
+                    claurst_core::config::PermissionMode::Plan
+                );
+                self.output_style = match self.config.output_style.as_deref() {
+                    Some("stream") => "stream".to_string(),
+                    Some("verbose") => "verbose".to_string(),
+                    _ => "auto".to_string(),
+                };
+                if imported_mcp {
+                    self.pending_mcp_reconnect = true;
+                }
+                self.status_message = Some(result_message);
+                self.import_config_dialog.close();
+            }
+            Err(err) => {
+                self.status_message = Some(format!("Import failed: {}", err));
+                self.import_config_dialog.close();
+            }
+        }
     }
 
     fn current_user_turn_index(&self) -> Option<usize> {
@@ -1337,6 +1457,12 @@ impl App {
             duration: None,
             interrupted: false,
         });
+        // Start the latency timer now — at prompt-submission time — so it
+        // measures actual round-trip time even when the provider buffers its
+        // full response before yielding any stream events (e.g. Gemini flash).
+        self.turn_start = Some(std::time::Instant::now());
+        self.last_turn_elapsed = None;
+        self.last_turn_verb = None;
     }
 
     fn sync_turn_metadata_to_messages(&mut self) {
@@ -1472,6 +1598,14 @@ impl App {
         self.open_model_picker_for_provider(&provider_id, Some(picker_title));
     }
 
+    fn persist_custom_provider_base_url(&self, base_url: &str) {
+        let mut settings = Settings::load_sync().unwrap_or_default();
+        let entry = settings.providers.entry("custom-openai".to_string()).or_default();
+        entry.api_base = Some(base_url.to_string());
+        entry.enabled = true;
+        let _ = settings.save_sync();
+    }
+
     fn persist_provider_and_model(&self) {
         let mut settings = Settings::load_sync().unwrap_or_default();
         settings.provider = self.config.provider.clone();
@@ -1493,12 +1627,14 @@ impl App {
                 "xai",
                 "openrouter",
                 "github-copilot",
+                "codex",
                 "cohere",
                 "perplexity",
                 "togetherai",
                 "together-ai",
                 "deepinfra",
                 "venice",
+                "minimax",
                 "ollama",
                 "lmstudio",
                 "llamacpp",
@@ -1706,10 +1842,14 @@ impl App {
         self.model_registry = claurst_api::ModelRegistry::new();
         self.auth_store = auth_store;
         self.connect_dialog = DialogSelectState::new("Connect a provider", provider_picker_items());
+        self.import_config_picker = DialogSelectState::new("Import config", import_config_picker_items());
+        self.import_config_dialog = ImportConfigDialogState::new();
         self.model_picker = ModelPickerState::new();
         self.key_input_dialog = crate::key_input_dialog::KeyInputDialogState::new();
+        self.custom_provider_dialog = crate::custom_provider_dialog::CustomProviderDialogState::new();
         self.device_auth_dialog = crate::device_auth_dialog::DeviceAuthDialogState::new();
         self.device_auth_pending = None;
+        self.pending_mcp_panel_auth = None;
         self.model_picker_fetch_pending = false;
         self.has_credentials = has_credentials;
         self.fast_mode = false;
@@ -1721,6 +1861,13 @@ impl App {
 
     /// Handle slash commands that should open UI screens rather than execute
     /// as normal commands. Returns `true` if the command was intercepted.
+    pub fn intercept_slash_command_with_args(&mut self, cmd: &str, args: &str) -> bool {
+        if cmd == "mcp" && !args.trim().is_empty() {
+            return false;
+        }
+        self.intercept_slash_command(cmd)
+    }
+
     pub fn intercept_slash_command(&mut self, cmd: &str) -> bool {
         self.close_secondary_views();
         match cmd {
@@ -1782,6 +1929,10 @@ impl App {
             }
             "hooks" => {
                 self.hooks_config_menu.open();
+                true
+            }
+            "import-config" => {
+                self.open_import_config_picker();
                 true
             }
             "connect" => {
@@ -1914,6 +2065,21 @@ impl App {
             "voice" => {
                 let was_on = self.voice_recorder.is_some();
                 if was_on {
+                    // Stop any active recording before disabling.
+                    if self.voice_recording {
+                        self.voice_recording = false;
+                        self.voice_event_rx = None;
+                        if let Some(ref recorder_arc) = self.voice_recorder {
+                            let recorder = recorder_arc.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Ok(mut r) = recorder.lock() {
+                                    tokio::runtime::Handle::current()
+                                        .block_on(r.stop_recording())
+                                        .ok();
+                                }
+                            });
+                        }
+                    }
                     self.voice_recorder = None;
                     self.voice_mode_notice.dismiss();
                     self.status_message = Some("Voice mode disabled.".to_string());
@@ -1924,7 +2090,9 @@ impl App {
                     }
                     self.voice_recorder = Some(recorder);
                     self.voice_mode_notice = crate::voice_mode_notice::VoiceModeNoticeState::new();
-                    self.status_message = Some("Voice mode enabled. Press Alt+V to record.".to_string());
+                    self.status_message = Some(
+                        "Voice mode enabled. Press Alt+V to start recording.".to_string(),
+                    );
                 }
                 true
             }
@@ -1991,8 +2159,11 @@ impl App {
         self.export_dialog.dismiss();
         self.context_viz.close();
         self.connect_dialog.close();
+        self.import_config_picker.close();
+        self.import_config_dialog.close();
         self.command_palette.close();
         self.key_input_dialog.close();
+        self.custom_provider_dialog.close();
         self.device_auth_dialog.close();
         self.settings_screen.close();
         self.theme_screen.close();
@@ -2180,6 +2351,9 @@ impl App {
                 turns_completed: 0,
                 is_coordinator: false,
                 last_output: Some(status.clone()),
+                agent_role: crate::agents_view::AgentRole::Normal,
+                model_name: None,
+                cost_usd: 0.0,
             })
             .collect();
     }
@@ -2438,6 +2612,10 @@ impl App {
         self.mcp_view.open(servers);
     }
 
+    pub fn take_pending_mcp_panel_auth(&mut self) -> Option<String> {
+        self.pending_mcp_panel_auth.take()
+    }
+
     pub fn take_pending_mcp_reconnect(&mut self) -> bool {
         let pending = self.pending_mcp_reconnect;
         self.pending_mcp_reconnect = false;
@@ -2680,6 +2858,44 @@ impl App {
             return false;
         }
 
+        // Custom provider dialog (URL + API key for OpenAI-compatible providers)
+        if self.custom_provider_dialog.visible {
+            match key.code {
+                KeyCode::Esc => {
+                    self.custom_provider_dialog.close();
+                }
+                KeyCode::Tab | KeyCode::Down => {
+                    self.custom_provider_dialog.move_next_field();
+                }
+                KeyCode::Up => {
+                    self.custom_provider_dialog.move_prev_field();
+                }
+                KeyCode::Enter => {
+                    if self.custom_provider_dialog.can_submit() {
+                        let provider_id = self.custom_provider_dialog.provider_id.clone();
+                        let provider_name = self.custom_provider_dialog.provider_name.clone();
+                        let (base_url, api_key) = self.custom_provider_dialog.take_values();
+                        self.persist_custom_provider_base_url(&base_url);
+                        self.auth_store.set(
+                            &provider_id,
+                            claurst_core::StoredCredential::ApiKey { key: api_key },
+                        );
+                        self.activate_provider(provider_id, provider_name, "Connected to");
+                    } else {
+                        self.custom_provider_dialog.move_next_field();
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.custom_provider_dialog.backspace();
+                }
+                KeyCode::Char(c) => {
+                    self.custom_provider_dialog.insert_char(c);
+                }
+                _ => {}
+            }
+            return false;
+        }
+
         // Connect-a-provider dialog (/connect command)
         if self.connect_dialog.visible {
             match key.code {
@@ -2706,12 +2922,19 @@ impl App {
                                 // (OAuth requires a registered app which Claurst doesn't have)
                                 self.key_input_dialog.open(selected.id.clone(), selected.title.clone());
                             }
+                            "custom-openai" => {
+                                let current_url = Settings::load_sync()
+                                    .ok()
+                                    .and_then(|settings| settings.providers.get("custom-openai").and_then(|p| p.api_base.clone()));
+                                self.custom_provider_dialog
+                                    .open(selected.id.clone(), selected.title.clone(), current_url);
+                            }
                             "github-copilot" => {
                                 // GitHub Copilot: device code flow
                                 self.device_auth_dialog.open(selected.id.clone(), selected.title.clone());
                                 self.device_auth_pending = Some("github-copilot".to_string());
                             }
-                            "openai-codex" => {
+                            "codex" | "openai-codex" => {
                                 // OpenAI Codex: browser OAuth flow (spawned by main loop)
                                 self.device_auth_dialog.open("openai-codex".into(), "OpenAI Codex".into());
                                 self.device_auth_pending = Some("openai-codex".to_string());
@@ -2731,6 +2954,43 @@ impl App {
                 }
                 KeyCode::Backspace => { self.connect_dialog.filter_pop(); }
                 KeyCode::Char(c) => { self.connect_dialog.filter_push(c); }
+                _ => {}
+            }
+            return false;
+        }
+
+        // Import-config source picker
+        if self.import_config_picker.visible {
+            match key.code {
+                KeyCode::Esc => { self.import_config_picker.close(); }
+                KeyCode::Home => { self.import_config_picker.move_home(); }
+                KeyCode::End => { self.import_config_picker.move_end(); }
+                KeyCode::Up => { self.import_config_picker.move_up(); }
+                KeyCode::Down => { self.import_config_picker.move_down(); }
+                KeyCode::PageUp => { self.import_config_picker.page_up(); }
+                KeyCode::PageDown => { self.import_config_picker.page_down(); }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.import_config_picker.move_up(); }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.import_config_picker.move_down(); }
+                KeyCode::Enter => {
+                    if let Some(selected) = self.import_config_picker.selected().cloned() {
+                        self.import_config_picker.close();
+                        if let Some(selection) = Self::import_selection_from_picker(&selected.id) {
+                            self.open_import_config_preview(selection);
+                        }
+                    }
+                }
+                KeyCode::Backspace => { self.import_config_picker.filter_pop(); }
+                KeyCode::Char(c) => { self.import_config_picker.filter_push(c); }
+                _ => {}
+            }
+            return false;
+        }
+
+        // Import-config preview dialog
+        if self.import_config_dialog.visible {
+            match key.code {
+                KeyCode::Esc => self.import_config_dialog.close(),
+                KeyCode::Enter => self.perform_import_config(),
                 _ => {}
             }
             return false;
@@ -2790,7 +3050,7 @@ impl App {
                     if let Some((model_id, effort)) = self.model_picker.confirm() {
                         // If user picked a model other than the fast-mode model
                         // while fast mode was active, turn fast mode off.
-                        if self.fast_mode && !is_fast_mode_model(&model_id) {
+                        if self.fast_mode && !self.model_picker.is_selected_fast_mode_model(&model_id) {
                             self.fast_mode = false;
                         }
                         if let Some(e) = effort {
@@ -3030,8 +3290,7 @@ impl App {
         }
 
         if self.mcp_view.open {
-            self.handle_mcp_view_key(key);
-            return false;
+            return self.handle_mcp_view_key(key);
         }
 
         if self.stats_dialog.open {
@@ -3118,6 +3377,24 @@ impl App {
         // Voice mode notice dismiss
         if key.code == KeyCode::Esc && self.voice_mode_notice.visible {
             self.voice_mode_notice.dismiss();
+            return false;
+        }
+
+        // Cancel an active voice recording with Esc.
+        if key.code == KeyCode::Esc && self.voice_recording {
+            self.voice_recording = false;
+            self.voice_event_rx = None;
+            if let Some(ref recorder_arc) = self.voice_recorder {
+                let recorder = recorder_arc.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(mut r) = recorder.lock() {
+                        tokio::runtime::Handle::current()
+                            .block_on(r.stop_recording())
+                            .ok();
+                    }
+                });
+            }
+            self.status_message = Some("Recording cancelled.".to_string());
             return false;
         }
 
@@ -3248,7 +3525,7 @@ impl App {
                 }
                 self.notifications.push(
                     NotificationKind::Info,
-                    "Recording\u{2026} (press Alt+V again to transcribe)".to_string(),
+                    "Recording\u{2026} (Alt+V to transcribe · Esc to cancel)".to_string(),
                     None,
                 );
             } else {
@@ -3303,7 +3580,7 @@ impl App {
                     | crate::prompt_input::VimMode::VisualBlock
             )
         {
-            use crate::image_paste::{read_clipboard_image, read_clipboard_text};
+            use crate::image_paste::{read_clipboard_image, read_clipboard_text, read_primary_text};
             if let Some(img) = read_clipboard_image() {
                 let label = img.label.clone();
                 let dims = img.dimensions;
@@ -3314,9 +3591,16 @@ impl App {
                     format!("Image attached: {}", label)
                 };
                 self.notifications.push(NotificationKind::Info, msg, Some(3));
-            } else if let Some(text) = read_clipboard_text() {
+            } else if let Some(text) = read_clipboard_text().or_else(read_primary_text) {
                 self.prompt_input.paste(&text);
+                self.refresh_prompt_input();
             }
+            return false;
+        }
+
+        // ---- Shift+Insert — selection/clipboard paste fallback -------------
+        if key.code == KeyCode::Insert && key.modifiers.contains(KeyModifiers::SHIFT) {
+            let _ = self.paste_primary_into_prompt();
             return false;
         }
 
@@ -3639,6 +3923,8 @@ impl App {
             KeyContext::DiffDialog
         } else if self.agents_menu.open || self.mcp_view.open || self.stats_dialog.open {
             KeyContext::Select
+        } else if self.import_config_dialog.visible {
+            KeyContext::Confirmation
         } else if self.settings_screen.visible {
             KeyContext::Settings
         } else if self.theme_screen.visible {
@@ -3674,7 +3960,7 @@ impl App {
         }
     }
 
-    fn handle_mcp_view_key(&mut self, key: KeyEvent) {
+    fn handle_mcp_view_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.mcp_view.close(),
             KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.mcp_view.switch_pane(),
@@ -3682,6 +3968,20 @@ impl App {
             KeyCode::Down => self.mcp_view.select_next(),
             KeyCode::Backspace => self.mcp_view.pop_search_char(),
             KeyCode::Char('e') => self.mcp_view.toggle_error_detail(),
+            KeyCode::Char('a')
+                if self.mcp_view.active_pane == crate::mcp_view::McpViewPane::ServerList =>
+            {
+                let selected_server = self
+                    .mcp_view
+                    .servers
+                    .get(self.mcp_view.selected_server)
+                    .map(|server| server.name.clone());
+                if let Some(server_name) = selected_server {
+                    self.pending_mcp_panel_auth = Some(server_name);
+                    self.mcp_view.close();
+                    self.status_message = Some("Starting MCP auth...".to_string());
+                }
+            }
             KeyCode::Char('r') => {
                 self.pending_mcp_reconnect = true;
                 self.status_message = Some("Reconnecting MCP runtime...".to_string());
@@ -3693,6 +3993,7 @@ impl App {
             }
             _ => {}
         }
+        false
     }
 
     fn handle_agents_menu_key(&mut self, key: KeyEvent) {
@@ -4533,6 +4834,37 @@ impl App {
         }
     }
 
+    fn prompt_can_accept_selection_paste(&self) -> bool {
+        !self.is_streaming
+            && self.permission_request.is_none()
+            && !self.history_search_overlay.visible
+            && self.history_search.is_none()
+            && !matches!(
+                self.prompt_input.vim_mode,
+                crate::prompt_input::VimMode::Normal
+                    | crate::prompt_input::VimMode::Visual
+                    | crate::prompt_input::VimMode::VisualBlock
+            )
+    }
+
+    fn paste_primary_into_prompt(&mut self) -> bool {
+        if !self.prompt_can_accept_selection_paste() {
+            return false;
+        }
+
+        if let Some(text) = crate::image_paste::read_primary_text()
+            .or_else(crate::image_paste::read_clipboard_text)
+        {
+            self.focus = FocusTarget::Input;
+            self.clear_selection();
+            self.prompt_input.paste(&text);
+            self.refresh_prompt_input();
+            return true;
+        }
+
+        false
+    }
+
     /// Process mouse events (trackpad scroll, text selection, etc.).
     pub fn handle_mouse_event(&mut self, mouse_event: MouseEvent) {
         use crossterm::event::MouseButton;
@@ -4573,6 +4905,8 @@ impl App {
         // Key-input and device-auth stay outside this gate so their visible text
         // can still be selected and copied with the mouse.
         let any_dialog = self.connect_dialog.visible
+            || self.import_config_picker.visible
+            || self.import_config_dialog.visible
             || self.command_palette.visible
             || self.model_picker.visible
             || self.export_dialog.visible
@@ -4587,6 +4921,8 @@ impl App {
                     // DialogSelect dialogs — check if click is inside for item selection
                     let in_dialog = if self.connect_dialog.visible {
                         self.connect_dialog.contains(mouse_event.column, mouse_event.row)
+                    } else if self.import_config_picker.visible {
+                        self.import_config_picker.contains(mouse_event.column, mouse_event.row)
                     } else if self.command_palette.visible {
                         self.command_palette.contains(mouse_event.column, mouse_event.row)
                     } else {
@@ -4600,6 +4936,8 @@ impl App {
                         // Click inside a DialogSelect — select the clicked item
                         if self.connect_dialog.visible {
                             self.connect_dialog.handle_mouse_click(mouse_event.row);
+                        } else if self.import_config_picker.visible {
+                            self.import_config_picker.handle_mouse_click(mouse_event.row);
                         } else if self.command_palette.visible {
                             self.command_palette.handle_mouse_click(mouse_event.row);
                         }
@@ -4613,10 +4951,12 @@ impl App {
                 MouseEventKind::ScrollUp => {
                     // Scroll through dialog items
                     if self.connect_dialog.visible { self.connect_dialog.move_up(); }
+                    else if self.import_config_picker.visible { self.import_config_picker.move_up(); }
                     else if self.command_palette.visible { self.command_palette.move_up(); }
                 }
                 MouseEventKind::ScrollDown => {
                     if self.connect_dialog.visible { self.connect_dialog.move_down(); }
+                    else if self.import_config_picker.visible { self.import_config_picker.move_down(); }
                     else if self.command_palette.visible { self.command_palette.move_down(); }
                 }
                 _ => {}
@@ -4673,6 +5013,11 @@ impl App {
                 }
             }
 
+            // ---- Primary-selection paste into the prompt ---------------
+            MouseEventKind::Down(MouseButton::Middle) => {
+                let _ = self.paste_primary_into_prompt();
+            }
+
             // ---- Text selection / focus routing -------------------------
             MouseEventKind::Down(MouseButton::Left) => {
                 // If a context menu is open, check if the click is on a menu item.
@@ -4724,6 +5069,17 @@ impl App {
                     && mouse_event.row < selectable_area.y.saturating_add(selectable_area.height)
                     && mouse_event.column >= selectable_area.x
                     && mouse_event.column < selectable_area.x.saturating_add(selectable_area.width);
+
+                // Check for click on a thinking block header (takes priority over text selection).
+                if let Some(&hash) = self.thinking_row_map.borrow().get(&mouse_event.row) {
+                    if self.thinking_expanded.contains(&hash) {
+                        self.thinking_expanded.remove(&hash);
+                    } else {
+                        self.thinking_expanded.insert(hash);
+                    }
+                    self.invalidate_transcript();
+                    return;
+                }
 
                 if in_input {
                     self.focus = FocusTarget::Input;
@@ -4821,15 +5177,12 @@ impl App {
                 if !self.is_streaming {
                     let seed = self.frame_count as usize ^ (self.messages.len() * 17);
                     self.spinner_verb = Some(sample_spinner_verb(seed).to_string());
-                    // Only set turn_start on the FIRST streaming event of a
-                    // turn.  MessageStop resets is_streaming between tool-use
-                    // cycles, but we must not reset the timer — the total turn
-                    // duration should cover the entire request, including all
-                    // tool-use rounds.
+                    // turn_start is set in begin_user_turn_snapshot (prompt
+                    // submission time).  Only fall back here if somehow no
+                    // user message was pushed before streaming began (e.g.
+                    // headless / programmatic callers).
                     if self.turn_start.is_none() {
                         self.turn_start = Some(std::time::Instant::now());
-                        self.last_turn_elapsed = None;
-                        self.last_turn_verb = None;
                     }
                     self.streaming_thinking.clear();
                 }
@@ -5016,82 +5369,6 @@ impl App {
         loop {
             self.frame_count = self.frame_count.wrapping_add(1);
 
-            // Sync cost/token counters from the shared tracker
-            self.cost_usd = self.cost_tracker.total_cost_usd();
-            self.token_count = self.cost_tracker.total_tokens() as u32;
-
-            // Expire old notifications
-            self.notifications.tick();
-            self.memory_update_notification.tick();
-
-            // Drain background model-fetch results (non-blocking).
-            if let Some(ref mut rx) = self.model_fetch_rx {
-                match rx.try_recv() {
-                    Ok(Ok(entries)) => {
-                        let provider = self
-                            .config
-                            .provider
-                            .clone()
-                            .unwrap_or_else(|| "anthropic".to_string());
-                        let provider_prefix = format!("{}/", provider);
-                        let current = self
-                            .model_name
-                            .strip_prefix(&provider_prefix)
-                            .unwrap_or(self.model_name.as_str())
-                            .to_string();
-                        self.model_picker.set_models(entries);
-                        // Re-apply the current-model highlight so it stays accurate.
-                        for m in &mut self.model_picker.models {
-                            m.is_current = m.id == current;
-                        }
-                        self.model_fetch_rx = None;
-                    }
-                    Ok(Err(()))
-                    | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                        self.model_picker.loading_models = false;
-                        self.model_fetch_rx = None;
-                    }
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
-                }
-            }
-
-            // Spawn async provider model-list fetch when requested.
-            if self.model_picker_fetch_pending {
-                self.model_picker_fetch_pending = false;
-                let provider_id_str = self.config.provider.clone().unwrap_or_else(|| "anthropic".to_string());
-                if let Some(ref registry) = self.provider_registry {
-                    let pid = claurst_core::ProviderId::new(&provider_id_str);
-                    if let Some(provider) = registry.get(&pid) {
-                        let provider = provider.clone();
-                        let (tx, rx) = tokio::sync::mpsc::channel(1);
-                        self.model_fetch_rx = Some(rx);
-                        self.model_picker.loading_models = true;
-                        tokio::spawn(async move {
-                            match provider.list_models().await {
-                                Ok(models) => {
-                                    let entries: Vec<crate::model_picker::ModelEntry> = models
-                                        .into_iter()
-                                        .map(|m| {
-                                            let ctx_k = m.context_window / 1000;
-                                            crate::model_picker::ModelEntry {
-                                                id: m.id.to_string(),
-                                                display_name: m.name.clone(),
-                                                description: format!("{}K context", ctx_k),
-                                                is_current: false,
-                                            }
-                                        })
-                                        .collect();
-                                    let _ = tx.send(Ok(entries)).await;
-                                }
-                                Err(_) => {
-                                    let _ = tx.send(Err(())).await;
-                                }
-                            }
-                        });
-                    }
-                }
-            }
-
             // Drain background session-list results.
             if let Some(ref mut rx) = self.session_list_rx {
                 match rx.try_recv() {
@@ -5158,7 +5435,7 @@ impl App {
                         VoiceEvent::RecordingStarted => {
                             self.voice_recording = true;
                             self.status_message =
-                                Some("Recording\u{2026} press V again or Enter to stop".to_string());
+                                Some("Recording\u{2026} (Alt+V or Esc to stop)".to_string());
                         }
                         VoiceEvent::RecordingStopped => {
                             self.voice_recording = false;
@@ -5196,11 +5473,6 @@ impl App {
                 }
             }
 
-            // Refresh task list if the overlay is visible (every frame for live updates)
-            if self.tasks_overlay.visible {
-                self.tasks_overlay.refresh_tasks(&claurst_tools::TASK_STORE);
-            }
-
             // Draw the frame
             terminal.draw(|f| render::render_app(f, self))?;
 
@@ -5236,12 +5508,10 @@ impl App {
                         if should_submit {
                             // Check if this is a slash command that should open a UI screen
                             if crate::input::is_slash_command(&self.prompt_input.text) {
-                                let cmd = {
-                                    let (c, _) =
-                                        crate::input::parse_slash_command(&self.prompt_input.text);
-                                    c.to_string()
-                                };
-                                if self.intercept_slash_command(&cmd) {
+                                let slash_input = self.prompt_input.text.clone();
+                                let (cmd, args) =
+                                        crate::input::parse_slash_command(&slash_input);
+                                if self.intercept_slash_command_with_args(cmd, args) {
                                     self.clear_prompt();
                                     continue;
                                 }
@@ -5347,6 +5617,13 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
+    }
+
+    #[test]
+    fn test_mcp_subcommand_is_not_intercepted() {
+        let mut app = make_app();
+        assert!(!app.intercept_slash_command_with_args("mcp", "auth mcphub"));
+        assert!(!app.mcp_view.open);
     }
 
     #[test]
@@ -5558,7 +5835,7 @@ mod tests {
         let pr = PermissionRequest::bash(
             "tu-1".to_string(),
             "Bash".to_string(),
-            "wants to run".to_string(),
+            "This will execute a shell command.".to_string(),
             "git status".to_string(),
             Some("git".to_string()),
         );
@@ -5590,7 +5867,7 @@ mod tests {
         let mut pr = PermissionRequest::bash(
             "tu-2".to_string(),
             "Bash".to_string(),
-            "wants to run".to_string(),
+            "This will execute a shell command.".to_string(),
             "cargo build".to_string(),
             Some("cargo".to_string()),
         );
@@ -5621,7 +5898,7 @@ mod tests {
         let pr = PermissionRequest::bash(
             "tu-3".to_string(),
             "Bash".to_string(),
-            "wants to run".to_string(),
+            "This will execute a shell command.".to_string(),
             "npm install".to_string(),
             Some("npm".to_string()),
         );

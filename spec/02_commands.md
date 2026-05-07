@@ -1659,14 +1659,6 @@ claude mcp add <name> <commandOrUrl> [args...]
 
 ---
 
-### `/share` (stub)
-
-**File:** `commands/share/index.js`
-
-**Type:** Stub — disabled in all external builds.
-
----
-
 ### `/skills`
 
 **Files:** `commands/skills/index.ts`, `commands/skills/skills.tsx`

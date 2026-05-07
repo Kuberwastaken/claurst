@@ -1,0 +1,20 @@
+# Rust
+src-rust/target/
+
+# OS
+.DS_Store
+
+# Refs
+refs/
+
+# Claude
+.claude
+
+# Git
+.gitignore
+.gitattributes
+
+# VSCode / unsolicited devcontainers mounts
+.vscode/
+.claurst/
+

@@ -101,13 +101,6 @@ pub fn model_supports_max_effort(id: &str) -> bool {
     id.starts_with("claude-opus-4")
 }
 
-/// The model ID that fast-mode locks to.
-pub const FAST_MODE_MODEL: &str = "claude-haiku-4-5";
-
-pub fn is_fast_mode_model(id: &str) -> bool {
-    id == FAST_MODE_MODEL || id.starts_with("claude-haiku-4-5")
-}
-
 /// Returns a short description string based on the model family inferred from
 /// the model ID.  Used when converting API model entries to `ModelEntry`.
 pub fn model_family_description(id: &str) -> String {
@@ -127,13 +120,26 @@ pub fn model_family_description(id: &str) -> String {
 // Provider grouping helpers
 // ---------------------------------------------------------------------------
 
+/// Format context window tokens for display in the model picker.
+pub fn format_context_window(context_window: u32) -> String {
+    if context_window >= 1_000_000 {
+        if context_window % 1_000_000 == 0 {
+            format!("{}M context", context_window / 1_000_000)
+        } else {
+            format!("{:.1}M context", context_window as f64 / 1_000_000.0)
+        }
+    } else {
+        format!("{}K context", context_window / 1000)
+    }
+}
+
 /// Format a model display line with optional context window and cost info.
 ///
 /// Example: `"gpt-4o  128K ctx  $5.00/M"`
 pub fn format_model_line(model_str: &str, context_window: Option<u32>, cost_per_1m: Option<f64>) -> String {
     let mut parts = vec![model_str.to_string()];
     if let Some(ctx) = context_window {
-        parts.push(format!("{}K ctx", ctx / 1000));
+        parts.push(format_context_window(ctx).replace(" context", " ctx"));
     }
     if let Some(cost) = cost_per_1m {
         if cost == 0.0 {
@@ -172,6 +178,8 @@ impl ModelPickerState {
                     "openai".to_string()
                 } else if m.contains("gemini") {
                     "google".to_string()
+                } else if m.contains("minimax") {
+                    "minimax".to_string()
                 } else {
                     "other".to_string()
                 }
@@ -250,10 +258,9 @@ pub fn models_for_provider_from_registry(
         entries
             .iter()
             .map(|e| {
-                let ctx_k = e.info.context_window / 1000;
                 let cost_str = match (e.cost_input, e.cost_output) {
-                    (Some(ci), Some(co)) => format!("{}K ctx | ${:.2}/${:.2} per M", ctx_k, ci, co),
-                    _ => format!("{}K ctx", ctx_k),
+                    (Some(ci), Some(co)) => format!("{} | ${:.2}/${:.2} per M", format_context_window(e.info.context_window), ci, co),
+                    _ => format_context_window(e.info.context_window),
                 };
                 ModelEntry {
                     id: e.info.id.to_string(),
@@ -297,6 +304,9 @@ pub fn models_for_provider(provider_id: &str) -> Vec<ModelEntry> {
             model_entry("gemini-2.5-flash", "Gemini 2.5 Flash", "1M context"),
             model_entry("gemini-2.0-flash", "Gemini 2.0 Flash", "1M context"),
         ],
+        "minimax" => vec![
+            model_entry("MiniMax-M2.7", "MiniMax M2.7", "Anthropic-compatible (128K context)"),
+        ],
         "groq" => vec![
             model_entry("llama-3.3-70b-versatile", "Llama 3.3 70B", "128K context"),
             model_entry("llama-3.1-8b-instant", "Llama 3.1 8B", "128K context"),
@@ -308,8 +318,16 @@ pub fn models_for_provider(provider_id: &str) -> Vec<ModelEntry> {
             model_entry("llama-3.1-8b", "Llama 3.1 8B", "128K context"),
         ],
         "deepseek" => vec![
-            model_entry("deepseek-chat", "DeepSeek V3", "64K context"),
-            model_entry("deepseek-reasoner", "DeepSeek R1", "64K context"),
+            model_entry(
+                "deepseek-v4-pro",
+                "DeepSeek V4 Pro",
+                "1M context, 384K output",
+            ),
+            model_entry(
+                "deepseek-v4-flash",
+                "DeepSeek V4 Flash",
+                "1M context, 384K output",
+            ),
         ],
         "mistral" => vec![
             model_entry("mistral-large-latest", "Mistral Large", "128K context"),
@@ -326,6 +344,14 @@ pub fn models_for_provider(provider_id: &str) -> Vec<ModelEntry> {
             model_entry("openai/gpt-4o", "GPT-4o", "via OpenRouter"),
             model_entry("google/gemini-2.5-pro", "Gemini 2.5 Pro", "via OpenRouter"),
             model_entry("meta-llama/llama-3.3-70b-instruct", "Llama 3.3 70B", "via OpenRouter"),
+        ],
+        "codex" | "openai-codex" => vec![
+            model_entry("gpt-5.2-codex", "GPT-5.2 Codex", "OAuth-backed Codex default"),
+            model_entry("gpt-5.1-codex", "GPT-5.1 Codex", "Previous Codex generation"),
+            model_entry("gpt-5.1-codex-mini", "GPT-5.1 Codex Mini", "Smaller Codex model"),
+            model_entry("gpt-5.1-codex-max", "GPT-5.1 Codex Max", "Larger Codex model"),
+            model_entry("gpt-5.4", "GPT-5.4", "General frontier model via Codex auth"),
+            model_entry("gpt-5.2", "GPT-5.2", "General model via Codex auth"),
         ],
         "github-copilot" => vec![
             model_entry("claude-sonnet-4.6", "Claude Sonnet 4.6", "via Copilot"),
@@ -361,16 +387,21 @@ pub fn models_for_provider(provider_id: &str) -> Vec<ModelEntry> {
             model_entry("llama-3.3-70b", "Llama 3.3 70B", "128K context"),
         ],
         "ollama" => vec![
-            model_entry("llama3.2", "Llama 3.2", "local"),
-            model_entry("mistral", "Mistral", "local"),
-            model_entry("codellama", "Code Llama", "local"),
-            model_entry("gemma2", "Gemma 2", "local"),
-            model_entry("phi3", "Phi-3", "local"),
-            model_entry("qwen2.5", "Qwen 2.5", "local"),
+            model_entry("qwen2.5-coder", "Qwen 2.5 Coder", "local — best for coding tasks"),
+            model_entry("deepseek-coder-v2", "DeepSeek Coder V2", "local — coding model"),
+            model_entry("codellama", "Code Llama", "local — coding model"),
+            model_entry("llama3.2", "Llama 3.2", "local — general purpose"),
+            model_entry("mistral", "Mistral", "local — general purpose"),
+            model_entry("gemma2", "Gemma 2", "local — general purpose"),
+            model_entry("phi3", "Phi-3", "local — general purpose"),
+            model_entry("qwen2.5", "Qwen 2.5", "local — general purpose"),
         ],
         "azure" => vec![
             model_entry("gpt-4o", "GPT-4o (Azure)", "128K context"),
             model_entry("gpt-4o-mini", "GPT-4o mini (Azure)", "128K context"),
+        ],
+        "custom-openai" => vec![
+            model_entry("default", "Default model", "OpenAI-compatible endpoint"),
         ],
         "amazon-bedrock" => vec![
             model_entry("anthropic.claude-sonnet-4-6-v1", "Claude Sonnet 4.6 (Bedrock)", "200K context"),
@@ -397,13 +428,16 @@ pub fn default_model_for_provider(provider_id: &str) -> String {
         "anthropic" => "claude-opus-4-6".to_string(),
         "openai" => "openai/gpt-4o".to_string(),
         "google" => "google/gemini-2.5-flash".to_string(),
+        "minimax" => "minimax/MiniMax-M2.7".to_string(),
         "groq" => "groq/llama-3.3-70b-versatile".to_string(),
         "cerebras" => "cerebras/llama-3.3-70b".to_string(),
-        "deepseek" => "deepseek/deepseek-chat".to_string(),
+        "deepseek" => "deepseek/deepseek-v4-pro".to_string(),
         "mistral" => "mistral/mistral-large-latest".to_string(),
         "xai" => "xai/grok-2".to_string(),
         "openrouter" => "openrouter/anthropic/claude-sonnet-4".to_string(),
         "github-copilot" => "github-copilot/gpt-4o".to_string(),
+        "codex" => "codex/gpt-5.2-codex".to_string(),
+        "openai-codex" => "openai-codex/gpt-5.2-codex".to_string(),
         "cohere" => "cohere/command-r-plus".to_string(),
         "perplexity" => "perplexity/sonar-pro".to_string(),
         "togetherai" | "together-ai" => "togetherai/meta-llama/Llama-3.3-70B-Instruct-Turbo".to_string(),
@@ -428,8 +462,10 @@ pub struct ModelPickerState {
     pub filter: String,
     /// Current effort level for models that support extended thinking.
     pub effort_level: EffortLevel,
-    /// Whether fast mode is currently active (locks model to FAST_MODE_MODEL).
+    /// Whether fast mode is currently active.
     pub fast_mode: bool,
+    /// The currently locked fast-mode model, if fast mode is active.
+    pub fast_mode_model: Option<String>,
     /// `true` once the dynamic model list has been loaded from the API.
     pub models_loaded: bool,
     /// `true` while the background fetch is in flight.
@@ -451,6 +487,7 @@ impl ModelPickerState {
             filter: String::new(),
             effort_level: EffortLevel::Normal,
             fast_mode: false,
+            fast_mode_model: None,
             models_loaded: false,
             loading_models: false,
         }
@@ -489,6 +526,7 @@ impl ModelPickerState {
         self.filter.clear();
         self.effort_level = effort;
         self.fast_mode = fast_mode;
+        self.fast_mode_model = fast_mode.then_some(current_model.to_string());
         self.visible = true;
     }
 
@@ -496,6 +534,10 @@ impl ModelPickerState {
     pub fn close(&mut self) {
         self.visible = false;
         self.filter.clear();
+    }
+
+    pub fn is_selected_fast_mode_model(&self, model_id: &str) -> bool {
+        self.fast_mode_model.as_deref() == Some(model_id)
     }
 
     /// Move selection up one row (wraps to last if at top).
@@ -562,6 +604,15 @@ impl ModelPickerState {
     /// in the correct provider-aware format.
     pub fn confirm(&mut self) -> Option<(String, Option<EffortLevel>)> {
         let filtered = self.filtered_models();
+        let custom = self.filter.trim();
+        if filtered.is_empty() {
+            if custom.is_empty() {
+                return None;
+            }
+            let id = custom.to_string();
+            self.close();
+            return Some((id, None));
+        }
         let entry = filtered.get(self.selected_idx)?;
         let id = entry.id.clone();
         let effort = if model_supports_effort(&id) { Some(self.effort_level) } else { None };
@@ -827,7 +878,10 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
 
     if state.fast_mode {
         lines.push(Line::from(vec![Span::styled(
-            format!(" \u{26a1} Fast mode ON ({})", FAST_MODE_MODEL),
+            format!(
+                " \u{26a1} Fast mode ON ({})",
+                state.fast_mode_model.as_deref().unwrap_or("current model")
+            ),
             Style::default().fg(Color::Yellow),
         )]));
     }
@@ -845,6 +899,12 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
 
     if filtered.is_empty() {
         lines.push(Line::from(vec![Span::styled(" No results found", Style::default().fg(dim))]));
+        if !state.filter.trim().is_empty() {
+            lines.push(Line::from(vec![Span::styled(
+                " Press Enter to use custom model",
+                Style::default().fg(Color::Rgb(200, 200, 200)),
+            )]));
+        }
     } else {
         for (i, model) in filtered.iter().enumerate() {
             let is_selected = i == state.selected_idx;
@@ -976,9 +1036,12 @@ mod tests {
     }
 
     #[test]
-    fn fast_mode_aliases_include_dated_haiku() {
-        assert!(is_fast_mode_model("claude-haiku-4-5"));
-        assert!(is_fast_mode_model("claude-haiku-4-5-20251001"));
+    fn open_with_fast_mode_tracks_locked_model() {
+        let mut p = ModelPickerState::new();
+        p.open_with_state("gpt-4o-mini", EffortLevel::Normal, true);
+        assert_eq!(p.fast_mode_model.as_deref(), Some("gpt-4o-mini"));
+        assert!(p.is_selected_fast_mode_model("gpt-4o-mini"));
+        assert!(!p.is_selected_fast_mode_model("gpt-4o"));
     }
 
     // 3. open() with an unknown model ID marks none as current and sets idx=0.
@@ -1046,14 +1109,14 @@ mod tests {
         assert!(!p.visible, "picker should be closed after confirm");
     }
 
-    // 9. confirm() on empty filter list returns None.
+    // 9. confirm() on empty filter list uses custom model when filter is set.
     #[test]
     fn confirm_empty_filter_returns_none() {
         let mut p = make_picker_with_current("claude-opus-4-6");
         p.filter = "zzznomatch999".to_string();
         p.selected_idx = 0;
         let result = p.confirm();
-        assert!(result.is_none());
+        assert_eq!(result.map(|(id, _)| id), Some("zzznomatch999".to_string()));
     }
 
     // 10. close() clears filter and hides overlay.
