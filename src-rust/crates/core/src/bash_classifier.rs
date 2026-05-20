@@ -128,10 +128,8 @@ pub fn classify_bash_command(command: &str) -> BashRiskLevel {
     }
 
     // dd with an if= (disk image writing) — extremely destructive
-    if cmd.starts_with("dd ") || cmd == "dd" {
-        if cmd.contains("if=") {
-            return BashRiskLevel::Critical;
-        }
+    if (cmd.starts_with("dd ") || cmd == "dd") && cmd.contains("if=") {
+        return BashRiskLevel::Critical;
     }
 
     // mkfs — format filesystem
@@ -145,8 +143,7 @@ pub fn classify_bash_command(command: &str) -> BashRiskLevel {
     }
 
     // Detect `rm` with `-rf` (or `-fr`) targeting root or very short paths
-    if cmd.starts_with("rm ") {
-        let args = &cmd[3..];
+    if let Some(args) = cmd.strip_prefix("rm ") {
         let has_r = has_flag(args, "-r")
             || has_flag(args, "-R")
             || has_flag(args, "-rf")
@@ -171,8 +168,7 @@ pub fn classify_bash_command(command: &str) -> BashRiskLevel {
     }
 
     // chmod 777 on / or critical paths
-    if cmd.starts_with("chmod ") {
-        let args = &cmd[6..];
+    if let Some(args) = cmd.strip_prefix("chmod ") {
         if (args.contains("777") || args.contains("a+rwx"))
             && (args.contains(" /") || args.ends_with('/'))
         {
@@ -251,8 +247,7 @@ pub fn classify_bash_command(command: &str) -> BashRiskLevel {
     }
 
     // mv that targets sensitive paths
-    if cmd.starts_with("mv ") {
-        let args = &cmd[3..];
+    if let Some(args) = cmd.strip_prefix("mv ") {
         let sensitive = [" /etc/", " /bin/", " /usr/", " /lib/", " /boot/"];
         for s in &sensitive {
             if args.contains(s) {
