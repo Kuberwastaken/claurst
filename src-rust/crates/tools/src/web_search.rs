@@ -1,4 +1,4 @@
-// WebSearch tool: search the web using Brave Search API or fallback to DuckDuckGo.
+// WebSearch tool that queries SearXNG, the Brave Search API, or DuckDuckGo depending on which backend is configured.
 //
 // Mirrors the TypeScript WebSearch tool behaviour:
 // - Accepts a query string
@@ -67,12 +67,63 @@ impl Tool for WebSearchTool {
         let num_results = params.num_results.min(10).max(1);
         debug!(query = %params.query, num_results, "Web search");
 
-        // Try Brave Search API first, then fall back to DuckDuckGo
-        if let Some(api_key) = std::env::var("BRAVE_SEARCH_API_KEY").ok().filter(|k| !k.is_empty()) {
+        // The tool tries SearXNG first, then Brave Search, then DuckDuckGo as a final fallback.
+        if let Some(base) = std::env::var("SEARXNG_URL").ok().filter(|s| !s.is_empty()) {
+            search_searxng(&params.query, num_results, &base).await
+        } else if let Some(api_key) = std::env::var("BRAVE_SEARCH_API_KEY").ok().filter(|k| !k.is_empty()) {
             search_brave(&params.query, num_results, &api_key).await
         } else {
             search_duckduckgo(&params.query, num_results).await
         }
+    }
+}
+
+/// Queries a SearXNG instance's JSON API at the given base origin and returns formatted results.
+async fn search_searxng(query: &str, num_results: usize, base: &str) -> ToolResult {
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/search?q={}&format=json&safesearch=0",
+        base.trim_end_matches('/'),
+        urlencoding_simple(query)
+    );
+
+    let resp = match client
+        .get(&url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return ToolResult::error(format!("SearXNG request failed: {}", e)),
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        return ToolResult::error(format!(
+            "SearXNG returned status {} (is JSON format enabled in settings.yml?)",
+            status
+        ));
+    }
+
+    let data: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => return ToolResult::error(format!("Failed to parse SearXNG response: {}", e)),
+    };
+
+    let mut output = String::new();
+    if let Some(items) = data.get("results").and_then(|r| r.as_array()) {
+        for (i, item) in items.iter().take(num_results).enumerate() {
+            let title = item.get("title").and_then(|t| t.as_str()).unwrap_or("(No title)");
+            let url = item.get("url").and_then(|u| u.as_str()).unwrap_or("");
+            let snippet = item.get("content").and_then(|s| s.as_str()).unwrap_or("");
+            output.push_str(&format!("{}. **{}**\n   URL: {}\n   {}\n\n", i + 1, title, url, snippet));
+        }
+    }
+
+    if output.is_empty() {
+        ToolResult::success("No results found.".to_string())
+    } else {
+        ToolResult::success(output)
     }
 }
 
