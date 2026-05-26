@@ -154,12 +154,23 @@ impl OpenAiCompatProvider {
     /// Override the base URL (e.g. from a user-supplied --api-base flag).
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        if self.quirks.ollama_native_host.is_some() {
+            self.quirks.ollama_native_host = Some(Self::ollama_host_from_base_url(&self.base_url));
+        }
         self
     }
 
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    fn ollama_host_from_base_url(base_url: &str) -> String {
+        base_url
+            .trim_end_matches('/')
+            .strip_suffix("/v1")
+            .unwrap_or_else(|| base_url.trim_end_matches('/'))
+            .to_string()
+    }
 
     /// Returns `true` when the provider has no usable API key.
     fn has_no_key(&self) -> bool {
@@ -1293,5 +1304,24 @@ mod tests {
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[1]["role"], json!("assistant"));
         assert_eq!(messages[1]["content"], json!("Done."));
+    }
+
+    #[test]
+    fn ollama_base_url_override_updates_native_host() {
+        let provider = OpenAiCompatProvider::new(
+            "ollama",
+            "Ollama",
+            "http://localhost:11434/v1",
+        )
+        .with_quirks(ProviderQuirks {
+            ollama_native_host: Some("http://localhost:11434".to_string()),
+            ..Default::default()
+        })
+        .with_base_url("http://192.168.1.50:11434/v1");
+
+        assert_eq!(
+            provider.quirks.ollama_native_host.as_deref(),
+            Some("http://192.168.1.50:11434")
+        );
     }
 }
