@@ -825,7 +825,7 @@ mod tests {
 
     #[test]
     fn search_filters_entries_correctly() {
-        let mut screen = SettingsScreen::new();
+        let screen = SettingsScreen::new();
         let all = all_entries(&screen);
         let filtered: Vec<_> = all
             .iter()
