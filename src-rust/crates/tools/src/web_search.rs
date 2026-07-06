@@ -80,7 +80,12 @@ impl Tool for WebSearchTool {
 
 /// Queries a SearXNG instance's JSON API at the given base origin and returns formatted results.
 async fn search_searxng(query: &str, num_results: usize, base: &str) -> ToolResult {
-    let client = reqwest::Client::new();
+    // A self-hosted SearXNG instance can be slow or unreachable; bound the
+    // request so the tool can't hang the turn.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .unwrap_or_default();
     let url = format!(
         "{}/search?q={}&format=json&safesearch=0",
         base.trim_end_matches('/'),

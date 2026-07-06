@@ -333,7 +333,13 @@ Network requests are subject to the host's firewall and proxy settings.
 
 **Permission level:** ReadOnly
 
-Perform a web search and return a list of results with titles, URLs, and snippets. Requires a configured search API key (e.g., Brave Search).
+Perform a web search and return a list of results with titles, URLs, and snippets.
+
+The backend is selected by environment, in priority order:
+
+1. **SearXNG** — set `SEARXNG_URL` to a self-hosted instance's base URL (its `settings.yml` must have the JSON `format` enabled).
+2. **Brave Search** — set `BRAVE_SEARCH_API_KEY`.
+3. **DuckDuckGo** — no-config fallback used when neither of the above is set.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
