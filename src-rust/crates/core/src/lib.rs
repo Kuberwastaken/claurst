@@ -735,7 +735,7 @@ pub mod config {
         match provider_id {
             "anthropic" => Some(crate::constants::ANTHROPIC_API_BASE),
             "openai" => Some("https://api.openai.com"),
-            "minimax" => Some("https://api.minimax.io/anthropic"),
+            "minimax" => Some("https://api.minimax.io/anthropic/v1"),
             "ollama" => Some("http://localhost:11434"),
             "lmstudio" | "lm-studio" => Some("http://localhost:1234"),
             "llamacpp" | "llama-cpp" | "llama-server" => Some("http://localhost:8080"),
