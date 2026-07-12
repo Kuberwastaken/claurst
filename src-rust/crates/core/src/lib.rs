@@ -735,7 +735,7 @@ pub mod config {
         match provider_id {
             "anthropic" => Some(crate::constants::ANTHROPIC_API_BASE),
             "openai" => Some("https://api.openai.com"),
-            "minimax" => Some("https://api.minimax.io/anthropic/v1"),
+            "minimax" => Some(crate::constants::MINIMAX_ANTHROPIC_API_BASE),
             "ollama" => Some("http://localhost:11434"),
             "lmstudio" | "lm-studio" => Some("http://localhost:1234"),
             "llamacpp" | "llama-cpp" | "llama-server" => Some("http://localhost:8080"),
@@ -2057,6 +2057,7 @@ pub mod constants {
 
     // API endpoints & headers
     pub const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
+    pub const MINIMAX_ANTHROPIC_API_BASE: &str = "https://api.minimax.io/anthropic";
     pub const ANTHROPIC_API_VERSION: &str = "2023-06-01";
     pub const ANTHROPIC_BETA_HEADER: &str =
         "interleaved-thinking-2025-05-14,token-efficient-tools-2025-02-19,files-api-2025-04-14,\

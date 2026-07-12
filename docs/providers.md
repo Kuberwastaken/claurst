@@ -242,6 +242,51 @@ Native Cohere API adapter.
 
 ---
 
+### MiniMax
+
+The built-in provider uses the Anthropic-compatible Messages API.
+
+**Authentication:** `MINIMAX_API_KEY` environment variable, or set `api_key` in `settings.json`.
+
+**Default model:** `MiniMax-M3`
+
+| Protocol | Global base URL | China base URL | Path added by Claurst |
+|---|---|---|---|
+| Anthropic | `https://api.minimax.io/anthropic` | `https://api.minimaxi.com/anthropic` | `/v1/messages` |
+| OpenAI-compatible | `https://api.minimax.io/v1` | `https://api.minimaxi.com/v1` | `/chat/completions` |
+
+The built-in `minimax` provider uses the Anthropic row. To use the China endpoint, set `MINIMAX_BASE_URL` or configure `api_base`:
+
+```json
+{
+  "provider": "minimax",
+  "model": "MiniMax-M3",
+  "providers": {
+    "minimax": {
+      "api_key": "...",
+      "api_base": "https://api.minimaxi.com/anthropic"
+    }
+  }
+}
+```
+
+For the OpenAI-compatible protocol, use the custom provider with the corresponding `/v1` base URL:
+
+```json
+{
+  "provider": "custom-openai",
+  "model": "MiniMax-M3",
+  "providers": {
+    "custom-openai": {
+      "api_key": "...",
+      "api_base": "https://api.minimax.io/v1"
+    }
+  }
+}
+```
+
+---
+
 ### Ollama
 
 Connects to a locally running Ollama instance. No API key required.

@@ -157,9 +157,13 @@ pub fn provider_from_config(
             Some(Arc::new(provider))
         }
         "google" => api_key.map(|key| Arc::new(GoogleProvider::new(key)) as Arc<dyn LlmProvider>),
-        "minimax" => {
-            api_key.map(|key| Arc::new(MinimaxProvider::new(key)) as Arc<dyn LlmProvider>)
-        }
+        "minimax" => api_key.map(|key| {
+            let mut provider = MinimaxProvider::new(key);
+            if let Some(base) = api_base {
+                provider = provider.with_base_url(base);
+            }
+            Arc::new(provider) as Arc<dyn LlmProvider>
+        }),
         "azure" => {
             let resource_name = provider_cfg
                 .and_then(|provider| provider.options.get("resource_name"))

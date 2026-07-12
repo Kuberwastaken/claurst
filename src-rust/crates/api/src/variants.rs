@@ -525,6 +525,26 @@ mod tests {
     }
 
     #[test]
+    fn minimax_thinking_modes_match_model_semantics() {
+        use EffortLevel::*;
+
+        assert_eq!(
+            keys("@ai-sdk/anthropic", "MiniMax-M3", "2026-06-01", "minimax"),
+            vec![None, High]
+        );
+        assert!(
+            keys(
+                "@ai-sdk/anthropic",
+                "MiniMax-M2.7",
+                "2026-03-18",
+                "minimax"
+            )
+            .is_empty(),
+            "always-on M2.7 thinking must not expose a disable toggle"
+        );
+    }
+
+    #[test]
     fn openai_modern_gpt5_has_none_and_xhigh() {
         use EffortLevel::*;
         // gpt-5.5 (version 5 >= 2): none + xhigh via the versioned path, no minimal.

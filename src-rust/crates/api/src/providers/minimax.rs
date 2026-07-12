@@ -17,7 +17,7 @@ use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
     StreamBlockAccumulator, StreamEvent, SystemPromptStyle,
 };
-use crate::types::{ApiMessage, ApiToolDefinition, CreateMessageRequest};
+use crate::types::{ApiMessage, ApiToolDefinition, CreateMessageRequest, ThinkingConfig};
 
 use super::message_normalization::normalize_anthropic_messages;
 
@@ -31,7 +31,7 @@ pub struct MinimaxProvider {
 impl MinimaxProvider {
     pub fn new(api_key: String) -> Self {
         let api_base = std::env::var("MINIMAX_BASE_URL")
-            .unwrap_or_else(|_| "https://api.minimax.io/anthropic/v1".to_string());
+            .unwrap_or_else(|_| claurst_core::constants::MINIMAX_ANTHROPIC_API_BASE.to_string());
         let mut headers = header::HeaderMap::new();
         headers.insert("X-Api-Key", header::HeaderValue::from_str(&api_key).expect("unable to parse api key for http header"));
         let http_client = Client::builder()
@@ -46,6 +46,15 @@ impl MinimaxProvider {
             api_base,
             id: ProviderId::new(ProviderId::MINIMAX),
         }
+    }
+
+    pub fn with_base_url(mut self, api_base: impl Into<String>) -> Self {
+        self.api_base = api_base.into();
+        self
+    }
+
+    fn messages_url(api_base: &str) -> String {
+        format!("{}/v1/messages", api_base.trim_end_matches('/'))
     }
 
     fn build_request(request: &ProviderRequest) -> CreateMessageRequest {
@@ -84,8 +93,8 @@ impl MinimaxProvider {
         if !request.stop_sequences.is_empty() {
             builder = builder.stop_sequences(request.stop_sequences.clone());
         }
-        if let Some(tc) = request.thinking.clone() {
-            builder = builder.thinking(tc);
+        if request.model.eq_ignore_ascii_case("MiniMax-M3") && request.thinking.is_some() {
+            builder = builder.thinking(ThinkingConfig::adaptive());
         }
 
         builder.build()
@@ -293,7 +302,7 @@ impl LlmProvider for MinimaxProvider {
                 body: None,
             })?;
 
-        let url = format!("{}/v1/messages", self.api_base);
+        let url = Self::messages_url(&self.api_base);
         let api_key = self.api_key.clone();
         let http_client = self.http_client.clone();
         let provider_id = self.id.clone();
@@ -393,14 +402,71 @@ impl LlmProvider for MinimaxProvider {
         ProviderCapabilities {
             streaming: true,
             tool_calling: true,
-            thinking: false,
-            image_input: false,
+            thinking: true,
+            image_input: true,
             pdf_input: false,
             audio_input: false,
             video_input: false,
-            caching: false,
+            caching: true,
             structured_output: true,
             system_prompt_style: SystemPromptStyle::TopLevel,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(model: &str, thinking: bool) -> ProviderRequest {
+        ProviderRequest {
+            model: model.to_string(),
+            messages: Vec::new(),
+            system_prompt: None,
+            tools: Vec::new(),
+            max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: Vec::new(),
+            thinking: thinking.then(|| ThinkingConfig::enabled(4096)),
+            provider_options: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn default_base_builds_exact_messages_url() {
+        assert_eq!(
+            MinimaxProvider::messages_url(claurst_core::constants::MINIMAX_ANTHROPIC_API_BASE),
+            "https://api.minimax.io/anthropic/v1/messages"
+        );
+        assert_eq!(
+            MinimaxProvider::messages_url("https://api.minimaxi.com/anthropic/"),
+            "https://api.minimaxi.com/anthropic/v1/messages"
+        );
+    }
+
+    #[test]
+    fn m3_uses_adaptive_thinking_without_a_budget() {
+        let body =
+            serde_json::to_value(MinimaxProvider::build_request(&request("MiniMax-M3", true)))
+                .expect("request should serialize");
+
+        assert_eq!(body["thinking"], serde_json::json!({ "type": "adaptive" }));
+        let parsed: ThinkingConfig = serde_json::from_value(body["thinking"].clone())
+            .expect("adaptive thinking should deserialize");
+        assert_eq!(parsed.thinking_type, "adaptive");
+        assert_eq!(parsed.budget_tokens, 0);
+    }
+
+    #[test]
+    fn always_on_m2_models_do_not_receive_anthropic_budget_config() {
+        let body = serde_json::to_value(MinimaxProvider::build_request(&request(
+            "MiniMax-M2.7",
+            true,
+        )))
+        .expect("request should serialize");
+
+        assert!(body.get("thinking").is_none());
     }
 }

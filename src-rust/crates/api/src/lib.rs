@@ -92,8 +92,9 @@ pub use providers::OpenAiProvider;
 
 // Phase 3 re-exports — model registry.
 pub use model_registry::{
-    CostBreakdown, ExperimentalMode, InterleavedReasoning, Modality, ModelEntry, ModelRegistry,
-    ModelStatus, ProviderEntry, ProviderOverride, effective_model_for_config,
+    CostBreakdown, CostTier, CostTierCondition, ExperimentalMode, InterleavedReasoning, Modality,
+    ModelEntry, ModelRegistry, ModelStatus, ProviderEntry, ProviderOverride,
+    effective_model_for_config,
 };
 pub use effort_support::{model_is_reasoning, supported_efforts, variant_ladder};
 pub use variants::{
@@ -208,7 +209,12 @@ pub mod types {
     pub struct ThinkingConfig {
         #[serde(rename = "type")]
         pub thinking_type: String,
+        #[serde(default, skip_serializing_if = "is_zero")]
         pub budget_tokens: u32,
+    }
+
+    fn is_zero(value: &u32) -> bool {
+        *value == 0
     }
 
     impl ThinkingConfig {
@@ -216,6 +222,13 @@ pub mod types {
             Self {
                 thinking_type: "enabled".to_string(),
                 budget_tokens: budget,
+            }
+        }
+
+        pub fn adaptive() -> Self {
+            Self {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 0,
             }
         }
     }

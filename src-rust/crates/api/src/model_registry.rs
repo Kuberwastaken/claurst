@@ -114,6 +114,35 @@ pub struct ExperimentalMode {
 // CostBreakdown
 // ---------------------------------------------------------------------------
 
+/// The condition that activates a models.dev pricing tier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CostTierCondition {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+}
+
+/// One conditional pricing tier. All prices are USD per 1M tokens.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CostTier {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_audio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_audio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<f64>,
+    pub tier: CostTierCondition,
+}
+
 /// Full pricing breakdown for one model.  All values are USD per 1M tokens.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CostBreakdown {
@@ -131,6 +160,10 @@ pub struct CostBreakdown {
     pub output_audio: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<f64>,
+    /// Generic conditional tiers from models.dev. Unlike the legacy field
+    /// below, each entry retains its actual activation threshold.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tiers: Vec<CostTier>,
     /// Pricing tier when the prompt exceeds 200K tokens (currently used by
     /// Claude on certain providers).  Not recursive — this is the only depth
     /// models.dev supports.
@@ -380,6 +413,8 @@ mod md {
         #[serde(default)]
         pub reasoning: Option<f64>,
         #[serde(default)]
+        pub tiers: Vec<CostTier>,
+        #[serde(default)]
         pub context_over_200k: Option<Box<MdCost>>,
     }
 
@@ -393,6 +428,7 @@ mod md {
                 input_audio: c.input_audio,
                 output_audio: c.output_audio,
                 reasoning: c.reasoning,
+                tiers: c.tiers,
                 context_over_200k: c.context_over_200k.map(|c| Box::new((*c).into())),
             }
         }
@@ -655,6 +691,11 @@ fn merge_cost(base: &CostBreakdown, over: &CostBreakdown) -> CostBreakdown {
         input_audio: over.input_audio.or(base.input_audio),
         output_audio: over.output_audio.or(base.output_audio),
         reasoning: over.reasoning.or(base.reasoning),
+        tiers: if over.tiers.is_empty() {
+            base.tiers.clone()
+        } else {
+            over.tiers.clone()
+        },
         context_over_200k: match (&over.context_over_200k, &base.context_over_200k) {
             (Some(o), Some(b)) => Some(Box::new(merge_cost(b, o))),
             (Some(o), None) => Some(o.clone()),
@@ -1546,6 +1587,51 @@ mod tests {
         assert!(
             reg.list_by_provider("minimax").len() >= 5,
             "minimax catalog must surface (~6), not the old hardcoded 1"
+        );
+    }
+
+    #[test]
+    fn minimax_targets_preserve_current_metadata() {
+        let reg = ModelRegistry::new();
+
+        let m3 = reg
+            .get("minimax", "MiniMax-M3")
+            .expect("MiniMax-M3 must be bundled");
+        assert_eq!(m3.info.context_window, 1_000_000);
+        assert!(m3.reasoning);
+        assert!(m3.tool_calling);
+        assert_eq!(
+            m3.modalities_input,
+            vec![Modality::Text, Modality::Image, Modality::Video]
+        );
+        assert_eq!(m3.cost_input, Some(0.3));
+        assert_eq!(m3.cost_output, Some(1.2));
+        assert_eq!(m3.cost_cache_read, Some(0.06));
+
+        let long_context_tier = m3
+            .cost
+            .tiers
+            .iter()
+            .find(|tier| tier.tier.kind == "context" && tier.tier.size == Some(512_000))
+            .expect("MiniMax-M3 must retain its 512k pricing tier");
+        assert_eq!(long_context_tier.input, Some(0.6));
+        assert_eq!(long_context_tier.output, Some(2.4));
+        assert_eq!(long_context_tier.cache_read, Some(0.12));
+
+        let m27 = reg
+            .get("minimax", "MiniMax-M2.7")
+            .expect("MiniMax-M2.7 must remain bundled");
+        assert_eq!(m27.info.context_window, 204_800);
+        assert!(m27.reasoning);
+        assert_eq!(m27.modalities_input, vec![Modality::Text]);
+        assert_eq!(m27.cost_input, Some(0.3));
+        assert_eq!(m27.cost_output, Some(1.2));
+        assert_eq!(m27.cost_cache_read, Some(0.06));
+        assert_eq!(m27.cost_cache_write, Some(0.375));
+
+        assert_eq!(
+            reg.best_model_for_provider("minimax").as_deref(),
+            Some("MiniMax-M3")
         );
     }
 
