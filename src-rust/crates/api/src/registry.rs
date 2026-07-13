@@ -162,6 +162,13 @@ pub fn provider_from_config(
             if let Some(base) = api_base {
                 provider = provider.with_base_url(base);
             }
+            if let Some(service_tier) = provider_cfg
+                .and_then(|config| config.options.get("service_tier"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+            {
+                provider = provider.with_service_tier(service_tier);
+            }
             Arc::new(provider) as Arc<dyn LlmProvider>
         }),
         "azure" => {

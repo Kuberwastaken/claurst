@@ -25,6 +25,7 @@ pub struct MinimaxProvider {
     http_client: Client,
     api_key: String,
     api_base: String,
+    service_tier: Option<String>,
     id: ProviderId,
 }
 
@@ -44,12 +45,18 @@ impl MinimaxProvider {
             http_client,
             api_key,
             api_base,
+            service_tier: None,
             id: ProviderId::new(ProviderId::MINIMAX),
         }
     }
 
     pub fn with_base_url(mut self, api_base: impl Into<String>) -> Self {
         self.api_base = api_base.into();
+        self
+    }
+
+    pub fn with_service_tier(mut self, service_tier: impl Into<String>) -> Self {
+        self.service_tier = Some(service_tier.into());
         self
     }
 
@@ -98,6 +105,17 @@ impl MinimaxProvider {
         }
 
         builder.build()
+    }
+
+    fn build_request_body(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<Value, serde_json::Error> {
+        let mut body = serde_json::to_value(Self::build_request(request))?;
+        if let Some(service_tier) = &self.service_tier {
+            body["service_tier"] = Value::String(service_tier.clone());
+        }
+        Ok(body)
     }
 
     fn map_stop_reason(s: &str) -> StopReason {
@@ -292,9 +310,8 @@ impl LlmProvider for MinimaxProvider {
         request: ProviderRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
     {
-        let api_request = Self::build_request(&request);
-
-        let body = serde_json::to_value(&api_request)
+        let body = self
+            .build_request_body(&request)
             .map_err(|e| ProviderError::Other {
                 provider: self.id.clone(),
                 message: format!("Failed to serialize request: {}", e),
@@ -417,6 +434,8 @@ impl LlmProvider for MinimaxProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     fn request(model: &str, thinking: bool) -> ProviderRequest {
         ProviderRequest {
@@ -444,6 +463,75 @@ mod tests {
             MinimaxProvider::messages_url("https://api.minimaxi.com/anthropic/"),
             "https://api.minimaxi.com/anthropic/v1/messages"
         );
+    }
+
+    #[tokio::test]
+    async fn configured_base_and_service_tier_reach_the_wire_request() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have an address");
+        let capture = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("request should connect");
+            let mut raw_request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            let mut expected_len = None;
+
+            loop {
+                let read = socket.read(&mut buffer).await.expect("request should read");
+                assert!(read > 0, "request ended before the body was complete");
+                raw_request.extend_from_slice(&buffer[..read]);
+
+                if expected_len.is_none() {
+                    if let Some(header_end) = raw_request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                    {
+                        let headers = std::str::from_utf8(&raw_request[..header_end])
+                            .expect("headers should be UTF-8");
+                        let content_length = headers
+                            .lines()
+                            .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
+                            .and_then(|line| line.split_once(':'))
+                            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                            .expect("request should include content-length");
+                        expected_len = Some(header_end + 4 + content_length);
+                    }
+                }
+
+                if expected_len.is_some_and(|len| raw_request.len() >= len) {
+                    break;
+                }
+            }
+
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .expect("response should write");
+            raw_request
+        });
+
+        let provider = MinimaxProvider::new("test-key".to_string())
+            .with_base_url(format!("http://{address}/anthropic"))
+            .with_service_tier("priority");
+        let _stream = provider
+            .create_message_stream(request("MiniMax-M3", false))
+            .await
+            .expect("request should succeed");
+
+        let raw_request = capture.await.expect("capture task should succeed");
+        let request_text = String::from_utf8(raw_request).expect("request should be UTF-8");
+        let (headers, body) = request_text
+            .split_once("\r\n\r\n")
+            .expect("request should contain headers and body");
+        assert_eq!(
+            headers.lines().next(),
+            Some("POST /anthropic/v1/messages HTTP/1.1")
+        );
+        let body: Value = serde_json::from_str(body).expect("body should be JSON");
+        assert_eq!(body["service_tier"], serde_json::json!("priority"));
     }
 
     #[test]

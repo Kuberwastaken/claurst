@@ -505,6 +505,23 @@ fn remap_provider_id(id: &str) -> &str {
     }
 }
 
+fn normalize_provider_api(provider_id: &str, api: Option<String>) -> Option<String> {
+    if matches!(
+        provider_id,
+        "minimax" | "minimax-cn" | "minimax-coding-plan" | "minimax-cn-coding-plan"
+    ) {
+        return api.map(|url| {
+            if let Some(base) = url.strip_suffix("/v1") {
+                base.to_owned()
+            } else {
+                url
+            }
+        });
+    }
+
+    api
+}
+
 fn transform_api(api: md::ApiJson) -> ParsedSnapshot {
     let mut out = ParsedSnapshot::default();
 
@@ -516,7 +533,7 @@ fn transform_api(api: md::ApiJson) -> ParsedSnapshot {
             id: pid.clone(),
             name: p.name,
             env: p.env,
-            api: p.api,
+            api: normalize_provider_api(&provider_id, p.api),
             npm: p.npm,
             doc: p.doc,
         });
@@ -1506,6 +1523,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn minimax_anthropic_api_root_excludes_the_messages_prefix() {
+        let upstream_api = ["https://api.minimax.io/anthropic", "v1"].join("/");
+        let json = serde_json::json!({
+            "minimax": {
+                "id": "minimax",
+                "name": "MiniMax",
+                "api": upstream_api,
+                "models": {}
+            }
+        })
+        .to_string();
+        let parsed = parse_snapshot_str(&json).expect("parse must succeed");
+        let provider = parsed.providers.get("minimax").expect("minimax provider");
+
+        assert_eq!(
+            provider.api.as_deref(),
+            Some("https://api.minimax.io/anthropic")
+        );
+    }
+
     // ---- experimental.modes expansion (opencode provider.ts:1247-1264) ----
 
     #[test]
@@ -1593,6 +1631,22 @@ mod tests {
     #[test]
     fn minimax_targets_preserve_current_metadata() {
         let reg = ModelRegistry::new();
+
+        for (provider_id, expected_api) in [
+            ("minimax", "https://api.minimax.io/anthropic"),
+            ("minimax-cn", "https://api.minimaxi.com/anthropic"),
+            ("minimax-coding-plan", "https://api.minimax.io/anthropic"),
+            (
+                "minimax-cn-coding-plan",
+                "https://api.minimaxi.com/anthropic",
+            ),
+        ] {
+            assert_eq!(
+                reg.provider(provider_id).and_then(|provider| provider.api.as_deref()),
+                Some(expected_api),
+                "{provider_id} must expose the Anthropic base URL without /v1"
+            );
+        }
 
         let m3 = reg
             .get("minimax", "MiniMax-M3")
