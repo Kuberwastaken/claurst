@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Claurst installer for Linux and macOS.
+# Claurst installer for Linux, macOS, and Windows (Git Bash / MSYS / Cygwin).
 #
 # Usage (one-liner):
 #   curl -fsSL https://github.com/Kuberwastaken/claurst/releases/latest/download/install.sh | bash
@@ -33,7 +33,9 @@ Options:
     -b, --binary <path>     Install from a local binary instead of downloading
         --token <token>     GitHub token for API/downloads (or set GITHUB_TOKEN / GH_TOKEN)
         --no-modify-path    Don't modify shell config files (.zshrc, .bashrc, etc.)
-        --install-dir <dir> Override install location (default: ${XDG_BIN_HOME:-~/.local/bin})
+        --install-dir <dir> Override install location
+                            (default: ${XDG_BIN_HOME:-~/.local/bin}; on Windows:
+                            %LOCALAPPDATA%\\Programs\\claurst)
 
 Examples:
     curl -fsSL https://github.com/Kuberwastaken/claurst/releases/latest/download/install.sh | bash
@@ -124,7 +126,43 @@ if [[ -n "$github_token" ]]; then
     github_curl_args+=(-H "Authorization: Bearer ${github_token}")
 fi
 
-INSTALL_DIR="${install_dir_override:-${XDG_BIN_HOME:-$HOME/.local/bin}}"
+# True when running under Git Bash / MSYS / Cygwin on Windows.
+is_windows_shell() {
+    case "$(uname -s 2>/dev/null || echo unknown)" in
+        MINGW*|MSYS*|CYGWIN*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Convert a Windows path (C:\foo or C:/foo) to a Unix path when cygpath exists.
+to_unix_path() {
+    local p="$1"
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -u "$p"
+    else
+        # MSYS/Git Bash often accept mixed paths after normalizing slashes.
+        echo "${p//\\//}"
+    fi
+}
+
+# Default install dir matches install.ps1 on Windows:
+#   %LOCALAPPDATA%\Programs\claurst  (fallback: %USERPROFILE%\.local\bin)
+# Unix: ${XDG_BIN_HOME:-~/.local/bin}
+default_install_dir() {
+    if is_windows_shell; then
+        if [[ -n "${LOCALAPPDATA:-}" ]]; then
+            echo "$(to_unix_path "$LOCALAPPDATA")/Programs/claurst"
+        elif [[ -n "${USERPROFILE:-}" ]]; then
+            echo "$(to_unix_path "$USERPROFILE")/.local/bin"
+        else
+            echo "${HOME}/.local/bin"
+        fi
+    else
+        echo "${XDG_BIN_HOME:-$HOME/.local/bin}"
+    fi
+}
+
+INSTALL_DIR="${install_dir_override:-$(default_install_dir)}"
 mkdir -p "$INSTALL_DIR"
 
 # ----- Detect platform & arch -----
@@ -134,12 +172,7 @@ detect_target() {
     case "$raw_os" in
         Darwin*)              os="macos" ;;
         Linux*)               os="linux" ;;
-        MINGW*|MSYS*|CYGWIN*)
-            print_message error "Detected Windows-like environment ($raw_os)."
-            print_message info "Run install.ps1 in PowerShell instead:"
-            print_message info "  irm https://github.com/${REPO}/releases/latest/download/install.ps1 | iex"
-            exit 1
-            ;;
+        MINGW*|MSYS*|CYGWIN*) os="windows" ;;
         *)
             print_message error "Unsupported OS: $raw_os"
             exit 1
@@ -164,14 +197,33 @@ detect_target() {
         fi
     fi
 
+    # Windows releases currently ship x86_64 only (same as install.ps1).
+    if [ "$os" = "windows" ] && [ "$arch" != "x86_64" ]; then
+        print_message warning "Windows ${arch} is not currently supported in releases. Falling back to x86_64."
+        arch="x86_64"
+    fi
+
     target="${os}-${arch}"
+    if [ "$os" = "windows" ]; then
+        archive_ext="zip"
+        binary_name="${APP}.exe"
+    else
+        archive_ext="tar.gz"
+        binary_name="$APP"
+    fi
 }
 
 # ----- Pre-flight: required tools -----
 check_required_tools() {
     local missing=()
-    command -v curl >/dev/null 2>&1 || missing+=("curl")
-    command -v tar  >/dev/null 2>&1 || missing+=("tar")
+    if [[ -z "$binary_path" ]]; then
+        command -v curl >/dev/null 2>&1 || missing+=("curl")
+        if is_windows_shell; then
+            command -v unzip >/dev/null 2>&1 || missing+=("unzip")
+        else
+            command -v tar >/dev/null 2>&1 || missing+=("tar")
+        fi
+    fi
     if [ "${#missing[@]}" -gt 0 ]; then
         print_message error "Missing required tools: ${missing[*]}"
         print_message info "Please install them and try again."
@@ -216,10 +268,12 @@ check_existing_install() {
 
 # ----- Download & extract -----
 download_and_install() {
-    local archive="${APP}-${target}.tar.gz"
+    local archive="${APP}-${target}.${archive_ext}"
     local url="https://github.com/${REPO}/releases/download/v${specific_version}/${archive}"
     local tmp_dir
-    tmp_dir=$(mktemp -d -t claurst-install-XXXXXX)
+    # mktemp -t is GNU-style; fall back for older / BSD layouts (and Git Bash).
+    tmp_dir=$(mktemp -d -t claurst-install-XXXXXX 2>/dev/null \
+        || mktemp -d "${TMPDIR:-/tmp}/claurst-install.XXXXXX")
     trap "rm -rf '$tmp_dir'" EXIT
 
     print_message info "${MUTED}Installing ${NC}${APP} ${MUTED}v${NC}${specific_version} ${MUTED}(${target})${NC}"
@@ -282,16 +336,24 @@ download_and_install() {
     fi
 
     print_message info "${MUTED}Extracting...${NC}"
-    tar -xzf "$tmp_dir/$archive" -C "$tmp_dir"
+    if [[ "$archive_ext" == "zip" ]]; then
+        # Quiet extract; -o overwrites without prompting (Windows zip layout).
+        if ! unzip -o -q "$tmp_dir/$archive" -d "$tmp_dir"; then
+            print_message error "Extract failed."
+            exit 1
+        fi
+    else
+        tar -xzf "$tmp_dir/$archive" -C "$tmp_dir"
+    fi
 
-    if [[ ! -f "$tmp_dir/$APP" ]]; then
-        print_message error "Archive did not contain expected binary '$APP'"
+    if [[ ! -f "$tmp_dir/$binary_name" ]]; then
+        print_message error "Archive did not contain expected binary '$binary_name'"
         print_message info "Contents:"
         ls -la "$tmp_dir"
         exit 1
     fi
 
-    install_binary "$tmp_dir/$APP"
+    install_binary "$tmp_dir/$binary_name"
 }
 
 install_from_binary() {
@@ -305,7 +367,20 @@ install_from_binary() {
 
 install_binary() {
     local source="$1"
-    local target_path="${INSTALL_DIR}/${APP}"
+    # Prefer binary_name from detect_target; local --binary installs may not set it.
+    local dest_name="${binary_name:-$APP}"
+    if is_windows_shell && [[ "$dest_name" != *.exe ]]; then
+        dest_name="${dest_name}.exe"
+    fi
+    local target_path="${INSTALL_DIR}/${dest_name}"
+
+    # Windows holds an exclusive lock on a running .exe — rename the old binary
+    # aside first (same approach as install.ps1).
+    if is_windows_shell && [[ -f "$target_path" ]]; then
+        local stale="${target_path}.old"
+        rm -f "$stale" 2>/dev/null || true
+        mv -f "$target_path" "$stale" 2>/dev/null || true
+    fi
 
     cp "$source" "$target_path"
     chmod 755 "$target_path"
@@ -319,11 +394,63 @@ install_binary() {
 }
 
 # ----- PATH modification -----
-add_to_path_if_needed() {
-    if [[ "$no_modify_path" == "true" ]]; then
-        return
+# On Windows, match install.ps1: update the user PATH env var (inherited by
+# PowerShell, cmd, and Git Bash). On Unix, append to shell config files.
+add_to_windows_user_path() {
+    local win_dir
+    if command -v cygpath >/dev/null 2>&1; then
+        win_dir=$(cygpath -w "$INSTALL_DIR")
+    else
+        # Best-effort: turn /c/Users/... into C:\Users\...
+        win_dir="$INSTALL_DIR"
+        if [[ "$win_dir" =~ ^/([a-zA-Z])/(.*) ]]; then
+            win_dir="${BASH_REMATCH[1]^}:\\${BASH_REMATCH[2]//\//\\}"
+        else
+            win_dir="${win_dir//\//\\}"
+        fi
     fi
 
+    # Use PowerShell so we only touch the User scope (same as install.ps1).
+    local ps_script
+    ps_script=$(cat <<'PSEOF'
+$ErrorActionPreference = 'Stop'
+$installDir = $env:CLAURST_INSTALL_DIR_WIN
+$current = [Environment]::GetEnvironmentVariable('Path', 'User')
+if ($null -eq $current) { $current = '' }
+$paths = $current -split ';' | Where-Object { $_ -ne '' }
+foreach ($p in $paths) {
+    if ($p.TrimEnd('\') -ieq $installDir.TrimEnd('\')) {
+        Write-Output 'already'
+        exit 0
+    }
+}
+if ([string]::IsNullOrEmpty($current)) {
+    $newPath = $installDir
+} else {
+    $newPath = $installDir + ';' + $current
+}
+[Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
+Write-Output 'added'
+PSEOF
+)
+
+    local result
+    if ! result=$(CLAURST_INSTALL_DIR_WIN="$win_dir" powershell.exe -NoProfile -NonInteractive -Command "$ps_script" 2>/dev/null); then
+        print_message warning "Could not update Windows user PATH. Add manually: $win_dir"
+        return
+    fi
+    result=$(echo "$result" | tr -d '\r' | tail -n 1)
+    # Visible in this Git Bash session immediately.
+    export PATH="$INSTALL_DIR:$PATH"
+    if [[ "$result" == "already" ]]; then
+        print_message info "${MUTED}Install dir already on user PATH: ${NC}$win_dir"
+    else
+        print_message success "Added $win_dir to user PATH"
+        print_message info "${MUTED}Open a new terminal for the change to take effect everywhere.${NC}"
+    fi
+}
+
+add_to_unix_path() {
     if [[ ":$PATH:" == *":$INSTALL_DIR:"* ]]; then
         return  # already on PATH for this session
     fi
@@ -383,6 +510,18 @@ add_to_path_if_needed() {
     } >> "$config_file"
     print_message success "Added $INSTALL_DIR to PATH in $config_file"
     print_message info "${MUTED}Restart your shell or run:${NC} source $config_file"
+}
+
+add_to_path_if_needed() {
+    if [[ "$no_modify_path" == "true" ]]; then
+        return
+    fi
+
+    if is_windows_shell; then
+        add_to_windows_user_path
+    else
+        add_to_unix_path
+    fi
 }
 
 # ----- GitHub Actions environment hint -----
