@@ -31,6 +31,7 @@ Options:
     -h, --help              Display this help message
     -v, --version <version> Install a specific version (e.g., 0.1.0 or v0.1.0)
     -b, --binary <path>     Install from a local binary instead of downloading
+        --token <token>     GitHub token for API/downloads (or set GITHUB_TOKEN / GH_TOKEN)
         --no-modify-path    Don't modify shell config files (.zshrc, .bashrc, etc.)
         --install-dir <dir> Override install location (default: ${XDG_BIN_HOME:-~/.local/bin})
 
@@ -38,6 +39,7 @@ Examples:
     curl -fsSL https://github.com/Kuberwastaken/claurst/releases/latest/download/install.sh | bash
     ./install.sh --version 0.1.0
     ./install.sh --binary /path/to/claurst
+    GITHUB_TOKEN=ghp_... ./install.sh
 EOF
 }
 
@@ -59,6 +61,8 @@ requested_version=${VERSION:-}
 no_modify_path=false
 binary_path=""
 install_dir_override=""
+# Prefer explicit --token; otherwise GITHUB_TOKEN, then GH_TOKEN (gh CLI convention).
+github_token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -84,6 +88,15 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             ;;
+        --token)
+            if [[ -n "${2:-}" ]]; then
+                github_token="$2"
+                shift 2
+            else
+                print_message error "Error: --token requires a token argument"
+                exit 1
+            fi
+            ;;
         --no-modify-path)
             no_modify_path=true
             shift
@@ -103,6 +116,13 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Build curl args for GitHub (API + asset downloads). Auth avoids rate limits
+# and enables private-release installs when a token is available.
+github_curl_args=(-fsSL -H "User-Agent: claurst-installer" -H "Accept: application/vnd.github+json")
+if [[ -n "$github_token" ]]; then
+    github_curl_args+=(-H "Authorization: Bearer ${github_token}")
+fi
 
 INSTALL_DIR="${install_dir_override:-${XDG_BIN_HOME:-$HOME/.local/bin}}"
 mkdir -p "$INSTALL_DIR"
@@ -166,11 +186,15 @@ resolve_version() {
         specific_version="$requested_version"
     else
         # Fetch latest version from GitHub API.  Use sed instead of jq for portability.
-        specific_version=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+        specific_version=$(curl "${github_curl_args[@]}" \
+            "https://api.github.com/repos/${REPO}/releases/latest" \
             | sed -n 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/p' \
             | head -n 1)
         if [[ -z "$specific_version" ]]; then
             print_message error "Failed to fetch latest version from GitHub API"
+            if [[ -z "$github_token" ]]; then
+                print_message info "If you hit rate limits or need a private release, set GITHUB_TOKEN or pass --token."
+            fi
             exit 1
         fi
     fi
@@ -200,11 +224,22 @@ download_and_install() {
 
     print_message info "${MUTED}Installing ${NC}${APP} ${MUTED}v${NC}${specific_version} ${MUTED}(${target})${NC}"
     print_message info "${MUTED}Downloading ${NC}${url}"
+    if [[ -n "$github_token" ]]; then
+        print_message info "${MUTED}Using GitHub authentication.${NC}"
+    fi
 
-    if ! curl -fL --progress-bar -o "$tmp_dir/$archive" "$url"; then
+    # Progress bar is optional; keep -f so HTTP errors fail the install.
+    local -a dl_args=(-fL --progress-bar -H "User-Agent: claurst-installer")
+    if [[ -n "$github_token" ]]; then
+        dl_args+=(-H "Authorization: Bearer ${github_token}")
+    fi
+    if ! curl "${dl_args[@]}" -o "$tmp_dir/$archive" "$url"; then
         print_message error "Download failed."
         print_message info "Check that release v${specific_version} exists for ${target}:"
         print_message info "  https://github.com/${REPO}/releases/tag/v${specific_version}"
+        if [[ -z "$github_token" ]]; then
+            print_message info "Private releases require GITHUB_TOKEN / GH_TOKEN or --token."
+        fi
         exit 1
     fi
 
@@ -214,7 +249,7 @@ download_and_install() {
     # case we warn and continue so existing installs keep working.  But if the
     # file IS present and the hash does NOT match, we abort hard.
     local sums_url="https://github.com/${REPO}/releases/download/v${specific_version}/SHA256SUMS"
-    if curl -fsSL -o "$tmp_dir/SHA256SUMS" "$sums_url" 2>/dev/null; then
+    if curl "${github_curl_args[@]}" -o "$tmp_dir/SHA256SUMS" "$sums_url" 2>/dev/null; then
         # sha256sum emits "<hash>  <filename>" (two spaces); awk collapses the
         # whitespace so $1=hash, $2=bare filename.  Match on the bare archive
         # name (not the full temp path).

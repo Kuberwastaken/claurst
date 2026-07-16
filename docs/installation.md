@@ -58,10 +58,40 @@ Both scripts accept the same flags:
 | `--version 0.1.0` | `-Version 0.1.0` | Install a specific version |
 | `--binary <path>` | `-Binary <path>` | Install from a local file (skip download) |
 | `--install-dir <path>` | `-InstallDir <path>` | Override the install directory |
+| `--token <token>` | `-Token <token>` | GitHub token for API/downloads |
 | `--no-modify-path` | `-NoModifyPath` | Don't touch shell config / user PATH |
 | `--help` | `-Help` | Show usage |
 
 Example: `curl -fsSL https://.../install.sh | bash -s -- --version 0.1.0`
+
+### GitHub authentication
+
+If GitHub rate-limits unauthenticated requests, or you install from a private
+fork/release, set a token via env or flag. The installer also accepts
+`GH_TOKEN` (GitHub CLI convention):
+
+```bash
+# Linux / macOS
+export GITHUB_TOKEN=ghp_...   # or GH_TOKEN
+curl -fsSL https://github.com/Kuberwastaken/claurst/releases/latest/download/install.sh | bash
+
+# Or pass the token as a flag when running the script locally:
+./install.sh --token ghp_...
+```
+
+```powershell
+# Windows
+$env:GITHUB_TOKEN = 'ghp_...'   # or $env:GH_TOKEN
+irm https://github.com/Kuberwastaken/claurst/releases/latest/download/install.ps1 | iex
+
+# Or:
+.\install.ps1 -Token ghp_...
+```
+
+The token is sent as `Authorization: Bearer …` on the GitHub API call that
+resolves the latest version and on asset/checksum downloads. A fine-grained
+or classic PAT with `contents: read` (public repos need no scopes beyond
+rate-limit relief) is enough.
 
 ---
 
