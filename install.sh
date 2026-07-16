@@ -375,15 +375,20 @@ install_binary() {
     local target_path="${INSTALL_DIR}/${dest_name}"
 
     # Windows holds an exclusive lock on a running .exe — rename the old binary
-    # aside first (same approach as install.ps1).
+    # aside first, then remove it after the new binary is in place (same as
+    # install.ps1). The lock is on the open handle, not the new path name.
+    local stale="${target_path}.old"
     if is_windows_shell && [[ -f "$target_path" ]]; then
-        local stale="${target_path}.old"
         rm -f "$stale" 2>/dev/null || true
         mv -f "$target_path" "$stale" 2>/dev/null || true
     fi
 
     cp "$source" "$target_path"
     chmod 755 "$target_path"
+
+    if [[ -f "$stale" ]]; then
+        rm -f "$stale" 2>/dev/null || true
+    fi
 
     # On macOS, strip the quarantine attribute so Gatekeeper doesn't block the unsigned binary.
     if [[ "$(uname -s)" == "Darwin" ]]; then
