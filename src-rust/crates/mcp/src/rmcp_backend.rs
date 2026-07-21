@@ -626,7 +626,7 @@ async fn build_snapshot(
     config: &claurst_core::config::McpServerConfig,
     peer: &rmcp::Peer<RoleClient>,
 ) -> anyhow::Result<McpClientSnapshot> {
-    let server_info = peer.peer_info().cloned();
+    let server_info = peer.peer_info().map(|info| (*info).clone());
 
     let (server_info_value, capabilities, instructions) = match server_info {
         Some(info) => (
