@@ -316,15 +316,22 @@ fn swap_binary(current: &Path, new: &Path) -> Result<()> {
 
     #[cfg(not(target_os = "windows"))]
     {
-        // On unix, std::fs::rename won't work across mounts; copy + chmod is safer.
-        // The kernel will let us replace the file even while it's running because
-        // unlink-and-replace just frees the directory entry.
-        std::fs::copy(new, current)
-            .with_context(|| format!("failed to copy new binary into {}", current.display()))?;
+        // std::fs::copy() writes into the existing inode (open + O_TRUNC), and
+        // that inode is the running process's own text segment — the kernel
+        // rejects the write with ETXTBSY ("Text file busy"). rename() instead
+        // swaps the directory entry to point at a new inode, which the kernel
+        // allows even while the old inode is still mapped and executing.
+        // rename() requires src/dest on the same filesystem, so stage the
+        // temp file next to `current` rather than relying on the OS tmp dir.
+        let staged = current.with_extension("new");
+        std::fs::copy(new, &staged)
+            .with_context(|| format!("failed to stage new binary at {}", staged.display()))?;
         let _ = std::process::Command::new("chmod")
             .arg("755")
-            .arg(current)
+            .arg(&staged)
             .status();
+        std::fs::rename(&staged, current)
+            .with_context(|| format!("failed to swap new binary into {}", current.display()))?;
         Ok(())
     }
 }
@@ -343,4 +350,55 @@ fn tempdir_for_upgrade() -> Result<PathBuf> {
     let dir = base.join(format!("claurst-upgrade-{}-{}", pid, now));
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+#[cfg(all(test, not(target_os = "windows")))]
+mod tests {
+    use super::swap_binary;
+    use std::process::Command;
+
+    // Regression test for the ETXTBSY bug: swap_binary must be able to
+    // replace a binary while it is actively running (mirrors `claurst
+    // upgrade` replacing its own executable). We copy a real ELF binary
+    // (`sleep`) so it has an executable text segment, spawn it so the
+    // kernel maps that segment, and then swap it out from under the
+    // running process.
+    #[test]
+    fn swap_binary_replaces_a_running_executable() {
+        let dir = std::env::temp_dir().join(format!(
+            "claurst-upgrade-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let current = dir.join("running");
+        let replacement = dir.join("replacement");
+        std::fs::copy("/usr/bin/sleep", &current).expect("fixture binary missing");
+        std::fs::copy("/usr/bin/sleep", &replacement).expect("fixture binary missing");
+        let _ = Command::new("chmod").arg("755").arg(&current).status();
+        let _ = Command::new("chmod").arg("755").arg(&replacement).status();
+
+        let mut child = Command::new(&current)
+            .arg("5")
+            .spawn()
+            .expect("failed to spawn fixture binary");
+
+        // Sanity check: overwriting the file in place while it's running
+        // is exactly what triggers ETXTBSY. This confirms the fixture
+        // actually reproduces the bug this test guards against.
+        let direct_overwrite = std::fs::copy(&replacement, &current);
+        assert!(
+            direct_overwrite.is_err(),
+            "expected direct overwrite of a running binary to fail with ETXTBSY"
+        );
+
+        let result = swap_binary(&current, &replacement);
+
+        child.kill().ok();
+        child.wait().ok();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        result.expect("swap_binary should replace a running binary via rename, not in-place write");
+    }
 }
