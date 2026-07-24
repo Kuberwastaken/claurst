@@ -1995,32 +1995,49 @@ async fn run_interactive(
         }
     }
 
-    // CLAUDE_STATUS_COMMAND: optional external command whose stdout replaces the
-    // left-side status bar text. Polled every 500ms (debounced) in the main loop.
-    // The command is run in a background task; results flow through a channel.
-    let status_cmd_str = std::env::var("CLAUDE_STATUS_COMMAND").ok();
+    // Status line: optional external command whose stdout is shown in a status
+    // bar row. Configured via settings.json `statusLine`. The command receives
+    // session data as JSON on stdin and is polled at `pollIntervalMs` (default 5s).
+    // Backward compat: CLAUDE_STATUS_COMMAND env var is also checked.
+    let status_cmd_cfg = live_config.status_line.as_ref().map(|s| {
+        (s.command.clone(), s.poll_interval_ms.unwrap_or(5000))
+    }).or_else(|| {
+        std::env::var("CLAUDE_STATUS_COMMAND").ok().map(|c| (c, 500u16 as u64))
+    });
     let (status_cmd_tx, mut status_cmd_rx) = mpsc::channel::<String>(4);
-    if let Some(ref cmd_str) = status_cmd_str {
+    // Shared session data for the polling task (updated from the main loop).
+    let session_data: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+    if let Some((ref cmd_str, poll_ms)) = status_cmd_cfg {
         let cmd_str = cmd_str.clone();
         let tx = status_cmd_tx.clone();
+        let sd = session_data.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                // Run via shell so pipes/redirects in the command string work.
+                tokio::time::sleep(Duration::from_millis(poll_ms)).await;
+                let input = sd.lock().unwrap().clone().unwrap_or_default();
                 let output = if cfg!(target_os = "windows") {
                     tokio::process::Command::new("cmd")
                         .args(["/C", &cmd_str])
-                        .output()
-                        .await
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .spawn()
                 } else {
                     tokio::process::Command::new("sh")
                         .args(["-c", &cmd_str])
-                        .output()
-                        .await
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .spawn()
                 };
-                if let Ok(out) = output {
-                    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    let _ = tx.try_send(text);
+                if let Ok(mut child) = output {
+                    use tokio::io::AsyncWriteExt;
+                    if let Some(mut stdin) = child.stdin.take() {
+                        stdin.write_all(input.as_bytes()).await.ok();
+                        drop(stdin);
+                    }
+                    if let Ok(out) = child.wait_with_output().await {
+                        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        let _ = tx.try_send(text);
+                    }
                 }
             }
         });
@@ -3636,8 +3653,42 @@ async fn run_interactive(
             }
         }
 
-        // Drain CLAUDE_STATUS_COMMAND results (most recent wins)
-        if status_cmd_str.is_some() {
+        // Update shared session data for status line polling task.
+        if status_cmd_cfg.is_some() {
+            let elapsed = app.session_start.elapsed().as_secs();
+            let total_in = app.token_count as u64;
+            let ctx_size = app.context_window_size;
+            let used_pct = if ctx_size > 0 {
+                Some(app.context_used_tokens as f64 / ctx_size as f64 * 100.0)
+            } else {
+                None
+            };
+            let json = serde_json::json!({
+                "session_id": "",
+                "model": {
+                    "display_name": app.model_name,
+                    "id": app.model_name,
+                },
+                "workspace": {
+                    "current_dir": app.current_dir,
+                },
+                "context_window": {
+                    "total_input_tokens": total_in,
+                    "total_output_tokens": 0u64,
+                    "context_window_size": ctx_size,
+                    "current_usage": null,
+                    "used_percentage": used_pct,
+                    "remaining_percentage": used_pct.map(|p| 100.0 - p),
+                },
+                "cost": {
+                    "total_cost_usd": app.cost_usd,
+                },
+                "elapsed_seconds": elapsed,
+            });
+            *session_data.lock().unwrap() = Some(serde_json::to_string(&json).unwrap_or_default());
+        }
+        // Drain status line results (most recent wins)
+        if status_cmd_cfg.is_some() {
             while let Ok(text) = status_cmd_rx.try_recv() {
                 app.status_line_override = if text.is_empty() { None } else { Some(text) };
             }
