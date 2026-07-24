@@ -590,6 +590,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         input_height(&app.prompt_input, prompt_text_width) + 1 // +1 for model/mode status line
     };
 
+    let status_line_height: u16 = if app.status_line_override.is_some() { 1 } else { 0 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -598,6 +599,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
             Constraint::Length(status_height),
             Constraint::Length(prompt_height),
             Constraint::Length(suggestions_height),
+            Constraint::Length(status_line_height),
             Constraint::Length(1),
         ])
         .split(size);
@@ -624,7 +626,10 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     if suggestions_height > 0 {
         render_prompt_suggestions(frame, app, chunks[4]);
     }
-    render_footer(frame, app, chunks[5]);
+    if status_line_height > 0 {
+        render_status_line_override(frame, app, chunks[5]);
+    }
+    render_footer(frame, app, chunks[6]);
 
     // Overlays (rendered on top in Z-order)
 
@@ -2787,19 +2792,6 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
-        // External status line override
-        if let Some(ref override_text) = app.status_line_override {
-            if !parts.is_empty() {
-                parts.push(Span::raw("  "));
-            }
-            // Strip any ANSI escapes for terminal rendering (plain text)
-            let clean: String = override_text
-                .chars()
-                .filter(|c| c.is_ascii_graphic() || *c == ' ')
-                .collect();
-            parts.push(Span::styled(clean, Style::default().fg(Color::DarkGray)));
-        }
-
         // 8. Bridge badge
         if let Some(badge) = app.bridge_state.status_badge(app.frame_count) {
             if !parts.is_empty() {
@@ -2842,6 +2834,42 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         height: footer_area.height,
     };
     frame.render_widget(Paragraph::new(vec![Line::from(spans)]), padded_area);
+}
+
+fn render_status_line_override(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let text = app.status_line_override.as_deref().unwrap_or("");
+    // Strip ANSI escape sequences (e.g. \x1b[32m) for plain-text rendering.
+    let clean: String = {
+        let mut out = String::with_capacity(text.len());
+        let mut in_esc = false;
+        for c in text.chars() {
+            if in_esc {
+                if c == 'm' { in_esc = false; }
+                continue;
+            }
+            if c == '\x1b' { in_esc = true; continue; }
+            out.push(c);
+        }
+        out
+    };
+    let padding = app.config.status_line.as_ref().and_then(|s| s.padding).unwrap_or(0);
+    let padded = Rect {
+        x: area.x + padding,
+        y: area.y,
+        width: area.width.saturating_sub(padding * 2),
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            clean.as_str(),
+            Style::default().fg(Color::DarkGray),
+        )))
+        .wrap(ratatui::widgets::Wrap { trim: false }),
+        padded,
+    );
 }
 
 fn render_prompt_suggestions(frame: &mut Frame, app: &App, area: Rect) {
