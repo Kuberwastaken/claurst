@@ -226,6 +226,24 @@ impl App {
                 self.status_message = Some(format!("Fast mode {}.", status));
                 true
             }
+            "cc-statusline" | "cc-status-line" => {
+                match &self.config.status_line {
+                    Some(sl) => {
+                        let interval = sl.poll_interval_ms.unwrap_or(5000);
+                        let padding = sl.padding.unwrap_or(0);
+                        self.status_message = Some(format!(
+                            "External statusLine active · command: {} · interval: {}ms · padding: {}",
+                            sl.command, interval, padding,
+                        ));
+                    }
+                    None => {
+                        self.status_message = Some(
+                            "No external statusLine configured. Set \"statusLine\": { \"command\": \"...\" } in ~/.claurst/settings.json".to_string(),
+                        );
+                    }
+                }
+                true
+            }
             "plan" => {
                 use claurst_core::config::PermissionMode;
                 self.plan_mode = !self.plan_mode;

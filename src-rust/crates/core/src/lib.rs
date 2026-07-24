@@ -1013,6 +1013,7 @@ pub mod config {
 
     /// Top-level configuration values, merged from CLI args + settings file + env.
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    #[serde(default)]
     pub struct Config {
         pub api_key: Option<String>,
         pub model: Option<String>,
@@ -1114,6 +1115,48 @@ pub mod config {
         /// Keyboard scrolling (PageUp/PageDown, etc.) is unaffected either way.
         #[serde(default, rename = "mouseCapture", skip_serializing_if = "Option::is_none")]
         pub mouse_capture: Option<bool>,
+        /// External status line command configuration. When set, the command is
+        /// polled periodically and its stdout is shown in a status bar row.
+        #[serde(default, rename = "statusLine", alias = "status_line", skip_serializing_if = "Option::is_none")]
+        pub status_line: Option<StatusLineConfig>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct StatusLineConfig {
+        /// Shell command to execute. Receives session JSON on stdin.
+        pub command: String,
+        /// Poll interval in milliseconds (default: 5000, minimum: 1000).
+        #[serde(
+            default,
+            rename = "pollIntervalMs",
+            alias = "poll_interval_ms",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub poll_interval_ms: Option<u64>,
+        /// Horizontal padding (in spaces) around the status text (default: 0).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub padding: Option<u16>,
+    }
+
+    #[cfg(test)]
+    mod status_line_tests {
+        use super::*;
+        #[test]
+        fn deserialize_status_line_config() {
+            let json = r#"{"command": "date", "pollIntervalMs": 1000, "padding": 1}"#;
+            let sl: StatusLineConfig = serde_json::from_str(json).unwrap();
+            assert_eq!(sl.command, "date");
+            assert_eq!(sl.poll_interval_ms, Some(1000));
+            assert_eq!(sl.padding, Some(1));
+        }
+        #[test]
+        fn deserialize_status_line_in_settings() {
+            let json = r#"{"config": {"statusLine": {"command": "date '+%H:%M:%S'", "pollIntervalMs": 1000, "padding": 1}}}"#;
+            let settings: Settings = serde_json::from_str(json).unwrap();
+            let sl = settings.config.status_line.unwrap();
+            assert_eq!(sl.command, "date '+%H:%M:%S'");
+            assert_eq!(sl.poll_interval_ms, Some(1000));
+        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -1982,6 +2025,7 @@ pub mod config {
                 file_injection_enabled: over.config.file_injection_enabled || base.config.file_injection_enabled,
                 file_injection_max_size: if over.config.file_injection_max_size != 0 { over.config.file_injection_max_size } else { base.config.file_injection_max_size },
                 request_timeout_secs: over.config.request_timeout_secs.or(base.config.request_timeout_secs),
+                status_line: over.config.status_line.or(base.config.status_line),
             };
             Self {
                 config: merged_config,

@@ -466,6 +466,13 @@ use super::types::{ContextMenuItem, ContextMenuState};
     }
 
     #[test]
+    fn test_cc_statusline_slash_command() {
+        let mut app = make_app();
+        assert!(app.intercept_slash_command("cc-statusline"));
+        assert!(app.status_message.as_deref().map_or(false, |m| m.contains("No external statusLine configured")));
+    }
+
+    #[test]
     fn test_mcp_subcommand_is_not_intercepted() {
         let mut app = make_app();
         assert!(!app.intercept_slash_command_with_args("mcp", "auth mcphub"));
