@@ -373,15 +373,27 @@ pub fn default_model_for_provider(
 /// intersects it with the discovered set (see the anthropic branch in the
 /// discovery spawn), falling back to the full projection if discovery fails.
 ///
-/// Live-endpoint providers (Ollama/LM Studio/llama.cpp, Copilot, the
-/// openai-compatible gateways, …) and curated-list providers (Codex, free) are
-/// intentionally excluded: they keep populating the picker from their
-/// `discover_models()` result, which the event loop merges additively onto the
-/// catalog projection.
+/// Live-endpoint and curated-list providers are intentionally excluded. The
+/// event loop either replaces or merges the projection according to
+/// [`provider_has_authoritative_live_models`].
 pub fn provider_uses_catalog_projection(provider_id: &str) -> bool {
     matches!(
         provider_id,
         "openai" | "google" | "azure" | "amazon-bedrock" | "cohere" | "minimax"
+    )
+}
+
+/// Whether live discovery is the complete set of models usable through a local
+/// runtime. Catalog rows describe models it could host, not what is loaded.
+pub fn provider_has_authoritative_live_models(provider_id: &str) -> bool {
+    matches!(
+        provider_id,
+        "ollama"
+            | "lmstudio"
+            | "lm-studio"
+            | "llamacpp"
+            | "llama-cpp"
+            | "llama-server"
     )
 }
 
@@ -1550,5 +1562,24 @@ mod tests {
                 "{pid} must keep its live/curated discovery"
             );
         }
+    }
+
+    #[test]
+    fn local_runtime_models_are_authoritative() {
+        for pid in [
+            "ollama",
+            "lmstudio",
+            "lm-studio",
+            "llamacpp",
+            "llama-cpp",
+            "llama-server",
+        ] {
+            assert!(
+                provider_has_authoritative_live_models(pid),
+                "{pid} must replace catalog rows with its live model list"
+            );
+        }
+        assert!(!provider_has_authoritative_live_models("github-copilot"));
+        assert!(!provider_has_authoritative_live_models("openrouter"));
     }
 }

@@ -35,6 +35,14 @@ fn normalize_openai_base(override_base: &str) -> String {
     }
 }
 
+fn canonical_local_provider_id(provider_id: &str) -> &str {
+    match provider_id {
+        "lmstudio" => ProviderId::LM_STUDIO,
+        "llamacpp" | "llama-server" => ProviderId::LLAMA_CPP,
+        _ => provider_id,
+    }
+}
+
 pub fn resolve_provider_api_base(
     config: &claurst_core::config::Config,
     provider_id: &str,
@@ -314,18 +322,24 @@ impl ProviderRegistry {
     /// # Panics
     /// Panics if no provider with that ID has been registered.
     pub fn set_default(&mut self, id: ProviderId) -> &mut Self {
+        let canonical_id = ProviderId::new(canonical_local_provider_id(&id));
         assert!(
-            self.providers.contains_key(&id),
+            self.providers.contains_key(&canonical_id),
             "set_default: provider '{}' is not registered",
             id,
         );
-        self.default_provider_id = id;
+        self.default_provider_id = canonical_id;
         self
     }
 
     /// Get a provider by ID.
     pub fn get(&self, id: &ProviderId) -> Option<&Arc<dyn LlmProvider>> {
-        self.providers.get(id)
+        self.providers.get(id).or_else(|| {
+            let canonical_id = canonical_local_provider_id(id);
+            (canonical_id != &**id)
+                .then(|| self.providers.get(&ProviderId::new(canonical_id)))
+                .flatten()
+        })
     }
 
     /// Get the default provider.
@@ -649,5 +663,37 @@ impl ProviderRegistry {
 impl Default for ProviderRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers;
+
+    #[test]
+    fn local_provider_aliases_resolve_to_canonical_registrations() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(providers::lm_studio()));
+        registry.register(Arc::new(providers::llama_cpp()));
+
+        let lm_studio = registry
+            .get(&ProviderId::new("lmstudio"))
+            .expect("lmstudio alias should resolve");
+        let llama_cpp = registry
+            .get(&ProviderId::new("llamacpp"))
+            .expect("llamacpp alias should resolve");
+
+        assert_eq!(&**lm_studio.id(), ProviderId::LM_STUDIO);
+        assert_eq!(&**llama_cpp.id(), ProviderId::LLAMA_CPP);
+    }
+
+    #[test]
+    fn alias_can_select_canonical_default_provider() {
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(providers::lm_studio()));
+        registry.set_default(ProviderId::new("lmstudio"));
+
+        assert_eq!(&**registry.default_provider_id(), ProviderId::LM_STUDIO);
     }
 }

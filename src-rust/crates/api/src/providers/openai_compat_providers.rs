@@ -104,11 +104,18 @@ pub fn ollama() -> OpenAiCompatProvider {
 pub fn lm_studio() -> OpenAiCompatProvider {
     let host =
         std::env::var("LM_STUDIO_HOST").unwrap_or_else(|_| "http://localhost:1234".to_string());
-    let base_url = format!("{}/v1", host.trim_end_matches('/'));
+    let native_host = host
+        .trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .trim_end_matches('/')
+        .to_string();
+    let base_url = format!("{}/v1", native_host);
     OpenAiCompatProvider::new(ProviderId::LM_STUDIO, "LM Studio", base_url).with_quirks(
         ProviderQuirks {
             overflow_patterns: vec!["greater than the context length".to_string()],
+            include_usage_in_stream: true,
             no_api_key_required: true,
+            lm_studio_native_host: Some(native_host),
             ..Default::default()
         },
     )

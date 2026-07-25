@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use claurst_core::provider_id::{ModelId, ProviderId};
 use claurst_core::types::ContentBlock;
 use futures::Stream;
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error_handling::parse_error_response;
@@ -88,6 +89,10 @@ pub struct ProviderQuirks {
     /// root (e.g. `"http://localhost:11434"`) so the native API can be called
     /// independently of the `/v1` base URL used for chat completions.
     pub ollama_native_host: Option<String>,
+
+    /// Native LM Studio host used to discover loaded model instances and their
+    /// configured context lengths from `/api/v1/models`.
+    pub lm_studio_native_host: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +107,37 @@ pub struct OpenAiCompatProvider {
     extra_headers: Vec<(String, String)>,
     quirks: ProviderQuirks,
     http_client: reqwest::Client,
+}
+
+#[derive(Debug, Deserialize)]
+struct LmStudioModelsResponse {
+    #[serde(default)]
+    models: Vec<LmStudioModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LmStudioModel {
+    #[serde(rename = "type")]
+    model_type: String,
+    key: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    loaded_instances: Vec<LmStudioLoadedInstance>,
+    #[serde(default)]
+    max_context_length: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LmStudioLoadedInstance {
+    id: String,
+    config: LmStudioInstanceConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct LmStudioInstanceConfig {
+    #[serde(default)]
+    context_length: Option<u32>,
 }
 
 impl OpenAiCompatProvider {
@@ -152,21 +188,24 @@ impl OpenAiCompatProvider {
 
     /// Override the base URL (e.g. from a user-supplied --api-base flag).
     ///
-    /// When the provider uses Ollama's native API host (set by the `ollama()`
-    /// factory), keep it in sync with the new base URL.  Otherwise health
-    /// checks and native model discovery would keep targeting the original
-    /// (localhost) host even though chat completions go to the overridden
-    /// server.
+    /// Keep any native API host in sync with the OpenAI-compatible base URL.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
-        if self.quirks.ollama_native_host.is_some() {
+        if self.quirks.ollama_native_host.is_some()
+            || self.quirks.lm_studio_native_host.is_some()
+        {
             let native_host = self
                 .base_url
                 .trim_end_matches('/')
                 .trim_end_matches("/v1")
                 .trim_end_matches('/')
                 .to_string();
-            self.quirks.ollama_native_host = Some(native_host);
+            if self.quirks.ollama_native_host.is_some() {
+                self.quirks.ollama_native_host = Some(native_host.clone());
+            }
+            if self.quirks.lm_studio_native_host.is_some() {
+                self.quirks.lm_studio_native_host = Some(native_host);
+            }
         }
         self
     }
@@ -652,6 +691,56 @@ impl OpenAiCompatProvider {
         Ok(models.into_iter().map(|(info, _, _)| info).collect())
     }
 
+    /// Return loaded LM Studio LLM instances. `None` means the native endpoint
+    /// is unavailable, so the caller should fall back to `/v1/models`.
+    async fn discover_models_lm_studio_native(
+        &self,
+        lm_studio_host: &str,
+    ) -> Option<Vec<ModelInfo>> {
+        let url = format!("{}/api/v1/models", lm_studio_host.trim_end_matches('/'));
+        let builder = self.apply_auth(self.http_client.get(url));
+        let response = self.apply_extra_headers(builder).send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let response: LmStudioModelsResponse = response.json().await.ok()?;
+        Some(Self::parse_lm_studio_native_models(response, &self.id))
+    }
+
+    fn parse_lm_studio_native_models(
+        response: LmStudioModelsResponse,
+        provider_id: &ProviderId,
+    ) -> Vec<ModelInfo> {
+        let mut discovered = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for model in response.models {
+            if model.model_type != "llm" {
+                continue;
+            }
+            let display_name = model.display_name.unwrap_or(model.key);
+            let max_context = model.max_context_length.unwrap_or(128_000);
+
+            for instance in model.loaded_instances {
+                if !seen.insert(instance.id.clone()) {
+                    continue;
+                }
+                let context_window = instance
+                    .config
+                    .context_length
+                    .unwrap_or(max_context);
+                discovered.push(ModelInfo {
+                    id: ModelId::new(instance.id),
+                    provider_id: provider_id.clone(),
+                    name: display_name.clone(),
+                    context_window,
+                    max_output_tokens: (context_window / 2).min(16_384),
+                    ..Default::default()
+                });
+            }
+        }
+        discovered
+    }
+
     /// Call `/api/show` for a single model to extract its actual context
     /// window, parameter count, and whether it's coding-oriented.
     ///
@@ -930,6 +1019,14 @@ impl LlmProvider for OpenAiCompatProvider {
         if let Some(ref ollama_host) = self.quirks.ollama_native_host {
             return self.discover_models_ollama_native(ollama_host).await;
         }
+        if let Some(ref lm_studio_host) = self.quirks.lm_studio_native_host {
+            if let Some(models) = self
+                .discover_models_lm_studio_native(lm_studio_host)
+                .await
+            {
+                return Ok(models);
+            }
+        }
 
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
         let builder = self.http_client.get(&url);
@@ -1111,5 +1208,71 @@ mod tests {
             provider.quirks.ollama_native_host.as_deref(),
             Some("http://192.0.2.10:11434"),
         );
+    }
+
+    #[test]
+    fn lm_studio_native_models_only_include_loaded_llms() {
+        let response = json!({
+            "models": [
+                {
+                    "type": "llm",
+                    "key": "qwen/unloaded",
+                    "display_name": "Unloaded Qwen",
+                    "loaded_instances": [],
+                    "max_context_length": 262144
+                },
+                {
+                    "type": "llm",
+                    "key": "organization/omnicoder-9b",
+                    "display_name": "Omnicoder 9B",
+                    "loaded_instances": [{
+                        "id": "omnicoder-9b",
+                        "config": { "context_length": 131072 }
+                    }],
+                    "max_context_length": 262144
+                },
+                {
+                    "type": "embedding",
+                    "key": "nomic-embed",
+                    "loaded_instances": [{
+                        "id": "nomic-embed",
+                        "config": { "context_length": 2048 }
+                    }]
+                }
+            ]
+        });
+
+        let response: LmStudioModelsResponse =
+            serde_json::from_value(response).expect("valid LM Studio fixture");
+        let models = OpenAiCompatProvider::parse_lm_studio_native_models(
+            response,
+            &ProviderId::new(ProviderId::LM_STUDIO),
+        );
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(&*models[0].id, "omnicoder-9b");
+        assert_eq!(models[0].name, "Omnicoder 9B");
+        assert_eq!(models[0].context_window, 131_072);
+    }
+
+    #[test]
+    fn with_base_url_retargets_lm_studio_native_host() {
+        let provider = OpenAiCompatProvider::new(
+            ProviderId::LM_STUDIO,
+            "LM Studio",
+            "http://localhost:1234/v1",
+        )
+        .with_quirks(ProviderQuirks {
+            include_usage_in_stream: true,
+            lm_studio_native_host: Some("http://localhost:1234".to_string()),
+            ..Default::default()
+        })
+        .with_base_url("http://192.0.2.20:1234/v1");
+
+        assert_eq!(
+            provider.quirks.lm_studio_native_host.as_deref(),
+            Some("http://192.0.2.20:1234"),
+        );
+        assert!(provider.quirks.include_usage_in_stream);
     }
 }

@@ -3656,15 +3656,19 @@ async fn run_interactive(
                     // no-op and never wipes the projection. For copilot the id
                     // IS the api.id, so this is the by-api.id merge.
                     //
-                    // Anthropic is the exception: its discovery result is the
-                    // subscription/key set already intersected with the catalog,
-                    // so we REPLACE (dropping legacy claude-3.x the credential
-                    // can't serve). An empty result (discovery failed / offline)
-                    // is a no-op that keeps the full catalog projection.
+                    // Anthropic and local runtimes return authoritative lists.
+                    // Anthropic keeps the catalog projection when discovery is
+                    // empty because that can mean authentication failed. Local
+                    // discovery reports failures separately, so empty means no
+                    // models are loaded.
                     if provider == "anthropic" {
                         if !entries.is_empty() {
                             app.model_picker.set_models(entries);
                         }
+                    } else if claurst_tui::model_picker::provider_has_authoritative_live_models(
+                        &provider,
+                    ) {
+                        app.model_picker.set_models(entries);
                     } else {
                         app.model_picker.merge_models(entries);
                     }
