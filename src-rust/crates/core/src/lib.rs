@@ -613,7 +613,7 @@ pub mod types {
 pub mod config {
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     // ---- Hook configuration ----------------------------------------------
 
@@ -1710,48 +1710,98 @@ pub mod config {
             Self::config_dir().join("settings.json")
         }
 
-        /// Load settings from disk, returning defaults when the file is missing.
-        pub async fn load() -> anyhow::Result<Self> {
-            let path = Self::global_settings_path();
+        fn parse_file(content: &str, path: &Path) -> anyhow::Result<Self> {
+            serde_json::from_str(content).map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to parse settings file {}: {}. The file was not modified; fix the JSON and restart Claurst.",
+                    path.display(),
+                    error
+                )
+            })
+        }
+
+        async fn load_from_path(path: &Path) -> anyhow::Result<Self> {
             if path.exists() {
-                let content = tokio::fs::read_to_string(&path).await?;
-                Ok(serde_json::from_str(&content).unwrap_or_default())
+                let content = tokio::fs::read_to_string(path).await?;
+                Self::parse_file(&content, path)
             } else {
                 Ok(Self::default())
             }
         }
 
-        /// Persist settings to disk.
-        pub async fn save(&self) -> anyhow::Result<()> {
-            let path = Self::global_settings_path();
+        fn load_from_path_sync(path: &Path) -> anyhow::Result<Self> {
+            if path.exists() {
+                let content = std::fs::read_to_string(path)?;
+                Self::parse_file(&content, path)
+            } else {
+                Ok(Self::default())
+            }
+        }
+
+        async fn save_to_path(&self, path: &Path) -> anyhow::Result<()> {
+            if path.exists() {
+                let content = tokio::fs::read_to_string(path).await?;
+                Self::parse_file(&content, path).map_err(|error| {
+                    anyhow::anyhow!(
+                        "Refusing to overwrite malformed settings file {}: {}",
+                        path.display(),
+                        error
+                    )
+                })?;
+            }
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
             let content = serde_json::to_string_pretty(self)?;
-            tokio::fs::write(&path, content).await?;
+            tokio::fs::write(path, content).await?;
             Ok(())
+        }
+
+        fn save_to_path_sync(&self, path: &Path) -> anyhow::Result<()> {
+            if path.exists() {
+                let content = std::fs::read_to_string(path)?;
+                Self::parse_file(&content, path).map_err(|error| {
+                    anyhow::anyhow!(
+                        "Refusing to overwrite malformed settings file {}: {}",
+                        path.display(),
+                        error
+                    )
+                })?;
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let content = serde_json::to_string_pretty(self)?;
+            std::fs::write(path, content)?;
+            Ok(())
+        }
+
+        /// Load settings from disk, returning defaults when the file is missing.
+        ///
+        /// A malformed file is returned as an error and is never replaced with
+        /// defaults.
+        pub async fn load() -> anyhow::Result<Self> {
+            let path = Self::global_settings_path();
+            Self::load_from_path(&path).await
+        }
+
+        /// Persist settings to disk without overwriting a malformed file.
+        pub async fn save(&self) -> anyhow::Result<()> {
+            let path = Self::global_settings_path();
+            self.save_to_path(&path).await
         }
 
         /// Synchronous variant used by pre-session commands.
         pub fn load_sync() -> anyhow::Result<Self> {
             let path = Self::global_settings_path();
-            if path.exists() {
-                let content = std::fs::read_to_string(&path)?;
-                Ok(serde_json::from_str(&content).unwrap_or_default())
-            } else {
-                Ok(Self::default())
-            }
+            Self::load_from_path_sync(&path)
         }
 
-        /// Synchronous variant used by pre-session commands.
+        /// Synchronous variant used by pre-session commands. Refuses to
+        /// overwrite a malformed file.
         pub fn save_sync(&self) -> anyhow::Result<()> {
             let path = Self::global_settings_path();
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let content = serde_json::to_string_pretty(self)?;
-            std::fs::write(&path, content)?;
-            Ok(())
+            self.save_to_path_sync(&path)
         }
 
         /// Return the effective `Config`, merging top-level provider settings
@@ -1818,14 +1868,14 @@ pub mod config {
 
         /// Load settings from all config levels and merge them.
         /// Priority: project > global.
-        pub async fn load_hierarchical(cwd: &std::path::Path) -> Self {
+        pub async fn load_hierarchical(cwd: &std::path::Path) -> anyhow::Result<Self> {
             // 1. Load global settings.
-            let mut merged = Self::load().await.unwrap_or_default();
+            let mut merged = Self::load().await?;
             // 2. Find and merge project settings (project wins).
             if let Some(project_settings) = Self::find_project_settings(cwd).await {
                 merged = Self::merge(merged, project_settings);
             }
-            merged
+            Ok(merged)
         }
 
         /// Walk up from `cwd` looking for `.claurst/settings.json` or
@@ -2053,6 +2103,66 @@ pub mod config {
             }
         }
         result
+    }
+
+    #[cfg(test)]
+    mod settings_io_tests {
+        use super::*;
+
+        const MALFORMED_SETTINGS: &str = r#"{"config":{"model":"test-model",}}"#;
+
+        #[test]
+        fn sync_load_reports_malformed_settings_without_modifying_them() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            std::fs::write(&path, MALFORMED_SETTINGS).unwrap();
+
+            let error = Settings::load_from_path_sync(&path).unwrap_err();
+
+            assert!(error.to_string().contains("Failed to parse settings file"));
+            assert!(error.to_string().contains(&path.display().to_string()));
+            assert!(error.to_string().contains("The file was not modified"));
+            assert_eq!(std::fs::read_to_string(path).unwrap(), MALFORMED_SETTINGS);
+        }
+
+        #[test]
+        fn sync_save_refuses_to_overwrite_malformed_settings() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            std::fs::write(&path, MALFORMED_SETTINGS).unwrap();
+            let mut replacement = Settings::default();
+            replacement.config.model = Some("replacement".to_string());
+
+            let error = replacement.save_to_path_sync(&path).unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("Refusing to overwrite malformed settings file")
+            );
+            assert_eq!(std::fs::read_to_string(path).unwrap(), MALFORMED_SETTINGS);
+        }
+
+        #[tokio::test]
+        async fn async_load_and_save_preserve_malformed_settings() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            tokio::fs::write(&path, MALFORMED_SETTINGS).await.unwrap();
+
+            let load_error = Settings::load_from_path(&path).await.unwrap_err();
+            assert!(load_error.to_string().contains("Failed to parse settings file"));
+
+            let save_error = Settings::default().save_to_path(&path).await.unwrap_err();
+            assert!(
+                save_error
+                    .to_string()
+                    .contains("Refusing to overwrite malformed settings file")
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(path).await.unwrap(),
+                MALFORMED_SETTINGS
+            );
+        }
     }
 
     #[cfg(test)]
@@ -4567,7 +4677,7 @@ mod tests {
         );
         std::fs::write(claurst.join("settings.json"), json).unwrap();
 
-        let merged = Settings::load_hierarchical(dir.path()).await;
+        let merged = Settings::load_hierarchical(dir.path()).await.unwrap();
         let server = merged
             .config
             .mcp_servers

@@ -486,8 +486,23 @@ async fn main() -> anyhow::Result<()> {
 
     debug!(cwd = %cwd.display(), "Starting Claurst");
 
-    // Load settings from disk (hierarchical: global < project)
-    let mut settings = Settings::load_hierarchical(&cwd).await;
+    // Determine mode early (needed for settings error reporting, auth error
+    // handling, and permission handler selection).
+    let is_headless = cli.print || cli.prompt.is_some();
+
+    // Load settings from disk (hierarchical: global < project). A malformed
+    // global file is kept intact; interactive mode displays the error in the
+    // startup dialog, while headless mode reports it on stderr.
+    let (mut settings, settings_load_error) = match Settings::load_hierarchical(&cwd).await {
+        Ok(settings) => (settings, None),
+        Err(error) => {
+            let message = error.to_string();
+            if is_headless {
+                eprintln!("Warning: {}", message);
+            }
+            (Settings::default(), Some(message))
+        }
+    };
     // `--trust-project-mcp` (and automation use cases) flip on the same global
     // trust the user could set via `trustProjectMcpServers`. Folding it into
     // `settings` here keeps a single source of truth for the gate, including
@@ -586,9 +601,6 @@ async fn main() -> anyhow::Result<()> {
         system_parts.push(append.clone());
     }
     let system_prompt = system_parts.join("\n\n");
-
-    // Determine mode early (needed for auth error handling and permission handler selection).
-    let is_headless = cli.print || cli.prompt.is_some();
 
     // Initialize API client.
     // Try config/env first; fall back to saved OAuth tokens.
@@ -892,6 +904,7 @@ async fn main() -> anyhow::Result<()> {
         run_interactive(
             config,
             settings,
+            settings_load_error,
             client,
             tools,
             tool_ctx,
@@ -1758,6 +1771,7 @@ fn permission_request_from_core(
 async fn run_interactive(
     config: Config,
     settings: claurst_core::config::Settings,
+    settings_load_error: Option<String>,
     client: Arc<claurst_api::AnthropicClient>,
     tools: Arc<Vec<Box<dyn claurst_tools::Tool>>>,
     tool_ctx: ToolContext,
@@ -1860,6 +1874,10 @@ async fn run_interactive(
     // Set up terminal
     let mut terminal = setup_terminal(live_config.mouse_capture_enabled())?;
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
+    if let Some(error) = settings_load_error {
+        app.invalid_config_dialog =
+            claurst_tui::InvalidConfigDialogState::show_settings_error(&error);
+    }
     // Gate input shift-normalization on whether the terminal speaks the kitty
     // keyboard protocol (detected in setup_terminal). On terminals that don't —
     // Windows conhost / CMD / legacy PowerShell, etc. — printable keys already
