@@ -293,6 +293,68 @@ fn walkdir_shallow(root: &Path, max_depth: usize) -> Vec<PathBuf> {
 // Atomic binary swap
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
+struct StagedBinary {
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl StagedBinary {
+    fn create_next_to(current: &Path) -> Result<(Self, std::fs::File)> {
+        use std::ffi::OsString;
+        use std::fs::OpenOptions;
+        use std::io::ErrorKind;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_STAGE_ID: AtomicU64 = AtomicU64::new(0);
+        const MAX_ATTEMPTS: usize = 128;
+
+        let parent = current
+            .parent()
+            .ok_or_else(|| anyhow!("installed binary path has no parent: {}", current.display()))?;
+        let file_name = current.file_name().ok_or_else(|| {
+            anyhow!(
+                "installed binary path has no file name: {}",
+                current.display()
+            )
+        })?;
+
+        for _ in 0..MAX_ATTEMPTS {
+            let id = NEXT_STAGE_ID.fetch_add(1, Ordering::Relaxed);
+            let mut staged_name = OsString::from(".");
+            staged_name.push(file_name);
+            staged_name.push(format!(".upgrade-{}-{}", std::process::id(), id));
+            let path = parent.join(staged_name);
+
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => return Ok((Self { path }, file)),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to create upgrade staging file next to {}",
+                            current.display()
+                        )
+                    });
+                }
+            }
+        }
+
+        bail!(
+            "failed to create a unique upgrade staging file next to {} after {} attempts",
+            current.display(),
+            MAX_ATTEMPTS
+        )
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StagedBinary {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 fn swap_binary(current: &Path, new: &Path) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
@@ -314,8 +376,11 @@ fn swap_binary(current: &Path, new: &Path) -> Result<()> {
         Ok(())
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(unix)]
     {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
         // std::fs::copy() writes into the existing inode (open + O_TRUNC), and
         // that inode is the running process's own text segment — the kernel
         // rejects the write with ETXTBSY ("Text file busy"). rename() instead
@@ -323,16 +388,36 @@ fn swap_binary(current: &Path, new: &Path) -> Result<()> {
         // allows even while the old inode is still mapped and executing.
         // rename() requires src/dest on the same filesystem, so stage the
         // temp file next to `current` rather than relying on the OS tmp dir.
-        let staged = current.with_extension("new");
-        std::fs::copy(new, &staged)
-            .with_context(|| format!("failed to stage new binary at {}", staged.display()))?;
-        let _ = std::process::Command::new("chmod")
-            .arg("755")
-            .arg(&staged)
-            .status();
-        std::fs::rename(&staged, current)
+        let (staged, mut staged_file) = StagedBinary::create_next_to(current)?;
+        let mut source = std::fs::File::open(new)
+            .with_context(|| format!("failed to open new binary at {}", new.display()))?;
+        std::io::copy(&mut source, &mut staged_file)
+            .with_context(|| format!("failed to stage new binary at {}", staged.path.display()))?;
+        staged_file
+            .set_permissions(std::fs::Permissions::from_mode(0o755))
+            .with_context(|| {
+                format!(
+                    "failed to make staged binary executable at {}",
+                    staged.path.display()
+                )
+            })?;
+        staged_file.flush().with_context(|| {
+            format!("failed to flush staged binary at {}", staged.path.display())
+        })?;
+        staged_file.sync_all().with_context(|| {
+            format!("failed to sync staged binary at {}", staged.path.display())
+        })?;
+        drop(staged_file);
+
+        std::fs::rename(&staged.path, current)
             .with_context(|| format!("failed to swap new binary into {}", current.display()))?;
         Ok(())
+    }
+
+    #[cfg(not(any(target_os = "windows", unix)))]
+    {
+        let _ = (current, new);
+        bail!("Unsupported OS for upgrade")
     }
 }
 
@@ -352,53 +437,155 @@ fn tempdir_for_upgrade() -> Result<PathBuf> {
     Ok(dir)
 }
 
-#[cfg(all(test, not(target_os = "windows")))]
+#[cfg(all(test, unix))]
 mod tests {
-    use super::swap_binary;
-    use std::process::Command;
+    use super::{swap_binary, StagedBinary};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
+            let id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "claurst-upgrade-test-{}-{}-{}",
+                std::process::id(),
+                name,
+                id
+            ));
+            std::fs::create_dir(&path).expect("failed to create test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    #[ignore = "spawned by swap_binary_replaces_a_running_executable"]
+    fn running_executable_fixture() {
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    fn staging_files_are_unique_and_removed_on_drop() {
+        let dir = TestDir::new("unique-stage");
+        let current = dir.path().join("claurst");
+
+        let (first, first_file) =
+            StagedBinary::create_next_to(&current).expect("first staging file");
+        let first_path = first.path.clone();
+        let (second, second_file) =
+            StagedBinary::create_next_to(&current).expect("second staging file");
+        let second_path = second.path.clone();
+
+        assert_ne!(first_path, second_path);
+        assert!(first_path.exists());
+        assert!(second_path.exists());
+
+        drop(first_file);
+        drop(second_file);
+        drop(first);
+        drop(second);
+
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
+    }
 
     // Regression test for the ETXTBSY bug: swap_binary must be able to
     // replace a binary while it is actively running (mirrors `claurst
-    // upgrade` replacing its own executable). We copy a real ELF binary
-    // (`sleep`) so it has an executable text segment, spawn it so the
-    // kernel maps that segment, and then swap it out from under the
-    // running process.
+    // upgrade` replacing its own executable). The current test harness is
+    // itself a portable native executable, so copying and spawning it avoids
+    // assumptions about whether system tools live in /bin or /usr/bin.
     #[test]
     fn swap_binary_replaces_a_running_executable() {
-        let dir = std::env::temp_dir().join(format!(
-            "claurst-upgrade-test-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("running-executable");
+        let current = dir.path().join("running");
+        let replacement = dir.path().join("replacement");
+        let legacy_staging_path = current.with_extension("new");
+        let replacement_bytes = b"#!/bin/sh\nprintf 'replacement binary\\n'\n";
 
-        let current = dir.join("running");
-        let replacement = dir.join("replacement");
-        std::fs::copy("/usr/bin/sleep", &current).expect("fixture binary missing");
-        std::fs::copy("/usr/bin/sleep", &replacement).expect("fixture binary missing");
-        let _ = Command::new("chmod").arg("755").arg(&current).status();
-        let _ = Command::new("chmod").arg("755").arg(&replacement).status();
+        std::fs::copy(
+            std::env::current_exe().expect("current test executable"),
+            &current,
+        )
+        .expect("failed to copy test executable");
+        std::fs::write(&replacement, replacement_bytes).expect("failed to write replacement");
+        std::fs::write(&legacy_staging_path, b"must not be overwritten")
+            .expect("failed to write legacy staging sentinel");
 
         let mut child = Command::new(&current)
-            .arg("5")
+            .args([
+                "--ignored",
+                "--exact",
+                "upgrade::tests::running_executable_fixture",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .expect("failed to spawn fixture binary");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            child.try_wait().expect("failed to inspect fixture process"),
+            None,
+            "fixture process exited before the swap"
+        );
 
         // Sanity check: overwriting the file in place while it's running
         // is exactly what triggers ETXTBSY. This confirms the fixture
         // actually reproduces the bug this test guards against.
-        let direct_overwrite = std::fs::copy(&replacement, &current);
-        assert!(
-            direct_overwrite.is_err(),
-            "expected direct overwrite of a running binary to fail with ETXTBSY"
-        );
+        #[cfg(target_os = "linux")]
+        {
+            let direct_overwrite = std::fs::copy(&replacement, &current);
+            assert!(
+                direct_overwrite.is_err(),
+                "expected direct overwrite of a running binary to fail with ETXTBSY"
+            );
+        }
 
         let result = swap_binary(&current, &replacement);
 
         child.kill().ok();
         child.wait().ok();
-        let _ = std::fs::remove_dir_all(&dir);
-
         result.expect("swap_binary should replace a running binary via rename, not in-place write");
+
+        assert_eq!(
+            std::fs::read(&current).expect("failed to read installed replacement"),
+            replacement_bytes
+        );
+        assert_eq!(
+            std::fs::metadata(&current)
+                .expect("failed to stat installed replacement")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::read(&legacy_staging_path).expect("failed to read staging sentinel"),
+            b"must not be overwritten"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("failed to inspect test directory")
+                .flatten()
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".running.upgrade-")),
+            "staging file was not cleaned up"
+        );
     }
 }
