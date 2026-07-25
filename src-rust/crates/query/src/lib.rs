@@ -292,6 +292,17 @@ const MAX_STEPS_DEGRADATION_MSG: &str =
 /// text so the message history stays well-formed.
 const TOOL_CANCELLED_MSG: &str = "Tool execution was cancelled by the user before it completed.";
 
+fn merge_provider_stream_usage(current: &mut UsageInfo, update: &UsageInfo) {
+    if update.total_input() > 0 {
+        current.input_tokens = update.input_tokens;
+        current.cache_read_input_tokens = update.cache_read_input_tokens;
+        current.cache_creation_input_tokens = update.cache_creation_input_tokens;
+    }
+    if update.output_tokens > 0 {
+        current.output_tokens = update.output_tokens;
+    }
+}
+
 // Spinner verbs are imported from claurst_core::spinner
 
 /// Resolve the effective effort level for a turn.
@@ -1051,9 +1062,7 @@ pub async fn run_query_loop(
                                         match &evt {
                                             claurst_api::StreamEvent::MessageStart { id, usage: u, .. } => {
                                                 msg_id = id.clone();
-                                                usage.input_tokens = u.input_tokens;
-                                                usage.cache_read_input_tokens = u.cache_read_input_tokens;
-                                                usage.cache_creation_input_tokens = u.cache_creation_input_tokens;
+                                                merge_provider_stream_usage(&mut usage, u);
                                             }
                                             claurst_api::StreamEvent::ContentBlockStart {
                                                 index,
@@ -1086,7 +1095,7 @@ pub async fn run_query_loop(
                                                     None => "end_turn".to_string(),
                                                 };
                                                 if let Some(u) = u {
-                                                    usage.output_tokens = u.output_tokens;
+                                                    merge_provider_stream_usage(&mut usage, u);
                                                 }
                                             }
                                             claurst_api::StreamEvent::MessageStop => break,
@@ -2070,6 +2079,48 @@ impl StreamHandler for ChannelStreamHandler {
 mod tests {
     use super::*;
     use claurst_api::SystemPrompt;
+
+    #[test]
+    fn final_stream_usage_supplies_prompt_tokens_to_turn_usage() {
+        let mut turn_usage = UsageInfo::default();
+        let final_usage = UsageInfo {
+            input_tokens: 1_200,
+            output_tokens: 80,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 300,
+        };
+
+        merge_provider_stream_usage(&mut turn_usage, &final_usage);
+
+        assert_eq!(turn_usage.input_tokens, 1_200);
+        assert_eq!(turn_usage.cache_read_input_tokens, 300);
+        assert_eq!(turn_usage.output_tokens, 80);
+        let context_counter_increment = turn_usage.input_tokens
+            + turn_usage.output_tokens
+            + turn_usage.cache_creation_input_tokens
+            + turn_usage.cache_read_input_tokens;
+        assert_eq!(context_counter_increment, 1_580);
+    }
+
+    #[test]
+    fn output_only_final_usage_preserves_start_input_tokens() {
+        let mut turn_usage = UsageInfo {
+            input_tokens: 900,
+            output_tokens: 0,
+            cache_creation_input_tokens: 100,
+            cache_read_input_tokens: 0,
+        };
+        let final_usage = UsageInfo {
+            output_tokens: 75,
+            ..Default::default()
+        };
+
+        merge_provider_stream_usage(&mut turn_usage, &final_usage);
+
+        assert_eq!(turn_usage.input_tokens, 900);
+        assert_eq!(turn_usage.cache_creation_input_tokens, 100);
+        assert_eq!(turn_usage.output_tokens, 75);
+    }
 
     fn make_config(sys: Option<&str>, append: Option<&str>) -> QueryConfig {
         QueryConfig {
