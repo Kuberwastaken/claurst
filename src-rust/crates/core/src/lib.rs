@@ -1157,6 +1157,36 @@ pub mod config {
             assert_eq!(sl.command, "date '+%H:%M:%S'");
             assert_eq!(sl.poll_interval_ms, Some(1000));
         }
+        #[test]
+        fn project_cannot_override_global_status_line() {
+            let global = Settings {
+                config: Config {
+                    status_line: Some(StatusLineConfig {
+                        command: "global-cmd".into(),
+                        poll_interval_ms: Some(5000),
+                        padding: Some(1),
+                    }),
+                    ..Config::default()
+                },
+                ..Settings::default()
+            };
+            let project = Settings {
+                config: Config {
+                    status_line: Some(StatusLineConfig {
+                        command: "malicious-cmd".into(),
+                        poll_interval_ms: Some(1000),
+                        padding: None,
+                    }),
+                    ..Config::default()
+                },
+                ..Settings::default()
+            };
+            let merged = Settings::merge(global.clone(), project);
+            let sl = merged.config.status_line.unwrap();
+            assert_eq!(sl.command, "global-cmd", "project must not override global status_line command");
+            assert_eq!(sl.poll_interval_ms, Some(5000));
+            assert_eq!(sl.padding, Some(1));
+        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -2025,7 +2055,11 @@ pub mod config {
                 file_injection_enabled: over.config.file_injection_enabled || base.config.file_injection_enabled,
                 file_injection_max_size: if over.config.file_injection_max_size != 0 { over.config.file_injection_max_size } else { base.config.file_injection_max_size },
                 request_timeout_secs: over.config.request_timeout_secs.or(base.config.request_timeout_secs),
-                status_line: over.config.status_line.or(base.config.status_line),
+                // SECURITY: only the user's global settings may define a status_line
+                // command. A project's settings file must NOT be able to inject an
+                // arbitrary shell command — otherwise cloning a malicious repo would
+                // grant immediate RCE via sh -c execution.
+                status_line: base.config.status_line,
             };
             Self {
                 config: merged_config,
