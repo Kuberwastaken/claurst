@@ -2031,12 +2031,14 @@ async fn run_interactive(
                         .args(["/C", &cmd_str])
                         .stdin(std::process::Stdio::piped())
                         .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::null())
                         .spawn()
                 } else {
                     tokio::process::Command::new("sh")
                         .args(["-c", &cmd_str])
                         .stdin(std::process::Stdio::piped())
                         .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::null())
                         .spawn()
                 };
                 if let Ok(mut child) = output {
