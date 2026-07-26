@@ -590,7 +590,16 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         input_height(&app.prompt_input, prompt_text_width) + 1 // +1 for model/mode status line
     };
 
-    let status_line_height: u16 = if app.status_line_override.is_some() { 1 } else { 0 };
+    let status_line_height: u16 = if let Some(ref text) = app.status_line_override {
+        let clean = strip_ansi(text);
+        let line_count = clean.lines().count().max(1) as u16;
+        let max_lines = app.config.status_line.as_ref()
+            .and_then(|s| s.max_lines)
+            .unwrap_or(10);
+        line_count.min(max_lines)
+    } else {
+        0
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2836,41 +2845,133 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(vec![Line::from(spans)]), padded_area);
 }
 
+/// Strip ANSI escape sequences and C0 control characters (except \n, \t)
+/// from text, returning clean plain text.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        let c = bytes[i];
+        if c == 0x1b {
+            // Escape sequence
+            i += 1;
+            if i >= len {
+                break;
+            }
+            match bytes[i] {
+                b'[' => {
+                    // CSI: consume until final byte (0x40-0x7E)
+                    i += 1;
+                    while i < len {
+                        let b = bytes[i];
+                        i += 1;
+                        if b.is_ascii_uppercase() || b.is_ascii_lowercase() || b == b'~' {
+                            break;
+                        }
+                    }
+                }
+                b']' => {
+                    // OSC: consume until BEL (0x07) or ST (\x1b\\)
+                    i += 1;
+                    while i < len {
+                        let b = bytes[i];
+                        i += 1;
+                        if b == 0x07 {
+                            break;
+                        }
+                        if b == 0x1b && i < len && bytes[i] == b'\\' {
+                            i += 1;
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    // Unknown escape: consume until a letter
+                    while i < len {
+                        let b = bytes[i];
+                        i += 1;
+                        if b.is_ascii_uppercase() || b.is_ascii_lowercase() {
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if c.is_ascii_control() && c != b'\n' && c != b'\t' {
+            i += 1;
+        } else {
+            // Multi-byte UTF-8: copy the full character
+            let char_len = utf8_char_len(c);
+            out.push_str(
+                core::str::from_utf8(&bytes[i..i + char_len]).unwrap_or("�"),
+            );
+            i += char_len;
+        }
+    }
+    out
+}
+
+/// Length of a UTF-8 character in bytes given its leading byte.
+fn utf8_char_len(lead: u8) -> usize {
+    if lead & 0x80 == 0 {
+        1
+    } else if lead & 0xE0 == 0xC0 {
+        2
+    } else if lead & 0xF0 == 0xE0 {
+        3
+    } else {
+        4
+    }
+}
+
+/// Truncate each line to `max_width` chars, appending "..." if truncated.
+fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
+    let mut out = String::new();
+    for (idx, line) in text.lines().enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        if line.len() > max_width && max_width > 3 {
+            let mut truncated = String::with_capacity(max_width);
+            let mut char_count = 0;
+            for c in line.chars() {
+                if char_count + 3 >= max_width {
+                    break;
+                }
+                truncated.push(c);
+                char_count += 1;
+            }
+            truncated.push_str("...");
+            out.push_str(&truncated);
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
 fn render_status_line_override(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 {
         return;
     }
     let text = app.status_line_override.as_deref().unwrap_or("");
-    // Strip ANSI escape sequences (e.g. \x1b[32m) for plain-text rendering.
-    let clean: String = {
-        let mut out = String::with_capacity(text.len());
-        let mut in_esc = false;
-        for c in text.chars() {
-            if in_esc {
-                if c == 'm' { in_esc = false; }
-                continue;
-            }
-            if c == '\x1b' { in_esc = true; continue; }
-            out.push(c);
-        }
-        out
-    };
+    let clean = strip_ansi(text);
     let padding = app.config.status_line.as_ref().and_then(|s| s.padding).unwrap_or(0);
     let pad = padding.min(area.width.saturating_div(2));
+    let content_width = area.width.saturating_sub(pad.saturating_mul(2)).max(1) as usize;
+    let display = truncate_with_ellipsis(&clean, content_width);
     let padded = Rect {
         x: area.x.saturating_add(pad),
         y: area.y,
-        width: area.width.saturating_sub(pad.saturating_mul(2)).max(1),
-        height: 1,
+        width: content_width as u16,
+        height: area.height,
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            clean.as_str(),
-            Style::default().fg(Color::DarkGray),
-        )))
-        .wrap(ratatui::widgets::Wrap { trim: false }),
-        padded,
-    );
+    let lines: Vec<Line> = display
+        .lines()
+        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::DarkGray))))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), padded);
 }
 
 fn render_prompt_suggestions(frame: &mut Frame, app: &App, area: Rect) {
