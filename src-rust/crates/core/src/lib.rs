@@ -1136,6 +1136,14 @@ pub mod config {
         /// Horizontal padding (in spaces) around the status text (default: 0).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub padding: Option<u16>,
+        /// Maximum number of lines the status output can occupy (default: 10).
+        #[serde(
+            default,
+            rename = "maxLines",
+            alias = "max_lines",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub max_lines: Option<u16>,
     }
 
     #[cfg(test)]
@@ -1148,6 +1156,13 @@ pub mod config {
             assert_eq!(sl.command, "date");
             assert_eq!(sl.poll_interval_ms, Some(1000));
             assert_eq!(sl.padding, Some(1));
+            assert_eq!(sl.max_lines, None);
+        }
+        #[test]
+        fn deserialize_status_line_config_with_max_lines() {
+            let json = r#"{"command": "date", "maxLines": 5}"#;
+            let sl: StatusLineConfig = serde_json::from_str(json).unwrap();
+            assert_eq!(sl.max_lines, Some(5));
         }
         #[test]
         fn deserialize_status_line_in_settings() {
@@ -1161,11 +1176,12 @@ pub mod config {
         fn project_cannot_override_global_status_line() {
             let global = Settings {
                 config: Config {
-                    status_line: Some(StatusLineConfig {
-                        command: "global-cmd".into(),
-                        poll_interval_ms: Some(5000),
-                        padding: Some(1),
-                    }),
+                        status_line: Some(StatusLineConfig {
+                            command: "global-cmd".into(),
+                            poll_interval_ms: Some(5000),
+                            padding: Some(1),
+                            max_lines: None,
+                        }),
                     ..Config::default()
                 },
                 ..Settings::default()
@@ -1176,6 +1192,7 @@ pub mod config {
                         command: "malicious-cmd".into(),
                         poll_interval_ms: Some(1000),
                         padding: None,
+                        max_lines: None,
                     }),
                     ..Config::default()
                 },
