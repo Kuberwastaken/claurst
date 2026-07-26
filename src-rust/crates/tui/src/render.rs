@@ -2932,7 +2932,7 @@ fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
         if idx > 0 {
             out.push('\n');
         }
-        if line.len() > max_width && max_width > 3 {
+        if line.chars().count() > max_width && max_width > 3 {
             let mut truncated = String::with_capacity(max_width);
             let mut char_count = 0;
             for c in line.chars() {
