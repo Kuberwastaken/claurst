@@ -1125,7 +1125,7 @@ pub mod config {
     pub struct StatusLineConfig {
         /// Shell command to execute. Receives session JSON on stdin.
         pub command: String,
-        /// Poll interval in milliseconds (default: 5000, minimum: 1000).
+        /// Poll interval in milliseconds (default: 5000, clamped to 1000-300000 at use-site).
         #[serde(
             default,
             rename = "pollIntervalMs",
