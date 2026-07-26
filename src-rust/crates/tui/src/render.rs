@@ -2856,10 +2856,11 @@ fn render_status_line_override(frame: &mut Frame, app: &App, area: Rect) {
         out
     };
     let padding = app.config.status_line.as_ref().and_then(|s| s.padding).unwrap_or(0);
+    let pad = padding.min(area.width.saturating_div(2));
     let padded = Rect {
-        x: area.x + padding,
+        x: area.x.saturating_add(pad),
         y: area.y,
-        width: area.width.saturating_sub(padding * 2),
+        width: area.width.saturating_sub(pad.saturating_mul(2)).max(1),
         height: 1,
     };
     frame.render_widget(
