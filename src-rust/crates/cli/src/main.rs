@@ -3691,15 +3691,18 @@ async fn run_interactive(
         // Update shared session data for status line polling task.
         if status_cmd_cfg.is_some() {
             let elapsed = app.session_start.elapsed().as_secs();
-            let total_in = app.token_count as u64;
             let ctx_size = app.context_window_size;
             let used_pct = if ctx_size > 0 {
                 Some(app.context_used_tokens as f64 / ctx_size as f64 * 100.0)
             } else {
                 None
             };
+            let total_input = cost_tracker.input_tokens()
+                + cost_tracker.cache_creation_tokens()
+                + cost_tracker.cache_read_tokens();
+            let total_output = cost_tracker.output_tokens();
             let json = serde_json::json!({
-                "session_id": "",
+                "session_id": tool_ctx.session_id,
                 "model": {
                     "display_name": app.model_name,
                     "id": app.model_name,
@@ -3708,10 +3711,15 @@ async fn run_interactive(
                     "current_dir": app.current_dir,
                 },
                 "context_window": {
-                    "total_input_tokens": total_in,
-                    "total_output_tokens": 0u64,
+                    "total_input_tokens": total_input,
+                    "total_output_tokens": total_output,
                     "context_window_size": ctx_size,
-                    "current_usage": null,
+                    "current_usage": {
+                        "input_tokens": cost_tracker.input_tokens(),
+                        "output_tokens": total_output,
+                        "cache_creation_input_tokens": cost_tracker.cache_creation_tokens(),
+                        "cache_read_input_tokens": cost_tracker.cache_read_tokens(),
+                    },
                     "used_percentage": used_pct,
                     "remaining_percentage": used_pct.map(|p| 100.0 - p),
                 },
