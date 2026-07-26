@@ -2007,13 +2007,24 @@ async fn run_interactive(
     let (status_cmd_tx, mut status_cmd_rx) = mpsc::channel::<String>(4);
     // Shared session data for the polling task (updated from the main loop).
     let session_data: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+    // Provide an initial empty payload so the status command has input on its
+    // very first run and does not block on or fail to parse an empty stdin.
+    *session_data.lock().unwrap() = Some(r#"{}"#.to_string());
+    let status_line_cancel = CancellationToken::new();
     if let Some((ref cmd_str, poll_ms)) = status_cmd_cfg {
         let cmd_str = cmd_str.clone();
         let tx = status_cmd_tx.clone();
         let sd = session_data.clone();
+        let cancel = status_line_cancel.clone();
         tokio::spawn(async move {
+            // Clamp interval: minimum 1000ms, maximum 300000ms (5 minutes).
+            let interval_ms = poll_ms.clamp(1000, 300000);
+            // Cap captured output at 4 KB.
+            let max_output_bytes: usize = 4096;
+            // Wait briefly before first poll so the main loop has a chance to
+            // populate session_data with real values.
+            tokio::time::sleep(Duration::from_millis(500)).await;
             loop {
-                tokio::time::sleep(Duration::from_millis(poll_ms)).await;
                 let input = sd.lock().unwrap().clone().unwrap_or_default();
                 let output = if cfg!(target_os = "windows") {
                     tokio::process::Command::new("cmd")
@@ -2029,15 +2040,37 @@ async fn run_interactive(
                         .spawn()
                 };
                 if let Ok(mut child) = output {
-                    use tokio::io::AsyncWriteExt;
+                    use tokio::io::{AsyncWriteExt, AsyncReadExt};
                     if let Some(mut stdin) = child.stdin.take() {
                         stdin.write_all(input.as_bytes()).await.ok();
                         drop(stdin);
                     }
-                    if let Ok(out) = child.wait_with_output().await {
-                        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                        let _ = tx.try_send(text);
+                    let mut child_stdout = child.stdout.take();
+                    // Timeout: kill child if it doesn't finish within interval_ms.
+                    let timed_out = tokio::time::timeout(
+                        Duration::from_millis(interval_ms),
+                        child.wait(),
+                    ).await;
+                    match timed_out {
+                        Ok(Ok(_)) => {
+                            let mut buf = Vec::with_capacity(max_output_bytes);
+                            if let Some(ref mut stdout) = child_stdout {
+                                stdout.read_to_end(&mut buf).await.ok();
+                            }
+                            let text = String::from_utf8_lossy(&buf[..buf.len().min(max_output_bytes)])
+                                .trim().to_string();
+                            let _ = tx.try_send(text);
+                        }
+                        Ok(Err(_)) => {}
+                        Err(_elapsed) => {
+                            let _ = child.start_kill();
+                            let _ = child.wait().await;
+                        }
                     }
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {}
                 }
             }
         });
@@ -4281,6 +4314,7 @@ async fn run_interactive(
     if let Some(runtime) = bridge_runtime.take() {
         runtime.cancel.cancel();
     }
+    status_line_cancel.cancel();
     restore_terminal(&mut terminal)?;
     Ok(())
 }

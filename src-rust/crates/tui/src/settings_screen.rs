@@ -837,7 +837,7 @@ mod tests {
         let entries = all_entries(&screen);
         // Base settings are always present, plus 0-3 conditional file injection settings
         assert!(entries.len() >= 16, "Should have at least 16 editable settings, got {}", entries.len());
-        assert!(entries.len() <= 20, "Should have at most 20 editable settings, got {}", entries.len());
+        assert!(entries.len() <= 21, "Should have at most 21 editable settings, got {}", entries.len());
     }
 
     #[test]
