@@ -26,6 +26,7 @@
     "GNUPGHOME": "/home/vscode/.gnupg",
     "PATH": "${containerWorkspaceFolder}/src-rust/target/debug:${containerWorkspaceFolder}/src-rust/target/release:${containerEnv:PATH}"
   },
+  "initializeCommand": "mkdir -p ${localWorkspaceFolder}/.claurst",
   "postCreateCommand": "mkdir -p /home/vscode/.gnupg && chmod 700 /home/vscode/.gnupg && sudo chown -R vscode:vscode /usr/local/cargo",
   "customizations": {
     "vscode": {

@@ -51,7 +51,7 @@ pub struct CopilotProvider {
 impl CopilotProvider {
     pub fn new(token: String) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
+            .timeout(crate::request_timeout())
             .build()
             .expect("failed to build reqwest client");
 
@@ -63,7 +63,7 @@ impl CopilotProvider {
     }
 
     pub fn from_env() -> Option<Self> {
-        std::env::var("GITHUB_TOKEN").ok().map(|t| Self::new(t))
+        std::env::var("GITHUB_TOKEN").ok().map(Self::new)
     }
 
     fn base_url() -> &'static str {
@@ -279,6 +279,14 @@ impl CopilotProvider {
         Self::to_responses_input(request)
     }
 
+    /// Public re-export of the Responses-API provider-option mapping
+    /// (`reasoningEffort`/`reasoningSummary` -> `reasoning`, `textVerbosity` ->
+    /// `text.verbosity`, `include`) so `CodexProvider` applies reasoning effort
+    /// identically instead of dropping it.
+    pub fn apply_responses_provider_options_pub(body: &mut Value, provider_options: &Value) {
+        Self::apply_responses_provider_options(body, provider_options)
+    }
+
     fn to_responses_input(request: &ProviderRequest) -> Vec<Value> {
         let mut input = Vec::new();
 
@@ -363,6 +371,7 @@ impl CopilotProvider {
                                     id,
                                     name,
                                     input: tool_input,
+                                    ..
                                 } => {
                                     flush_assistant_content(&mut input, &mut message_parts);
                                     input.push(json!({
@@ -447,17 +456,17 @@ impl CopilotProvider {
     /// unreachable or returns empty data.
     fn hardcoded_models(provider_id: &ProviderId) -> Vec<ModelInfo> {
         vec![
-            ModelInfo { id: ModelId::new("claude-sonnet-4.6"), provider_id: provider_id.clone(), name: "Claude Sonnet 4.6 (Copilot)".into(), context_window: 128_000, max_output_tokens: 32_000 },
-            ModelInfo { id: ModelId::new("claude-sonnet-4.5"), provider_id: provider_id.clone(), name: "Claude Sonnet 4.5 (Copilot)".into(), context_window: 128_000, max_output_tokens: 32_000 },
-            ModelInfo { id: ModelId::new("claude-haiku-4.5"), provider_id: provider_id.clone(), name: "Claude Haiku 4.5 (Copilot)".into(), context_window: 128_000, max_output_tokens: 32_000 },
-            ModelInfo { id: ModelId::new("gpt-4.1"), provider_id: provider_id.clone(), name: "GPT-4.1 (Copilot)".into(), context_window: 64_000, max_output_tokens: 16_384 },
-            ModelInfo { id: ModelId::new("gpt-4o"), provider_id: provider_id.clone(), name: "GPT-4o (Copilot)".into(), context_window: 128_000, max_output_tokens: 16_384 },
-            ModelInfo { id: ModelId::new("gpt-4o-mini"), provider_id: provider_id.clone(), name: "GPT-4o Mini (Copilot)".into(), context_window: 128_000, max_output_tokens: 16_384 },
-            ModelInfo { id: ModelId::new("gpt-5.4"), provider_id: provider_id.clone(), name: "GPT-5.4 (Copilot)".into(), context_window: 128_000, max_output_tokens: 128_000 },
-            ModelInfo { id: ModelId::new("gpt-5-mini"), provider_id: provider_id.clone(), name: "GPT-5 Mini (Copilot)".into(), context_window: 128_000, max_output_tokens: 128_000 },
-            ModelInfo { id: ModelId::new("o3-mini"), provider_id: provider_id.clone(), name: "o3-mini (Copilot)".into(), context_window: 200_000, max_output_tokens: 100_000 },
-            ModelInfo { id: ModelId::new("o4-mini"), provider_id: provider_id.clone(), name: "o4-mini (Copilot)".into(), context_window: 200_000, max_output_tokens: 100_000 },
-            ModelInfo { id: ModelId::new("gemini-3-flash-preview"), provider_id: provider_id.clone(), name: "Gemini 3 Flash (Copilot)".into(), context_window: 128_000, max_output_tokens: 64_000 },
+            ModelInfo { id: ModelId::new("claude-sonnet-4.6"), provider_id: provider_id.clone(), name: "Claude Sonnet 4.6 (Copilot)".into(), context_window: 128_000, max_output_tokens: 32_000, ..Default::default() },
+            ModelInfo { id: ModelId::new("claude-sonnet-4.5"), provider_id: provider_id.clone(), name: "Claude Sonnet 4.5 (Copilot)".into(), context_window: 128_000, max_output_tokens: 32_000, ..Default::default() },
+            ModelInfo { id: ModelId::new("claude-haiku-4.5"), provider_id: provider_id.clone(), name: "Claude Haiku 4.5 (Copilot)".into(), context_window: 128_000, max_output_tokens: 32_000, ..Default::default() },
+            ModelInfo { id: ModelId::new("gpt-4.1"), provider_id: provider_id.clone(), name: "GPT-4.1 (Copilot)".into(), context_window: 64_000, max_output_tokens: 16_384, ..Default::default() },
+            ModelInfo { id: ModelId::new("gpt-4o"), provider_id: provider_id.clone(), name: "GPT-4o (Copilot)".into(), context_window: 128_000, max_output_tokens: 16_384, ..Default::default() },
+            ModelInfo { id: ModelId::new("gpt-4o-mini"), provider_id: provider_id.clone(), name: "GPT-4o Mini (Copilot)".into(), context_window: 128_000, max_output_tokens: 16_384, ..Default::default() },
+            ModelInfo { id: ModelId::new("gpt-5.4"), provider_id: provider_id.clone(), name: "GPT-5.4 (Copilot)".into(), context_window: 128_000, max_output_tokens: 128_000, ..Default::default() },
+            ModelInfo { id: ModelId::new("gpt-5-mini"), provider_id: provider_id.clone(), name: "GPT-5 Mini (Copilot)".into(), context_window: 128_000, max_output_tokens: 128_000, ..Default::default() },
+            ModelInfo { id: ModelId::new("o3-mini"), provider_id: provider_id.clone(), name: "o3-mini (Copilot)".into(), context_window: 200_000, max_output_tokens: 100_000, ..Default::default() },
+            ModelInfo { id: ModelId::new("o4-mini"), provider_id: provider_id.clone(), name: "o4-mini (Copilot)".into(), context_window: 200_000, max_output_tokens: 100_000, ..Default::default() },
+            ModelInfo { id: ModelId::new("gemini-3-flash-preview"), provider_id: provider_id.clone(), name: "Gemini 3 Flash (Copilot)".into(), context_window: 128_000, max_output_tokens: 64_000, ..Default::default() },
         ]
     }
 
@@ -543,7 +552,12 @@ impl CopilotProvider {
                         .and_then(|value| value.as_str())
                         .unwrap_or("{}");
                     let input = serde_json::from_str(args).unwrap_or_else(|_| json!({}));
-                    content.push(ContentBlock::ToolUse { id, name, input });
+                    content.push(ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input,
+                        thought_signature: None,
+                    });
                 }
                 _ => {}
             }
@@ -652,10 +666,11 @@ impl CopilotProvider {
             for (index, block) in response.content.iter().enumerate() {
                 let start_block = match block {
                     ContentBlock::Text { .. } => ContentBlock::Text { text: String::new() },
-                    ContentBlock::ToolUse { id, name, .. } => ContentBlock::ToolUse {
+                    ContentBlock::ToolUse { id, name, thought_signature, .. } => ContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: json!({}),
+                        thought_signature: thought_signature.clone(),
                     },
                     ContentBlock::Thinking { .. } => ContentBlock::Thinking {
                         thinking: String::new(),
@@ -892,11 +907,18 @@ impl LlmProvider for CopilotProvider {
         let resp = self.do_streaming(&request).await?;
         let provider_id = self.id.clone();
 
+        // TODO(#228): Copilot speaks the OpenAI-Chat wire format and could reuse
+        // `protocol::openai_chat::OpenAiChatDecoder`, except it surfaces reasoning
+        // as `ReasoningDelta { index: 0 }` (no dedicated Thinking block). Migrate
+        // once that decoder gains a "simple reasoning" mode; keeping this loop is
+        // behavior-preserving until then.
         let s = stream! {
             use futures::StreamExt;
 
             let mut byte_stream = resp.bytes_stream();
-            let mut leftover = String::new();
+            // Shared byte-buffering decoder (#228): complete lines only, so a
+            // multibyte codepoint straddling a chunk boundary is never corrupted.
+            let mut decoder = crate::SseByteDecoder::new();
 
             let mut message_started = false;
             let mut message_id = String::from("unknown");
@@ -919,21 +941,7 @@ impl LlmProvider for CopilotProvider {
                     }
                 };
 
-                let text = String::from_utf8_lossy(&chunk);
-                let combined = if leftover.is_empty() {
-                    text.to_string()
-                } else {
-                    let mut s = std::mem::take(&mut leftover);
-                    s.push_str(&text);
-                    s
-                };
-
-                let mut lines: Vec<&str> = combined.split('\n').collect();
-                if !combined.ends_with('\n') {
-                    leftover = lines.pop().unwrap_or("").to_string();
-                }
-
-                for line in lines {
+                for line in decoder.push(&chunk) {
                     let line = line.trim_end_matches('\r').trim();
 
                     if line.is_empty() || line.starts_with(':') {
@@ -1050,6 +1058,7 @@ impl LlmProvider for CopilotProvider {
                                         id: tc_id.to_string(),
                                         name,
                                         input: serde_json::json!({}),
+                                        thought_signature: None,
                                     },
                                 });
                             }
@@ -1109,7 +1118,7 @@ impl LlmProvider for CopilotProvider {
         Ok(Box::pin(s))
     }
 
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+    async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         // Try to fetch the live model list from the Copilot API.
         let url = format!("{}/models", Self::base_url());
         let builder = self.http_client.get(&url);
@@ -1189,6 +1198,7 @@ impl LlmProvider for CopilotProvider {
                                 name: name.to_string(),
                                 context_window: ctx,
                                 max_output_tokens: max_out,
+                                ..Default::default()
                             });
                         }
                     }

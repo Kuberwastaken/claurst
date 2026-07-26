@@ -240,18 +240,20 @@ fn try_save_linux_image(path: &PathBuf) -> bool {
         .args(["-selection", "clipboard", "-t", "image/png", "-o"])
         .output()
     {
-        if out.status.success() && !out.stdout.is_empty() {
-            if std::fs::write(path, &out.stdout).is_ok() {
-                return true;
-            }
+        if out.status.success()
+            && !out.stdout.is_empty()
+            && std::fs::write(path, &out.stdout).is_ok()
+        {
+            return true;
         }
     }
     // wl-paste
     if let Ok(out) = Command::new("wl-paste").args(["--type", "image/png"]).output() {
-        if out.status.success() && !out.stdout.is_empty() {
-            if std::fs::write(path, &out.stdout).is_ok() {
-                return true;
-            }
+        if out.status.success()
+            && !out.stdout.is_empty()
+            && std::fs::write(path, &out.stdout).is_ok()
+        {
+            return true;
         }
     }
     false

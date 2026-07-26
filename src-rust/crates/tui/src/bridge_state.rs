@@ -5,8 +5,10 @@ use ratatui::text::Span;
 
 /// The current state of the remote bridge connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub enum BridgeConnectionState {
     /// No bridge configured / not in use.
+    #[default]
     Disconnected,
     /// Currently attempting to connect.
     Connecting,
@@ -23,11 +25,6 @@ pub enum BridgeConnectionState {
     OutboundOnly,
 }
 
-impl Default for BridgeConnectionState {
-    fn default() -> Self {
-        Self::Disconnected
-    }
-}
 
 impl BridgeConnectionState {
     /// Return a styled status badge `Span` suitable for the status bar.

@@ -61,6 +61,12 @@ pub struct SessionBranchingState {
 // Implementation
 // ---------------------------------------------------------------------------
 
+impl Default for SessionBranchingState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SessionBranchingState {
     /// Create a new, hidden branching state.
     pub fn new() -> Self {

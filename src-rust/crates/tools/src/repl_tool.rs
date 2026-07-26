@@ -14,6 +14,7 @@
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
+use claurst_core::bash_classifier::{classify_bash_command, BashRiskLevel};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
@@ -41,6 +42,13 @@ struct ReplSession {
 }
 
 /// Key: (session_id, language)
+///
+// TODO(#209): interpreter processes are intentionally kept alive across tool
+// calls and are only removed here when they die or on the next call. There is
+// currently no session-end teardown hook wired into the app that could kill
+// leftover interpreters for a finished session, so we do not attempt it here.
+// When such a hook exists, drain REPL_SESSIONS for the ending session_id and
+// kill each child. The security gate above is the priority for #209.
 static REPL_SESSIONS: Lazy<Arc<DashMap<(String, String), Arc<Mutex<ReplSession>>>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
@@ -194,6 +202,9 @@ struct ReplInput {
 
 #[async_trait]
 impl Tool for ReplTool {
+    // Gates itself: calls `ctx.check_permission` in `execute()` (#210).
+    fn self_gates(&self) -> bool { true }
+
     fn name(&self) -> &str {
         "REPL"
     }
@@ -238,6 +249,31 @@ impl Tool for ReplTool {
             .unwrap_or("bash")
             .to_lowercase();
 
+        // ── Security gate (issue #209) ───────────────────────────────────────
+        // REPL executes arbitrary, model-supplied code in a live interpreter, so
+        // it must pass the same permission gate as the Bash tool BEFORE any
+        // interpreter is spawned or any code is run.  `execute_tool` does not gate
+        // on our behalf, so we gate here.  `is_read_only = false` ensures the
+        // action is treated as arbitrary execution (never auto-approved in
+        // Default/Plan/AcceptEdits modes).
+        let preview: String = params.code.chars().take(80).collect::<String>().replace('\n', " ");
+        let reason = format!("REPL ({}): {}", language, preview);
+        if let Err(e) = ctx.check_permission(self.name(), &reason, false) {
+            return ToolResult::error(e.to_string());
+        }
+
+        // For shell languages, additionally block Critical-risk commands
+        // unconditionally — exactly like the PTY Bash tool does.
+        if matches!(language.as_str(), "bash" | "sh" | "")
+            && classify_bash_command(&params.code) == BashRiskLevel::Critical
+        {
+            return ToolResult::error(format!(
+                "Command blocked: classified as Critical risk by the bash security classifier.\n\
+                 Refusing to execute REPL code: {}",
+                preview
+            ));
+        }
+
         debug!(
             session = %ctx.session_id,
             language = %language,
@@ -258,5 +294,121 @@ impl Tool for ReplTool {
                 ToolResult::error(format!("REPL error: {}", e))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    /// Handler that always asks; combined with `non_interactive = true` this
+    /// resolves to a permission denial (mirrors `AskPermissionHandler` in lib.rs).
+    struct DenyHandler;
+    impl claurst_core::permissions::PermissionHandler for DenyHandler {
+        fn check_permission(
+            &self,
+            _request: &claurst_core::permissions::PermissionRequest,
+        ) -> claurst_core::permissions::PermissionDecision {
+            claurst_core::permissions::PermissionDecision::Ask {
+                reason: "denied in test".to_string(),
+            }
+        }
+        fn request_permission(
+            &self,
+            request: &claurst_core::permissions::PermissionRequest,
+        ) -> claurst_core::permissions::PermissionDecision {
+            self.check_permission(request)
+        }
+    }
+
+    /// Handler that allows everything — used to exercise the Critical-block path.
+    struct AllowHandler;
+    impl claurst_core::permissions::PermissionHandler for AllowHandler {
+        fn check_permission(
+            &self,
+            _request: &claurst_core::permissions::PermissionRequest,
+        ) -> claurst_core::permissions::PermissionDecision {
+            claurst_core::permissions::PermissionDecision::Allow
+        }
+        fn request_permission(
+            &self,
+            _request: &claurst_core::permissions::PermissionRequest,
+        ) -> claurst_core::permissions::PermissionDecision {
+            claurst_core::permissions::PermissionDecision::Allow
+        }
+    }
+
+    fn ctx_with(
+        handler: Arc<dyn claurst_core::permissions::PermissionHandler>,
+        session_id: &str,
+    ) -> ToolContext {
+        ToolContext {
+            working_dir: std::env::temp_dir(),
+            permission_mode: claurst_core::config::PermissionMode::Default,
+            permission_handler: handler,
+            cost_tracker: claurst_core::cost::CostTracker::new(),
+            session_id: session_id.to_string(),
+            file_history: Arc::new(parking_lot::Mutex::new(
+                claurst_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config: claurst_core::config::Config::default(),
+            managed_agent_config: None,
+            completion_notifier: None,
+            pending_permissions: None,
+            permission_manager: None,
+            user_question_tx: None,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    #[test]
+    fn repl_requires_execute_permission_level() {
+        assert_eq!(ReplTool.permission_level(), PermissionLevel::Execute);
+    }
+
+    #[tokio::test]
+    async fn repl_denied_permission_blocks_execution() {
+        let ctx = ctx_with(Arc::new(DenyHandler), "repl-deny-test");
+        let result = ReplTool
+            .execute(
+                json!({ "language": "python", "code": "print('should not run')" }),
+                &ctx,
+            )
+            .await;
+
+        assert!(result.is_error, "denied REPL must return an error result");
+        // No interpreter should have been spawned for this session/language.
+        assert!(
+            REPL_SESSIONS
+                .get(&("repl-deny-test".to_string(), "python".to_string()))
+                .is_none(),
+            "no REPL session must be spawned when permission is denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn repl_blocks_critical_bash_even_when_allowed() {
+        let ctx = ctx_with(Arc::new(AllowHandler), "repl-critical-test");
+        let result = ReplTool
+            .execute(json!({ "language": "bash", "code": "rm -rf /" }), &ctx)
+            .await;
+
+        assert!(result.is_error, "Critical bash must be blocked");
+        assert!(
+            result.content.contains("Critical"),
+            "block message should mention the Critical classification, got: {}",
+            result.content
+        );
+        assert!(
+            REPL_SESSIONS
+                .get(&("repl-critical-test".to_string(), "bash".to_string()))
+                .is_none(),
+            "no bash REPL session must be spawned for a Critical command"
+        );
     }
 }

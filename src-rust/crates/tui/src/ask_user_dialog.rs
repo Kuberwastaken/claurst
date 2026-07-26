@@ -38,6 +38,7 @@ const INPUT_FG: Color = Color::Rgb(200, 255, 200);
 const NUMBER_FG: Color = Color::Rgb(150, 150, 200);
 
 /// State for the ask-user question dialog overlay.
+#[derive(Default)]
 pub struct AskUserDialogState {
     /// Whether the dialog is currently visible.
     pub visible: bool,
@@ -56,19 +57,6 @@ pub struct AskUserDialogState {
     pub(crate) reply_tx: Option<tokio::sync::oneshot::Sender<String>>,
 }
 
-impl Default for AskUserDialogState {
-    fn default() -> Self {
-        Self {
-            visible: false,
-            question: String::new(),
-            options: None,
-            selected_idx: 0,
-            custom_text: String::new(),
-            in_custom_input: false,
-            reply_tx: None,
-        }
-    }
-}
 
 impl AskUserDialogState {
     pub fn new() -> Self {

@@ -6,7 +6,7 @@
 
 Claurst is a high-performance Rust reimplementation of Claude Code — a terminal-native AI coding agent with streaming responses, 40+ built-in tools, 15+ LLM provider integrations, a full ratatui TUI, and an extensible plugin system.
 
-**Version:** 0.1.3 (Beta) · **License:** GPL-3.0 · [GitHub](https://github.com/Kuberwastaken/claurst)
+**Version:** 0.1.7 (Beta) · **License:** GPL-3.0 · [GitHub](https://github.com/Kuberwastaken/claurst)
 
 </div>
 
@@ -43,6 +43,12 @@ Anthropic Claude (default), OpenAI, Google Gemini, AWS Bedrock, Azure OpenAI, Ol
 
 ### AMOLED terminal UI
 A ratatui-based TUI with real-time streaming, syntax-highlighted code blocks, diff viewer, permission dialogs, slash command autocomplete, session browser, and a full keybinding system.
+
+### Multi-account credentials
+Store multiple named Anthropic (Claude.ai / Console) and Codex (ChatGPT) accounts in one install and switch between them instantly with `/switch` or `claurst auth switch <id>`. Identity is detected from the OAuth JWT, so re-logging-in the same account is idempotent. See [Authentication](auth#multi-account-profiles).
+
+### @file injection
+Type `@path/to/file` anywhere in a prompt to inject the file's contents inline. Typeahead autocomplete suggests paths as you type, with size/binary safety checks before submit. See [@file Injection](keybindings#file-injection-with-typeahead).
 
 ### Plugin system
 Extend Claurst with TOML-manifest plugins that add custom slash commands, MCP servers, hooks, output styles, and tool overlays.
@@ -128,7 +134,9 @@ claurst --provider ollama --model llama3.2
 OPENAI_API_KEY=sk-... claurst --provider openai --model gpt-4o
 ```
 
-See [Providers](providers) for setup instructions for every supported provider.
+See [Providers](providers) for setup instructions for every supported provider,
+or the [Local Models](local-models) guide for running against llama.cpp,
+LM Studio, Ollama, or any OpenAI-compatible server on your own machine.
 
 ---
 
@@ -152,6 +160,10 @@ Inside the interactive TUI, type `/` to see all available commands. Common ones:
 |---------|-------------|
 | `/help` | Show all commands |
 | `/model` | Switch model or provider |
+| `/login` | OAuth login (Anthropic; `--codex` for ChatGPT, `--label <name>` to name) |
+| `/accounts` | List stored Anthropic + Codex accounts |
+| `/switch <id>` | Switch active account (`--codex` for Codex) |
+| `/logout` | Clear credentials for the active account (`--all` to purge) |
 | `/goal <objective>` | Set an autonomous multi-turn goal |
 | `/managed-agents` | Configure manager-executor agents |
 | `/compact` | Compress conversation history |
@@ -182,6 +194,7 @@ See [Slash Commands](commands) for the complete reference.
 - [Slash Commands](commands) — all 70+ commands
 - [Tools Reference](tools) — all 40+ tools and permission levels
 - [Providers](providers) — configuring each LLM provider
+- [Local Models](local-models) — llama.cpp, LM Studio, Ollama, and other OpenAI-compatible servers
 - [MCP Integration](mcp) — Model Context Protocol servers
 - [Plugins](plugins) — building and using plugins
 - [Agents](agents) — multi-agent orchestration

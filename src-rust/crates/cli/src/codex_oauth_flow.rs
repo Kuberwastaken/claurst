@@ -27,7 +27,7 @@ pub fn generate_code_verifier() -> String {
     let u3 = uuid::Uuid::new_v4();
     bytes[32..48].copy_from_slice(&u3.as_bytes()[..16]);
 
-    URL_SAFE_NO_PAD.encode(&bytes)
+    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// Compute PKCE code challenge (SHA-256 of verifier, base64url encoded).
@@ -65,6 +65,15 @@ pub fn build_auth_url(code_challenge: &str, state: &str) -> String {
 /// display it (and copy it to the clipboard) in case the automatic browser
 /// launch fails.
 pub async fn run_oauth_flow(event_tx: mpsc::Sender<DeviceAuthEvent>) -> anyhow::Result<CodexTokens> {
+    run_oauth_flow_with_label(event_tx, None).await
+}
+
+/// Same as [`run_oauth_flow`] but lets the caller supply a label for the
+/// newly registered profile.
+pub async fn run_oauth_flow_with_label(
+    event_tx: mpsc::Sender<DeviceAuthEvent>,
+    label: Option<&str>,
+) -> anyhow::Result<CodexTokens> {
     let verifier = generate_code_verifier();
     let challenge = compute_code_challenge(&verifier);
     let state = generate_state();
@@ -92,8 +101,8 @@ pub async fn run_oauth_flow(event_tx: mpsc::Sender<DeviceAuthEvent>) -> anyhow::
     // Exchange code for tokens
     let tokens = exchange_code_for_tokens(&code, &verifier).await?;
 
-    // Persist tokens
-    claurst_core::oauth_config::save_codex_tokens(&tokens)?;
+    // Persist tokens and register an account profile in the registry.
+    claurst_core::oauth_config::save_codex_tokens_and_register(&tokens, label)?;
 
     eprintln!("Codex login successful!");
     Ok(tokens)

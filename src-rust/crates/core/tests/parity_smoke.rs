@@ -2,7 +2,7 @@
 //! Verifies that core data structures are usable as the TS CLI would use them.
 
 use claurst_core::{
-    session_storage::{TranscriptEntry, transcript_dir},
+    session_storage::transcript_dir,
     prompt_history::HistoryEntry,
     file_history::FileHistory,
     claudemd::load_all_memory_files,

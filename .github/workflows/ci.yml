@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src-rust/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src-rust/**'
+      - '.github/workflows/ci.yml'
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+    name: Test (${{ matrix.os }})
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # ALSA headers for the voice feature's cpal dependency (same setup as
+      # release.yml). cmake — required by btls-sys/BoringSSL via wreq — is
+      # preinstalled on all GitHub-hosted runners.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev pkg-config
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-rust/target
+          key: ci-${{ matrix.os }}-cargo-${{ hashFiles('src-rust/Cargo.lock') }}
+          restore-keys: ci-${{ matrix.os }}-cargo-
+
+      - name: Run tests
+        working-directory: src-rust
+        # Run serially: a number of tests mutate process-global state (env vars
+        # like HOME / ANTHROPIC_API_KEY, etc.) and would otherwise race under
+        # parallel execution, flaking non-deterministically across runners.
+        run: cargo test --workspace --locked -- --test-threads=1
+
+      # Enforced (#227): clippy is clean under `-D warnings`, aside from a few
+      # documented crate-level / targeted `#[allow]`s for noisy or risky lints.
+      # rustfmt stays advisory below: the tree is intentionally not fmt-clean
+      # (CRLF-terminated files and pre-existing drift), so running fmt --check
+      # here is informational only.
+      - name: Clippy
+        if: runner.os == 'Linux'
+        working-directory: src-rust
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: rustfmt (advisory)
+        if: runner.os == 'Linux'
+        working-directory: src-rust
+        continue-on-error: true
+        run: cargo fmt --all --check

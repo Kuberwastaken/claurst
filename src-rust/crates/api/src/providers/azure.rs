@@ -11,14 +11,14 @@ use std::pin::Pin;
 
 use async_stream::stream;
 use async_trait::async_trait;
-use claurst_core::provider_id::{ModelId, ProviderId};
+use claurst_core::provider_id::ProviderId;
 use claurst_core::types::{ContentBlock, UsageInfo};
 use futures::Stream;
 use serde_json::{json, Value};
 use tracing::debug;
 
 use crate::error_handling::parse_error_response;
-use crate::provider::{LlmProvider, ModelInfo};
+use crate::provider::LlmProvider;
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StreamEvent,
@@ -43,7 +43,7 @@ pub struct AzureProvider {
 impl AzureProvider {
     pub fn new(resource_name: String, api_key: String) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
+            .timeout(crate::request_timeout())
             .build()
             .expect("failed to build reqwest client");
 
@@ -239,11 +239,18 @@ impl LlmProvider for AzureProvider {
         let resp = self.do_streaming(&request).await?;
         let provider_id = self.id.clone();
 
+        // TODO(#228): Azure OpenAI speaks the OpenAI-Chat wire format but does no
+        // reasoning extraction at all. Migrate to
+        // `protocol::openai_chat::OpenAiChatDecoder` once it can be configured to
+        // skip reasoning (the current decoder always extracts it) so the switch
+        // stays behavior-preserving.
         let s = stream! {
             use futures::StreamExt;
 
             let mut byte_stream = resp.bytes_stream();
-            let mut leftover = String::new();
+            // Shared byte-buffering decoder (#228): complete lines only, so a
+            // multibyte codepoint straddling a chunk boundary is never corrupted.
+            let mut decoder = crate::SseByteDecoder::new();
 
             let mut message_started = false;
             let mut message_id = String::from("unknown");
@@ -266,21 +273,7 @@ impl LlmProvider for AzureProvider {
                     }
                 };
 
-                let text = String::from_utf8_lossy(&chunk);
-                let combined = if leftover.is_empty() {
-                    text.to_string()
-                } else {
-                    let mut s = std::mem::take(&mut leftover);
-                    s.push_str(&text);
-                    s
-                };
-
-                let mut lines: Vec<&str> = combined.split('\n').collect();
-                if !combined.ends_with('\n') {
-                    leftover = lines.pop().unwrap_or("").to_string();
-                }
-
-                for line in lines {
+                for line in decoder.push(&chunk) {
                     let line = line.trim_end_matches('\r').trim();
 
                     if line.is_empty() || line.starts_with(':') {
@@ -384,6 +377,7 @@ impl LlmProvider for AzureProvider {
                                         id: tc_id.to_string(),
                                         name,
                                         input: serde_json::json!({}),
+                                        thought_signature: None,
                                     },
                                 });
                             }
@@ -439,39 +433,6 @@ impl LlmProvider for AzureProvider {
         };
 
         Ok(Box::pin(s))
-    }
-
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
-        Ok(vec![
-            ModelInfo {
-                id: ModelId::new("gpt-4o"),
-                provider_id: self.id.clone(),
-                name: "GPT-4o (Azure)".to_string(),
-                context_window: 128_000,
-                max_output_tokens: 16_384,
-            },
-            ModelInfo {
-                id: ModelId::new("gpt-4o-mini"),
-                provider_id: self.id.clone(),
-                name: "GPT-4o Mini (Azure)".to_string(),
-                context_window: 128_000,
-                max_output_tokens: 16_384,
-            },
-            ModelInfo {
-                id: ModelId::new("gpt-4-turbo"),
-                provider_id: self.id.clone(),
-                name: "GPT-4 Turbo (Azure)".to_string(),
-                context_window: 128_000,
-                max_output_tokens: 4_096,
-            },
-            ModelInfo {
-                id: ModelId::new("gpt-35-turbo"),
-                provider_id: self.id.clone(),
-                name: "GPT-3.5 Turbo (Azure)".to_string(),
-                context_window: 16_385,
-                max_output_tokens: 4_096,
-            },
-        ])
     }
 
     async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {

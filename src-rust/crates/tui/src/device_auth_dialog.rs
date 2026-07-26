@@ -54,6 +54,12 @@ pub struct DeviceAuthDialogState {
     pub auth_url: String,
 }
 
+impl Default for DeviceAuthDialogState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DeviceAuthDialogState {
     pub fn new() -> Self {
         Self {

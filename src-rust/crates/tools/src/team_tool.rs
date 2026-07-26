@@ -107,7 +107,7 @@ static ACTIVE_TEAMS: Lazy<DashMap<String, Vec<CancellationToken>>> =
 // ---------------------------------------------------------------------------
 
 fn teams_base_dir() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".claurst").join("teams"))
+    Some(claurst_core::config::Settings::config_dir().join("teams"))
 }
 
 fn team_dir(team_name: &str) -> Option<std::path::PathBuf> {

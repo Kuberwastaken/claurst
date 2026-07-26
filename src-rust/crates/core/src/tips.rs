@@ -132,11 +132,6 @@ static ALL_TIPS: Lazy<Vec<Tip>> = Lazy::new(|| {
             cooldown_sessions: 15,
         },
         Tip {
-            id: "feedback-command",
-            content: "Use /feedback to help us improve!",
-            cooldown_sessions: 15,
-        },
-        Tip {
             id: "status-line",
             content: "Use /statusline to set up a custom status line that will display beneath the input box",
             cooldown_sessions: 25,
@@ -191,7 +186,7 @@ pub struct TipHistory {
 impl TipHistory {
     /// Path to the persisted history file: `~/.claurst/tip_history.json`.
     fn history_path() -> Option<std::path::PathBuf> {
-        dirs::home_dir().map(|h| h.join(".claurst").join("tip_history.json"))
+        Some(crate::config::Settings::config_dir().join("tip_history.json"))
     }
 
     /// Load history from `~/.claurst/tip_history.json`.
@@ -304,7 +299,7 @@ pub fn select_tip(session_num: u64) -> Option<&'static Tip> {
     }
 
     // Sort by least recently shown (highest `sessions_since` first).
-    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    candidates.sort_by_key(|b| std::cmp::Reverse(b.1));
     Some(candidates[0].0)
 }
 

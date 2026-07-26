@@ -72,7 +72,7 @@ pub fn message_to_cloud(msg: &Message, session_id: &str, msg_id: &str, ts: u64) 
         .into_iter()
         .map(|block| {
             serde_json::to_value(&block)
-                .unwrap_or_else(|_| Value::Null)
+                .unwrap_or(Value::Null)
         })
         .collect();
 

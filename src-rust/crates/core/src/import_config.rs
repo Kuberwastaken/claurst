@@ -124,6 +124,18 @@ pub fn build_import_preview(selection: ImportSelection) -> Result<ImportPreview>
     Ok(prepare_import(selection)?.preview)
 }
 
+/// Like [`build_import_preview`] but against an explicit [`ImportPaths`] instead
+/// of the detected home directory. Lets tests stage a fixture without mutating
+/// the process-global `HOME` env var (which races with every other test that
+/// reads the home directory in parallel).
+#[cfg(test)]
+pub(crate) fn build_import_preview_with_paths(
+    selection: ImportSelection,
+    paths: ImportPaths,
+) -> Result<ImportPreview> {
+    Ok(prepare_import_with_paths(selection, paths)?.preview)
+}
+
 pub fn execute_import(selection: ImportSelection) -> Result<ImportExecutionResult> {
     let prepared = prepare_import(selection)?;
     let paths = ImportPaths::detect();
@@ -193,7 +205,13 @@ pub fn summarize_import_result(result: &ImportExecutionResult, paths: &ImportPat
 }
 
 fn prepare_import(selection: ImportSelection) -> Result<PreparedImport> {
-    let paths = ImportPaths::detect();
+    prepare_import_with_paths(selection, ImportPaths::detect())
+}
+
+fn prepare_import_with_paths(
+    selection: ImportSelection,
+    paths: ImportPaths,
+) -> Result<PreparedImport> {
     let mut preview = ImportPreview {
         selection,
         claude_md: None,
@@ -677,6 +695,8 @@ fn parse_mcp_servers(value: &Value) -> Result<Vec<McpServerConfig>> {
             env,
             url,
             server_type,
+            // Imported from a user-chosen config (e.g. Claude Desktop): trusted.
+            origin: Default::default(),
         });
     }
 
@@ -857,10 +877,13 @@ mod tests {
 
     #[test]
     fn build_import_preview_maps_settings_and_doc() {
+        // Stage the fixture against an explicit ImportPaths instead of mutating
+        // the process-global HOME env var. The old approach set_var("HOME"),
+        // which (a) doesn't redirect dirs::home_dir() on Windows and (b) raced
+        // with every other test reading the home dir in parallel.
         let tmp = TempDir::new().unwrap();
-        let home = tmp.path();
-        let claude_dir = home.join(".claude");
-        let claurst_dir = home.join(".claurst");
+        let claude_dir = tmp.path().join(".claude");
+        let claurst_dir = tmp.path().join(".claurst");
         std::fs::create_dir_all(&claude_dir).unwrap();
         std::fs::create_dir_all(&claurst_dir).unwrap();
         std::fs::write(claude_dir.join("CLAUDE.md"), "hello\nworld").unwrap();
@@ -883,10 +906,14 @@ mod tests {
         )
         .unwrap();
 
-        let old_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", home);
+        let paths = ImportPaths {
+            source_claude_md: claude_dir.join("CLAUDE.md"),
+            source_settings_json: claude_dir.join("settings.json"),
+            target_claude_md: claurst_dir.join("CLAUDE.md"),
+            target_settings_json: claurst_dir.join("settings.json"),
+        };
 
-        let preview = build_import_preview(ImportSelection::Both).unwrap();
+        let preview = build_import_preview_with_paths(ImportSelection::Both, paths).unwrap();
         assert!(preview.claude_md.is_some());
         let settings = preview.settings.unwrap();
         assert!(settings.fields.iter().any(|f| f.name == "model" && f.action == PreviewAction::Skip));
@@ -894,11 +921,5 @@ mod tests {
         assert!(settings.fields.iter().any(|f| f.name.starts_with("hooks")));
         assert!(settings.fields.iter().any(|f| f.name.starts_with("mcpServers")));
         assert!(settings.fields.iter().any(|f| f.name == "env" && f.action == PreviewAction::Skip));
-
-        if let Some(old) = old_home {
-            std::env::set_var("HOME", old);
-        } else {
-            std::env::remove_var("HOME");
-        }
     }
 }

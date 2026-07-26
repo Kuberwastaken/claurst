@@ -1,9 +1,9 @@
 # Claurst Authentication Guide
 
 Claurst needs credentials to call the Anthropic API (or another provider's
-API). This document covers every supported authentication method, how tokens
-are stored, how to check and clear credentials, and how to authenticate with
-non-Anthropic providers.
+API). This document covers every supported authentication method, multi-account
+profile switching, how tokens are stored, how to check and clear credentials,
+and how to authenticate with non-Anthropic providers.
 
 ---
 
@@ -14,11 +14,18 @@ Claurst checks for credentials in the following priority order:
 1. `--api-key` flag (highest priority, session-only)
 2. `api_key` field in `~/.claurst/settings.json`
 3. `ANTHROPIC_API_KEY` environment variable
-4. Saved OAuth tokens in `~/.claurst/oauth_tokens.json`
+4. Tokens for the **active Anthropic profile** under
+   `~/.claurst/accounts/anthropic/<id>/oauth_tokens.json`
+5. Legacy `~/.claurst/oauth_tokens.json` (auto-migrated to a profile on first
+   read)
 
 The first non-empty credential found is used. Provider-specific credentials
 (OpenAI, Google, etc.) follow the same pattern but use their own environment
 variables and provider config entries.
+
+Codex (OpenAI ChatGPT subscription) accounts follow a parallel system —
+multiple profiles stored under `~/.claurst/accounts/codex/<id>/`, with the
+active profile selected via the account registry.
 
 ---
 
@@ -109,7 +116,8 @@ claurst auth login
 5. The browser redirects to `http://localhost:<port>/callback` with an
    authorization code.
 6. Claurst exchanges the code for tokens via the token endpoint.
-7. Tokens are saved to `~/.claurst/oauth_tokens.json`.
+7. Tokens are saved under `~/.claurst/accounts/anthropic/<profile-id>/oauth_tokens.json`
+   and the profile is registered as **active** in `~/.claurst/accounts.json`.
 
 This flow produces a Bearer token (`user:inference` scope) used directly for
 API calls.
@@ -121,9 +129,21 @@ claurst auth login --console
 ```
 
 This uses the Anthropic Console authorization endpoint. After token exchange,
-Claurst calls the Console API to create a new API key, stores it in
-`~/.claurst/oauth_tokens.json`, and uses it as a standard API key for
+Claurst calls the Console API to create a new API key, stores it in the
+active profile's `oauth_tokens.json`, and uses it as a standard API key for
 subsequent requests (not as a Bearer token).
+
+### Naming the profile
+
+Add `--label <name>` to give the new profile a human-friendly name (otherwise
+the id is derived from the JWT email's local-part). This becomes the id you
+use when running `claurst auth switch`:
+
+```bash
+claurst auth login --label work
+claurst auth login --label personal
+claurst auth switch personal
+```
 
 ### Manual fallback
 
@@ -131,6 +151,131 @@ If the browser does not open automatically, Claurst prints the full
 authorization URL. Copy and paste it into a browser. After you authorize,
 paste the authorization code shown in the browser back into the terminal
 when prompted.
+
+---
+
+## Multi-Account Profiles
+
+Claurst stores **multiple named accounts per provider** and lets you switch
+between them without re-logging-in. Supported providers today: **Anthropic**
+(Claude.ai / Console) and **Codex** (OpenAI ChatGPT subscription).
+
+This is useful for separating work and personal accounts, juggling
+Pro/Max/Team plans, or testing against multiple organizations.
+
+### On-disk layout
+
+```
+~/.claurst/
+├── accounts.json                              # registry (active + metadata)
+└── accounts/
+    ├── anthropic/
+    │   ├── work/oauth_tokens.json
+    │   └── personal/oauth_tokens.json
+    └── codex/
+        └── work/codex_tokens.json
+```
+
+`accounts.json` schema (excerpt):
+
+```json
+{
+  "version": 1,
+  "providers": {
+    "anthropic": {
+      "active": "personal",
+      "profiles": {
+        "work":     { "id": "work",     "email": "kuber@company.example",  "subscription_tier": "max", "added_at": "2026-05-25T19:00:00Z" },
+        "personal": { "id": "personal", "email": "kuber@personal.example", "subscription_tier": "pro", "added_at": "2026-05-25T19:05:00Z" }
+      }
+    },
+    "codex": {
+      "active": "work",
+      "profiles": { "work": { "id": "work", "email": "kuber@company.example" } }
+    }
+  }
+}
+```
+
+### CLI
+
+`claurst auth` and `claurst codex` are symmetric — same subcommands for both
+providers:
+
+```bash
+# Add accounts (each login becomes its own profile)
+claurst auth login                       # Claude.ai (default)
+claurst auth login --console             # Console / API-key flow
+claurst auth login --label work          # name the profile
+claurst codex login                      # ChatGPT/Codex OAuth
+claurst codex login --label personal
+
+# Inspect
+claurst auth status                      # show active Anthropic profile
+claurst auth list                        # all Anthropic profiles
+claurst codex list                       # all Codex profiles
+claurst accounts                         # both at once (use --json for JSON)
+
+# Switch the active account
+claurst auth switch work
+claurst codex switch personal
+
+# Remove a stored profile
+claurst auth remove work                 # delete profile + tokens dir
+claurst codex remove personal
+
+# Logout (clears tokens for the active profile)
+claurst auth logout
+claurst codex logout
+```
+
+`claurst auth status` and `claurst codex status` exit `0` when logged in and
+`1` otherwise, so they can drive scripts:
+
+```bash
+if claurst codex status > /dev/null; then
+  echo "Codex login present"
+fi
+```
+
+### Slash commands
+
+Inside the interactive REPL the same operations are available as slash
+commands — Anthropic is the default, pass `--codex` to target Codex:
+
+```
+/login                          # OAuth login (Claude.ai)
+/login --console                # API-key flow
+/login --codex                  # add a Codex account
+/login --label work             # name the new profile
+/logout                         # clear active Anthropic credentials
+/logout --codex                 # clear active Codex credentials
+/logout --all                   # purge every stored Anthropic profile
+/accounts                       # list every stored account
+/switch personal                # set active Anthropic to "personal"
+/switch --codex work            # set active Codex to "work"
+```
+
+`/accounts` lists every profile with a `*` next to the active one and shows
+email and subscription tier when known.
+
+### Identity detection
+
+When you log in, Claurst decodes the JWT id_token (or access token for Codex)
+to extract your email and provider-side account_id. If a stored profile
+already matches that identity, the existing profile is refreshed instead of
+a duplicate being created — re-logging-in the same account is idempotent.
+
+### Backward compatibility
+
+If you previously used Claurst (with the older single-file storage), your
+existing tokens are auto-migrated on first read:
+
+- `~/.claurst/oauth_tokens.json` → `~/.claurst/accounts/anthropic/<derived>/oauth_tokens.json`
+- `~/.claurst/codex_tokens.json` → `~/.claurst/accounts/codex/<derived>/codex_tokens.json`
+
+The legacy files are removed after a successful migration. No manual action
+needed.
 
 ---
 
@@ -153,12 +298,12 @@ ANTHROPIC_API_KEY="sk-ant-..." claurst --print "summarize the last 10 commits"
 
 ## Token Storage
 
-### Anthropic OAuth tokens
+### Anthropic OAuth tokens (per profile)
 
-Saved to:
+Each Anthropic account profile has its own file:
 
 ```
-~/.claurst/oauth_tokens.json
+~/.claurst/accounts/anthropic/<profile-id>/oauth_tokens.json
 ```
 
 The file contains the access token, optional refresh token, expiry timestamp,
@@ -175,12 +320,21 @@ granted scopes, and account email. Example structure:
 }
 ```
 
-The file is written with user-only permissions (`600` on Unix). Do not commit
-it to version control.
+The active profile pointer lives in `~/.claurst/accounts.json` (see
+[Multi-Account Profiles](#multi-account-profiles)). Files are written with
+user-only permissions (`600` on Unix). Do not commit them to version control.
+
+### Codex tokens (per profile)
+
+```
+~/.claurst/accounts/codex/<profile-id>/codex_tokens.json
+```
+
+Contains the OpenAI access token, refresh token, account_id, and expiry.
 
 ### Provider credential store
 
-API keys for non-Anthropic providers are stored in:
+API keys for non-Anthropic providers without dedicated OAuth flows are stored in:
 
 ```
 ~/.claurst/auth.json
@@ -202,6 +356,10 @@ This file is keyed by provider ID and contains either an `api` credential
   }
 }
 ```
+
+> **Note:** `~/.claurst/auth.json` is the multi-provider credential cache for
+> simple API-key providers. It is **distinct** from `~/.claurst/accounts.json`,
+> which is the multi-account registry for Anthropic/Codex OAuth profiles.
 
 ---
 
@@ -252,35 +410,57 @@ fi
 
 ## Logging Out
 
+By default, `logout` removes the **active** account's tokens and drops that
+profile from the registry; other stored profiles are untouched, so a stored
+secondary profile becomes the candidate for next selection.
+
 ```bash
+# Remove the active Anthropic profile
 claurst auth logout
+
+# Remove the active Codex profile
+claurst codex logout
+
+# Or from inside the REPL
+/logout
+/logout --codex
 ```
 
-This removes `~/.claurst/oauth_tokens.json`. API keys set via environment
-variables or `settings.json` are not affected; you must remove those manually.
+To purge every stored profile for a provider (and clear any API key in
+`settings.json`):
 
-To fully clear all stored credentials:
+```
+/logout --all          # Anthropic
+/logout --codex --all  # Codex
+```
+
+API keys set via environment variables are not affected by `logout`; remove
+them from your shell profile manually.
+
+To delete a specific stored profile without making it active first:
 
 ```bash
-claurst auth logout
-rm -f ~/.claurst/auth.json
+claurst auth remove work
+claurst codex remove personal
 ```
 
 ---
 
 ## Token Refresh
 
-When Claurst loads OAuth tokens from `~/.claurst/oauth_tokens.json` and the
-access token is expired, it automatically attempts a silent refresh:
+When Claurst loads OAuth tokens for the active profile and the access token
+is expired, it automatically attempts a silent refresh:
 
-1. A `POST` request is sent to the token endpoint with the stored refresh token.
-2. If successful, the new access token (and optionally a new refresh token) is
-   written back to `~/.claurst/oauth_tokens.json`.
+1. A `POST` request is sent to the provider's token endpoint with the stored
+   refresh token.
+2. If successful, the new access token (and optionally a new refresh token)
+   is written back to the same per-profile token file.
 3. The refreshed token is used for the current session.
 
 If the refresh fails (network error, expired refresh token, revoked grant),
 Claurst falls back to any configured API key. If no API key is available,
-authentication fails and you must run `claurst auth login` again.
+authentication fails and you must run `claurst auth login` (optionally with
+`--label <name>` to reuse a profile id) again.
 
 ---
 
@@ -393,10 +573,15 @@ claurst --provider llamacpp --api-base http://localhost:8080
 - Restrict permissions on `~/.claurst/` to your user only:
   ```bash
   chmod 700 ~/.claurst
-  chmod 600 ~/.claurst/oauth_tokens.json
+  chmod 700 ~/.claurst/accounts
+  chmod 600 ~/.claurst/accounts.json
   chmod 600 ~/.claurst/auth.json
   chmod 600 ~/.claurst/settings.json
+  find ~/.claurst/accounts -type f -name '*tokens.json' -exec chmod 600 {} +
   ```
+  Claurst already sets `0600` on `accounts.json` automatically on Unix; the
+  command above is the belt-and-braces version that also covers the per-
+  profile token files.
 - Do not commit `~/.claurst/` to version control.
 - Add `.claurst/` to your project's `.gitignore` to prevent accidentally
   committing project-level settings files that may contain keys.

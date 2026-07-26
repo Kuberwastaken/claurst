@@ -5,19 +5,19 @@ use std::pin::Pin;
 
 use async_stream::stream;
 use async_trait::async_trait;
-use claurst_core::provider_id::{ModelId, ProviderId};
+use claurst_core::provider_id::ProviderId;
 use claurst_core::types::{ContentBlock, UsageInfo};
 use futures::Stream;
 use reqwest::{Client, header};
 use serde_json::Value;
 
-use crate::provider::{LlmProvider, ModelInfo};
+use crate::provider::LlmProvider;
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
-    StreamEvent, SystemPromptStyle,
+    StreamBlockAccumulator, StreamEvent, SystemPromptStyle,
 };
-use crate::types::{ApiMessage, ApiToolDefinition, CreateMessageRequest};
+use crate::types::{ApiMessage, ApiToolDefinition, CreateMessageRequest, ThinkingConfig};
 
 use super::message_normalization::normalize_anthropic_messages;
 
@@ -25,18 +25,19 @@ pub struct MinimaxProvider {
     http_client: Client,
     api_key: String,
     api_base: String,
+    service_tier: Option<String>,
     id: ProviderId,
 }
 
 impl MinimaxProvider {
     pub fn new(api_key: String) -> Self {
         let api_base = std::env::var("MINIMAX_BASE_URL")
-            .unwrap_or_else(|_| "https://api.minimax.io/anthropic".to_string());
+            .unwrap_or_else(|_| claurst_core::constants::MINIMAX_ANTHROPIC_API_BASE.to_string());
         let mut headers = header::HeaderMap::new();
         headers.insert("X-Api-Key", header::HeaderValue::from_str(&api_key).expect("unable to parse api key for http header"));
         let http_client = Client::builder()
             .default_headers(headers)
-            .timeout(std::time::Duration::from_secs(600))
+            .timeout(crate::request_timeout())
             .build()
             .expect("MinimaxProvider: failed to build HTTP client");
 
@@ -44,8 +45,23 @@ impl MinimaxProvider {
             http_client,
             api_key,
             api_base,
+            service_tier: None,
             id: ProviderId::new(ProviderId::MINIMAX),
         }
+    }
+
+    pub fn with_base_url(mut self, api_base: impl Into<String>) -> Self {
+        self.api_base = api_base.into();
+        self
+    }
+
+    pub fn with_service_tier(mut self, service_tier: impl Into<String>) -> Self {
+        self.service_tier = Some(service_tier.into());
+        self
+    }
+
+    fn messages_url(api_base: &str) -> String {
+        format!("{}/v1/messages", api_base.trim_end_matches('/'))
     }
 
     fn build_request(request: &ProviderRequest) -> CreateMessageRequest {
@@ -84,11 +100,22 @@ impl MinimaxProvider {
         if !request.stop_sequences.is_empty() {
             builder = builder.stop_sequences(request.stop_sequences.clone());
         }
-        if let Some(tc) = request.thinking.clone() {
-            builder = builder.thinking(tc);
+        if request.model.eq_ignore_ascii_case("MiniMax-M3") && request.thinking.is_some() {
+            builder = builder.thinking(ThinkingConfig::adaptive());
         }
 
         builder.build()
+    }
+
+    fn build_request_body(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<Value, serde_json::Error> {
+        let mut body = serde_json::to_value(Self::build_request(request))?;
+        if let Some(service_tier) = &self.service_tier {
+            body["service_tier"] = Value::String(service_tier.clone());
+        }
+        Ok(body)
     }
 
     fn map_stop_reason(s: &str) -> StopReason {
@@ -131,6 +158,7 @@ impl MinimaxProvider {
                             id,
                             name,
                             input: serde_json::Value::Object(Default::default()),
+                            thought_signature: None,
                         }
                     }
                     _ => return None,
@@ -217,103 +245,57 @@ impl LlmProvider for MinimaxProvider {
 
         let mut id = String::from("unknown");
         let mut model = String::new();
-        let mut text_parts: Vec<(usize, String)> = Vec::new();
-        let mut content_blocks: Vec<ContentBlock> = Vec::new();
         let mut stop_reason = StopReason::EndTurn;
         let mut usage = UsageInfo::default();
 
-        let mut tool_buffers: std::collections::HashMap<usize, (String, String, String)> =
-            std::collections::HashMap::new();
+        // Accumulate every content block keyed by its stream index — captures
+        // thinking/signature/reasoning deltas and preserves interleave order via
+        // a single ordered pass, instead of appending non-text blocks with
+        // usize::MAX. Same-class fix as the Anthropic aggregator. See issue #217.
+        let mut blocks = StreamBlockAccumulator::new();
 
         use futures::StreamExt;
         while let Some(result) = stream.next().await {
             match result {
                 Err(e) => return Err(e),
-                Ok(evt) => match evt {
-                    StreamEvent::MessageStart {
-                        id: msg_id,
-                        model: msg_model,
-                        usage: msg_usage,
-                    } => {
-                        id = msg_id;
-                        model = msg_model;
-                        usage = msg_usage;
-                    }
-                    StreamEvent::ContentBlockStart {
-                        index,
-                        content_block,
-                    } => match content_block {
-                        ContentBlock::Text { text } => {
-                            text_parts.push((index, text));
-                        }
-                        ContentBlock::ToolUse {
-                            id: tool_id,
-                            name,
-                            input: _,
+                Ok(evt) => {
+                    blocks.on_event(&evt);
+                    match evt {
+                        StreamEvent::MessageStart {
+                            id: msg_id,
+                            model: msg_model,
+                            usage: msg_usage,
                         } => {
-                            tool_buffers.insert(index, (tool_id, name, String::new()));
+                            id = msg_id;
+                            model = msg_model;
+                            usage = msg_usage;
                         }
-                        other => {
-                            content_blocks.push(other);
+                        StreamEvent::MessageDelta {
+                            stop_reason: sr,
+                            usage: delta_usage,
+                        } => {
+                            if let Some(r) = sr {
+                                stop_reason = r;
+                            }
+                            if let Some(u) = delta_usage {
+                                usage.output_tokens += u.output_tokens;
+                            }
                         }
-                    },
-                    StreamEvent::TextDelta { index, text } => {
-                        if let Some(entry) = text_parts.iter_mut().find(|(i, _)| *i == index) {
-                            entry.1.push_str(&text);
-                        }
-                    }
-                    StreamEvent::InputJsonDelta {
-                        index,
-                        partial_json,
-                    } => {
-                        if let Some((_, _, buf)) = tool_buffers.get_mut(&index) {
-                            buf.push_str(&partial_json);
-                        }
-                    }
-                    StreamEvent::ContentBlockStop { index } => {
-                        if let Some((tool_id, name, json_buf)) = tool_buffers.remove(&index) {
-                            let input = serde_json::from_str(&json_buf)
-                                .unwrap_or(serde_json::Value::Object(Default::default()));
-                            content_blocks.push(ContentBlock::ToolUse {
-                                id: tool_id,
-                                name,
-                                input,
+                        StreamEvent::MessageStop => break,
+                        StreamEvent::Error { error_type, message } => {
+                            return Err(ProviderError::StreamError {
+                                provider: self.id.clone(),
+                                message: format!("[{}] {}", error_type, message),
+                                partial_response: None,
                             });
                         }
+                        _ => {}
                     }
-                    StreamEvent::MessageDelta {
-                        stop_reason: sr,
-                        usage: delta_usage,
-                    } => {
-                        if let Some(r) = sr {
-                            stop_reason = r;
-                        }
-                        if let Some(u) = delta_usage {
-                            usage.output_tokens += u.output_tokens;
-                        }
-                    }
-                    StreamEvent::MessageStop => break,
-                    StreamEvent::Error { error_type, message } => {
-                        return Err(ProviderError::StreamError {
-                            provider: self.id.clone(),
-                            message: format!("[{}] {}", error_type, message),
-                            partial_response: None,
-                        });
-                    }
-                    _ => {}
-                },
+                }
             }
         }
 
-        text_parts.sort_by_key(|(i, _)| *i);
-        let mut all_blocks: Vec<(usize, ContentBlock)> = text_parts
-            .into_iter()
-            .map(|(i, text)| (i, ContentBlock::Text { text }))
-            .collect();
-        for block in content_blocks {
-            all_blocks.push((usize::MAX, block));
-        }
-        let final_content: Vec<ContentBlock> = all_blocks.into_iter().map(|(_, b)| b).collect();
+        let final_content: Vec<ContentBlock> = blocks.finish();
 
         Ok(ProviderResponse {
             id,
@@ -329,9 +311,8 @@ impl LlmProvider for MinimaxProvider {
         request: ProviderRequest,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
     {
-        let api_request = Self::build_request(&request);
-
-        let body = serde_json::to_value(&api_request)
+        let body = self
+            .build_request_body(&request)
             .map_err(|e| ProviderError::Other {
                 provider: self.id.clone(),
                 message: format!("Failed to serialize request: {}", e),
@@ -339,7 +320,7 @@ impl LlmProvider for MinimaxProvider {
                 body: None,
             })?;
 
-        let url = format!("{}/v1/messages", self.api_base);
+        let url = Self::messages_url(&self.api_base);
         let api_key = self.api_key.clone();
         let http_client = self.http_client.clone();
         let provider_id = self.id.clone();
@@ -372,9 +353,14 @@ impl LlmProvider for MinimaxProvider {
         }
 
         let provider_id_inner = provider_id.clone();
+        // TODO(#228): MiniMax streams the **Anthropic** messages wire format
+        // (decoded via `map_anthropic_event`), so it belongs to the future
+        // `AnthropicMessages` protocol — not `OpenAiChatDecoder`.
         let s = stream! {
             let byte_stream = resp.bytes_stream();
-            let mut leftover = String::new();
+            // Shared byte-buffering decoder (#228): complete lines only, so a
+            // multibyte codepoint straddling a chunk boundary is never corrupted.
+            let mut decoder = crate::SseByteDecoder::new();
 
             use futures::StreamExt;
             let mut stream = std::pin::pin!(byte_stream);
@@ -382,21 +368,7 @@ impl LlmProvider for MinimaxProvider {
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
-                        let text = String::from_utf8_lossy(&chunk);
-                        let combined = if leftover.is_empty() {
-                            text.to_string()
-                        } else {
-                            let mut s = std::mem::take(&mut leftover);
-                            s.push_str(&text);
-                            s
-                        };
-
-                        let mut lines: Vec<&str> = combined.split('\n').collect();
-                        if !combined.ends_with('\n') {
-                            leftover = lines.pop().unwrap_or("").to_string();
-                        }
-
-                        for line in lines {
+                        for line in decoder.push(&chunk) {
                             let line = line.trim_end_matches('\r').trim();
                             if line.is_empty() {
                                 continue;
@@ -440,19 +412,6 @@ impl LlmProvider for MinimaxProvider {
         Ok(Box::pin(s))
     }
 
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
-        let minimax_id = ProviderId::new(ProviderId::MINIMAX);
-        Ok(vec![
-            ModelInfo {
-                id: ModelId::new("MiniMax-M2.7"),
-                provider_id: minimax_id.clone(),
-                name: "MiniMax-M2.7".to_string(),
-                context_window: 128_000,
-                max_output_tokens: 8192,
-            },
-        ])
-    }
-
     async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
         Ok(ProviderStatus::Healthy)
     }
@@ -461,14 +420,142 @@ impl LlmProvider for MinimaxProvider {
         ProviderCapabilities {
             streaming: true,
             tool_calling: true,
-            thinking: false,
-            image_input: false,
+            thinking: true,
+            image_input: true,
             pdf_input: false,
             audio_input: false,
             video_input: false,
-            caching: false,
+            caching: true,
             structured_output: true,
             system_prompt_style: SystemPromptStyle::TopLevel,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn request(model: &str, thinking: bool) -> ProviderRequest {
+        ProviderRequest {
+            model: model.to_string(),
+            messages: Vec::new(),
+            system_prompt: None,
+            tools: Vec::new(),
+            max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: Vec::new(),
+            thinking: thinking.then(|| ThinkingConfig::enabled(4096)),
+            provider_options: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn default_base_builds_exact_messages_url() {
+        assert_eq!(
+            MinimaxProvider::messages_url(claurst_core::constants::MINIMAX_ANTHROPIC_API_BASE),
+            "https://api.minimax.io/anthropic/v1/messages"
+        );
+        assert_eq!(
+            MinimaxProvider::messages_url("https://api.minimaxi.com/anthropic/"),
+            "https://api.minimaxi.com/anthropic/v1/messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_base_and_service_tier_reach_the_wire_request() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have an address");
+        let capture = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("request should connect");
+            let mut raw_request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            let mut expected_len = None;
+
+            loop {
+                let read = socket.read(&mut buffer).await.expect("request should read");
+                assert!(read > 0, "request ended before the body was complete");
+                raw_request.extend_from_slice(&buffer[..read]);
+
+                if expected_len.is_none() {
+                    if let Some(header_end) = raw_request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                    {
+                        let headers = std::str::from_utf8(&raw_request[..header_end])
+                            .expect("headers should be UTF-8");
+                        let content_length = headers
+                            .lines()
+                            .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
+                            .and_then(|line| line.split_once(':'))
+                            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                            .expect("request should include content-length");
+                        expected_len = Some(header_end + 4 + content_length);
+                    }
+                }
+
+                if expected_len.is_some_and(|len| raw_request.len() >= len) {
+                    break;
+                }
+            }
+
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .expect("response should write");
+            raw_request
+        });
+
+        let provider = MinimaxProvider::new("test-key".to_string())
+            .with_base_url(format!("http://{address}/anthropic"))
+            .with_service_tier("priority");
+        let _stream = provider
+            .create_message_stream(request("MiniMax-M3", false))
+            .await
+            .expect("request should succeed");
+
+        let raw_request = capture.await.expect("capture task should succeed");
+        let request_text = String::from_utf8(raw_request).expect("request should be UTF-8");
+        let (headers, body) = request_text
+            .split_once("\r\n\r\n")
+            .expect("request should contain headers and body");
+        assert_eq!(
+            headers.lines().next(),
+            Some("POST /anthropic/v1/messages HTTP/1.1")
+        );
+        let body: Value = serde_json::from_str(body).expect("body should be JSON");
+        assert_eq!(body["service_tier"], serde_json::json!("priority"));
+    }
+
+    #[test]
+    fn m3_uses_adaptive_thinking_without_a_budget() {
+        let body =
+            serde_json::to_value(MinimaxProvider::build_request(&request("MiniMax-M3", true)))
+                .expect("request should serialize");
+
+        assert_eq!(body["thinking"], serde_json::json!({ "type": "adaptive" }));
+        let parsed: ThinkingConfig = serde_json::from_value(body["thinking"].clone())
+            .expect("adaptive thinking should deserialize");
+        assert_eq!(parsed.thinking_type, "adaptive");
+        assert_eq!(parsed.budget_tokens, 0);
+    }
+
+    #[test]
+    fn always_on_m2_models_do_not_receive_anthropic_budget_config() {
+        let body = serde_json::to_value(MinimaxProvider::build_request(&request(
+            "MiniMax-M2.7",
+            true,
+        )))
+        .expect("request should serialize");
+
+        assert!(body.get("thinking").is_none());
     }
 }

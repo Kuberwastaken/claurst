@@ -42,6 +42,9 @@ portable-pty = "0.9"
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
+# Used by PtyBashTool to poll the PTY master fd so the read loop can stop as soon
+# as the direct child exits instead of hanging on a detached grandchild (#220/#184).
+libc = "0.2"
 
 [features]
 computer-use = ["dep:enigo", "dep:xcap", "dep:image"]

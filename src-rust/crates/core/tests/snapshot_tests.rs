@@ -1,13 +1,13 @@
-/// Integration tests for ShadowSnapshot — ported from opencode's snapshot.test.ts.
-///
-/// Each test:
-///   1. Creates a real temp git repo
-///   2. Makes file changes
-///   3. Exercises ShadowSnapshot methods
-///   4. Asserts filesystem + return-value invariants
-///
-/// Tests are async and require git to be on PATH.  They are skipped gracefully
-/// when git is unavailable.
+//! Integration tests for ShadowSnapshot — ported from opencode's snapshot.test.ts.
+//!
+//! Each test:
+//! 1. Creates a real temp git repo
+//! 2. Makes file changes
+//! 3. Exercises ShadowSnapshot methods
+//! 4. Asserts filesystem + return-value invariants
+//!
+//! Tests are async and require git to be on PATH.  They are skipped gracefully
+//! when git is unavailable.
 
 use std::path::{Path, PathBuf};
 use std::fs;
@@ -53,8 +53,20 @@ async fn git(dir: &Path, args: &[&str]) {
         .ok();
 }
 
+/// A process-wide tempdir that backs every shadow snapshot store in this test
+/// binary. Routing snapshots here keeps the tests hermetic: sandboxed builds
+/// (e.g. Nix) run with no HOME and disallow writes outside the build tree, so
+/// the real `dirs::data_dir()` location is unwritable. Each test uses a
+/// distinct repo tempdir, so the per-project/worktree hashes never collide.
+fn shadow_data_root() -> &'static Path {
+    use std::sync::OnceLock;
+    static ROOT: OnceLock<TempDir> = OnceLock::new();
+    ROOT.get_or_init(|| tempfile::tempdir().expect("shadow data tempdir"))
+        .path()
+}
+
 fn snap_or_skip(dir: &Path) -> ShadowSnapshot {
-    match ShadowSnapshot::for_session(dir) {
+    match ShadowSnapshot::for_session_in(dir, shadow_data_root()) {
         Some(s) => s,
         None => {
             eprintln!("git not available or not a repo; skipping test");
@@ -156,7 +168,7 @@ async fn binary_file_tracked_and_reverted() {
     let snap = snap_or_skip(p);
 
     let before = snap.track().await.expect("track");
-    fs::write(p.join("image.png"), &[0x89u8, 0x50, 0x4e, 0x47]).unwrap();
+    fs::write(p.join("image.png"), [0x89u8, 0x50, 0x4e, 0x47]).unwrap();
 
     let patch = snap.patch(&before).await;
     assert!(patch.files.contains(&fwd(p, "image.png")), "binary file in patch");

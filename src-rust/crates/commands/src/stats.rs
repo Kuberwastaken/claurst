@@ -1216,8 +1216,7 @@ pub fn run(raw: &[&str], ctx: &CommandContext) -> CommandResult {
 mod tests {
     use super::*;
     use claurst_core::session_storage::{
-        write_transcript_entry, AiTitleEntry, CustomTitleEntry, LastPromptEntry,
-        TranscriptMessage,
+        AiTitleEntry, CustomTitleEntry, LastPromptEntry, TranscriptMessage,
     };
     use claurst_core::types::{Message, MessageContent, MessageCost, Role};
     use tempfile::TempDir;
@@ -1237,6 +1236,7 @@ mod tests {
                 id: format!("tu-{i}"),
                 name: t.to_string(),
                 input: serde_json::json!({}),
+                thought_signature: None,
             });
         }
         TranscriptEntry::Assistant(TranscriptMessage {
@@ -1292,9 +1292,19 @@ mod tests {
         entries: Vec<TranscriptEntry>,
     ) -> PathBuf {
         let path = dir.join(format!("{session_id}.jsonl"));
-        for e in entries {
-            write_transcript_entry(&path, &e).await.unwrap();
+        // Write the whole fixture synchronously in one shot. The reader
+        // (`aggregate_from_dir` / `parse_jsonl_sync`) uses blocking `std::fs`,
+        // so writing each line via the async `write_transcript_entry`
+        // (open/append/close per entry on the blocking pool) left a
+        // write-then-read visibility gap that dropped trailing lines on the
+        // loaded Linux CI runner — non-deterministically failing the turn count
+        // and last-prompt assertions. A single sync write removes that race.
+        let mut buf = String::new();
+        for e in &entries {
+            buf.push_str(&serde_json::to_string(e).unwrap());
+            buf.push('\n');
         }
+        std::fs::write(&path, buf).unwrap();
         path
     }
 

@@ -364,7 +364,7 @@ impl LlmProvider for FreeProvider {
         }))
     }
 
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+    async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         let provider_id = self.id.clone();
         let mk = |id: &str, name: &str, ctx: u32| ModelInfo {
             id: ModelId::new(id),
@@ -372,6 +372,7 @@ impl LlmProvider for FreeProvider {
             name: name.to_string(),
             context_window: ctx,
             max_output_tokens: 8_192,
+            ..Default::default()
         };
 
         let mut models = vec![mk(
@@ -484,7 +485,7 @@ mod tests {
             })
         }
 
-        async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
             Ok(vec![])
         }
 

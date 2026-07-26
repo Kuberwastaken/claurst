@@ -57,19 +57,30 @@ fn eye_spans(s: &'static str) -> Vec<Span<'static>> {
     let mut buf_is_eyeball = false;
 
     for ch in s.chars() {
-        let is_eyeball = ch == '▘' || ch == '▝' || ch == '▀' || ch == '▄' || ch == '▖';
+        let is_eyeball =
+            ch == '▘'
+                || ch == '▝'
+                || ch == '▀'
+                || ch == '▄'
+                || ch == '▖'
+                || ch == '▌'
+                || ch == '▐';
+
         if is_eyeball != buf_is_eyeball && !buf.is_empty() {
             let style = if buf_is_eyeball { eyeball_style() } else { eye_bg_style() };
             spans.push(Span::styled(buf.clone(), style));
             buf.clear();
         }
+
         buf_is_eyeball = is_eyeball;
         buf.push(ch);
     }
+
     if !buf.is_empty() {
         let style = if buf_is_eyeball { eyeball_style() } else { eye_bg_style() };
         spans.push(Span::styled(buf, style));
     }
+
     spans
 }
 
@@ -173,7 +184,7 @@ pub fn rustle_lines(pose: &RustlePose) -> [Line<'static>; 5] {
         ),
         RustlePose::LookRight => (
             "█▄█",
-            "▝ █ ▝",    // single-pixel upper-right quarter blocks = eyes shifted right
+            " ▀█ ▀",    // mirror of Default: upper-half blocks, shifted right
             "█▄█",
         ),
         RustlePose::LookDown => (
@@ -239,5 +250,11 @@ mod tests {
     fn arms_up_pose_right_eye_matches_left_eye_size() {
         let lines = rustle_lines(&RustlePose::ArmsUp);
         assert_eq!(line_text(&lines[1]), "█▀█▀ █▀ █▀█");
+    }
+
+    #[test]
+    fn look_right_pose_eyes_match_default_size() {
+        let lines = rustle_lines(&RustlePose::LookRight);
+        assert_eq!(line_text(&lines[1]), "█▄█ ▀█ ▀█▄█");
     }
 }

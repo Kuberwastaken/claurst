@@ -200,6 +200,7 @@ impl MessageTransformer for AnthropicTransformer {
                         id: tool_id,
                         name,
                         input,
+                        thought_signature: None,
                     });
                 }
                 "thinking" => {

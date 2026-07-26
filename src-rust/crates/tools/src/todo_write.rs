@@ -4,26 +4,50 @@ use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
 // Session-aware persistence helpers
 // ---------------------------------------------------------------------------
 
+/// Validate that `session_id` is a plain filename — no path separators or
+/// `..` components that could be used for directory traversal (issue #204).
+fn validate_session_id(session_id: &str) -> Result<(), String> {
+    if session_id.contains('/') || session_id.contains('\\') || session_id.contains("..") {
+        return Err("session_id contains illegal characters".into());
+    }
+    Ok(())
+}
+
 /// Returns the path to the persisted todo list for `session_id`.
-pub fn todos_path(session_id: &str) -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".claurst")
-        .join("todos")
-        .join(format!("{}.json", session_id))
+pub fn todos_path(session_id: &str) -> anyhow::Result<PathBuf> {
+    validate_session_id(session_id).map_err(|e| anyhow::anyhow!(e))?;
+    Ok(todos_dir().join(format!("{}.json", session_id)))
+}
+
+/// Directory holding persisted todo lists (`<claurst home>/todos`).
+fn todos_dir() -> PathBuf {
+    claurst_core::config::Settings::config_dir().join("todos")
 }
 
 /// Load the persisted todo list for `session_id`. Returns an empty vec if the
-/// file does not exist or cannot be parsed.
+/// file does not exist, cannot be parsed, or if `session_id` contains illegal
+/// path characters (issue #204).
 pub fn load_todos(session_id: &str) -> Vec<Value> {
-    let path = todos_path(session_id);
+    load_todos_in(&todos_dir(), session_id)
+}
+
+/// Like [`load_todos`] but reads from an explicit todos directory. Lets tests
+/// run hermetically without depending on a writable HOME.
+///
+/// Returns an empty vec when `session_id` contains illegal path characters
+/// (issue #204).
+pub fn load_todos_in(dir: &Path, session_id: &str) -> Vec<Value> {
+    if validate_session_id(session_id).is_err() {
+        return vec![];
+    }
+    let path = dir.join(format!("{}.json", session_id));
     std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str::<Vec<Value>>(&s).ok())
@@ -32,7 +56,19 @@ pub fn load_todos(session_id: &str) -> Vec<Value> {
 
 /// Persist `todos` to `~/.claurst/todos/<session_id>.json`.
 pub fn save_todos(session_id: &str, todos: &[Value]) {
-    let path = todos_path(session_id);
+    save_todos_in(&todos_dir(), session_id, todos);
+}
+
+/// Like [`save_todos`] but writes into an explicit todos directory. Lets tests
+/// run hermetically without depending on a writable HOME.
+///
+/// Silently returns when `session_id` contains illegal path characters
+/// (issue #204).
+pub fn save_todos_in(dir: &Path, session_id: &str, todos: &[Value]) {
+    if validate_session_id(session_id).is_err() {
+        return;
+    }
+    let path = dir.join(format!("{}.json", session_id));
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -343,15 +379,19 @@ mod tests {
 
     #[test]
     fn test_todos_path_contains_session_id() {
-        let path = todos_path("my-session-123");
+        let path = todos_path("my-session-123").unwrap();
         let path_str = path.to_string_lossy();
         assert!(
             path_str.contains("my-session-123"),
             "todos_path should embed the session id"
         );
+        // Route the assertion through the same canonical resolver instead of
+        // hardcoding `.claurst`: the todos file must live under the resolved
+        // claurst home (which may be ~/.claurst, $CLAURST_HOME, or the XDG dir).
+        let home = claurst_core::config::Settings::config_dir();
         assert!(
-            path_str.contains(".claurst"),
-            "todos_path should be under ~/.claurst"
+            path.starts_with(home.join("todos")),
+            "todos_path should be under the claurst home"
         );
         assert!(
             path_str.ends_with(".json"),
@@ -378,13 +418,13 @@ mod tests {
             json!({"id": "1", "content": "Task one", "status": "pending"}),
             json!({"id": "2", "content": "Task two", "status": "completed"}),
         ];
-        save_todos(&session_id, &todos);
-        let loaded = load_todos(&session_id);
+        let dir = tempfile::tempdir().expect("tempdir");
+        save_todos_in(dir.path(), &session_id, &todos);
+        let loaded = load_todos_in(dir.path(), &session_id);
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0]["id"].as_str(), Some("1"));
         assert_eq!(loaded[1]["status"].as_str(), Some("completed"));
-        // Clean up.
-        let _ = std::fs::remove_file(todos_path(&session_id));
+        // tempdir cleans up automatically.
     }
 
     // --- Status parsing ------------------------------------------------------

@@ -1,19 +1,19 @@
+use std::path::PathBuf;
+
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Widget, Wrap};
 use ratatui::Frame;
 
-use crate::overlays::centered_rect;
+use crate::file_injection::AtFileIssue;
 use crate::image_paste::PastedImage;
 
 /// Outcome of the file injection dialog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileInjectionOutcome {
-    /// Inject all files, including oversized/binary ones.
+    /// Inject all files, ignoring size/binary limits.
     InjectAll,
-    /// Inject only within-limit files; skip oversized/binary.
-    SkipOversized,
     /// Abort (restore input to prompt for editing).
     Abort,
 }
@@ -28,10 +28,14 @@ pub struct FileInjectionDialogState {
     pub pending_input: Option<String>,
     /// Stashed image attachments at submit time.
     pub pending_imgs: Vec<PastedImage>,
-    /// Files that exceeded limits or had issues: (path, size_kb, display_issue).
-    pub oversized: Vec<(String, usize, String)>,
-    /// Currently selected option: 0 = InjectAll, 1 = SkipOversized, 2 = Abort.
+    /// Files that exceeded limits or had issues: (path, size_kb, issue).
+    pub oversized: Vec<(String, usize, AtFileIssue)>,
+    /// Currently selected option: 0 = Allow, 1 = Abort.
     pub selected: usize,
+    /// Size limit in KB, for display in the dialog.
+    pub limit_kb: usize,
+    /// Working directory for relative path display.
+    pub cwd: Option<PathBuf>,
     /// Set when user confirms; consumed by main.rs to trigger send.
     pub outcome: Option<FileInjectionOutcome>,
 }
@@ -43,7 +47,9 @@ impl FileInjectionDialogState {
             pending_input: None,
             pending_imgs: Vec::new(),
             oversized: Vec::new(),
-            selected: 0, // Default to "Inject anyway"
+            selected: 0,
+            limit_kb: 0,
+            cwd: None,
             outcome: None,
         }
     }
@@ -53,38 +59,38 @@ impl FileInjectionDialogState {
         &mut self,
         input: String,
         imgs: Vec<PastedImage>,
-        oversized: Vec<(String, usize, String)>,
+        oversized: Vec<(String, usize, AtFileIssue)>,
+        limit_kb: usize,
+        cwd: Option<PathBuf>,
     ) {
         self.visible = true;
         self.pending_input = Some(input);
         self.pending_imgs = imgs;
         self.oversized = oversized;
-        self.selected = 0; // Default to "Inject anyway"
+        self.limit_kb = limit_kb;
+        self.cwd = cwd;
+        // Directory-only: default to Abort (Allow does nothing useful for dirs)
+        self.selected = if self.is_directory_only() { 1 } else { 0 };
         self.outcome = None;
     }
 
-    /// Move selection up (wraps).
-    pub fn select_prev(&mut self) {
-        self.selected = if self.selected == 0 { 2 } else { self.selected - 1 };
-    }
-
-    /// Move selection down (wraps).
-    pub fn select_next(&mut self) {
-        self.selected = if self.selected == 2 { 0 } else { self.selected + 1 };
+    /// Check if all oversized items are directories.
+    pub fn is_directory_only(&self) -> bool {
+        !self.oversized.is_empty() && self.oversized.iter().all(|(_, _, issue)| matches!(issue, AtFileIssue::IsDirectory))
     }
 
     /// Returns the currently-selected outcome option.
     pub fn current_outcome(&self) -> FileInjectionOutcome {
-        match self.selected {
-            0 => FileInjectionOutcome::InjectAll,
-            1 => FileInjectionOutcome::SkipOversized,
-            _ => FileInjectionOutcome::Abort,
+        if self.selected == 0 {
+            FileInjectionOutcome::InjectAll
+        } else {
+            FileInjectionOutcome::Abort
         }
     }
 
-    /// Returns `true` if the currently-selected option is not "Abort".
+    /// Returns `true` if the currently-selected option is Allow.
     pub fn is_accept_selected(&self) -> bool {
-        self.current_outcome() != FileInjectionOutcome::Abort
+        self.current_outcome() == FileInjectionOutcome::InjectAll
     }
 
     /// Confirm the selected option.
@@ -92,7 +98,7 @@ impl FileInjectionDialogState {
         self.outcome = Some(self.current_outcome());
     }
 
-    /// Dismiss the dialog.
+    /// Dismiss the dialog (Abort path).
     pub fn dismiss(&mut self) {
         self.visible = false;
         self.pending_input = None;
@@ -109,6 +115,22 @@ impl FileInjectionDialogState {
         let imgs = std::mem::take(&mut self.pending_imgs);
         self.visible = false;
         Some((outcome, input, imgs))
+    }
+
+    /// Return a display path: relative to cwd when possible, otherwise absolute.
+    pub fn display_path<'a>(&self, abs_path: &'a str) -> &'a str {
+        if let Some(cwd) = &self.cwd {
+            let cwd_str = cwd.to_string_lossy();
+            // Strip cwd prefix plus trailing slash
+            let prefix = format!("{}/", cwd_str);
+            if let Some(rel) = abs_path.strip_prefix(prefix.as_str()) {
+                return rel;
+            }
+            if abs_path == cwd_str.as_ref() {
+                return ".";
+            }
+        }
+        abs_path
     }
 }
 
@@ -128,38 +150,72 @@ pub fn render_file_injection_dialog(
         return;
     }
 
-    let dialog_width = 72u16.min(area.width.saturating_sub(4));
-    let dialog_height = 16u16.min(area.height.saturating_sub(4));
-    let dialog_area = centered_rect(dialog_width, dialog_height, area);
+    let is_directory = state.is_directory_only();
+    let n_files = state.oversized.len();
 
-    frame.render_widget(Clear, dialog_area);
+    // Height: 1 blank + 1 label + 1 blank + N files + 1 blank + 1 hint + 1 blank
+    let content_rows = 5 + n_files;
+    let dialog_height = (content_rows as u16 + 2).min(area.height.saturating_sub(4));
+    let dialog_width = 72u16.min(area.width.saturating_sub(4));
+    let dialog_area = Rect {
+        x: (area.width.saturating_sub(dialog_width)) / 2,
+        y: (area.height.saturating_sub(dialog_height).saturating_sub(3)) / 2,
+        width: dialog_width,
+        height: dialog_height,
+    };
+
+    let title = if is_directory {
+        " ⚠  Directory Injection Warning "
+    } else {
+        " ⚠  File Injection Warning "
+    };
+
+    let bg = Color::Rgb(35, 35, 35);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Line::from(vec![Span::styled(
-            " ⚠  File Injection Warning ",
+            title,
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         )]))
-        .border_style(Style::default().fg(Color::Yellow));
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(bg))
+        .padding(Padding { left: 2, right: 2, top: 0, bottom: 0 });
 
     let inner = block.inner(dialog_area);
+    frame.render_widget(Clear, dialog_area);
     frame.render_widget(block, dialog_area);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
+    lines.push(Line::from(""));
+
+    // Header: label + limit info
+    let label_word = if is_directory {
+        if n_files == 1 { "directory" } else { "directories" }
+    } else if n_files == 1 { "file" } else { "files" }
+    ;
+    let header = if is_directory {
+        format!("The following {} cannot be auto-injected:", label_word)
+    } else if state.limit_kb > 0 {
+        format!("The following {} is over the file size limit ({} KB):", label_word, state.limit_kb)
+    } else {
+        format!("The following {} cannot be auto-injected:", label_word)
+    };
+
     lines.push(Line::from(vec![Span::styled(
-        "The following file(s) cannot be auto-injected:",
+        header,
         Style::default().fg(Color::White),
     )]));
     lines.push(Line::from(""));
 
-    for (path, size_kb, issue) in &state.oversized {
-        let text = if issue.contains("TooLarge") {
-            format!("• {} ({} KB, exceeds limit)", path, size_kb)
-        } else if issue.contains("Binary") {
-            format!("• {} (binary file)", path)
-        } else {
-            format!("• {} ({})", path, issue)
+    for (path, _size_kb, issue) in &state.oversized {
+        let display = state.display_path(path).to_owned();
+        let text = match issue {
+            AtFileIssue::Binary => format!("• {} (binary)", display),
+            AtFileIssue::TooLarge(_) => format!("• {} (too large)", display),
+            AtFileIssue::Unreadable(msg) => format!("• {} (unreadable: {})", display, msg),
+            AtFileIssue::IsDirectory => format!("• {}", display),
         };
 
         lines.push(Line::from(vec![Span::styled(
@@ -170,43 +226,31 @@ pub fn render_file_injection_dialog(
 
     lines.push(Line::from(""));
 
-    // Options
-    let inject_style = if state.selected == 0 {
-        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    if is_directory {
+        lines.push(Line::from(vec![Span::styled(
+            "  Enter or Esc to dismiss",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        )]));
     } else {
-        Style::default().fg(Color::Green)
-    };
-    let skip_style = if state.selected == 1 {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::REVERSED)
-    } else {
-        Style::default().fg(Color::Yellow)
-    };
-    let abort_style = if state.selected == 2 {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD | Modifier::REVERSED)
-    } else {
-        Style::default().fg(Color::Red)
-    };
+        lines.push(Line::from(vec![
+            Span::styled(
+                "  Enter to inject anyway",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  ·  Esc to abort",
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            ),
+        ]));
+    }
 
-    lines.push(Line::from(vec![
-        Span::styled("[I] ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Inject anyway", inject_style),
-        Span::raw("    "),
-        Span::styled("[S] ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Skip these", skip_style),
-        Span::raw("    "),
-        Span::styled("[Esc] ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Abort", abort_style),
-    ]));
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(
-        "  ↑↓ / I/S/Esc to select  ·  Enter to confirm",
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-    )]));
 
     Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .render(inner, frame.buffer_mut());
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -224,54 +268,43 @@ mod tests {
     #[test]
     fn file_injection_dialog_show_sets_visible() {
         let mut state = FileInjectionDialogState::new();
-        state.show("input".to_string(), vec![], vec![("file.txt".to_string(), 100, "TooLarge".to_string())]);
+        state.show("input".to_string(), vec![], vec![("file.txt".to_string(), 100, AtFileIssue::TooLarge(100))], 100, None);
         assert!(state.visible);
         assert_eq!(state.selected, 0);
         assert!(!state.oversized.is_empty());
     }
 
     #[test]
-    fn file_injection_dialog_navigate() {
+    fn file_injection_dialog_directory_only_defaults_to_abort() {
         let mut state = FileInjectionDialogState::new();
-        state.show("input".to_string(), vec![], vec![]);
-        assert_eq!(state.current_outcome(), FileInjectionOutcome::InjectAll);
-        state.select_next();
-        assert_eq!(state.current_outcome(), FileInjectionOutcome::SkipOversized);
-        state.select_next();
-        assert_eq!(state.current_outcome(), FileInjectionOutcome::Abort);
-        state.select_prev();
-        assert_eq!(state.current_outcome(), FileInjectionOutcome::SkipOversized);
-    }
-
-    #[test]
-    fn file_injection_dialog_navigate_wraps() {
-        let mut state = FileInjectionDialogState::new();
-        state.show("input".to_string(), vec![], vec![]);
-        state.select_next(); // 0 → 1
-        state.select_next(); // 1 → 2
-        state.select_next(); // 2 → 0
-        assert_eq!(state.current_outcome(), FileInjectionOutcome::InjectAll);
-        state.select_prev(); // 0 → 2
+        state.show("input".to_string(), vec![], vec![("dir".to_string(), 0, AtFileIssue::IsDirectory)], 0, None);
         assert_eq!(state.current_outcome(), FileInjectionOutcome::Abort);
     }
 
     #[test]
-    fn file_injection_dialog_confirm() {
+    fn file_injection_dialog_confirm_allow() {
         let mut state = FileInjectionDialogState::new();
-        state.show("input".to_string(), vec![], vec![]);
-        state.select_next(); // Go to SkipOversized
+        state.show("input".to_string(), vec![], vec![], 100, None);
         state.confirm();
-        assert_eq!(state.outcome, Some(FileInjectionOutcome::SkipOversized));
+        assert_eq!(state.outcome, Some(FileInjectionOutcome::InjectAll));
+    }
+
+    #[test]
+    fn file_injection_dialog_confirm_abort() {
+        let mut state = FileInjectionDialogState::new();
+        state.show("input".to_string(), vec![], vec![], 100, None);
+        state.selected = 1; // Abort
+        state.confirm();
+        assert_eq!(state.outcome, Some(FileInjectionOutcome::Abort));
     }
 
     #[test]
     fn file_injection_dialog_take_outcome() {
         let mut state = FileInjectionDialogState::new();
-        state.show("test input".to_string(), vec![], vec![]);
-        state.select_next();
-        state.confirm();
+        state.show("test input".to_string(), vec![], vec![], 100, None);
+        state.confirm(); // Allow
         let (outcome, input, _) = state.take_outcome().unwrap();
-        assert_eq!(outcome, FileInjectionOutcome::SkipOversized);
+        assert_eq!(outcome, FileInjectionOutcome::InjectAll);
         assert_eq!(input, "test input");
         assert!(!state.visible);
         assert_eq!(state.outcome, None);
@@ -284,7 +317,9 @@ mod tests {
         state.show(
             "input".to_string(),
             vec![],
-            vec![("large_file.rs".to_string(), 250, "TooLarge".to_string())],
+            vec![("large_file.rs".to_string(), 250, AtFileIssue::TooLarge(250))],
+            100,
+            None,
         );
         terminal
             .draw(|frame| {
@@ -314,5 +349,52 @@ mod tests {
             })
             .unwrap();
         assert_eq!(terminal.backend().buffer().content(), before.content());
+    }
+
+    #[test]
+    fn display_path_strips_cwd() {
+        let mut state = FileInjectionDialogState::new();
+        state.cwd = Some(PathBuf::from("/home/user/project"));
+        assert_eq!(state.display_path("/home/user/project/src/main.rs"), "src/main.rs");
+        assert_eq!(state.display_path("/other/path"), "/other/path");
+    }
+
+    #[test]
+    fn display_path_without_cwd_returns_input_unchanged() {
+        let state = FileInjectionDialogState::new(); // cwd = None
+        assert_eq!(state.display_path("/some/absolute/path.rs"), "/some/absolute/path.rs");
+    }
+
+    fn render_to_string(state: &FileInjectionDialogState) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| {
+            render_file_injection_dialog(frame, state, frame.area());
+        }).unwrap();
+        terminal.backend().buffer().clone().content().iter().map(|c| c.symbol().chars().next().unwrap_or(' ')).collect()
+    }
+
+    #[test]
+    fn file_injection_dialog_renders_too_large_annotation() {
+        let mut state = FileInjectionDialogState::new();
+        state.show("input".to_string(), vec![], vec![("large.rs".to_string(), 250, AtFileIssue::TooLarge(250))], 100, None);
+        let content = render_to_string(&state);
+        assert!(content.contains("too large"), "Expected '(too large)' annotation in rendered output");
+    }
+
+    #[test]
+    fn file_injection_dialog_renders_unreadable_annotation() {
+        let mut state = FileInjectionDialogState::new();
+        state.show("input".to_string(), vec![], vec![("secret.rs".to_string(), 0, AtFileIssue::Unreadable("Permission denied".to_string()))], 0, None);
+        let content = render_to_string(&state);
+        assert!(content.contains("unreadable"), "Expected '(unreadable: ...)' annotation in rendered output");
+    }
+
+    #[test]
+    fn file_injection_dialog_hint_uses_anyway_not_anyways() {
+        let mut state = FileInjectionDialogState::new();
+        state.show("input".to_string(), vec![], vec![("file.rs".to_string(), 250, AtFileIssue::TooLarge(250))], 100, None);
+        let content = render_to_string(&state);
+        assert!(!content.contains("anyways"), "Should use 'anyway' not 'anyways'");
+        assert!(content.contains("anyway"), "Expected 'anyway' in hint text");
     }
 }

@@ -449,11 +449,7 @@ pub fn render_elicitation_dialog(state: &ElicitationDialogState, area: Rect, buf
     // Render with scroll if needed
     let total = lines.len();
     let visible_h = inner.height as usize;
-    let scroll = if total > visible_h {
-        total - visible_h
-    } else {
-        0
-    };
+    let scroll = total.saturating_sub(visible_h);
     let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).collect();
     Paragraph::new(visible_lines).render(inner, buf);
 }

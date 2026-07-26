@@ -96,7 +96,7 @@ impl FeedbackSurveyState {
                 true
             }
             FeedbackSurveyStage::SharePrompt => {
-                if matches!(digit, 1 | 2 | 3) {
+                if matches!(digit, 1..=3) {
                     self.stage = FeedbackSurveyStage::Thanks;
                 }
                 true

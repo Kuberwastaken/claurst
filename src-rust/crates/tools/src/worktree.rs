@@ -55,6 +55,10 @@ struct EnterWorktreeInput {
 
 #[async_trait]
 impl Tool for EnterWorktreeTool {
+    // Gates itself: prompts for worktree creation AND for the post_create_command
+    // in `execute()` (#210). The central backstop must not also prompt.
+    fn self_gates(&self) -> bool { true }
+
     fn name(&self) -> &str { "EnterWorktree" }
 
     fn description(&self) -> &str {
@@ -203,35 +207,57 @@ impl Tool for EnterWorktreeTool {
                     original_head,
                 });
 
-                // Run optional post-create command in the new worktree directory
+                // Run optional post-create command in the new worktree directory.
+                //
+                // Security (#210): the post_create_command is model-supplied and
+                // was previously run via raw `sh -c` behind only the generic
+                // "create a git worktree" prompt — the command itself was never
+                // gated or surfaced. Gate it specifically here: classify it,
+                // hard-block Critical-risk commands, and prompt with the ACTUAL
+                // command text so the user sees exactly what will run.
                 let post_create_output = if let Some(cmd) = params.post_create_command {
-                    let shell_result = if cfg!(target_os = "windows") {
-                        tokio::process::Command::new("cmd")
-                            .args(["/C", &cmd])
-                            .current_dir(&worktree_path)
-                            .output()
-                            .await
+                    let risk = claurst_core::bash_classifier::classify_bash_command(&cmd);
+                    if risk == claurst_core::bash_classifier::BashRiskLevel::Critical {
+                        format!(
+                            "\nPost-create command '{}' was BLOCKED: classified as Critical risk \
+                             and never executed. Re-create the worktree without it, or run a safer command.",
+                            cmd
+                        )
+                    } else if let Err(e) = ctx.check_permission(
+                        self.name(),
+                        &format!("Run post-create command in the new worktree: {}", cmd),
+                        false,
+                    ) {
+                        format!("\nPost-create command '{}' was not run: {}", cmd, e)
                     } else {
-                        tokio::process::Command::new("sh")
-                            .args(["-c", &cmd])
-                            .current_dir(&worktree_path)
-                            .output()
-                            .await
-                    };
-                    match shell_result {
-                        Ok(out) if out.status.success() => {
-                            let stdout = String::from_utf8_lossy(&out.stdout);
-                            format!("\nPost-create command '{}' completed successfully.{}",
-                                cmd,
-                                if stdout.trim().is_empty() { String::new() } else { format!("\nOutput: {}", stdout.trim()) }
-                            )
+                        let shell_result = if cfg!(target_os = "windows") {
+                            tokio::process::Command::new("cmd")
+                                .args(["/C", &cmd])
+                                .current_dir(&worktree_path)
+                                .output()
+                                .await
+                        } else {
+                            tokio::process::Command::new("sh")
+                                .args(["-c", &cmd])
+                                .current_dir(&worktree_path)
+                                .output()
+                                .await
+                        };
+                        match shell_result {
+                            Ok(out) if out.status.success() => {
+                                let stdout = String::from_utf8_lossy(&out.stdout);
+                                format!("\nPost-create command '{}' completed successfully.{}",
+                                    cmd,
+                                    if stdout.trim().is_empty() { String::new() } else { format!("\nOutput: {}", stdout.trim()) }
+                                )
+                            }
+                            Ok(out) => {
+                                let stderr = String::from_utf8_lossy(&out.stderr);
+                                format!("\nPost-create command '{}' exited with error.\nStderr: {}",
+                                    cmd, stderr.trim())
+                            }
+                            Err(e) => format!("\nCould not run post-create command '{}': {}", cmd, e),
                         }
-                        Ok(out) => {
-                            let stderr = String::from_utf8_lossy(&out.stderr);
-                            format!("\nPost-create command '{}' exited with error.\nStderr: {}",
-                                cmd, stderr.trim())
-                        }
-                        Err(e) => format!("\nCould not run post-create command '{}': {}", cmd, e),
                     }
                 } else {
                     String::new()
@@ -436,5 +462,101 @@ async fn run_git(cwd: &std::path::Path, args: &[&str]) -> Result<String, String>
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::allow_all_context;
+    use claurst_core::permissions::{PermissionDecision, PermissionHandler, PermissionRequest};
+
+    /// Handler that allows worktree creation but denies (via `Ask`) any request
+    /// whose description mentions the post-create command.
+    struct DenyPostCreateHandler;
+    impl PermissionHandler for DenyPostCreateHandler {
+        fn check_permission(&self, request: &PermissionRequest) -> PermissionDecision {
+            if request.description.contains("post-create command") {
+                PermissionDecision::Ask { reason: "denied in test".to_string() }
+            } else {
+                PermissionDecision::Allow
+            }
+        }
+        fn request_permission(&self, request: &PermissionRequest) -> PermissionDecision {
+            self.check_permission(request)
+        }
+    }
+
+    async fn init_git_repo(dir: &std::path::Path) {
+        run_git(dir, &["init"]).await.expect("git init");
+        run_git(dir, &["config", "user.email", "t@example.com"]).await.expect("git config email");
+        run_git(dir, &["config", "user.name", "Test"]).await.expect("git config name");
+        std::fs::write(dir.join("README.md"), b"hi").unwrap();
+        run_git(dir, &["add", "."]).await.expect("git add");
+        run_git(dir, &["commit", "-m", "init"]).await.expect("git commit");
+    }
+
+    async fn reset_session() {
+        *WORKTREE_SESSION.write().await = None;
+    }
+
+    /// A Critical-classified post_create_command is BLOCKED and never executed,
+    /// while the worktree itself is still created.
+    #[tokio::test]
+    async fn worktree_post_create_critical_command_is_blocked() {
+        reset_session().await;
+        let tmp = tempfile::tempdir().unwrap();
+        init_git_repo(tmp.path()).await;
+
+        // `dd if=…` is classified Critical, yet writing /dev/null → marker is a
+        // harmless no-op if it ever ran — so this test is regression-safe.
+        let marker = tmp.path().join("critical_ran");
+        let cmd = format!("dd if=/dev/null of={}", marker.display());
+
+        let ctx = allow_all_context(tmp.path().to_path_buf());
+        let result = EnterWorktreeTool
+            .execute(json!({ "post_create_command": cmd }), &ctx)
+            .await;
+
+        assert!(!result.is_error, "worktree creation should still succeed");
+        assert!(
+            result.content.contains("BLOCKED"),
+            "Critical post-create command must be reported as blocked: {}",
+            result.content
+        );
+        assert!(!marker.exists(), "Critical post-create command must NOT run");
+        reset_session().await;
+    }
+
+    /// A (non-Critical) post_create_command is not executed when permission is
+    /// denied; the worktree is still created.
+    #[tokio::test]
+    async fn worktree_post_create_command_denied_is_not_run() {
+        reset_session().await;
+        let tmp = tempfile::tempdir().unwrap();
+        init_git_repo(tmp.path()).await;
+
+        let marker = tmp.path().join("denied_ran");
+        let cmd = format!("touch {}", marker.display());
+
+        let mut ctx = allow_all_context(tmp.path().to_path_buf());
+        ctx.permission_handler = Arc::new(DenyPostCreateHandler);
+
+        let result = EnterWorktreeTool
+            .execute(json!({ "post_create_command": cmd }), &ctx)
+            .await;
+
+        assert!(!result.is_error, "worktree creation should still succeed");
+        assert!(
+            result.content.contains("was not run"),
+            "denied post-create command must be reported as not run: {}",
+            result.content
+        );
+        assert!(!marker.exists(), "denied post-create command must NOT run");
+        reset_session().await;
     }
 }

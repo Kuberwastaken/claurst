@@ -137,7 +137,7 @@ fn print_help() {
            -f, --force         Reinstall even if already up to date\n\
            -h, --help          Show this help\n\n\
          Downloads the latest claurst release from GitHub and replaces this\n\
-         binary in place. Settings in ~/.claurst are preserved."
+         binary in place. Your settings and sessions are preserved."
     );
 }
 

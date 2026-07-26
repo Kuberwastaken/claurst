@@ -20,6 +20,7 @@ This document covers all keyboard shortcuts in Claurst, how to customize them, v
 6. [Special Input Behaviors](#special-input-behaviors)
    - [Shift+Enter for Newline](#shiftenter-for-newline)
    - [ESC During Streaming](#esc-during-streaming)
+   - [@file Injection with Typeahead](#file-injection-with-typeahead)
 7. [Non-English Keyboard Layout Support](#non-english-keyboard-layout-support)
 
 ---
@@ -47,25 +48,35 @@ These bindings are active when focus is in the chat input field.
 |-----|--------|-------------|
 | `Enter` | submit | Submit the current message to the model |
 | `Shift+Enter` | newline | Insert a literal newline without submitting |
-| `Up` | historyPrev | Navigate to the previous message in input history |
-| `Down` | historyNext | Navigate to the next message in input history |
+| `Ctrl+J` | newline | Newline (fallback for terminals without CSI-u protocol) |
+| `Up` / `Ctrl+O` | historyPrev | Navigate to the previous message in input history |
+| `Down` / `Ctrl+I` | historyNext | Navigate to the next message in input history |
 | `Tab` | indent | Insert indentation (or cycle completions if open) |
 | `Shift+Tab` | reverseIndent | Remove one level of indentation |
 | `Page Up` | scrollUp | Scroll the conversation view up one page |
 | `Page Down` | scrollDown | Scroll the conversation view down one page |
-| `Home` | lineStart | Move cursor to beginning of line |
-| `End` | lineEnd | Move cursor to end of line |
-| `Ctrl+A` | openModelPicker | Open the interactive model picker |
-| `Ctrl+E` | goLineEnd | Move cursor to end of line (Emacs-style) |
-| `Ctrl+K` | commandPalette | Open the slash command palette |
+| `Home` / `Cmd+Left` / `Ctrl+A` | goLineStart | Move cursor to beginning of line |
+| `End` / `Cmd+Right` / `Ctrl+E` | goLineEnd | Move cursor to end of line |
+| `Ctrl+Left` | moveWordBackward | Move one word left |
+| `Ctrl+Right` | moveWordForward | Move one word right |
+| `Alt+Left` | previousMessage | Jump to previous user/assistant message |
+| `Alt+Right` | nextMessage | Jump to next user/assistant message |
+| `Ctrl+Shift+A` | openModelPicker | Open the interactive model picker |
+| `Ctrl+K` | openCommandPalette | Open the slash command palette |
 | `Ctrl+U` | killToStart | Delete from cursor to beginning of line |
-| `Ctrl+W` | killWord | Delete the word before the cursor |
+| `Ctrl+W` / `Alt+Backspace` | killWord | Delete the word before the cursor |
 | `Alt+D` | deleteWord | Delete the word after the cursor |
-| `Ctrl+M` | sendMessage | Send the current message (non-rebindable alias for Enter) |
-| `Ctrl+F` | find | Open inline search within the current conversation |
+| `Ctrl+H` | deleteCharBefore | Delete character before cursor |
+| `Ctrl+L` | clearLine | Clear current input line |
+| `Ctrl+F` | findInMessage | Open inline search within the current conversation |
 | `Ctrl+Shift+F` | globalSearch | Open global codebase search |
-| `F3` | findNext | Jump to next search match |
-| `Shift+F3` | findPrev | Jump to previous search match |
+| `F3` / `Ctrl+]` | findNext | Jump to next search match |
+| `Shift+F3` / `Ctrl+[` | findPrev | Jump to previous search match |
+| `Ctrl+G` | goToLine | Jump to a specific line |
+| `Ctrl+.` | jumpToNextError | Jump to next error / issue |
+| `Ctrl+Shift+.` | jumpToPreviousError | Jump to previous error / issue |
+
+> `Ctrl+A` previously opened the model picker; it now moves the cursor to the line start (matching Emacs/readline). The model picker is now `Ctrl+Shift+A`. Old `keybindings.json` files are auto-migrated.
 
 ### Confirmation Context
 
@@ -109,25 +120,25 @@ The `/keybindings` command opens an interactive TUI keybinding editor:
 /keybindings
 ```
 
-The editor lists all bindable actions grouped by context. Use arrow keys to navigate, press `Enter` on an action to enter rebind mode, then press the desired key combination. Press `Escape` to cancel a rebind. Changes are saved immediately to `~/.claude/keybindings.json`.
+The editor lists all bindable actions grouped by context. Use arrow keys to navigate, press `Enter` on an action to enter rebind mode, then press the desired key combination. Press `Escape` to cancel a rebind. Changes are saved immediately to `~/.claurst/keybindings.json`.
 
 ### Via keybindings.json
 
-For batch edits or scripted configuration, edit `~/.claude/keybindings.json` directly. The file format is:
+For batch edits or scripted configuration, edit `~/.claurst/keybindings.json` directly. The file format is:
 
 ```json
 {
-  "version": 1,
+  "schema_version": 1,
   "bindings": [
     {
-      "context": "chat",
+      "context": "Chat",
       "action": "submit",
-      "key": "ctrl+enter"
+      "chord": "ctrl+enter"
     },
     {
-      "context": "global",
+      "context": "Global",
       "action": "historySearch",
-      "key": "ctrl+p"
+      "chord": "ctrl+p"
     }
   ]
 }
@@ -138,8 +149,23 @@ Each binding object has:
 | Field | Type | Description |
 |-------|------|-------------|
 | `context` | string | Keybinding context (see table above) |
-| `action` | string | Action identifier (see default tables above) |
-| `key` | string | Key combination in normalized form |
+| `action` | string \| null | Action identifier (or `null` to unbind) |
+| `chord` | string | Key combination in normalized form |
+
+### Schema Versioning and Smart Merge
+
+`keybindings.json` carries a top-level `schema_version` field (currently `1`). When Claurst's defaults change in a release, the file is auto-migrated on next launch:
+
+1. Claurst reads the file and compares `schema_version` against the bundled `KEYBINDINGS_SCHEMA_VERSION`.
+2. If the file is older, Claurst runs a **smart merge**:
+   - Your customizations (any binding whose `chord` you set explicitly) are preserved.
+   - Stale bindings that match an *old* default that has since changed are dropped — for example, the previous `ctrl+a → openModelPicker` binding is removed because `ctrl+a` is now reserved for select-all in the input.
+   - Any new bindings present in the current defaults but not in your file are added.
+3. The migrated file is written back with the new `schema_version`.
+
+A warning is logged whenever a migration occurs. If you want to opt out of the merge for a binding, leave a different action assigned to it — explicit customizations always win.
+
+Setting `"action": null` for a chord explicitly **unbinds** the default — useful when you want a key to do nothing rather than fire its default action.
 
 Key notation uses lowercase letters, with modifier prefixes separated by `+`:
 
@@ -190,9 +216,14 @@ The following keys have fixed behavior and cannot be rebound:
 |-----|---------------|
 | `Ctrl+C` | Interrupt current operation / send SIGINT to foreground process |
 | `Ctrl+D` | Exit Claurst when input is empty; signal EOF when input has content |
-| `Ctrl+M` | Identical to `Enter` at the terminal level; always submits the message |
+| `Ctrl+M` | Identical to `Enter` at the terminal level (terminals emit `CR` for both) |
 
-These keys are handled at the terminal input layer before the keybinding system processes events. Overriding them in `keybindings.json` has no effect.
+These keys are handled at the terminal input layer before the keybinding system processes events. If any of them appear as a `chord` in `keybindings.json`, Claurst:
+
+1. Logs a warning at startup (`Cannot rebind protected key '<chord>' in keybindings.json`).
+2. **Filters the binding out** of the loaded set before resolving any keystrokes.
+
+So overriding a protected key is a no-op in behavior, but you also get a clear signal in the logs that the binding was rejected.
 
 ---
 
@@ -271,6 +302,59 @@ In vim insert mode, `Enter` also submits. Use `Shift+Enter` for newlines in vim 
 Pressing `Escape` while the model is streaming a response interrupts the stream. The partial response is preserved in the conversation history and the model stops generating. The input field regains focus and you can send a follow-up message.
 
 This is equivalent to pressing `Ctrl+C` during streaming, except that `Ctrl+C` also signals any tool calls in progress to abort (via `AbortController`), while `Escape` only stops the stream and allows running tools to finish.
+
+---
+
+### @file Injection with Typeahead
+
+Type `@` followed by a path in the prompt to inject a file's contents into your message. The `@` token only triggers when it is at a word boundary (start of input or preceded by whitespace). As you type after the `@`, Claurst opens a typeahead completion overlay scanning the current working directory.
+
+```
+explain @src/main.rs and compare to @tests/integration.rs
+```
+
+When you press `Enter`, Claurst:
+
+1. Scans the message for `@<path>` tokens at word boundaries.
+2. Resolves each path relative to the working directory; `~/` expands to your home directory.
+3. Reads the file contents and substitutes them inline before sending the prompt to the model.
+
+The `@` reference works with:
+
+- Plain absolute paths: `@/etc/hosts`
+- Paths relative to cwd: `@src/main.rs`
+- Home-relative paths: `@~/.bashrc`
+- Trailing punctuation is stripped: `@src/main.rs.` is treated as `@src/main.rs`
+
+An `@` that is *not* at a word boundary (e.g. inside an email `me@example.com`) is left alone — neither the typeahead nor the file injection triggers.
+
+**Limits and warnings.** If a referenced path is too large, binary, a directory, or unreadable, Claurst opens a confirmation dialog before sending:
+
+| Issue | Behavior |
+|-------|----------|
+| File exceeds size limit | Dialog offers "Allow anyway" or "Abort" |
+| Binary file | Dialog warns; same choice |
+| Path is a directory | Dialog warns; cannot inject (must remove or rewrite the @ref) |
+| Path unreadable | Skipped; error shown in dialog |
+
+Files that pass all checks are injected silently — no dialog is shown.
+
+**Configuration.** Two settings in `~/.claurst/settings.json`:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `fileInjectionEnabled` | `true` | Master switch — set to `false` to disable @-injection entirely |
+| `fileInjectionMaxSize` | `100` | Per-file size limit in KB; `0` disables the check (accept all) |
+
+These can also be edited in the in-app settings screen.
+
+**Typeahead navigation.** While the completion overlay is open:
+
+| Key | Action |
+|-----|--------|
+| `Up` / `Down` | Move selection |
+| `Tab` / `Enter` | Insert the highlighted completion |
+| `Escape` | Dismiss the overlay (keep typed text) |
 
 ---
 

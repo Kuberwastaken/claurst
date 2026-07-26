@@ -222,6 +222,15 @@ pub struct SystemPromptOptions {
     pub skip_env_info: bool,
     /// Active goal addendum (injected in dynamic section when a goal is running).
     pub active_goal_addendum: Option<String>,
+    /// Names of the tools actually enabled for this session (issue #233).
+    ///
+    /// When `Some`, the "Tool use guidelines" section only emits the
+    /// per-tool guidance blocks for tools present in this list, so we don't
+    /// pay the fixed prompt tax for guidance about tools that aren't loaded.
+    /// When `None` (the default), the enabled set is treated as *unknown* and
+    /// all per-tool guidance is emitted — preserving the previous behaviour
+    /// for callers that don't yet thread the tool list through.
+    pub enabled_tools: Option<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -251,29 +260,23 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
             )
         });
 
-    let mut parts: Vec<String> = Vec::new();
-
     // ------------------------------------------------------------------ //
     // CACHEABLE sections (before the dynamic boundary)                   //
     // ------------------------------------------------------------------ //
-
-    // 1. Attribution header
-    parts.push(prefix.attribution_text().to_string());
-
-    // 2. Core capabilities
-    parts.push(CORE_CAPABILITIES.to_string());
-
-    // 3. Tool use guidelines
-    parts.push(TOOL_USE_GUIDELINES.to_string());
-
-    // 4. Executing actions with care
-    parts.push(ACTIONS_SECTION.to_string());
-
-    // 5. Safety guidelines
-    parts.push(SAFETY_GUIDELINES.to_string());
-
-    // 6. Cyber-risk instruction (owned by safeguards — do not edit)
-    parts.push(CYBER_RISK_INSTRUCTION.to_string());
+    let mut parts: Vec<String> = vec![
+        // 1. Attribution header
+        prefix.attribution_text().to_string(),
+        // 2. Core capabilities
+        CORE_CAPABILITIES.to_string(),
+        // 3. Tool use guidelines (per-tool blocks are conditional on the enabled set)
+        build_tool_use_guidelines(opts.enabled_tools.as_deref()),
+        // 4. Executing actions with care
+        ACTIONS_SECTION.to_string(),
+        // 5. Safety guidelines
+        SAFETY_GUIDELINES.to_string(),
+        // 6. Cyber-risk instruction (owned by safeguards — do not edit)
+        CYBER_RISK_INSTRUCTION.to_string(),
+    ];
 
     // 7. Output style (cacheable when non-Default; its content is stable)
     if let Some(style_text) = opts
@@ -487,15 +490,91 @@ You have access to powerful tools for software engineering tasks:
 4. **Communicate blockers**: If stuck, ask the user rather than guessing
 "#;
 
-const TOOL_USE_GUIDELINES: &str = r#"
-## Tool use guidelines
+// ---------------------------------------------------------------------------
+// Tool use guidelines (issue #233: progressive tool disclosure)
+//
+// The section is split into two parts:
+//   * general, tool-agnostic guidance that is always emitted, and
+//   * per-tool guidance blocks that are emitted only when the corresponding
+//     tool is actually enabled for the session.
+//
+// Emitting only the relevant per-tool blocks removes the fixed prompt tax we
+// used to pay for describing tools that aren't even loaded.
+// ---------------------------------------------------------------------------
 
-- Use dedicated tools (Read, Edit, Glob, Grep) instead of bash equivalents
-- For searches, prefer Grep over `grep`; prefer Glob over `find`
-- Parallelize independent tool calls in a single response
-- For file edits: always read the file first, then make targeted edits
-- Bash commands timeout after 2 minutes; use background mode for long operations
-"#;
+/// Tools we ship a dedicated guideline block for, in the order they should
+/// appear.  A tool not in this list simply contributes no per-tool guidance.
+const GUIDELINE_TOOLS: &[&str] = &[
+    "Bash",
+    "Read",
+    "Edit",
+    "Write",
+    "Glob",
+    "Grep",
+    "WebSearch",
+    "WebFetch",
+    "Agent",
+    "TodoWrite",
+    "NotebookEdit",
+    "Skill",
+    "AskUserQuestion",
+];
+
+/// The per-tool guidance line for `tool`, or `None` if we ship no block for it.
+fn tool_specific_guideline(tool: &str) -> Option<&'static str> {
+    Some(match tool {
+        "Bash" => "- Bash commands time out after 2 minutes; use background mode for long-running operations.",
+        "Read" => "- Read a file with the Read tool before editing it; Read also handles images and large files.",
+        "Edit" => "- For edits, read the file first, then make targeted string replacements with Edit.",
+        "Write" => "- Use Write to create new files or fully overwrite; prefer Edit for partial changes.",
+        "Glob" => "- To find files by name or pattern, prefer the Glob tool over `find`/`ls`.",
+        "Grep" => "- To search file contents, prefer the Grep tool over shelling out to `grep`/`rg`.",
+        "WebSearch" => "- Use WebSearch to find current information on the internet.",
+        "WebFetch" => "- Use WebFetch to retrieve and read the contents of a specific URL.",
+        "Agent" => "- Delegate complex, multi-step, or parallelizable subtasks to sub-agents via the Agent tool.",
+        "TodoWrite" => "- Use TodoWrite to plan and track multi-step work; keep exactly one item in_progress.",
+        "NotebookEdit" => "- Use NotebookEdit to modify Jupyter (.ipynb) cells instead of editing raw JSON.",
+        "Skill" => "- Invoke Skill to run a matching skill/slash-command instead of reimplementing it.",
+        "AskUserQuestion" => "- Use AskUserQuestion when the user must choose between options or clarify intent.",
+        _ => return None,
+    })
+}
+
+/// Build the "Tool use guidelines" section.
+///
+/// `enabled` is the set of tool names active for the session:
+/// * `Some(names)` → emit per-tool blocks only for tools in `names`.
+/// * `None` → enabled set unknown; emit every per-tool block (backwards-compatible behaviour).
+///
+/// The general, tool-agnostic guidance is always emitted unchanged.
+fn build_tool_use_guidelines(enabled: Option<&[String]>) -> String {
+    let mut lines: Vec<String> = vec![
+        String::new(),
+        "## Tool use guidelines".to_string(),
+        String::new(),
+        "- Prefer purpose-built tools over raw shell commands when a dedicated tool exists."
+            .to_string(),
+        "- Parallelize independent tool calls by issuing them together in a single response."
+            .to_string(),
+        "- When you're unsure which tool fits a task, use ToolSearch to discover an appropriate one."
+            .to_string(),
+    ];
+
+    for &tool in GUIDELINE_TOOLS {
+        let include = match enabled {
+            None => true,
+            Some(names) => names.iter().any(|n| n == tool),
+        };
+        if include {
+            if let Some(line) = tool_specific_guideline(tool) {
+                lines.push(line.to_string());
+            }
+        }
+    }
+
+    lines.push(String::new());
+    lines.join("\n")
+}
 
 const ACTIONS_SECTION: &str = r#"
 ## Executing actions with care
@@ -651,6 +730,75 @@ mod tests {
         let prefix = SystemPromptPrefix::detect(true, true);
         assert_eq!(prefix, SystemPromptPrefix::SdkPreset);
         assert!(prefix.attribution_text().contains("Claude Agent SDK"));
+    }
+
+    #[test]
+    fn test_no_enabled_set_emits_all_tool_guidelines() {
+        // enabled_tools = None (default) → every per-tool block is emitted.
+        let prompt = build_system_prompt(&default_opts());
+        assert!(prompt.contains("Bash commands time out"));
+        assert!(prompt.contains("prefer the Grep tool"));
+        assert!(prompt.contains("prefer the Glob tool"));
+        assert!(prompt.contains("Read a file with the Read tool"));
+        assert!(prompt.contains("Use WebSearch"));
+        // General guidance is always present.
+        assert!(prompt.contains("Parallelize independent tool calls"));
+    }
+
+    #[test]
+    fn test_conditional_tool_guidelines_only_enabled() {
+        let opts = SystemPromptOptions {
+            enabled_tools: Some(vec!["Read".to_string(), "Edit".to_string()]),
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+
+        // Guidance for enabled tools is present.
+        assert!(
+            prompt.contains("Read a file with the Read tool"),
+            "Read guideline should be emitted"
+        );
+        assert!(
+            prompt.contains("targeted string replacements with Edit"),
+            "Edit guideline should be emitted"
+        );
+
+        // Guidance for tools NOT in the enabled set is omitted.
+        assert!(
+            !prompt.contains("Bash commands time out"),
+            "Bash guideline must be omitted when Bash is not enabled"
+        );
+        assert!(
+            !prompt.contains("prefer the Grep tool"),
+            "Grep guideline must be omitted when Grep is not enabled"
+        );
+        assert!(
+            !prompt.contains("prefer the Glob tool"),
+            "Glob guideline must be omitted when Glob is not enabled"
+        );
+        assert!(
+            !prompt.contains("Use WebSearch"),
+            "WebSearch guideline must be omitted when WebSearch is not enabled"
+        );
+
+        // General, tool-agnostic guidance stays regardless of the enabled set.
+        assert!(prompt.contains("## Tool use guidelines"));
+        assert!(prompt.contains("Parallelize independent tool calls"));
+    }
+
+    #[test]
+    fn test_empty_enabled_set_omits_all_tool_specific_guidelines() {
+        // Some(empty) is an *explicit* empty set → no per-tool blocks at all,
+        // but the general guidance still renders.
+        let opts = SystemPromptOptions {
+            enabled_tools: Some(vec![]),
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+        assert!(prompt.contains("## Tool use guidelines"));
+        assert!(prompt.contains("Parallelize independent tool calls"));
+        assert!(!prompt.contains("Bash commands time out"));
+        assert!(!prompt.contains("Read a file with the Read tool"));
     }
 
     #[test]

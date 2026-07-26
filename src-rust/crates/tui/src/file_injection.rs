@@ -7,6 +7,7 @@ pub enum AtFileIssue {
     TooLarge(usize), // size in KB that exceeds limit
     Binary,
     Unreadable(String), // error message
+    IsDirectory, // Path points to a directory, not a file
 }
 
 /// A parsed file reference from the user's input (e.g., "@src/main.rs").
@@ -43,17 +44,20 @@ pub fn parse_at_refs(text: &str, cwd: &Path, max_size_kb: usize) -> (Vec<AtFileR
         // For now, we'll be permissive and accept the @ and everything after, trimming punctuation.
         let mut token = word.to_string();
 
-        // Remove trailing punctuation if present
-        while token.ends_with(|c: char| c.is_ascii_punctuation()) && !token.ends_with('/') {
+        // Remove trailing punctuation, but never strip the leading '@' itself.
+        while token.len() > 1 && token.ends_with(|c: char| c.is_ascii_punctuation()) && !token.ends_with('/') {
             token.pop();
         }
 
         let path_part = &token[1..]; // Skip the '@'
+        if path_part.is_empty() {
+            continue; // bare '@' with no path — skip
+        }
 
         // Expand ~ to home directory
-        let expanded_path = if path_part.starts_with("~/") {
+        let expanded_path = if let Some(rest) = path_part.strip_prefix("~/") {
             if let Some(home) = dirs::home_dir() {
-                home.join(&path_part[2..])
+                home.join(rest)
             } else {
                 cwd.join(path_part)
             }
@@ -63,13 +67,24 @@ pub fn parse_at_refs(text: &str, cwd: &Path, max_size_kb: usize) -> (Vec<AtFileR
             cwd.join(path_part)
         };
 
-        // Try to read the file
-        if !expanded_path.exists() || !expanded_path.is_file() {
-            continue; // Skip non-existent files
+        // Check if path exists and is a file (not a directory)
+        if !expanded_path.exists() {
+            continue; // Skip non-existent paths
+        }
+
+        if expanded_path.is_dir() {
+            oversized.push(AtFileRef {
+                token: token.clone(),
+                path: expanded_path,
+                size_kb: 0,
+                contents: None,
+                issue: Some(AtFileIssue::IsDirectory),
+            });
+            continue;
         }
 
         let size_kb = match fs::metadata(&expanded_path) {
-            Ok(meta) => (meta.len() as usize + 1023) / 1024, // Round up to KB
+            Ok(meta) => (meta.len() as usize).div_ceil(1024), // Round up to KB
             Err(e) => {
                 oversized.push(AtFileRef {
                     token: token.clone(),
@@ -122,7 +137,7 @@ pub fn parse_at_refs(text: &str, cwd: &Path, max_size_kb: usize) -> (Vec<AtFileR
 
 /// Build XML file blocks from a slice of resolved refs.
 /// Returns a string like:
-/// ```
+/// ```text
 /// <file path="src/main.rs">
 /// ...contents...
 /// </file>

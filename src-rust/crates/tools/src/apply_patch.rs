@@ -65,9 +65,8 @@ fn parse_unified_diff(patch: &str) -> Result<Vec<FilePatch>, String> {
                 file_patches.push(f);
             }
             // Don't extract the path here — we do it from the +++ line.
-        } else if line.starts_with("+++ ") {
+        } else if let Some(raw) = line.strip_prefix("+++ ") {
             // Extract target path, stripping the "b/" prefix if present.
-            let raw = &line[4..];
             let path = raw
                 .trim_start_matches("b/")
                 .trim()
@@ -87,12 +86,12 @@ fn parse_unified_diff(patch: &str) -> Result<Vec<FilePatch>, String> {
                 lines: Vec::new(),
             });
         } else if let Some(ref mut hunk) = current_hunk {
-            if line.starts_with('+') {
-                hunk.lines.push(('+', line[1..].to_string()));
-            } else if line.starts_with('-') {
-                hunk.lines.push(('-', line[1..].to_string()));
-            } else if line.starts_with(' ') {
-                hunk.lines.push((' ', line[1..].to_string()));
+            if let Some(rest) = line.strip_prefix('+') {
+                hunk.lines.push(('+', rest.to_string()));
+            } else if let Some(rest) = line.strip_prefix('-') {
+                hunk.lines.push(('-', rest.to_string()));
+            } else if let Some(rest) = line.strip_prefix(' ') {
+                hunk.lines.push((' ', rest.to_string()));
             } else if line.starts_with('\\') {
                 // "\ No newline at end of file" — ignore.
             }
@@ -248,6 +247,9 @@ fn find_context_position(
 
 #[async_trait]
 impl Tool for ApplyPatchTool {
+    // Gates itself: calls `ctx.check_permission` in `execute()` (#210).
+    fn self_gates(&self) -> bool { true }
+
     fn name(&self) -> &str {
         claurst_core::constants::TOOL_NAME_APPLY_PATCH
     }
@@ -342,7 +344,13 @@ impl Tool for ApplyPatchTool {
                 String::new()
             };
 
-            // Split into lines (keep newlines for join later).
+            // Detect the file's dominant line ending BEFORE editing so we can
+            // rejoin with it instead of collapsing everything to LF (#225).
+            // `str::lines()` strips both `\n` and `\r\n`, so a CRLF file would
+            // otherwise be silently rewritten to LF throughout.
+            let eol = crate::line_endings::LineEnding::detect(&original_content);
+
+            // Split into lines (line endings are re-applied on join below).
             let mut lines: Vec<String> = original_content
                 .lines()
                 .map(|l| l.to_string())
@@ -378,10 +386,11 @@ impl Tool for ApplyPatchTool {
             let new_content = if lines.is_empty() {
                 String::new()
             } else {
-                // Re-join with newlines; preserve trailing newline if original had one.
-                let mut s = lines.join("\n");
+                // Re-join with the file's original line ending; preserve a
+                // trailing newline if the original had one.
+                let mut s = lines.join(eol.as_str());
                 if original_content.ends_with('\n') || original_content.is_empty() {
-                    s.push('\n');
+                    s.push_str(eol.as_str());
                 }
                 s
             };
@@ -420,7 +429,7 @@ impl Tool for ApplyPatchTool {
         // ----------------------------------------------------------------
 
         for (path, original_bytes, new_content) in &to_write {
-            if let Err(e) = tokio::fs::write(path, new_content).await {
+            if let Err(e) = crate::write_atomic(path, new_content.as_bytes()).await {
                 return ToolResult::error(format!(
                     "Failed to write {}: {}",
                     path.display(),
@@ -523,5 +532,50 @@ mod tests {
         assert_eq!(fps.len(), 2);
         assert_eq!(fps[0].path, "a.rs");
         assert_eq!(fps[1].path, "b.rs");
+    }
+
+    /// #225: applying a patch to a CRLF file must keep CRLF, not collapse the
+    /// whole file to LF (str::lines() strips the `\r`).
+    #[tokio::test]
+    async fn apply_patch_crlf_file_preserves_crlf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        let original = "one\r\ntwo\r\nthree\r\n";
+        std::fs::write(&path, original).unwrap();
+
+        let ctx = crate::test_support::allow_all_context(dir.path().to_path_buf());
+        // Patch content itself uses LF (as a real unified diff would); the
+        // target file's CRLF endings must survive the round-trip.
+        let patch = "--- a/file.txt\n+++ b/file.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n";
+        let res = ApplyPatchTool
+            .execute(json!({ "patch": patch }), &ctx)
+            .await;
+        assert!(!res.is_error, "apply patch failed: {}", res.content);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, "one\r\nTWO\r\nthree\r\n");
+        assert_eq!(after.matches('\n').count(), after.matches("\r\n").count());
+    }
+
+    /// #226: ApplyPatch writes through `write_atomic`. A successful patch must
+    /// leave the file with the right content and NO `.claurst-tmp-*` scratch
+    /// file lingering in the directory.
+    #[tokio::test]
+    async fn apply_patch_writes_atomically_no_tmp_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("foo.txt");
+        std::fs::write(&path, "hello\nworld\n").unwrap();
+
+        let ctx = crate::test_support::allow_all_context(dir.path().to_path_buf());
+        let patch = "--- a/foo.txt\n+++ b/foo.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+rust\n";
+        let res = ApplyPatchTool.execute(json!({ "patch": patch }), &ctx).await;
+        assert!(!res.is_error, "apply patch failed: {}", res.content);
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\nrust\n");
+        let tmp_left = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".claurst-tmp-"));
+        assert!(!tmp_left, "atomic write must not leave a temp file behind");
     }
 }

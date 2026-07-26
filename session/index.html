@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CLAURST · Session</title>
+<link rel="icon" type="image/png" href="/public/Rustle.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #030303;
+    --surface: #0a0a0a;
+    --surface-border: rgba(255, 255, 255, 0.12);
+    --crosshair: rgba(255, 255, 255, 0.4);
+    --text-primary: #ffffff;
+    --text-secondary: #a3a3a3;
+    --text-muted: #525252;
+    --accent: #e91e63;
+    --accent-shy: rgba(233, 30, 99, 0.2);
+    --font-mono: 'JetBrains Mono', monospace;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+  html { font-size: 90%; }
+  body {
+    background-color: var(--bg);
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    line-height: 1.6;
+    min-height: 100vh;
+  }
+  ::selection { background-color: var(--accent-shy); color: var(--text-primary); }
+  ::-webkit-scrollbar { width: 3px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--accent); border-radius: 99px; }
+  ::-webkit-scrollbar-thumb:hover { background: #ff2a76; }
+  * { scrollbar-width: thin; scrollbar-color: var(--accent) transparent; }
+  .bg-grid {
+    position: fixed; inset: 0; z-index: -2; pointer-events: none;
+    background-image:
+      linear-gradient(to right, rgba(255,255,255,0.02) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(255,255,255,0.02) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+  .bg-glow {
+    position: fixed; top: 0vw; left: 20vw; width: 60vw; height: 60vh;
+    background: radial-gradient(ellipse at center, var(--accent-shy) 0%, transparent 70%);
+    opacity: 0.15; z-index: -1; pointer-events: none; filter: blur(100px);
+  }
+  .shell-wrapper {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 1rem;
+  }
+  .shell {
+    max-width: 720px;
+    width: 100%;
+    border-left: 1px solid var(--surface-border);
+    border-right: 1px solid var(--surface-border);
+    position: relative;
+  }
+  .grid-section {
+    border-bottom: 1px solid var(--surface-border);
+    position: relative;
+  }
+  .grid-section.top-border { border-top: 1px solid var(--surface-border); }
+  .grid-section::after, .grid-section::before,
+  .grid-section.top-border .cross-top-left, .grid-section.top-border .cross-top-right {
+    content: '';
+    position: absolute;
+    width: 9px;
+    height: 9px;
+    background:
+      linear-gradient(var(--crosshair), var(--crosshair)) center/1px 100% no-repeat,
+      linear-gradient(var(--crosshair), var(--crosshair)) center/100% 1px no-repeat;
+    z-index: 10;
+  }
+  .grid-section::before { bottom: -5px; left: -5px; }
+  .grid-section::after { bottom: -5px; right: -5px; }
+  .cross-top-left { top: -5px; left: -5px; }
+  .cross-top-right { top: -5px; right: -5px; }
+  nav {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 1.5rem 2rem;
+  }
+  .nav-left { display: flex; align-items: center; gap: 0.8rem; }
+  .nav-logo { width: 28px; height: 28px; }
+  .nav-brand { font-size: 1.1rem; font-weight: 700; letter-spacing: 0.05em; }
+  .nav-tag {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+  .status-body {
+    padding: 3rem 2rem;
+    text-align: center;
+  }
+  .status-title {
+    font-size: 1rem;
+    font-weight: 500;
+    color: var(--text-primary);
+    margin-bottom: 0.75rem;
+    letter-spacing: 0.02em;
+  }
+  .status-detail {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    line-height: 1.6;
+    max-width: 480px;
+    margin: 0 auto;
+  }
+  .status-detail code {
+    background: rgba(0, 0, 0, 0.4);
+    border: 1px solid var(--surface-border);
+    padding: 1px 6px;
+    border-radius: 3px;
+    color: var(--accent);
+    font-size: 0.8rem;
+  }
+  .status-detail a { color: var(--accent); text-decoration: none; }
+  .status-detail a:hover { color: #ff2a76; }
+  .status-spinner {
+    width: 14px;
+    height: 14px;
+    border: 1.5px solid var(--surface-border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    display: inline-block;
+    vertical-align: -2px;
+    margin-right: 8px;
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .footer-row {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    color: var(--text-muted);
+    font-size: 0.75rem;
+  }
+  .footer-item {
+    padding: 1rem 0.6rem;
+    text-align: center;
+    border-right: 1px solid var(--surface-border);
+    color: var(--text-muted);
+    text-decoration: none;
+    transition: background 0.2s, color 0.2s;
+  }
+  .footer-item:last-child { border-right: none; }
+  a.footer-item:hover { color: #fff; background: #ff2a76; }
+  iframe#viewer {
+    display: none;
+    border: 0;
+    width: 100vw;
+    height: 100vh;
+    position: fixed;
+    inset: 0;
+    background: var(--bg);
+  }
+  body.viewer-ready .shell-wrapper { display: none; }
+  body.viewer-ready iframe#viewer { display: block; }
+  @media (max-width: 640px) {
+    nav { padding: 1rem; }
+    .status-body { padding: 2rem 1rem; }
+  }
+</style>
+</head>
+<body>
+<div class="bg-grid"></div>
+<div class="bg-glow"></div>
+
+<div class="shell-wrapper">
+  <div class="shell">
+    <header class="grid-section top-border">
+      <div class="cross-top-left"></div>
+      <div class="cross-top-right"></div>
+      <nav>
+        <div class="nav-left">
+          <img src="/public/Rustle.png" alt="Rustle" class="nav-logo" onerror="this.style.display='none'">
+          <div class="nav-brand">CLAURST</div>
+        </div>
+        <div class="nav-tag">Session</div>
+      </nav>
+    </header>
+
+    <main class="grid-section" role="status" aria-live="polite">
+      <div class="status-body">
+        <div class="status-title" id="status-title"><span class="status-spinner"></span>Loading session</div>
+        <div class="status-detail" id="status-detail">Fetching gist contents from GitHub&hellip;</div>
+      </div>
+    </main>
+
+    <footer class="grid-section footer-row">
+      <a class="footer-item" href="/">Home</a>
+      <div class="footer-item">&copy; 2026 Claurst</div>
+      <a class="footer-item" href="https://github.com/Kuberwastaken/claurst" target="_blank" rel="noopener">GitHub</a>
+    </footer>
+  </div>
+</div>
+
+<iframe id="viewer" title="Claurst session" sandbox="allow-scripts allow-popups allow-same-origin"></iframe>
+
+<script>
+(async function () {
+  var titleEl = document.getElementById('status-title');
+  var detailEl = document.getElementById('status-detail');
+  var viewer = document.getElementById('viewer');
+
+  function fail(title, html) {
+    titleEl.textContent = title;
+    detailEl.innerHTML = html;
+  }
+
+  var id = (location.hash || '').replace(/^#/, '').trim();
+  if (!id) {
+    fail(
+      'No session selected',
+      'Append a gist id to the URL, e.g. <code>/session/#&lt;gist-id&gt;</code>.'
+    );
+    return;
+  }
+  if (!/^[a-f0-9]{6,}$/i.test(id)) {
+    fail('Invalid gist id', 'The fragment after <code>#</code> does not look like a GitHub gist id.');
+    return;
+  }
+
+  try {
+    var res = await fetch('https://api.github.com/gists/' + encodeURIComponent(id), {
+      headers: { 'Accept': 'application/vnd.github+json' }
+    });
+    if (res.status === 404) {
+      fail('Gist not found', 'The link may be wrong, or the gist may have been deleted.');
+      return;
+    }
+    if (res.status === 403) {
+      fail(
+        'Rate-limited by GitHub',
+        'Anonymous GitHub API calls are rate-limited &mdash; wait a minute and refresh.'
+      );
+      return;
+    }
+    if (!res.ok) {
+      fail('Unable to load gist', 'GitHub returned status ' + res.status + '.');
+      return;
+    }
+    var gist = await res.json();
+    var files = gist.files || {};
+    var htmlFile = null;
+    var names = Object.keys(files);
+    for (var i = 0; i < names.length; i++) {
+      var f = files[names[i]];
+      if (f && f.filename && /\.html?$/i.test(f.filename)) { htmlFile = f; break; }
+    }
+    if (!htmlFile) {
+      fail('Not a Claurst session', 'No HTML file was found in this gist.');
+      return;
+    }
+    var content = htmlFile.content || '';
+    if (htmlFile.truncated && htmlFile.raw_url) {
+      var r2 = await fetch(htmlFile.raw_url);
+      if (r2.ok) content = await r2.text();
+    }
+    viewer.srcdoc = content;
+    document.body.classList.add('viewer-ready');
+  } catch (e) {
+    fail('Network error', String(e && e.message ? e.message : e));
+  }
+})();
+</script>
+</body>
+</html>

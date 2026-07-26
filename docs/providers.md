@@ -2,6 +2,10 @@
 
 Claurst supports a wide range of LLM providers through a unified provider abstraction. Every provider implements the same `LlmProvider` trait, so switching between them requires only a configuration change.
 
+> Running a model on your own machine (llama.cpp, LM Studio, Ollama, vLLM)? See
+> the dedicated [Local Models](local-models) guide for recommended server flags,
+> tool-calling setup, model guidance, and cache accounting.
+
 ---
 
 ## Selecting a Provider
@@ -242,6 +246,85 @@ Native Cohere API adapter.
 
 ---
 
+### MiniMax
+
+The built-in provider uses the Anthropic-compatible Messages API.
+
+**Authentication:** `MINIMAX_API_KEY` environment variable, or set `api_key` in `settings.json`.
+
+**Default model:** `MiniMax-M3`
+
+| Model | Context window | Input modalities | Thinking |
+|---|---:|---|---|
+| `MiniMax-M3` | 1,000,000 | Text, image, video | Off by default; supports `adaptive` and `disabled` |
+| `MiniMax-M2.7` | 204,800 | Text | Always on |
+
+The catalog retains the model's complete input-modality metadata. Claurst's built-in attachment flow currently sends text and image blocks.
+
+Pricing is in USD per million tokens:
+
+| Model | Service tier | Input range | Input | Output | Cache read | Cache write |
+|---|---|---:|---:|---:|---:|---:|
+| `MiniMax-M3` | Standard | Up to 512k | $0.30 | $1.20 | $0.06 | Not published |
+| `MiniMax-M3` | Standard | Over 512k | $0.60 | $2.40 | $0.12 | Not published |
+| `MiniMax-M3` | Priority | Up to 512k | $0.45 | $1.80 | $0.09 | Not published |
+| `MiniMax-M3` | Priority | Over 512k | $0.90 | $3.60 | $0.18 | Not published |
+| `MiniMax-M2.7` | Standard | All requests | $0.30 | $1.20 | $0.06 | $0.375 |
+
+| Protocol | Global base URL | China base URL | Path added by Claurst |
+|---|---|---|---|
+| Anthropic | `https://api.minimax.io/anthropic` | `https://api.minimaxi.com/anthropic` | `/v1/messages` |
+| OpenAI-compatible | `https://api.minimax.io/v1` | `https://api.minimaxi.com/v1` | `/chat/completions` |
+
+The built-in `minimax` provider uses the Anthropic row. To use the China endpoint, set `MINIMAX_BASE_URL` or configure `api_base`:
+
+```json
+{
+  "provider": "minimax",
+  "model": "MiniMax-M3",
+  "providers": {
+    "minimax": {
+      "api_key": "...",
+      "api_base": "https://api.minimaxi.com/anthropic"
+    }
+  }
+}
+```
+
+MiniMax-M3 uses the standard service tier by default. To request priority admission, set `service_tier` in the provider options:
+
+```json
+{
+  "provider": "minimax",
+  "model": "MiniMax-M3",
+  "providers": {
+    "minimax": {
+      "api_key": "...",
+      "options": {
+        "service_tier": "priority"
+      }
+    }
+  }
+}
+```
+
+For the OpenAI-compatible protocol, use the custom provider with the corresponding `/v1` base URL:
+
+```json
+{
+  "provider": "custom-openai",
+  "model": "MiniMax-M3",
+  "providers": {
+    "custom-openai": {
+      "api_key": "...",
+      "api_base": "https://api.minimax.io/v1"
+    }
+  }
+}
+```
+
+---
+
 ### Ollama
 
 Connects to a locally running Ollama instance. No API key required.
@@ -318,6 +401,10 @@ Connects to a locally running llama.cpp HTTP server. No API key required.
 ```
 
 Start llama.cpp with the `--server` flag before use.
+
+For recommended `llama-server` flags (tool calling, context sizing, prompt
+caching), model guidance, and cache-accounting details, see the
+[Local Models](local-models) guide.
 
 ---
 
@@ -632,3 +719,51 @@ The above example allows only `gpt-4o` (whitelist minus blacklist).
 Claurst ships a bundled snapshot of models for Anthropic, OpenAI, and Google. At runtime it optionally refreshes from the public `https://models.dev/api.json` API (cached to `~/.claurst/models_cache.json`, refreshed at most every 5 minutes). Network failures are swallowed silently; the bundled snapshot is always sufficient for normal operation.
 
 When no model is explicitly set, Claurst scores available models by priority patterns to pick the best default. Well-known model prefixes (`claude-*`, `gpt-*`, `gemini-*`, etc.) are always routed to their canonical provider regardless of gateway entries in the remote cache.
+
+### Overriding model metadata
+
+Self-hosted endpoints (the `custom-openai` / Ollama / LM Studio / llama.cpp
+providers) and model aliases that models.dev does not know can end up with the
+wrong context window or max-output size — either because the alias is matched to
+an unrelated catalog entry, or because there is no catalog entry at all. The
+`modelOverrides` map lets you supply or correct that metadata. **User overrides
+take precedence over the models.dev catalog and over the built-in defaults.**
+
+Add it at the top level of `~/.claurst/settings.json` (or inside the `config`
+object), keyed by the fully-qualified `"provider/model"` id:
+
+```json
+{
+  "modelOverrides": {
+    "custom-openai/my-local-llm": {
+      "contextWindow": 32768,
+      "maxOutputTokens": 4096,
+      "name": "My Local LLM",
+      "releaseDate": "2026-01-01",
+      "status": "beta"
+    },
+    "ollama/qwen3-coder-30b": {
+      "contextWindow": 262144
+    }
+  }
+}
+```
+
+**Fields** (all optional — an unset field keeps the catalog value):
+
+| Field | Type | Description |
+|---|---|---|
+| `contextWindow` | integer | Total context window size in tokens |
+| `maxOutputTokens` | integer | Maximum tokens the model can emit in one response |
+| `name` | string | Human-readable display name shown in the model picker |
+| `releaseDate` | string | ISO 8601 date; drives newest-first ordering in the picker |
+| `status` | string | Lifecycle status (`active`, `beta`, `alpha`, `deprecated`) |
+
+Field names accept both camelCase (`contextWindow`) and snake_case
+(`context_window`). The key **must** contain a `/` — a bare model id is ignored,
+because the registry is keyed by `provider/model`.
+
+When the keyed model exists in the catalog, the override patches it in place.
+When it does not (a self-hosted alias), Claurst materialises a synthetic entry
+so the corrected values flow everywhere the metadata is read: the `/model`
+picker, the token-usage warnings, and the auto-compact thresholds.

@@ -1,15 +1,15 @@
-// ToolSearchTool: search for tools by name or keyword.
+// ToolSearchTool: discover tools by name or keyword.
 //
-// This is used by the model to discover "deferred" tools that are not yet
-// loaded into context. In the Rust port there is no deferred-tool mechanism
-// (all tools are always available), but this tool still provides a useful
-// search interface for the model to discover available capabilities.
+// The model uses this to find the right tool for a task, or to look up a
+// tool it half-remembers. The catalog is built from the *actually registered*
+// tools (`all_tools()`), so it always reflects real tool names and their
+// one-line descriptions instead of a hand-maintained list that can drift.
 //
 // Supports two query modes:
-//   - "select:ToolName"  → direct lookup by exact name
-//   - "keyword search"   → fuzzy name + description match with scoring
+//   - "select:ToolName[,Other]" → direct lookup by exact name(s)
+//   - "keyword search"          → ranked name + description + keyword match
 
-use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
+use crate::{all_tools, PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -23,64 +23,137 @@ struct ToolSearchInput {
     max_results: usize,
 }
 
-fn default_max() -> usize { 5 }
+fn default_max() -> usize {
+    5
+}
 
-/// A minimal catalog entry describing one tool.
-#[derive(Debug, Clone)]
-struct ToolEntry {
-    name: &'static str,
-    description: &'static str,
+/// A catalog entry describing one searchable tool.
+struct CatalogEntry {
+    name: String,
+    description: String,
     keywords: &'static [&'static str],
 }
 
-/// Static catalog of all built-in tools with keywords for scoring.
-static TOOL_CATALOG: &[ToolEntry] = &[
-    ToolEntry { name: "Bash", description: "Execute shell commands", keywords: &["shell", "run", "command", "exec", "terminal"] },
-    ToolEntry { name: "Read", description: "Read file contents", keywords: &["file", "read", "cat", "content"] },
-    ToolEntry { name: "Write", description: "Write or create files", keywords: &["file", "write", "create", "save"] },
-    ToolEntry { name: "Edit", description: "Edit existing files with string replacement", keywords: &["file", "edit", "modify", "replace", "patch"] },
-    ToolEntry { name: "Glob", description: "Find files by pattern", keywords: &["find", "pattern", "search", "files", "glob"] },
-    ToolEntry { name: "Grep", description: "Search file contents with regex", keywords: &["search", "regex", "grep", "find", "content"] },
-    ToolEntry { name: "WebFetch", description: "Fetch web page content", keywords: &["web", "fetch", "http", "url", "browser"] },
-    ToolEntry { name: "WebSearch", description: "Search the web", keywords: &["web", "search", "internet", "query"] },
-    ToolEntry { name: "NotebookEdit", description: "Edit Jupyter notebook cells", keywords: &["notebook", "jupyter", "ipynb", "cell"] },
-    ToolEntry { name: "TodoWrite", description: "Manage todo list", keywords: &["todo", "task", "list", "write"] },
-    ToolEntry { name: "AskUserQuestion", description: "Ask the user a question", keywords: &["ask", "question", "user", "input", "clarify"] },
-    ToolEntry { name: "EnterPlanMode", description: "Enter planning mode", keywords: &["plan", "mode", "planning"] },
-    ToolEntry { name: "ExitPlanMode", description: "Exit planning mode", keywords: &["plan", "exit", "mode"] },
-    ToolEntry { name: "Sleep", description: "Wait for a duration", keywords: &["sleep", "wait", "delay", "pause"] },
-    ToolEntry { name: "PowerShell", description: "Execute PowerShell commands", keywords: &["powershell", "windows", "ps", "command"] },
-    ToolEntry { name: "CronCreate", description: "Schedule a recurring cron task", keywords: &["cron", "schedule", "recurring", "timer"] },
-    ToolEntry { name: "CronDelete", description: "Cancel a scheduled cron task", keywords: &["cron", "delete", "cancel", "remove"] },
-    ToolEntry { name: "CronList", description: "List all cron tasks", keywords: &["cron", "list", "scheduled", "tasks"] },
-    ToolEntry { name: "EnterWorktree", description: "Create and enter a git worktree", keywords: &["worktree", "git", "branch", "isolate"] },
-    ToolEntry { name: "ExitWorktree", description: "Exit the current git worktree", keywords: &["worktree", "git", "exit", "restore"] },
-    ToolEntry { name: "TaskCreate", description: "Create a background task", keywords: &["task", "create", "background", "async"] },
-    ToolEntry { name: "TaskGet", description: "Get task details", keywords: &["task", "get", "status", "details"] },
-    ToolEntry { name: "TaskUpdate", description: "Update a task's status", keywords: &["task", "update", "status", "progress"] },
-    ToolEntry { name: "TaskList", description: "List all tasks", keywords: &["task", "list", "all", "tasks"] },
-    ToolEntry { name: "TaskStop", description: "Stop a running task", keywords: &["task", "stop", "kill", "cancel"] },
-    ToolEntry { name: "TaskOutput", description: "Get task output/logs", keywords: &["task", "output", "logs", "result"] },
-    ToolEntry { name: "ListMcpResources", description: "List MCP server resources", keywords: &["mcp", "resource", "list", "server"] },
-    ToolEntry { name: "ReadMcpResource", description: "Read an MCP resource", keywords: &["mcp", "resource", "read", "server"] },
-    ToolEntry { name: "Agent", description: "Launch a sub-agent for complex tasks", keywords: &["agent", "subagent", "task", "parallel", "delegate"] },
-    ToolEntry { name: "Brief", description: "Send a formatted message to the user", keywords: &["brief", "message", "notify", "proactive", "status", "update"] },
-    ToolEntry { name: "Config", description: "Get or set Claurst configuration", keywords: &["config", "settings", "model", "verbose", "permission", "configure"] },
-    ToolEntry { name: "SendMessage", description: "Send a message to another agent", keywords: &["send", "message", "agent", "broadcast", "communicate", "inbox"] },
-    ToolEntry { name: "Skill", description: "Execute a skill prompt template", keywords: &["skill", "command", "template", "prompt", "slash", "custom"] },
-];
+/// Extra search synonyms for high-value tools, keyed by canonical name.
+/// These improve recall for natural-language queries (e.g. "search the web").
+fn keywords_for(name: &str) -> &'static [&'static str] {
+    match name {
+        "Bash" => &["shell", "run", "command", "exec", "terminal"],
+        "Read" => &["file", "cat", "content", "open"],
+        "Write" => &["file", "create", "save", "new"],
+        "Edit" => &["file", "modify", "replace", "patch", "change"],
+        "Glob" => &["find", "pattern", "files", "filename"],
+        "Grep" => &["search", "regex", "content", "ripgrep"],
+        "WebFetch" => &["web", "url", "http", "download", "browse", "internet"],
+        "WebSearch" => &["web", "internet", "google", "browse", "news"],
+        "NotebookEdit" => &["notebook", "jupyter", "ipynb", "cell"],
+        "TodoWrite" => &["todo", "task", "plan", "checklist"],
+        "AskUserQuestion" => &["ask", "question", "clarify", "choose"],
+        "Agent" => &["agent", "subagent", "delegate", "parallel", "spawn"],
+        "Skill" => &["skill", "slash", "command", "template", "prompt"],
+        "Config" => &["config", "settings", "model", "permission"],
+        "SendMessage" => &["message", "broadcast", "inbox", "communicate"],
+        _ => &[],
+    }
+}
+
+/// Tools that are registered outside `all_tools()` (e.g. the Agent tool lives
+/// in the query crate) but should still be discoverable here.
+static SUPPLEMENTAL_TOOLS: &[(&str, &str)] = &[(
+    "Agent",
+    "Launch a sub-agent to handle a complex, multi-step task in parallel.",
+)];
+
+/// Collapse a possibly multi-line/verbose description into a single tidy line.
+fn one_line(desc: &str) -> String {
+    let collapsed = desc.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Prefer the first sentence; otherwise cap the length so results stay terse.
+    let first_sentence = collapsed
+        .find(". ")
+        .map(|i| &collapsed[..=i]) // include the period
+        .unwrap_or(&collapsed);
+    let trimmed = first_sentence.trim_end_matches('.').trim();
+    if trimmed.chars().count() > 160 {
+        let cut: String = trimmed.chars().take(157).collect();
+        format!("{}...", cut.trim_end())
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Build the searchable catalog from the live tool registry plus supplements.
+fn build_catalog() -> Vec<CatalogEntry> {
+    let mut entries: Vec<CatalogEntry> = all_tools()
+        .iter()
+        .map(|t| CatalogEntry {
+            name: t.name().to_string(),
+            description: one_line(t.description()),
+            keywords: keywords_for(t.name()),
+        })
+        .collect();
+
+    for (name, desc) in SUPPLEMENTAL_TOOLS {
+        if !entries.iter().any(|e| e.name == *name) {
+            entries.push(CatalogEntry {
+                name: (*name).to_string(),
+                description: one_line(desc),
+                keywords: keywords_for(name),
+            });
+        }
+    }
+
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries
+}
+
+/// Score a single catalog entry against the lowercase query terms.
+/// Name matches dominate, then keywords, then description hits.
+fn score_entry(entry: &CatalogEntry, terms: &[&str]) -> usize {
+    let name_lower = entry.name.to_lowercase();
+    let desc_lower = entry.description.to_lowercase();
+    let mut score = 0usize;
+
+    for term in terms {
+        if name_lower == *term {
+            score += 25; // exact name match ranks highest
+        } else if name_lower.contains(term) {
+            score += 10;
+        }
+
+        for &kw in entry.keywords {
+            if kw == *term {
+                score += 8;
+            } else if kw.contains(term) {
+                score += 3;
+            }
+        }
+
+        if desc_lower.split_whitespace().any(|w| w.trim_matches(|c: char| !c.is_alphanumeric()) == *term) {
+            score += 5; // whole-word description hit
+        } else if desc_lower.contains(term) {
+            score += 2; // substring description hit
+        }
+    }
+
+    score
+}
 
 #[async_trait]
 impl Tool for ToolSearchTool {
-    fn name(&self) -> &str { "ToolSearch" }
-
-    fn description(&self) -> &str {
-        "Search for available tools by name or keyword. Use 'select:ToolName' for direct \
-         lookup or provide keywords for fuzzy search. Returns matching tool names and their \
-         descriptions. Max 5 results by default."
+    fn name(&self) -> &str {
+        "ToolSearch"
     }
 
-    fn permission_level(&self) -> PermissionLevel { PermissionLevel::None }
+    fn description(&self) -> &str {
+        "Find the right tool for a task. Search all available tools by name or keyword and \
+         get back the best-matching tool names with a one-line description each. Use a natural \
+         phrase (e.g. 'search the web', 'edit a file') to discover a capability, or \
+         'select:ToolName' for a direct lookup. Returns up to 5 results by default."
+    }
+
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::None
+    }
 
     fn input_schema(&self) -> Value {
         json!({
@@ -88,11 +161,11 @@ impl Tool for ToolSearchTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Query: use 'select:ToolName' for direct selection, or keywords to search"
+                    "description": "A task description or keywords to find a tool, or 'select:ToolName' for a direct lookup"
                 },
                 "max_results": {
                     "type": "number",
-                    "description": "Maximum results to return (default: 5)"
+                    "description": "Maximum results to return (default: 5, max: 20)"
                 }
             },
             "required": ["query"]
@@ -106,18 +179,24 @@ impl Tool for ToolSearchTool {
         };
 
         let query = params.query.trim();
-        let max = params.max_results.min(20);
+        let max = params.max_results.clamp(1, 20);
+        let catalog = build_catalog();
 
-        // select: prefix — direct lookup
+        // ---- select: prefix — direct lookup by exact name(s) ----------------
         if let Some(names_str) = query.strip_prefix("select:").map(str::trim) {
-            let requested: Vec<&str> = names_str.split(',').map(str::trim).collect();
+            let requested: Vec<&str> = names_str
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
             let mut found = Vec::new();
             let mut missing = Vec::new();
 
             for name in requested {
-                if let Some(entry) = TOOL_CATALOG.iter().find(|e| {
-                    e.name.eq_ignore_ascii_case(name)
-                }) {
+                if let Some(entry) = catalog
+                    .iter()
+                    .find(|e| e.name.eq_ignore_ascii_case(name))
+                {
                     found.push(format!("{}: {}", entry.name, entry.description));
                 } else {
                     missing.push(name.to_string());
@@ -138,51 +217,43 @@ impl Tool for ToolSearchTool {
             return ToolResult::success(out);
         }
 
-        // Keyword search with scoring
+        // ---- keyword search with scoring ------------------------------------
         let q_lower = query.to_lowercase();
-        let terms: Vec<&str> = q_lower.split_whitespace().collect();
+        let terms: Vec<&str> = q_lower
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| t.len() > 1) // drop empties and single-char noise
+            .collect();
 
-        let mut scored: Vec<(usize, &ToolEntry)> = TOOL_CATALOG
+        if terms.is_empty() {
+            return ToolResult::success(format!(
+                "Empty query. Provide keywords or a task description, or use 'select:ToolName'. \
+                 {} tools available.",
+                catalog.len()
+            ));
+        }
+
+        let mut scored: Vec<(usize, &CatalogEntry)> = catalog
             .iter()
             .filter_map(|entry| {
-                let mut score = 0usize;
-                let name_lower = entry.name.to_lowercase();
-                let desc_lower = entry.description.to_lowercase();
-
-                for term in &terms {
-                    // Exact name match
-                    if name_lower == *term {
-                        score += 20;
-                    } else if name_lower.contains(term) {
-                        score += 10;
-                    }
-
-                    // Description match
-                    if desc_lower.contains(term) {
-                        score += 5;
-                    }
-
-                    // Keyword match
-                    for &kw in entry.keywords {
-                        if kw == *term {
-                            score += 8;
-                        } else if kw.contains(term) {
-                            score += 3;
-                        }
-                    }
+                let score = score_entry(entry, &terms);
+                if score > 0 {
+                    Some((score, entry))
+                } else {
+                    None
                 }
-
-                if score > 0 { Some((score, entry)) } else { None }
             })
             .collect();
 
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        // Highest score first; break ties by name for deterministic output.
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
         scored.truncate(max);
 
         if scored.is_empty() {
             return ToolResult::success(format!(
-                "No tools found matching '{}'. Try broader keywords or use 'select:ToolName'.",
-                query
+                "No tools matched '{}'. Try broader keywords or use 'select:ToolName'. \
+                 {} tools are available.",
+                query,
+                catalog.len()
             ));
         }
 
@@ -192,10 +263,75 @@ impl Tool for ToolSearchTool {
             .collect();
 
         ToolResult::success(format!(
-            "Tools matching '{}':\n\n{}\n\nTotal tools available: {}",
+            "Tools matching '{}' (use one of these for the task):\n\n{}\n\n{} of {} tools shown.",
             query,
             lines.join("\n"),
-            TOOL_CATALOG.len()
+            scored.len(),
+            catalog.len()
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx() -> ToolContext {
+        crate::test_support::allow_all_context(std::env::temp_dir())
+    }
+
+    async fn run(query: &str) -> String {
+        let tool = ToolSearchTool;
+        let out = tool
+            .execute(json!({ "query": query }), &ctx())
+            .await;
+        out.content
+    }
+
+    #[tokio::test]
+    async fn web_query_surfaces_web_tools() {
+        let out = run("search the web").await;
+        assert!(
+            out.contains("WebSearch"),
+            "expected WebSearch in results, got:\n{out}"
+        );
+        // WebSearch should rank ahead of WebFetch for this query.
+        let ws = out.find("WebSearch");
+        let wf = out.find("WebFetch");
+        if let (Some(ws), Some(wf)) = (ws, wf) {
+            assert!(ws < wf, "WebSearch should rank above WebFetch:\n{out}");
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_name_ranks_first() {
+        let out = run("grep").await;
+        let first_line = out
+            .lines()
+            .find(|l| l.contains(": "))
+            .unwrap_or_default();
+        assert!(
+            first_line.starts_with("Grep:"),
+            "exact name match should rank first, got first result line: {first_line:?}\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_prefix_direct_lookup() {
+        let out = run("select:WebFetch,DoesNotExist").await;
+        assert!(out.contains("WebFetch:"), "should find WebFetch:\n{out}");
+        assert!(
+            out.contains("Not found: DoesNotExist"),
+            "should report the missing tool:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_is_discoverable_via_supplement() {
+        let out = run("delegate a subagent task").await;
+        assert!(
+            out.contains("Agent"),
+            "Agent tool should be discoverable even though it lives outside all_tools():\n{out}"
+        );
     }
 }

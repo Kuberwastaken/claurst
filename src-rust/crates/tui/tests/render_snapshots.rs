@@ -157,11 +157,18 @@ fn system_message_preserves_text() {
 
 #[test]
 fn thinking_block_collapsed() {
-    let lines = render_thinking_block("hidden thoughts", false);
+    // Collapsed renders a single "Thinking: <first-line summary>" line: the
+    // first line becomes the heading preview, while the body (later lines) is
+    // suppressed until expanded.
+    let lines = render_thinking_block("Planning the fix\nsecret detailed reasoning body", false);
     assert_eq!(lines.len(), 1);
     let text = flatten(&lines);
     assert!(text.contains("Thinking"));
-    assert!(!text.contains("hidden thoughts"));
+    assert!(text.contains("Planning the fix"), "collapsed should show the heading preview");
+    assert!(
+        !text.contains("secret detailed reasoning body"),
+        "collapsed should hide the reasoning body"
+    );
 }
 
 #[test]

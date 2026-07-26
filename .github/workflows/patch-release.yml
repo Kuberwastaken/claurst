@@ -255,6 +255,20 @@ jobs:
           echo "Patched release assets:"
           ls -lh release/
 
+      # Regenerate SHA256SUMS over the freshly-rebuilt assets so it matches the
+      # patched archives.  release.yml has this step; patch-release.yml was
+      # missing it, so a patch re-uploaded the archives but left a STALE
+      # SHA256SUMS — breaking install.sh's checksum verification for everyone.
+      # Written to a temp path first so it never hashes itself; `release/*` is
+      # uploaded with --clobber below, overwriting the old SHA256SUMS.
+      - name: Generate SHA256SUMS
+        run: |
+          cd release
+          sha256sum * > "$RUNNER_TEMP/SHA256SUMS"
+          mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
+          echo "── SHA256SUMS ──────────────────────────────────────"
+          cat SHA256SUMS
+
       # Force-move the tag to the current HEAD so that source pinned by the
       # tag matches the binaries we're about to upload.  Without this, the
       # tag still points at the original commit and the assets diverge from

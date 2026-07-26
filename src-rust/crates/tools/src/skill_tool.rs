@@ -30,6 +30,9 @@ struct SkillInput {
 
 #[async_trait]
 impl Tool for SkillTool {
+    // Gates itself: calls `ctx.check_permission_for_path` in `execute()` (#210).
+    fn self_gates(&self) -> bool { true }
+
     fn name(&self) -> &str { "Skill" }
 
     fn description(&self) -> &str {
@@ -131,9 +134,7 @@ fn skill_search_dirs(ctx: &ToolContext) -> Vec<PathBuf> {
     let mut dirs = vec![
         ctx.working_dir.join(".claurst").join("commands"),
     ];
-    if let Some(home) = dirs::home_dir() {
-        dirs.push(home.join(".claurst").join("commands"));
-    }
+    dirs.push(claurst_core::config::Settings::config_dir().join("commands"));
     dirs
 }
 
@@ -149,25 +150,23 @@ async fn list_skills(dirs: &[PathBuf]) -> ToolResult {
     // Then add disk skills, skipping any that shadow a bundled name.
     let mut disk_skills: Vec<(String, PathBuf)> = Vec::new();
     for dir in dirs {
-        match tokio::fs::read_dir(dir).await {
-            Ok(mut entries) => {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    let path = entry.path();
-                    if path.extension().map_or(false, |e| e == "md") {
-                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                            let name = stem.to_string();
-                            // Deduplicate — project-level shadows user-level;
-                            // bundled skills shadow everything.
-                            if !disk_skills.iter().any(|(n, _)| n == &name)
-                                && !bundled_names.contains(&name.as_str())
-                            {
-                                disk_skills.push((name, path));
-                            }
+        // Missing/unreadable directory: skip silently.
+        if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "md") {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        let name = stem.to_string();
+                        // Deduplicate — project-level shadows user-level;
+                        // bundled skills shadow everything.
+                        if !disk_skills.iter().any(|(n, _)| n == &name)
+                            && !bundled_names.contains(&name.as_str())
+                        {
+                            disk_skills.push((name, path));
                         }
                     }
                 }
             }
-            Err(_) => {} // directory doesn't exist, skip
         }
     }
 
@@ -221,9 +220,8 @@ async fn read_skill_description(path: &std::path::Path) -> String {
 
 /// Remove YAML frontmatter delimited by `---` at the start of the file.
 fn strip_frontmatter(content: &str) -> String {
-    if content.starts_with("---") {
+    if let Some(after_open) = content.strip_prefix("---") {
         // Find closing ---
-        let after_open = &content[3..];
         if let Some(close_pos) = after_open.find("\n---") {
             // Skip past the closing delimiter and any leading newline
             let rest = &after_open[close_pos + 4..];

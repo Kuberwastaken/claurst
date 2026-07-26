@@ -33,15 +33,23 @@ impl ShadowSnapshot {
     /// Create a `ShadowSnapshot` for `working_dir`, or return `None` when
     /// git is not on PATH or the directory is not inside a git repository.
     pub fn for_session(working_dir: &Path) -> Option<Self> {
+        let data_root = dirs::data_dir()?.join("claurst").join("snapshot");
+        Self::for_session_in(working_dir, &data_root)
+    }
+
+    /// Like [`for_session`] but roots the shadow gitdir under an explicit
+    /// `data_root` instead of the user's data directory. Lets tests (and
+    /// sandboxed builds with no writable HOME) stage a hermetic snapshot
+    /// store in a tempdir rather than writing under `~/.claurst`.
+    pub fn for_session_in(working_dir: &Path, data_root: &Path) -> Option<Self> {
         if which::which("git").is_err() {
             warn!("snapshot: git not on PATH, disabled");
             return None;
         }
         let repo_root = find_repo_root(working_dir)?;
-        let data_dir = dirs::data_dir()?.join("claurst").join("snapshot");
         let project_hash = path_hash(&repo_root);
         let worktree_hash = path_hash(working_dir);
-        let gitdir = data_dir.join(project_hash).join(worktree_hash);
+        let gitdir = data_root.join(project_hash).join(worktree_hash);
         Some(Self {
             gitdir,
             worktree: working_dir.to_path_buf(),
@@ -113,9 +121,8 @@ impl ShadowSnapshot {
             warn!("snapshot: cannot create gitdir: {e}");
             return None;
         }
-        if !existed {
-            if !self.init_shadow().await { return None; }
-        }
+        if !existed
+            && !self.init_shadow().await { return None; }
         self.stage().await;
         let r = self.shadow(vec!["write-tree"]).await;
         if r.code != 0 {
@@ -174,7 +181,7 @@ impl ShadowSnapshot {
                 let key = fwd_str(abs);
                 if !seen.insert(key) { continue; }
                 let rel = abs.strip_prefix(&self.worktree)
-                    .map(|p| fwd_str(p))
+                    .map(fwd_str)
                     .unwrap_or_else(|_| fwd_str(abs));
                 ops.push(Op { hash: patch.hash.clone(), abs: abs.clone(), rel });
             }

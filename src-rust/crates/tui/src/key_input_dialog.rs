@@ -25,6 +25,12 @@ pub struct KeyInputDialogState {
     pub cursor_pos: usize,
 }
 
+impl Default for KeyInputDialogState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KeyInputDialogState {
     pub fn new() -> Self {
         Self {

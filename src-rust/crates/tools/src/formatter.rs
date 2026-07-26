@@ -17,7 +17,7 @@ pub async fn try_format_file(path: &str, ctx: &ToolContext) {
         .map(|e| format!(".{}", e))
         .unwrap_or_default();
 
-    for (_name, fmt) in formatters {
+    for fmt in formatters.values() {
         if fmt.disabled || fmt.command.is_empty() {
             continue;
         }

@@ -34,6 +34,33 @@ pub struct ModelInfo {
 
     /// Maximum number of tokens the model can emit in a single response.
     pub max_output_tokens: u32,
+
+    /// First public availability (ISO 8601 date), when known.  Catalog-backed
+    /// providers populate this from the models.dev snapshot; live-discovery
+    /// providers may leave it `None`.  Drives date-DESC listing in pickers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_date: Option<String>,
+
+    /// Lifecycle status string (`"active"`, `"beta"`, …), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+impl Default for ModelInfo {
+    /// Empty placeholder used with struct-update syntax
+    /// (`ModelInfo { id, .., ..Default::default() }`) so the optional metadata
+    /// fields don't have to be repeated at every construction site.
+    fn default() -> Self {
+        Self {
+            id: ModelId::new(""),
+            provider_id: ProviderId::new(""),
+            name: String::new(),
+            context_window: 0,
+            max_output_tokens: 0,
+            release_date: None,
+            status: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -68,11 +95,18 @@ pub trait LlmProvider: Send + Sync {
         ProviderError,
     >;
 
-    /// Return the list of models available through this provider.
+    /// Discover models exposed by a *live* endpoint (e.g. `GET /v1/models` for
+    /// a local Ollama/LM Studio server, or a Copilot entitlement query).
     ///
-    /// Implementations may make a network call (e.g. `GET /v1/models`) or
-    /// return a hard-coded list for providers that do not expose a models API.
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError>;
+    /// Catalog-backed providers (Anthropic, OpenAI, Google, …) do **not**
+    /// override this: their model list is a read-only projection of the
+    /// models.dev catalog held in [`crate::ModelRegistry`], so the picker never
+    /// turns a provider return value into the displayed list.  The default impl
+    /// therefore returns an empty vector — only providers whose models cannot be
+    /// known ahead of time (local runtimes, dynamic gateways) implement it.
+    async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        Ok(Vec::new())
+    }
 
     /// Check whether the provider is authenticated and reachable.
     ///

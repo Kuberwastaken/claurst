@@ -71,21 +71,17 @@ pub type SharedSkillIndex = Arc<RwLock<SkillIndex>>;
 pub async fn prefetch_skills(project_root: &Path, index: SharedSkillIndex) {
     let mut local = SkillIndex::default();
 
-    // 1. User-defined skills: ~/.claurst/skills/*.md + {project_root}/.claurst/skills/*.md
-    let search_dirs: Vec<std::path::PathBuf> = {
-        let mut dirs = Vec::new();
-        if let Some(home) = dirs::home_dir() {
-            dirs.push(home.join(".claurst").join("skills"));
-        }
-        dirs.push(project_root.join(".claurst").join("skills"));
-        dirs
-    };
+    // 1. User-defined skills: <claurst home>/skills/*.md + {project_root}/.claurst/skills/*.md
+    let search_dirs: Vec<std::path::PathBuf> = vec![
+        claurst_core::config::Settings::config_dir().join("skills"),
+        project_root.join(".claurst").join("skills"),
+    ];
 
     for dir in &search_dirs {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map_or(false, |e| e == "md") {
+                if path.extension().is_some_and(|e| e == "md") {
                     if let Some(skill) = load_skill_from_file(&path) {
                         local.insert(skill);
                     }
@@ -104,7 +100,7 @@ pub async fn prefetch_skills(project_root: &Path, index: SharedSkillIndex) {
         if let Ok(entries) = std::fs::read_dir(&bundled) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map_or(false, |e| e == "md") {
+                if path.extension().is_some_and(|e| e == "md") {
                     if let Some(mut skill) = load_skill_from_file(&path) {
                         skill.source = "bundled".to_string();
                         local.insert(skill);
@@ -136,9 +132,9 @@ fn load_skill_from_file(path: &std::path::Path) -> Option<SkillDefinition> {
     let stem = path.file_stem()?.to_string_lossy().to_string();
 
     // Try to parse front-matter
-    if content.starts_with("---") {
-        let end = content[3..].find("\n---")? + 3;
-        let front = &content[3..end];
+    if let Some(after) = content.strip_prefix("---") {
+        let end = after.find("\n---")?;
+        let front = &after[..end];
         let name = extract_yaml_str(front, "name").unwrap_or_else(|| stem.clone());
         let description = extract_yaml_str(front, "description").unwrap_or_default();
         let tags = extract_yaml_list(front, "tags");

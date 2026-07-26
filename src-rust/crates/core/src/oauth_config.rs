@@ -48,6 +48,97 @@ pub const ALL_OAUTH_SCOPES: &[&str] = &[
 pub const MINIMUM_SCOPES: &[&str] = &[CLAUDE_AI_INFERENCE_SCOPE, CLAUDE_AI_PROFILE_SCOPE];
 
 // ---------------------------------------------------------------------------
+// Claude Code stealth-impersonation constants
+// ---------------------------------------------------------------------------
+
+/// User-Agent advertised to Anthropic's API on OAuth-authenticated requests.
+/// Must match a Claude Code version the server still accepts; bump when
+/// Anthropic invalidates the current value.
+pub const CLAUDE_CODE_VERSION_FOR_OAUTH: &str = "2.1.162";
+
+/// `anthropic-beta` flags for OAuth requests, in the exact order the official
+/// `claude` sends on a Pro account. The first two are required for the server to
+/// accept subscription tokens; the rest are additive capability flags. Max /
+/// extra-usage accounts get two more (`OAUTH_BETA_FLAGS_MAX_EXTRA`); sending
+/// `context-1m` on Pro-without-credits triggers a 429.
+pub const OAUTH_BETA_FLAGS: &[&str] = &[
+    "claude-code-20250219",
+    "oauth-2025-04-20",
+    "interleaved-thinking-2025-05-14",
+    "thinking-token-count-2026-05-13",
+    "context-management-2025-06-27",
+    "prompt-caching-scope-2026-01-05",
+    "advisor-tool-2026-03-01",
+    "advanced-tool-use-2025-11-20",
+    "effort-2025-11-24",
+    "afk-mode-2026-01-31",
+    "extended-cache-ttl-2025-04-11",
+    "cache-diagnosis-2026-04-07",
+];
+
+/// Betas added on Max / extra-usage accounts, inserted after
+/// `prompt-caching-scope-2026-01-05` to keep the official ordering.
+pub const OAUTH_BETA_FLAGS_MAX_EXTRA: &[&str] =
+    &["context-1m-2025-08-07", "mid-conversation-system-2026-04-07"];
+
+/// Build the `anthropic-beta` flag list matching the official client for the
+/// account's tier. `has_premium` = account has 1M-context / extra-usage
+/// entitlement (Max or extra-usage enabled).
+pub fn oauth_beta_flags(has_premium: bool) -> Vec<&'static str> {
+    if !has_premium {
+        return OAUTH_BETA_FLAGS.to_vec();
+    }
+    let mut v = Vec::with_capacity(OAUTH_BETA_FLAGS.len() + 2);
+    for &f in OAUTH_BETA_FLAGS {
+        v.push(f);
+        if f == "prompt-caching-scope-2026-01-05" {
+            v.extend_from_slice(OAUTH_BETA_FLAGS_MAX_EXTRA);
+        }
+    }
+    v
+}
+
+/// User-Agent for OAuth requests: `claude-cli/<version> (external, cli)`.
+pub fn claude_code_user_agent() -> String {
+    format!("claude-cli/{CLAUDE_CODE_VERSION_FOR_OAUTH} (external, cli)")
+}
+
+/// Salt baked into the official bundle (a minified JS var), used in the
+/// `cc_version` client hash. Re-extracted and bumped per release by
+/// `claude-re/scripts/update-claude-code.sh`. See `findings/CCH-NATIVE.md`.
+pub const CLAUDE_CODE_BILLING_SALT: &str = "59cf53e54c78";
+
+/// The official CLI's real client hash: the `cc_version` suffix, i.e.
+/// `sha256(SALT + text[4] + text[7] + text[20] + VERSION)[..3]`, where `text`
+/// is the first user (non-meta) message. (`cch` itself is always literal
+/// `00000`.) See `findings/CCH-NATIVE.md`.
+pub fn claude_code_cc_version_suffix(first_user_text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let chars: Vec<char> = first_user_text.chars().collect();
+    // Out-of-range index -> "0", matching JS `H[z] || "0"`.
+    let pick = |z: usize| chars.get(z).map_or_else(|| "0".to_string(), |c| c.to_string());
+    let k = format!("{}{}{}", pick(4), pick(7), pick(20));
+    let input = format!("{CLAUDE_CODE_BILLING_SALT}{k}{CLAUDE_CODE_VERSION_FOR_OAUTH}");
+    hex::encode(Sha256::digest(input.as_bytes()))[..3].to_string()
+}
+
+/// The `x-anthropic-billing-header` block (`system[0]`): `cc_version` + client
+/// hash suffix, `cc_entrypoint=cli`, and the literal `cch=00000` (the CLI never
+/// computes a cch). See `findings/CCH-NATIVE.md`.
+pub fn claude_code_billing_header(first_user_text: &str) -> String {
+    let suffix = claude_code_cc_version_suffix(first_user_text);
+    format!(
+        "x-anthropic-billing-header: cc_version={CLAUDE_CODE_VERSION_FOR_OAUTH}.{suffix}; cc_entrypoint=cli; cch=00000;"
+    )
+}
+
+/// System-prompt prefix that must appear as the first system block on every
+/// OAuth-authenticated request. Anthropic's gate refuses requests whose system
+/// prompt does not start with this identity string.
+pub const CLAUDE_CODE_SYSTEM_PROMPT_PREFIX: &str =
+    "You are Claude Code, Anthropic's official CLI for Claude.";
+
+// ---------------------------------------------------------------------------
 // OAuthConfig struct
 // ---------------------------------------------------------------------------
 
@@ -76,10 +167,28 @@ pub struct OAuthConfig {
 // Production config (mirrors PROD_OAUTH_CONFIG in oauth.ts)
 // ---------------------------------------------------------------------------
 
-// NOTE: These OAuth client IDs are registered to Anthropic's official Claude Code CLI.
-// They will NOT work for Claurst — Anthropic's auth server will reject or misattribute requests.
-// Users should use an API key from console.anthropic.com instead.
-// To use OAuth, Claurst would need its own registered OAuth application with Anthropic.
+// Claude Code OAuth client ID, used in stealth-impersonation mode so that
+// Anthropic's auth server accepts Claude Pro/Max tokens through Claurst.
+// The matching request-time impersonation (user-agent, x-app, anthropic-beta,
+// and the Claude Code system-prompt prefix) is wired up in
+// `claurst_api::client::AnthropicClient` and is required for these tokens to
+// be honoured by the API.
+//
+// Billing note (verified live 2026-06-03, Claude Pro account, extra-usage
+// disabled): a Pro/Max subscription token used through Claurst's impersonation
+// IS served and DRAWS FROM THE INTERACTIVE SUBSCRIPTION QUOTA — `oauth/usage`
+// `five_hour`/`seven_day` utilisation climbed (percentage, 0-100 scale) with
+// extra-usage off and `seven_day_oauth_apps` staying null. A side-by-side run of
+// the official `claude -p` (same token via CLAUDE_CODE_OAUTH_TOKEN) hit the same
+// buckets, i.e. Claurst is billed exactly like the official interactive client.
+// This CONTRADICTS the earlier assumption that third-party usage falls back to
+// the "extra usage" pool. The CCH was not even required (requests succeeded
+// without it). Caveats: (1) tested before Anthropic's 2026-06-15 dual-bucket
+// change, which routes `claude -p`/Agent-SDK/third-party usage to a separate
+// monthly API-rate credit — re-verify after that date; (2) advertising the
+// `context-1m` beta forces long-context requests onto extra-usage credits (429
+// "Usage credits are required for long context requests"), so it is omitted from
+// OAUTH_BETA_FLAGS.
 pub const PROD_OAUTH: OAuthConfig = OAuthConfig {
     base_api_url: "https://api.anthropic.com",
     // Routes through claude.com/cai/* for attribution, 307s to claude.ai in
@@ -93,7 +202,7 @@ pub const PROD_OAUTH: OAuthConfig = OAuthConfig {
     console_success_url: "https://platform.claude.com/buy_credits?returnUrl=/oauth/code/success%3Fapp%3Dclaude-code",
     claudeai_success_url: "https://platform.claude.com/oauth/code/success?app=claude-code",
     manual_redirect_url: "https://platform.claude.com/oauth/code/callback",
-    client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e", // Anthropic's Claude Code — will not work for Claurst
+    client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e", // Claude Code client ID (stealth)
     oauth_file_suffix: "",
     mcp_proxy_url: "https://mcp-proxy.anthropic.com",
     mcp_proxy_path: "/v1/mcp/{server_id}",
@@ -114,7 +223,7 @@ pub const STAGING_OAUTH: OAuthConfig = OAuthConfig {
     console_success_url: "https://platform.staging.ant.dev/buy_credits?returnUrl=/oauth/code/success%3Fapp%3Dclaude-code",
     claudeai_success_url: "https://platform.staging.ant.dev/oauth/code/success?app=claude-code",
     manual_redirect_url: "https://platform.staging.ant.dev/oauth/code/callback",
-    client_id: "22422756-60c9-4084-8eb7-27705fd5cf9a", // Anthropic's Claude Code staging — will not work for Claurst
+    client_id: "22422756-60c9-4084-8eb7-27705fd5cf9a", // Claude Code staging client ID (stealth)
     oauth_file_suffix: "-staging-oauth",
     mcp_proxy_url: "https://mcp-proxy-staging.anthropic.com",
     mcp_proxy_path: "/v1/mcp/{server_id}",
@@ -307,23 +416,32 @@ pub struct CodexTokens {
     pub expires_at: Option<u64>,
 }
 
-/// Path to the Codex tokens file (~/.claurst/codex_tokens.json)
+/// Legacy single-file path: `~/.claurst/codex_tokens.json`. Kept for
+/// backward-compat reads when no account registry exists.
 fn codex_tokens_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".claurst").join("codex_tokens.json"))
+    Some(crate::config::Settings::config_dir().join("codex_tokens.json"))
 }
 
-/// Save Codex OAuth tokens to ~/.claurst/codex_tokens.json
-pub fn save_codex_tokens(tokens: &CodexTokens) -> anyhow::Result<()> {
-    let path = codex_tokens_path().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    let json = serde_json::to_string(tokens)?;
-    std::fs::write(&path, json)?;
+/// Save Codex OAuth tokens for a named profile under
+/// `~/.claurst/accounts/codex/<profile_id>/codex_tokens.json`.
+pub fn save_codex_tokens_for_profile(
+    tokens: &CodexTokens,
+    profile_id: &str,
+) -> anyhow::Result<()> {
+    let path = crate::accounts::codex_token_path(profile_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        crate::accounts::set_user_only_dir_perms(parent);
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(tokens)?)?;
+    // Codex access + refresh tokens must not be world/group readable (#212).
+    crate::accounts::set_user_only_perms(&path);
     Ok(())
 }
 
-/// Load Codex OAuth tokens from ~/.claurst/codex_tokens.json
-pub fn get_codex_tokens() -> Option<CodexTokens> {
-    let path = codex_tokens_path()?;
+/// Load Codex OAuth tokens for a named profile.
+pub fn load_codex_tokens_for_profile(profile_id: &str) -> Option<CodexTokens> {
+    let path = crate::accounts::codex_token_path(profile_id);
     if !path.exists() {
         return None;
     }
@@ -331,11 +449,113 @@ pub fn get_codex_tokens() -> Option<CodexTokens> {
     serde_json::from_str(&json).ok()
 }
 
-/// Clear stored Codex tokens
+/// Save Codex OAuth tokens, registering and activating a profile. Returns the
+/// profile id. If a profile with a matching account_id already exists, reuses
+/// it; otherwise derives an id from the JWT identity (or `label`, if given).
+pub fn save_codex_tokens_and_register(
+    tokens: &CodexTokens,
+    label: Option<&str>,
+) -> anyhow::Result<String> {
+    use crate::accounts::{
+        ensure_unique_profile_id, jwt_identity, slugify_profile_id, AccountProfile,
+        AccountRegistry, PROVIDER_CODEX,
+    };
+
+    let identity = jwt_identity(&tokens.access_token);
+    let mut registry = AccountRegistry::load();
+
+    let existing_id = registry
+        .list(PROVIDER_CODEX)
+        .into_iter()
+        .find(|p| {
+            (identity.email.is_some() && p.email == identity.email)
+                || (tokens.account_id.is_some() && p.account_id == tokens.account_id)
+                || (identity.account_id.is_some()
+                    && p.account_id == identity.account_id)
+        })
+        .map(|p| p.id);
+
+    let id = if let Some(id) = existing_id {
+        id
+    } else if let Some(label) = label {
+        ensure_unique_profile_id(&registry, PROVIDER_CODEX, label)
+    } else {
+        let base = identity
+            .email
+            .as_deref()
+            .map(|e| e.split('@').next().unwrap_or(e).to_string())
+            .or_else(|| tokens.account_id.clone())
+            .or_else(|| identity.account_id.clone())
+            .unwrap_or_else(|| "account".to_string());
+        ensure_unique_profile_id(&registry, PROVIDER_CODEX, &base)
+    };
+
+    save_codex_tokens_for_profile(tokens, &id)?;
+
+    let profile = AccountProfile {
+        id: id.clone(),
+        label: label.map(slugify_profile_id),
+        email: identity.email,
+        account_id: tokens
+            .account_id
+            .clone()
+            .or(identity.account_id),
+        organization_uuid: None,
+        subscription_tier: None,
+        added_at: None,
+        last_selected_at: None,
+    };
+    registry.upsert(PROVIDER_CODEX, profile, true)?;
+    Ok(id)
+}
+
+/// Save Codex tokens — back-compat shim. Writes to the active codex profile,
+/// creating one if none exists.
+pub fn save_codex_tokens(tokens: &CodexTokens) -> anyhow::Result<()> {
+    let registry = crate::accounts::AccountRegistry::load();
+    if let Some(active) = registry.active(crate::accounts::PROVIDER_CODEX) {
+        save_codex_tokens_for_profile(tokens, active)
+    } else {
+        save_codex_tokens_and_register(tokens, None).map(|_| ())
+    }
+}
+
+/// Load the active Codex profile's tokens. Falls back to the legacy
+/// single-file storage (auto-migrating on first read).
+pub fn get_codex_tokens() -> Option<CodexTokens> {
+    let registry = crate::accounts::AccountRegistry::load();
+    if let Some(active) = registry.active(crate::accounts::PROVIDER_CODEX) {
+        if let Some(t) = load_codex_tokens_for_profile(active) {
+            return Some(t);
+        }
+    }
+    // Legacy fallback + migration.
+    let legacy = codex_tokens_path()?;
+    if !legacy.exists() {
+        return None;
+    }
+    let json = std::fs::read_to_string(&legacy).ok()?;
+    let tokens: CodexTokens = serde_json::from_str(&json).ok()?;
+    if save_codex_tokens_and_register(&tokens, None).is_ok() {
+        let _ = std::fs::remove_file(&legacy);
+    }
+    Some(tokens)
+}
+
+/// Clear tokens for the active Codex profile. Removes the profile from the
+/// registry as well.
 pub fn clear_codex_tokens() -> anyhow::Result<()> {
-    let path = codex_tokens_path().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-    if path.exists() {
-        std::fs::remove_file(&path)?;
+    let mut registry = crate::accounts::AccountRegistry::load();
+    if let Some(active) = registry
+        .active(crate::accounts::PROVIDER_CODEX)
+        .map(String::from)
+    {
+        registry.remove(crate::accounts::PROVIDER_CODEX, &active)?;
+    }
+    if let Some(legacy) = codex_tokens_path() {
+        if legacy.exists() {
+            std::fs::remove_file(&legacy)?;
+        }
     }
     Ok(())
 }
@@ -410,5 +630,31 @@ mod tests {
         assert!(url.contains("state456"));
         assert!(url.contains("S256"));
         assert!(url.contains("localhost"));
+    }
+
+    /// Golden vector cross-checking the `b1q` port. `EXPECTED_SUFFIX` is
+    /// auto-maintained per version by `claude-re/scripts/update-claude-code.sh`
+    /// (independent shell `sha256`); first verified live for 2.1.161 (== `9f1`).
+    #[test]
+    fn test_cc_version_suffix_golden() {
+        // Chars at indices 4/7/20 are 'n', ' ', 'a'.
+        const GOLDEN_INPUT: &str = "Réponds uniquement par le mot: PROXYTEST";
+        const EXPECTED_SUFFIX: &str = "c4f"; // AUTO-MAINTAINED: cc_version suffix
+        assert_eq!(claude_code_cc_version_suffix(GOLDEN_INPUT), EXPECTED_SUFFIX);
+
+        let h = claude_code_billing_header(GOLDEN_INPUT);
+        assert_eq!(
+            h,
+            format!("x-anthropic-billing-header: cc_version={CLAUDE_CODE_VERSION_FOR_OAUTH}.{EXPECTED_SUFFIX}; cc_entrypoint=cli; cch=00000;")
+        );
+        assert!(h.contains("cch=00000;"));
+    }
+
+    #[test]
+    fn test_cc_version_suffix_short_text_uses_zero_padding() {
+        // Indices 7 and 20 are out of range -> "0"; must not panic.
+        let s = claude_code_cc_version_suffix("abcd");
+        assert_eq!(s.len(), 3);
+        assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

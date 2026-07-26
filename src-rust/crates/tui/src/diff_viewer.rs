@@ -120,7 +120,7 @@ pub struct DiffViewerState {
     /// Rendered line cache: (file_index, terminal_width) → lines.
     render_cache: HashMap<(usize, u16), Vec<String>>,
     /// Whether the dialog is open.
-    pub open: bool,
+    pub visible: bool,
     /// Per-file collapsed state (indexed by file position in `files`).
     pub collapsed: Vec<bool>,
 }
@@ -135,7 +135,7 @@ impl DiffViewerState {
             diff_type: DiffType::GitDiff,
             detail_scroll: 0,
             render_cache: HashMap::new(),
-            open: false,
+            visible: false,
             collapsed: Vec::new(),
         }
     }
@@ -159,7 +159,7 @@ impl DiffViewerState {
     }
 
     pub fn close(&mut self) {
-        self.open = false;
+        self.visible = false;
     }
 
     pub fn select_prev(&mut self) {
@@ -221,7 +221,7 @@ impl DiffViewerState {
     fn open_for_type(&mut self, diff_type: DiffType, project_root: &std::path::Path) {
         self.diff_type = diff_type;
         self.reload_files(project_root);
-        self.open = true;
+        self.visible = true;
     }
 
     fn reload_files(&mut self, project_root: &std::path::Path) {
@@ -489,10 +489,10 @@ pub fn parse_unified_diff(text: &str) -> Vec<FileDiffStats> {
                 if let Some(f) = current_file.as_mut() {
                     f.removed += 1;
                 }
-            } else if raw_line.starts_with(' ') {
+            } else if let Some(rest) = raw_line.strip_prefix(' ') {
                 hunk.lines.push(DiffLine {
                     kind: DiffLineKind::Context,
-                    content: raw_line[1..].to_string(),
+                    content: rest.to_string(),
                     old_line_no: Some(old_line),
                     new_line_no: Some(new_line),
                 });
@@ -539,7 +539,7 @@ fn parse_hunk_header(line: &str) -> (u32, u32, u32, u32) {
 
 /// Render the diff dialog overlay.
 pub fn render_diff_dialog(state: &mut DiffViewerState, area: Rect, buf: &mut Buffer) {
-    if !state.open {
+    if !state.visible {
         return;
     }
 
@@ -772,11 +772,9 @@ fn render_diff_detail(state: &DiffViewerState, area: Rect, buf: &mut Buffer) {
         let thumb_size = ((bar_h * bar_h) / total_lines).max(1).min(bar_h);
         // Thumb position
         let scroll_range = total_lines.saturating_sub(bar_h);
-        let thumb_top = if scroll_range > 0 {
-            (scroll * (bar_h.saturating_sub(thumb_size))) / scroll_range
-        } else {
-            0
-        };
+        let thumb_top = (scroll * (bar_h.saturating_sub(thumb_size)))
+            .checked_div(scroll_range)
+            .unwrap_or(0);
 
         for row in 0..bar_h {
             let y = inner.y + row as u16;
@@ -784,7 +782,7 @@ fn render_diff_detail(state: &DiffViewerState, area: Rect, buf: &mut Buffer) {
                 '\u{25b2}'  // ▲
             } else if row == bar_h - 1 {
                 '\u{25bc}'  // ▼
-            } else if row >= thumb_top + 1 && row < thumb_top + thumb_size + 1 {
+            } else if row > thumb_top && row < thumb_top + thumb_size + 1 {
                 '\u{2588}'  // █ (thumb)
             } else {
                 '\u{2502}'  // │ (track)
@@ -1293,7 +1291,7 @@ mod tests {
         use ratatui::Terminal;
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         let mut state = DiffViewerState::new();
-        state.open = true;
+        state.visible = true;
         state.files = vec![make_file("src/lib.rs", 5, 2, false)];
         state.collapsed = vec![true]; // collapsed
         terminal.draw(|frame| {

@@ -16,6 +16,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const CLAUDE_ORANGE: Color = Color::Rgb(233, 30, 99);
 const PROMPT_POINTER: &str = "\u{276f}";
@@ -779,7 +780,7 @@ fn vim_normal(
 }
 
 fn vim_g(
-    text: &mut String,
+    text: &mut str,
     cursor: &mut usize,
     key: &str,
     pending: &mut VimPendingState,
@@ -890,7 +891,7 @@ fn vim_operator(
     if key == "g" { *pending = VimPendingState::OperatorG { op, count }; return false; }
     // Simple motions
     let target = match key {
-        "h" => { let mut p = *cursor; for _ in 0..count.max(1) { if p > 0 { p -= 1; } } p }
+        "h" => { let mut p = *cursor; for _ in 0..count.max(1) { p = p.saturating_sub(1); } p }
         "l" => { let mut p = *cursor; for _ in 0..count.max(1) { if p < text.len() { p = text[p..].char_indices().nth(1).map(|(b,_)| p+b).unwrap_or(text.len()); } } p }
         "w" => { let mut p = *cursor; for _ in 0..count.max(1) { p = motion_w(text, p); } p }
         "b" => { let mut p = *cursor; for _ in 0..count.max(1) { p = motion_b(text, p); } p }
@@ -1119,7 +1120,7 @@ pub(crate) fn compute_file_suggestions(
 
         if at_word_boundary {
             let file_prefix = &input[at_idx + 1..];
-            suggestions = suggest_files(file_prefix, 0, file_autocomplete_limit, file_autocomplete_show_hidden);
+            suggestions = suggest_files(file_prefix, file_autocomplete_limit, file_autocomplete_show_hidden);
         }
     }
 
@@ -1135,12 +1136,10 @@ pub(crate) fn compute_file_suggestions(
 /// - `"/"` → files in root with full paths (e.g., ["/Users", "/Applications"])
 /// - `"~"` → suggest "~/" if it exists
 /// - `"~/"` → files in home with names only
-fn suggest_files(prefix: &str, depth: usize, max_suggestions: usize, show_hidden: bool) -> Vec<TypeaheadSuggestion> {
-    const MAX_DEPTH: usize = 3;
-
-    if depth > MAX_DEPTH {
-        return Vec::new();
-    }
+///
+/// Note: calls `fs::read_dir` synchronously on every invocation; may stall on slow/network
+/// filesystems. Consider debouncing at the call site if this becomes a problem.
+fn suggest_files(prefix: &str, max_suggestions: usize, show_hidden: bool) -> Vec<TypeaheadSuggestion> {
     use std::path::PathBuf;
     use std::fs;
 
@@ -1163,11 +1162,11 @@ fn suggest_files(prefix: &str, depth: usize, max_suggestions: usize, show_hidden
         };
 
         let path = PathBuf::from(&expanded);
-        if path.is_dir() {
-            // User typed a complete directory: list its contents
+        if path.is_dir() && prefix.ends_with('/') {
+            // User typed a complete directory with trailing slash: list its contents
             (path, true, String::new())
         } else if let Some(parent) = path.parent() {
-            // User typed a partial path: list parent's contents and filter
+            // User typed a partial path or directory without slash: list parent's contents and filter
             let partial = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -1181,11 +1180,11 @@ fn suggest_files(prefix: &str, depth: usize, max_suggestions: usize, show_hidden
         // Relative path in cwd
         if let Ok(cwd) = std::env::current_dir() {
             let path = cwd.join(prefix);
-            if path.is_dir() {
-                // Complete directory: list its contents
+            if path.is_dir() && prefix.ends_with('/') {
+                // Complete directory with trailing slash: list its contents
                 (path, false, String::new())
             } else if let Some(parent) = path.parent() {
-                // Partial path: list parent and filter
+                // Partial path or directory without slash: list parent and filter
                 let partial = path
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -1211,13 +1210,13 @@ fn suggest_files(prefix: &str, depth: usize, max_suggestions: usize, show_hidden
                         .and_then(|n| n.to_str())
                         .map(|s| s.to_string())?;
 
-                    // Filter by partial name
-                    if !partial_name.is_empty() && !name.starts_with(&partial_name) {
+                    // Filter by partial name (case-insensitive)
+                    if !partial_name.is_empty() && !name.to_lowercase().starts_with(&partial_name.to_lowercase()) {
                         return None;
                     }
 
                     // Filter hidden files unless user explicitly types a dot or show_hidden_files is enabled
-                    if !show_hidden && name.starts_with('.') && !partial_name.starts_with('.') {
+                    if !show_hidden && name.starts_with('.') && !partial_name.to_lowercase().starts_with('.') {
                         return None;
                     }
 
@@ -1225,7 +1224,7 @@ fn suggest_files(prefix: &str, depth: usize, max_suggestions: usize, show_hidden
                     let is_symlink = entry.file_type().ok().map(|ft| ft.is_symlink()).unwrap_or(false);
                     let is_dir = path.is_dir();
 
-                    Some((name, is_dir, is_symlink))
+                    Some((name, is_dir, is_symlink, path))
                 })
             })
             .collect();
@@ -1239,16 +1238,29 @@ fn suggest_files(prefix: &str, depth: usize, max_suggestions: usize, show_hidden
             }
         });
 
-        for (name, is_dir, is_symlink) in files {
+        for (name, is_dir, is_symlink, full_path) in files {
             if suggestions.len() >= max_suggestions {
                 break;
             }
 
+            if is_dir && !dir_has_visible_contents(&full_path, show_hidden) {
+                continue;
+            }
+
+            let is_listing_mode = prefix.ends_with('/');
             let suggestion_text = if show_full_paths {
                 let full = search_dir.join(&name);
                 full.to_string_lossy().to_string()
                     + if is_dir { "/" } else { "" }
+            } else if is_listing_mode {
+                // When listing a directory's contents, prepend the full prefix path
+                format!("{}{}{}", prefix, name, if is_dir { "/" } else { "" })
+            } else if !partial_name.is_empty() && prefix.ends_with(&partial_name) {
+                // When filtering in a subdirectory, prepend the parent path
+                let parent_path = &prefix[..prefix.len() - partial_name.len()];
+                format!("{}{}{}", parent_path, name, if is_dir { "/" } else { "" })
             } else {
+                // Fallback: just use the matched filename
                 name.clone() + if is_dir { "/" } else { "" }
             };
 
@@ -1275,6 +1287,19 @@ fn suggest_files(prefix: &str, depth: usize, max_suggestions: usize, show_hidden
     suggestions
 }
 
+/// Returns true if `dir` contains at least one visible entry.
+/// When `show_hidden` is false, dotfiles are not counted as visible.
+fn dir_has_visible_contents(dir: &std::path::Path, show_hidden: bool) -> bool {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => entries.filter_map(|e| e.ok()).any(|entry| {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            show_hidden || !name_str.starts_with('.')
+        }),
+        Err(_) => false,
+    }
+}
+
 /// Get the home directory path.
 fn home_dir() -> Option<String> {
     std::env::var("HOME")
@@ -1289,10 +1314,25 @@ fn home_dir() -> Option<String> {
 /// Handle a paste event.
 ///
 /// Large pastes (≥3 lines or >150 chars) are replaced with a compact
-/// placeholder like `[Pasted ~12 lines #3]` while the real content is stored
-/// in `paste_contents` for retrieval at submit time.  This mirrors opencode's
-/// behaviour and prevents the input box from flooding with multi-hundred-line
-/// pastes.  Single-line short strings are inserted verbatim.
+/// placeholder like `[Pasted text #3 +12 lines]` (the shared claurst-core
+/// reference format) while the real content is stored in `paste_contents`.
+/// The placeholder is expanded back into the full content at submit time
+/// (`take()`), by clicking it, or via the `expandPaste` keybinding.
+/// Single-line short strings are inserted verbatim.
+/// Normalize `\r\n` and lone `\r` into `\n`.
+///
+/// The prompt buffer must never contain a bare carriage return: the renderer
+/// splits logical lines on `\n` and advances the cursor's byte offset assuming
+/// a single-byte separator, so a `\r` (or CRLF pair) desyncs that accounting
+/// and can slice mid-codepoint (#221).
+fn normalize_newlines(s: &str) -> String {
+    if s.contains('\r') {
+        s.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        s.to_string()
+    }
+}
+
 pub fn handle_paste(
     content: &str,
     paste_counter: &mut u32,
@@ -1303,7 +1343,9 @@ pub fn handle_paste(
         return (content.to_string(), None);
     }
     *paste_counter += 1;
-    let placeholder = format!("[Pasted ~{} lines #{}]", line_count, paste_counter);
+    let num_lines = claurst_core::prompt_history::get_pasted_text_ref_num_lines(content);
+    let placeholder =
+        claurst_core::prompt_history::format_pasted_text_ref(*paste_counter, num_lines);
     (placeholder, Some(content.to_string()))
 }
 
@@ -1665,7 +1707,13 @@ impl PromptInputState {
 
     /// Handle a paste event.
     pub fn paste(&mut self, content: &str) {
-        let (text, stored) = handle_paste(content, &mut self.paste_counter);
+        // Normalize CRLF / lone CR into LF before storing or inserting. A stray
+        // '\r' in the buffer desyncs the render cursor's byte accounting (which
+        // assumes a 1-byte '\n' separator) and can slice mid-codepoint (#221).
+        // Stored paste bodies are normalized too, because expanding a
+        // placeholder splices the body back into the buffer.
+        let content = normalize_newlines(content);
+        let (text, stored) = handle_paste(&content, &mut self.paste_counter);
         if let Some(stored_content) = stored {
             self.paste_contents.insert(self.paste_counter, stored_content);
         }
@@ -1858,7 +1906,7 @@ impl PromptInputState {
         while idx < chars.len() && chars[idx].is_whitespace() {
             idx += 1;
         }
-        self.cursor = self.cursor + char_idx_to_byte(rest, idx);
+        self.cursor += char_idx_to_byte(rest, idx);
     }
 
     /// Alt+D: Delete word after cursor.
@@ -2545,18 +2593,142 @@ impl PromptInputState {
         self.visual_anchor = None;
         self.vim_command_buf.clear();
         self.vim_search_buf.clear();
+        // #223: emptying the buffer removes every `[Pasted text #N ...]`
+        // placeholder along with it, so the paste bodies stored in
+        // `paste_contents` are now unreachable. Drop them to bound memory —
+        // otherwise every large block ever pasted is retained for the App's
+        // lifetime. `clear()` is the funnel for submit (`take()`), cancel, and
+        // reset, so eviction only ever fires once a placeholder has left the
+        // buffer, never while one is still live (so expansion is never broken).
+        self.paste_contents.clear();
     }
 
-    /// Take the current text, clearing the input.
+    /// Take the current text, clearing the input. Paste placeholders are
+    /// expanded back into their stored bodies so the submitted message carries
+    /// the real pasted content, not the `[Pasted text #N ...]` stand-in.
     pub fn take(&mut self) -> String {
-        let text = self.text.clone();
+        let text = self.expanded_text();
         self.clear();
         text
     }
 
-    /// Update typeahead suggestions for slash commands in the current text.
-    pub fn update_suggestions(&mut self, slash_commands: &[(&str, &str)]) {
-        self.suggestions = compute_slash_suggestions(&self.text, slash_commands);
+    /// The submit-ready text: every `[Pasted text #N]` / `[Pasted text #N +X
+    /// lines]` placeholder replaced with its stored body. Placeholders whose
+    /// body is no longer stored (e.g. hand-typed or edited references) are
+    /// left as-is. Replacements run in reverse order so earlier byte offsets
+    /// stay valid.
+    pub fn expanded_text(&self) -> String {
+        let mut out = self.text.clone();
+        if self.paste_contents.is_empty() {
+            return out;
+        }
+        let refs = claurst_core::prompt_history::parse_references_with_positions(&self.text);
+        for (id, matched, start) in refs.into_iter().rev() {
+            if !matched.starts_with("[Pasted text #") {
+                continue;
+            }
+            if let Some(body) = self.paste_contents.get(&id) {
+                out.replace_range(start..start + matched.len(), body);
+            }
+        }
+        out
+    }
+
+    /// True when the buffer contains at least one paste placeholder that can
+    /// still be expanded (its body is stored). Drives the footer hint.
+    pub fn has_expandable_paste_ref(&self) -> bool {
+        if self.paste_contents.is_empty() {
+            return false;
+        }
+        claurst_core::prompt_history::parse_references_with_positions(&self.text)
+            .iter()
+            .any(|(id, matched, _)| {
+                matched.starts_with("[Pasted text #") && self.paste_contents.contains_key(id)
+            })
+    }
+
+    /// Expand the paste placeholder covering byte offset `offset` (start
+    /// inclusive, end inclusive so the cursor sitting just past the `]` still
+    /// counts) back into its stored body, in place. The cursor lands at the
+    /// end of the inserted body. Returns `true` if a placeholder was expanded.
+    pub fn expand_paste_ref_at(&mut self, offset: usize) -> bool {
+        if self.mode == InputMode::Readonly {
+            return false;
+        }
+        let refs = claurst_core::prompt_history::parse_references_with_positions(&self.text);
+        for (id, matched, start) in refs {
+            if !matched.starts_with("[Pasted text #") {
+                continue;
+            }
+            let end = start + matched.len();
+            if offset < start || offset > end {
+                continue;
+            }
+            let Some(body) = self.paste_contents.remove(&id) else {
+                continue;
+            };
+            self.push_undo();
+            self.text.replace_range(start..end, &body);
+            self.cursor = start + body.len();
+            self.update_token_estimate();
+            return true;
+        }
+        false
+    }
+
+    /// The paste placeholder covering byte offset `offset` (same hit rules as
+    /// `expand_paste_ref_at`) together with its stored body, without mutating
+    /// the buffer — used by the read-only paste viewer.
+    pub fn paste_ref_at(&self, offset: usize) -> Option<(u32, String)> {
+        let refs = claurst_core::prompt_history::parse_references_with_positions(&self.text);
+        for (id, matched, start) in refs {
+            if !matched.starts_with("[Pasted text #") {
+                continue;
+            }
+            let end = start + matched.len();
+            if offset < start || offset > end {
+                continue;
+            }
+            if let Some(body) = self.paste_contents.get(&id) {
+                return Some((id, body.clone()));
+            }
+        }
+        None
+    }
+
+    /// Expand the paste placeholder at the cursor; falls back to the first
+    /// expandable placeholder in the buffer so the keybinding works without
+    /// first navigating onto the reference.
+    pub fn expand_paste_ref_at_cursor(&mut self) -> bool {
+        if self.expand_paste_ref_at(self.cursor) {
+            return true;
+        }
+        let first = claurst_core::prompt_history::parse_references_with_positions(&self.text)
+            .into_iter()
+            .find(|(id, matched, _)| {
+                matched.starts_with("[Pasted text #") && self.paste_contents.contains_key(id)
+            });
+        match first {
+            Some((_, _, start)) => self.expand_paste_ref_at(start),
+            None => false,
+        }
+    }
+
+    /// Returns true if the text (up to cursor) contains a word-boundary `@` token,
+    /// meaning an `@file` reference is actively being typed.
+    pub fn has_active_file_ref(&self) -> bool {
+        let text = &self.text[..self.cursor];
+        text.rfind('@').is_some_and(|at_idx| {
+            at_idx == 0 || text[..at_idx].chars().last().is_some_and(|c| c.is_whitespace())
+        })
+    }
+
+    /// Update typeahead suggestions for slash commands and file references in the current text.
+    pub fn update_suggestions(&mut self, slash_commands: &[(&str, &str)], file_autocomplete_limit: usize, file_autocomplete_show_hidden: bool) {
+        // Only look at text up to the cursor — text after the cursor belongs to a
+        // different editing position and would confuse rfind('@') / rfind('/').
+        let text_before_cursor = &self.text[..self.cursor];
+        self.suggestions = compute_typeahead(text_before_cursor, slash_commands, file_autocomplete_limit, file_autocomplete_show_hidden);
 
         if self.suggestions.is_empty() {
             self.suggestion_index = None;
@@ -2587,8 +2759,47 @@ impl PromptInputState {
     pub fn accept_suggestion(&mut self) {
         if let Some(idx) = self.suggestion_index {
             if let Some(s) = self.suggestions.get(idx) {
-                self.text = s.text.clone();
-                self.cursor = self.text.len();
+                let new_cursor = match s.source {
+                    TypeaheadSource::SlashCommand | TypeaheadSource::History => {
+                        // Replace entire text; discard anything after cursor too.
+                        self.text = s.text.clone();
+                        self.text.len()
+                    }
+                    TypeaheadSource::FileRef => {
+                        // Replace from the last word-boundary @ up to the cursor.
+                        // Preserve any text that was already after the cursor.
+                        let tail = self.text[self.cursor..].to_string();
+                        if let Some(at_idx) = self.text[..self.cursor].rfind('@') {
+                            let at_word_boundary = at_idx == 0
+                                || self.text[..at_idx]
+                                    .chars()
+                                    .last()
+                                    .map(|c| c.is_whitespace())
+                                    .unwrap_or(false);
+                            if at_word_boundary {
+                                let mut new_text = self.text[..at_idx].to_string();
+                                new_text.push_str(&s.text);
+                                let cursor = new_text.len();
+                                new_text.push_str(&tail);
+                                self.text = new_text;
+                                cursor
+                            } else {
+                                let mut new_text = s.text.clone();
+                                let cursor = new_text.len();
+                                new_text.push_str(&tail);
+                                self.text = new_text;
+                                cursor
+                            }
+                        } else {
+                            let mut new_text = s.text.clone();
+                            let cursor = new_text.len();
+                            new_text.push_str(&tail);
+                            self.text = new_text;
+                            cursor
+                        }
+                    }
+                };
+                self.cursor = new_cursor;
                 self.suggestions.clear();
                 self.suggestion_index = None;
                 self.update_token_estimate();
@@ -2623,9 +2834,9 @@ impl PromptInputState {
                 while b > 0 && !line.is_char_boundary(b) {
                     b -= 1;
                 }
-                let intra_chars = line[..b].chars().count();
-                let chunk_idx = if intra_chars == 0 { 0 } else { intra_chars / width };
-                let chunk_col = intra_chars % width;
+                let display_col = UnicodeWidthStr::width(&line[..b]);
+                let chunk_idx = if display_col == 0 { 0 } else { display_col / width };
+                let chunk_col = display_col % width;
                 return (row + chunk_idx, chunk_col);
             }
             let chunks = wrap_line(line, width).len().max(1);
@@ -2664,7 +2875,7 @@ impl PromptInputState {
         true
     }
 
-    fn visual_row_count(&self, width: usize) -> usize {
+    pub(crate) fn visual_row_count(&self, width: usize) -> usize {
         if self.text.is_empty() || width == 0 {
             return 1;
         }
@@ -2675,7 +2886,7 @@ impl PromptInputState {
         total.max(1)
     }
 
-    fn set_cursor_at_visual(&mut self, target_row: usize, target_col: usize, width: usize) {
+    pub(crate) fn set_cursor_at_visual(&mut self, target_row: usize, target_col: usize, width: usize) {
         if width == 0 {
             return;
         }
@@ -2719,7 +2930,7 @@ impl PromptInputState {
 
     /// Rough token estimate: ~4 chars per token.
     fn update_token_estimate(&mut self) {
-        self.token_estimate = (self.text.len() + 3) / 4;
+        self.token_estimate = self.text.len().div_ceil(4);
     }
 
     pub fn is_empty(&self) -> bool { self.text.trim().is_empty() }
@@ -2765,25 +2976,175 @@ pub fn input_height(state: &PromptInputState, text_width: u16) -> u16 {
     base + if state.pending_images.is_empty() { 0 } else { 1 }
 }
 
-/// Wrap a logical line into visual chunks of `width` chars (char-based, not
-/// byte-based, to preserve UTF-8 characters). Empty input yields a single
-/// empty chunk so the caller can still place a cursor.
+/// Wrap a logical line into visual chunks of `width` terminal cells. Empty
+/// input yields a single empty chunk so the caller can still place a cursor.
 pub fn wrap_line(line: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![line.to_string()];
     }
-    let chars: Vec<char> = line.chars().collect();
-    if chars.is_empty() {
+    if line.is_empty() {
         return vec![String::new()];
     }
-    let mut out = Vec::with_capacity(chars.len() / width + 1);
-    let mut i = 0;
-    while i < chars.len() {
-        let end = (i + width).min(chars.len());
-        out.push(chars[i..end].iter().collect());
-        i = end;
+
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+
+    for ch in line.chars() {
+        let ch_width = ch.width().unwrap_or(0);
+        if current_width > 0 && current_width + ch_width > width {
+            out.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width += ch_width;
     }
+    if !current.is_empty() {
+        out.push(current);
+    }
+
     out
+}
+
+/// Themed per-character gradient for an inline keyword's prompt-box highlight.
+///
+/// Each keyword gets its own two-color fade painted one span per character
+/// (bold), matching the quality of the original ultracode highlight.
+#[derive(Clone, Copy)]
+struct KeywordGradient {
+    start: (u8, u8, u8),
+    end: (u8, u8, u8),
+    /// When true, apply a small deterministic per-character offset so the run
+    /// looks textured/dithered (stony) rather than a smooth fade — used by
+    /// `rocky` for a granite look.
+    dither: bool,
+}
+
+/// Claurst-red gradient for `ultracode` (matches the `/effort` selector's red
+/// theme): the signature red fading into a deeper red. Unchanged.
+const ULTRACODE_GRADIENT: KeywordGradient = KeywordGradient {
+    start: (233, 30, 99),
+    end: (140, 20, 45),
+    dither: false,
+};
+
+/// Stony grey gradient for the `rocky` persona — light granite fading to dark
+/// stone, dithered per character for a textured rock face.
+const ROCKY_GRADIENT: KeywordGradient = KeywordGradient {
+    start: (176, 176, 182),
+    end: (92, 92, 100),
+    dither: true,
+};
+
+/// Earthy gradient for the `caveman` persona — tree-root brown fading to leaf
+/// green.
+const CAVEMAN_GRADIENT: KeywordGradient = KeywordGradient {
+    start: (120, 78, 42),
+    end: (74, 150, 58),
+    dither: false,
+};
+
+/// The themed gradient for a keyword, or `None` if it should not be painted
+/// (e.g. `normal`, which is a reset and gets the default no-gradient look).
+fn keyword_gradient_for(keyword: &str) -> Option<KeywordGradient> {
+    match keyword.to_ascii_lowercase().as_str() {
+        "ultracode" => Some(ULTRACODE_GRADIENT),
+        "rocky" => Some(ROCKY_GRADIENT),
+        "caveman" => Some(CAVEMAN_GRADIENT),
+        _ => None,
+    }
+}
+
+/// Linearly interpolate between two RGB colors at `t` in `[0, 1]`, returning the
+/// raw channels so callers can post-process (e.g. dither) before wrapping in a
+/// `Color`.
+fn keyword_lerp_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    (mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2))
+}
+
+/// The color for character index `i` of a keyword run at gradient position `t`.
+fn keyword_gradient_color(grad: &KeywordGradient, t: f32, i: usize) -> Color {
+    let (mut r, mut g, mut b) = keyword_lerp_rgb(grad.start, grad.end, t);
+    if grad.dither {
+        // Deterministic per-character speckle so adjacent stone glyphs differ
+        // slightly, giving a dithered granite texture instead of a smooth fade.
+        let d: i16 = match i % 3 {
+            0 => 20,
+            1 => -16,
+            _ => 8,
+        };
+        let jitter = |c: u8| (c as i16 + d).clamp(0, 255) as u8;
+        r = jitter(r);
+        g = jitter(g);
+        b = jitter(b);
+    }
+    Color::Rgb(r, g, b)
+}
+
+/// Build the styled spans for a single display-line `text`, painting every
+/// inline keyword occurrence (`ultracode`, `rocky`, `caveman` — the single
+/// word, case-insensitive, whole-word) with its own themed per-character
+/// gradient, bold. `normal` is a reset and is intentionally not painted.
+///
+/// VISUAL ONLY: the returned spans concatenate back to exactly `text`, in order,
+/// with identical characters and widths -- only the *style* differs on keyword
+/// characters. Text outside any keyword is emitted as a single span carrying
+/// `base_style`, so cursor positioning, wrapping, and editing are unaffected.
+pub(crate) fn styled_spans_with_keyword_gradient(
+    text: &str,
+    base_style: Style,
+) -> Vec<Span<'static>> {
+    // Collect (start, end, gradient) for every gradient-bearing keyword.
+    let mut matches: Vec<(usize, usize, KeywordGradient)> = Vec::new();
+    for kw in claurst_core::keywords::INLINE_KEYWORDS {
+        if !kw.gradient {
+            continue;
+        }
+        let Some(grad) = keyword_gradient_for(kw.keyword) else {
+            continue;
+        };
+        for (start, end) in claurst_core::keywords::keyword_match_ranges(text, kw.keyword) {
+            matches.push((start, end, grad));
+        }
+    }
+    if matches.is_empty() {
+        return vec![Span::styled(text.to_string(), base_style)];
+    }
+    matches.sort_by_key(|(start, _, _)| *start);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut pos = 0usize;
+    for (start, end, grad) in matches {
+        // Defensive: keywords are mutually non-overlapping, but skip any stray
+        // overlap so spans always reassemble to exactly `text`.
+        if start < pos {
+            continue;
+        }
+        if start > pos {
+            spans.push(Span::styled(text[pos..start].to_string(), base_style));
+        }
+        let keyword = &text[start..end];
+        let char_count = keyword.chars().count().max(1);
+        for (i, ch) in keyword.chars().enumerate() {
+            let t = if char_count == 1 {
+                0.0
+            } else {
+                i as f32 / (char_count - 1) as f32
+            };
+            let color = keyword_gradient_color(&grad, t, i);
+            spans.push(Span::styled(
+                ch.to_string(),
+                base_style.fg(color).add_modifier(Modifier::BOLD),
+            ));
+        }
+        pos = end;
+    }
+    if pos < text.len() {
+        spans.push(Span::styled(text[pos..].to_string(), base_style));
+    }
+    spans
 }
 
 /// Render the prompt input widget in the same low-chrome style as Claurst:
@@ -2834,7 +3195,7 @@ pub fn render_prompt_input(
         _ => accent_override,                   // use mode-aware accent color
     };
     let prompt_prefix = format!("{PROMPT_POINTER} ");
-    let prefix_width = prompt_prefix.chars().count() as u16;
+    let prefix_width = UnicodeWidthStr::width(prompt_prefix.as_str()) as u16;
     // Reserve a 2-cell right margin so wrapped text doesn't kiss the right edge
     // of the box (issue #149: padding too tight).
     let right_pad: u16 = 2;
@@ -2847,7 +3208,7 @@ pub fn render_prompt_input(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        (ms / 530) % 2 == 0
+        (ms / 530).is_multiple_of(2)
     } else {
         true
     };
@@ -2880,17 +3241,12 @@ pub fn render_prompt_input(
     // Text rows start 1 row below the top separator.
     let text_start_y = area.y + 1;
 
-    // Split into logical lines; guarantee at least one.
-    let logical_lines: Vec<String> = {
-        let collected: Vec<String> = display_text.lines().map(|l| l.to_string()).collect();
-        if display_text.ends_with('\n') || collected.is_empty() {
-            let mut v = collected;
-            v.push(String::new());
-            v
-        } else {
-            collected
-        }
-    };
+    // Split into logical lines on '\n'. Using `split` (not `.lines()`, which
+    // strips '\r') keeps the byte accounting below in sync with the buffer:
+    // each logical line is separated by exactly one '\n' byte, and text ending
+    // in '\n' naturally yields a trailing empty line. `split` always yields at
+    // least one element, so there is always >= 1 logical line (#221).
+    let logical_lines: Vec<String> = display_text.split('\n').map(|l| l.to_string()).collect();
 
     let text_style = if state.text.is_empty() && !focused {
         Style::default().fg(Color::DarkGray)
@@ -2899,21 +3255,22 @@ pub fn render_prompt_input(
     };
 
     // Wrap each logical line into visual rows that fit `available_width`,
-    // and remember the (logical_idx, intra_line_char_offset) for each row
+    // and remember the (logical_idx, intra_line_display_col) for each row
     // so we can later compute where the cursor lives.
     let mut visual_rows: Vec<(usize, usize, String)> = Vec::new();
     for (li, line_text) in logical_lines.iter().enumerate() {
         let chunks = wrap_line(line_text, available_width.max(1));
         let mut col_offset = 0usize;
         for chunk in chunks {
-            let chunk_len = chunk.chars().count();
+            let chunk_len = UnicodeWidthStr::width(chunk.as_str());
             visual_rows.push((li, col_offset, chunk));
             col_offset += chunk_len;
         }
     }
 
     // Compute cursor's visual (row, col) within `visual_rows`.
-    // We map state.cursor (a byte offset into state.text) to (logical_line, char_offset).
+    // We map state.cursor (a byte offset into state.text) to
+    // (logical_line, display column).
     let cursor_pos: Option<(usize, usize)> = if focused && !state.text.is_empty() {
         let mut byte_idx = 0usize;
         let mut found: Option<(usize, usize)> = None;
@@ -2922,9 +3279,15 @@ pub fn render_prompt_input(
             // The +1 accounts for the '\n' between logical lines (last line has no trailing \n).
             let line_end_byte = byte_idx + line_bytes;
             if state.cursor <= line_end_byte {
-                let intra_byte = state.cursor - byte_idx;
-                let char_offset = line_text[..intra_byte.min(line_bytes)].chars().count();
-                found = Some((li, char_offset));
+                // Clamp the cursor into this line, then walk back to a char
+                // boundary so a multibyte codepoint straddling the cut never
+                // panics the slice (#221).
+                let mut intra_byte = (state.cursor - byte_idx).min(line_bytes);
+                while intra_byte > 0 && !line_text.is_char_boundary(intra_byte) {
+                    intra_byte -= 1;
+                }
+                let display_col = UnicodeWidthStr::width(&line_text[..intra_byte]);
+                found = Some((li, display_col));
                 break 'outer;
             }
             byte_idx = line_end_byte + 1; // newline
@@ -2932,7 +3295,10 @@ pub fn render_prompt_input(
         // Fallback: cursor at end of text.
         found.or_else(|| {
             let li = logical_lines.len().saturating_sub(1);
-            let col = logical_lines.get(li).map(|s| s.chars().count()).unwrap_or(0);
+            let col = logical_lines
+                .get(li)
+                .map(|s| UnicodeWidthStr::width(s.as_str()))
+                .unwrap_or(0);
             Some((li, col))
         })
     } else if focused && state.text.is_empty() {
@@ -2948,7 +3314,7 @@ pub fn render_prompt_input(
             if *row_li != li {
                 continue;
             }
-            let chunk_len = chunk.chars().count();
+            let chunk_len = UnicodeWidthStr::width(chunk.as_str());
             let row_col_end = row_col_start + chunk_len;
             if col >= *row_col_start && col <= row_col_end {
                 last_match = Some((vi, col - row_col_start));
@@ -2986,15 +3352,16 @@ pub fn render_prompt_input(
         let is_first_row_of_first_logical = display_idx == 0 && scroll_offset == 0;
 
         let spans: Vec<Span<'static>> = if is_first_row_of_first_logical {
-            vec![
-                Span::styled(prompt_prefix.clone(), Style::default().fg(accent).add_modifier(Modifier::BOLD)),
-                Span::styled(chunk.clone(), text_style),
-            ]
+            let mut v = vec![Span::styled(
+                prompt_prefix.clone(),
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            )];
+            v.extend(styled_spans_with_keyword_gradient(chunk, text_style));
+            v
         } else {
-            vec![
-                Span::raw(" ".repeat(prefix_width as usize)),
-                Span::styled(chunk.clone(), text_style),
-            ]
+            let mut v = vec![Span::raw(" ".repeat(prefix_width as usize))];
+            v.extend(styled_spans_with_keyword_gradient(chunk, text_style));
+            v
         };
 
         Paragraph::new(Line::from(spans)).render(
@@ -3107,6 +3474,10 @@ pub fn render_prompt_input(
 
 #[cfg(test)]
 mod tests {
+    // Several tests are named after the vim key they exercise (e.g. `W`, `G`,
+    // `N`); the uppercase letters are meaningful, matching the motion helpers
+    // above that already carry `#[allow(non_snake_case)]`.
+    #![allow(non_snake_case)]
     use super::*;
 
     // ---- VimMode --------------------------------------------------------
@@ -3295,6 +3666,36 @@ mod tests {
     }
 
     #[test]
+    fn cursor_visual_pos_counts_wide_characters() {
+        let mut s = PromptInputState::new();
+        s.text = "你a".to_string();
+        s.cursor = "你".len();
+
+        assert_eq!(s.cursor_visual_pos(10), (0, 2));
+    }
+
+    #[test]
+    fn render_cursor_after_wide_character() {
+        let mut s = PromptInputState::new();
+        s.text = "你a".to_string();
+        s.cursor = "你".len();
+
+        let area = Rect { x: 0, y: 0, width: 12, height: 4 };
+        let mut buf = Buffer::empty(area);
+        render_prompt_input(
+            &s,
+            area,
+            &mut buf,
+            true,
+            InputMode::Default,
+            Color::Blue,
+            false,
+        );
+
+        assert_eq!(buf[(4, 1)].symbol(), "\u{2588}");
+    }
+
+    #[test]
     fn readonly_blocks_insert() {
         let mut s = PromptInputState::new();
         s.mode = InputMode::Readonly;
@@ -3374,11 +3775,10 @@ mod tests {
     #[test]
     fn paste_large_content_placeholder() {
         let mut counter = 0u32;
-        // >150 chars → triggers placeholder
+        // >150 chars, single line → placeholder without a line count
         let big = "x".repeat(200);
         let (result, stored) = handle_paste(&big, &mut counter);
-        assert!(result.starts_with("[Pasted ~"), "expected placeholder, got: {result}");
-        assert!(result.contains("#1"), "expected counter in placeholder, got: {result}");
+        assert_eq!(result, "[Pasted text #1]");
         assert!(stored.is_some());
         assert_eq!(counter, 1);
     }
@@ -3389,8 +3789,7 @@ mod tests {
         // ≥3 lines → triggers placeholder regardless of length
         let big = "line\n".repeat(300);
         let (result, stored) = handle_paste(&big, &mut counter);
-        assert!(result.starts_with("[Pasted ~"), "expected placeholder, got: {result}");
-        assert!(result.contains("lines"), "expected line count in placeholder, got: {result}");
+        assert_eq!(result, "[Pasted text #1 +300 lines]");
         assert!(stored.is_some());
     }
 
@@ -3400,7 +3799,7 @@ mod tests {
         // Exactly 3 lines (the threshold) should use a placeholder.
         let three_lines = "a\nb\nc";
         let (result, stored) = handle_paste(three_lines, &mut counter);
-        assert!(result.starts_with("[Pasted ~"), "3-line paste should be placeholder, got: {result}");
+        assert_eq!(result, "[Pasted text #1 +2 lines]");
         assert!(stored.is_some());
     }
 
@@ -3421,6 +3820,139 @@ mod tests {
         handle_paste(&big, &mut counter);
         handle_paste(&big, &mut counter);
         assert_eq!(counter, 2);
+    }
+
+    #[test]
+    fn paste_contents_evicted_on_submit() {
+        // #223: every large paste stored its body in `paste_contents` but the
+        // map was never pruned, so it grew for the App's lifetime. Submitting
+        // (take → clear) must reclaim the stored bodies.
+        let mut s = PromptInputState::new();
+        let block_a = "alpha line\n".repeat(50);
+        let block_b = "beta line\n".repeat(60);
+        let block_c = "gamma line\n".repeat(70);
+
+        s.paste(&block_a);
+        s.paste(" and then "); // small — inlined, no counter bump, not stored
+        s.paste(&block_b);
+        s.paste(&block_c);
+
+        // Three large pastes were stored, keyed by the incrementing counter.
+        assert_eq!(s.paste_contents.len(), 3, "each large paste should be stored");
+
+        // Before eviction every placeholder in the buffer maps back to its
+        // original body.
+        assert!(s.text.contains("#1") && s.text.contains("#2") && s.text.contains("#3"));
+        assert_eq!(s.paste_contents.get(&1), Some(&block_a));
+        assert_eq!(s.paste_contents.get(&2), Some(&block_b));
+        assert_eq!(s.paste_contents.get(&3), Some(&block_c));
+
+        // Submit. The taken text carries the expanded bodies (the agent must
+        // receive the real content, not the placeholders) and the stored
+        // bodies are reclaimed.
+        let taken = s.take();
+        assert!(!taken.contains("[Pasted text #"), "placeholders must be expanded on take");
+        assert!(taken.contains(&block_a) && taken.contains(&block_b) && taken.contains(&block_c));
+        assert!(taken.contains(" and then "), "inline text between pastes survives");
+        assert!(s.paste_contents.is_empty(), "paste_contents must be emptied on submit (#223)");
+        assert!(s.text.is_empty());
+
+        // A fresh paste after submit starts clean and bounded.
+        s.paste(&block_a);
+        assert_eq!(s.paste_contents.len(), 1);
+    }
+
+    #[test]
+    fn paste_contents_evicted_on_cancel() {
+        // Discarding the buffer (Esc / clear) must also reclaim stored pastes.
+        let mut s = PromptInputState::new();
+        s.paste(&"discard me\n".repeat(40));
+        assert_eq!(s.paste_contents.len(), 1);
+        s.clear();
+        assert!(s.paste_contents.is_empty(), "clear() must reclaim stored pastes (#223)");
+    }
+
+    #[test]
+    fn take_expands_placeholder_with_surrounding_text() {
+        let mut s = PromptInputState::new();
+        for c in "explain this: ".chars() {
+            s.insert_char(c);
+        }
+        let body = "fn main() {\n    println!(\"hi\");\n}\n";
+        s.paste(body);
+        for c in " please".chars() {
+            s.insert_char(c);
+        }
+        assert!(s.text.contains("[Pasted text #1"));
+        let taken = s.take();
+        assert_eq!(taken, format!("explain this: {body} please"));
+    }
+
+    #[test]
+    fn take_leaves_unknown_refs_alone() {
+        // A hand-typed reference with no stored body must pass through
+        // untouched instead of vanishing or panicking.
+        let mut s = PromptInputState::new();
+        for c in "see [Pasted text #7] there".chars() {
+            s.insert_char(c);
+        }
+        assert_eq!(s.take(), "see [Pasted text #7] there");
+    }
+
+    #[test]
+    fn take_expands_crlf_paste_normalized() {
+        // CRLF pastes are normalized at store time, so the expanded submit
+        // text never re-introduces a bare '\r' (#221 invariant).
+        let mut s = PromptInputState::new();
+        s.paste("a\r\nb\r\nc\r\nd");
+        let taken = s.take();
+        assert_eq!(taken, "a\nb\nc\nd");
+    }
+
+    #[test]
+    fn expand_paste_ref_at_cursor_inline() {
+        let mut s = PromptInputState::new();
+        let body = "x\ny\nz";
+        s.paste(body);
+        // Cursor sits right after the placeholder post-paste (inclusive end).
+        assert!(s.expand_paste_ref_at_cursor());
+        assert_eq!(s.text, body);
+        assert_eq!(s.cursor, body.len());
+        assert!(s.paste_contents.is_empty(), "expanded body is dropped from the store");
+        // A second expand has nothing left to do.
+        assert!(!s.expand_paste_ref_at_cursor());
+    }
+
+    #[test]
+    fn expand_paste_ref_falls_back_to_first_ref() {
+        let mut s = PromptInputState::new();
+        s.paste("one\ntwo\nthree");
+        // Move the cursor away from the placeholder.
+        s.cursor = 0;
+        for c in "prefix ".chars() {
+            s.insert_char(c);
+        }
+        s.cursor = 0;
+        assert!(s.expand_paste_ref_at_cursor());
+        assert_eq!(s.text, "prefix one\ntwo\nthree");
+    }
+
+    #[test]
+    fn expand_paste_ref_ignores_image_refs() {
+        let mut s = PromptInputState::new();
+        s.paste("a\nb\nc"); // stored as text paste #1
+        s.cursor = 0;
+        for c in "[Image #1] ".chars() {
+            s.insert_char(c);
+        }
+        // Cursor inside the image ref: must not splice the text body there.
+        s.cursor = 3;
+        assert!(!s.expand_paste_ref_at(3));
+        assert!(s.text.starts_with("[Image #1] "));
+        // The text placeholder itself still expands.
+        assert!(s.has_expandable_paste_ref());
+        assert!(s.expand_paste_ref_at(s.text.len()));
+        assert_eq!(s.text, "[Image #1] a\nb\nc");
     }
 
     // ---- compute_typeahead ---------------------------------------------
@@ -3462,7 +3994,8 @@ mod tests {
         let mut s = PromptInputState::new();
         let cmds = [("help", "Help"), ("history", "History"), ("compact", "Compact")];
         s.text = "/h".to_string();
-        s.update_suggestions(&cmds);
+        s.cursor = s.text.len();
+        s.update_suggestions(&cmds, 15, false);
         assert_eq!(s.suggestions.len(), 2);
         assert_eq!(s.suggestion_index, Some(0));
         s.suggestion_next();
@@ -3476,7 +4009,8 @@ mod tests {
         let mut s = PromptInputState::new();
         let cmds = [("help", "Show help")];
         s.text = "/he".to_string();
-        s.update_suggestions(&cmds);
+        s.cursor = s.text.len();
+        s.update_suggestions(&cmds, 15, false);
         s.suggestion_next();
         s.accept_suggestion();
         assert_eq!(s.text, "/help");
@@ -4304,5 +4838,247 @@ mod tests {
                 suggestion.description
             );
         }
+    }
+
+    // ---- has_active_file_ref tests ----------------------------------------
+
+    #[test]
+    fn has_active_file_ref_at_start() {
+        let mut s = PromptInputState::new();
+        s.text = "@src/".to_string();
+        s.cursor = s.text.len();
+        assert!(s.has_active_file_ref());
+    }
+
+    #[test]
+    fn has_active_file_ref_after_space() {
+        let mut s = PromptInputState::new();
+        s.text = "hello @".to_string();
+        s.cursor = s.text.len();
+        assert!(s.has_active_file_ref());
+    }
+
+    #[test]
+    fn has_active_file_ref_email_not_boundary() {
+        let mut s = PromptInputState::new();
+        s.text = "email@host".to_string();
+        s.cursor = s.text.len();
+        assert!(!s.has_active_file_ref());
+    }
+
+    #[test]
+    fn has_active_file_ref_no_at() {
+        let mut s = PromptInputState::new();
+        s.text = "no at sign here".to_string();
+        s.cursor = s.text.len();
+        assert!(!s.has_active_file_ref());
+    }
+
+    // ---- accept_suggestion FileRef tests ------------------------------------
+
+    #[test]
+    fn accept_suggestion_file_ref_at_start() {
+        let mut s = PromptInputState::new();
+        s.text = "@src/ma".to_string();
+        s.cursor = s.text.len();
+        s.suggestions = vec![TypeaheadSuggestion {
+            text: "@src/main.rs".to_string(),
+            description: "file".to_string(),
+            source: TypeaheadSource::FileRef,
+        }];
+        s.suggestion_index = Some(0);
+        s.accept_suggestion();
+        assert_eq!(s.text, "@src/main.rs");
+        assert_eq!(s.cursor, "@src/main.rs".len());
+        assert!(s.suggestions.is_empty());
+    }
+
+    #[test]
+    fn accept_suggestion_file_ref_after_text_preserves_prefix() {
+        let mut s = PromptInputState::new();
+        s.text = "some text @src/ma".to_string();
+        s.cursor = s.text.len();
+        s.suggestions = vec![TypeaheadSuggestion {
+            text: "@src/main.rs".to_string(),
+            description: "file".to_string(),
+            source: TypeaheadSource::FileRef,
+        }];
+        s.suggestion_index = Some(0);
+        s.accept_suggestion();
+        assert_eq!(s.text, "some text @src/main.rs");
+        assert_eq!(s.cursor, "some text @src/main.rs".len());
+    }
+
+    #[test]
+    fn accept_suggestion_file_ref_preserves_tail() {
+        let mut s = PromptInputState::new();
+        // Cursor is mid-string; tail after cursor is preserved
+        let prefix = "@src/ma";
+        let tail = " more text";
+        s.text = format!("{}{}", prefix, tail);
+        s.cursor = prefix.len();
+        s.suggestions = vec![TypeaheadSuggestion {
+            text: "@src/main.rs".to_string(),
+            description: "file".to_string(),
+            source: TypeaheadSource::FileRef,
+        }];
+        s.suggestion_index = Some(0);
+        s.accept_suggestion();
+        assert_eq!(s.text, "@src/main.rs more text");
+        assert_eq!(s.cursor, "@src/main.rs".len());
+    }
+
+    // ---- #221: CRLF + multibyte paste/render safety --------------------
+
+    #[test]
+    fn paste_normalizes_crlf_and_lone_cr() {
+        // A stray '\r' must never enter the buffer: it desyncs the renderer's
+        // cursor byte accounting (which assumes a 1-byte separator) (#221).
+        let mut s = PromptInputState::new();
+        s.paste("x\r\né");
+        assert_eq!(s.text, "x\né");
+        assert!(!s.text.contains('\r'));
+        assert!(s.text.is_char_boundary(s.cursor));
+
+        let mut s2 = PromptInputState::new();
+        s2.paste("a\rb");
+        assert_eq!(s2.text, "a\nb");
+    }
+
+    #[test]
+    fn render_crlf_multibyte_cursor_midcodepoint_no_panic() {
+        // Seed a buffer with CRLF + a 2-byte char and place the cursor where the
+        // pre-fix accounting mapped mid-codepoint (`&"é"[..1]`) and panicked.
+        let mut s = PromptInputState::new();
+        s.text = "x\r\né".to_string();
+        s.cursor = 3; // byte offset of the start of 'é' (a valid boundary)
+
+        let area = Rect { x: 0, y: 0, width: 12, height: 4 };
+        let mut buf = Buffer::empty(area);
+        // Reaching the end of this call without panicking is the assertion.
+        render_prompt_input(&s, area, &mut buf, true, InputMode::Default, Color::Blue, false);
+    }
+
+    // ---- keyword gradient (ultracode + personas) -----------------------
+
+    /// Count of bold Rgb spans and the distinct colors seen in `spans`.
+    fn bold_rgb_stats(spans: &[Span<'static>]) -> (usize, std::collections::HashSet<(u8, u8, u8)>) {
+        let mut bold_rgb = 0usize;
+        let mut colors = std::collections::HashSet::new();
+        for s in spans {
+            if let Some(Color::Rgb(r, g, b)) = s.style.fg {
+                if s.style.add_modifier.contains(Modifier::BOLD) {
+                    bold_rgb += 1;
+                    colors.insert((r, g, b));
+                }
+            }
+        }
+        (bold_rgb, colors)
+    }
+
+    #[test]
+    fn ultracode_gradient_highlights_keyword_visual_only() {
+        let base = Style::default().fg(Color::White);
+        let text = "please ultracode this";
+        let spans = styled_spans_with_keyword_gradient(text, base);
+
+        // Visual only: reassembled text is byte-identical to the input.
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, text);
+        // Total display width is unchanged.
+        assert_eq!(
+            UnicodeWidthStr::width(joined.as_str()),
+            UnicodeWidthStr::width(text)
+        );
+
+        // Each keyword character gets its own bold Rgb span, and the per-char
+        // colors actually vary across the gradient.
+        let (bold_rgb, colors) = bold_rgb_stats(&spans);
+        assert_eq!(bold_rgb, "ultracode".len(), "one styled span per keyword char");
+        assert!(colors.len() > 1, "gradient should vary per character");
+    }
+
+    #[test]
+    fn ultracode_gradient_colors_are_unchanged() {
+        // Regression guard: the ultracode red gradient must be byte-identical to
+        // the original implementation (start #E91E63 → end #8C142D).
+        let base = Style::default();
+        let spans = styled_spans_with_keyword_gradient("ultracode", base);
+        let first = spans.first().unwrap().style.fg;
+        let last = spans.last().unwrap().style.fg;
+        assert_eq!(first, Some(Color::Rgb(233, 30, 99)));
+        assert_eq!(last, Some(Color::Rgb(140, 20, 45)));
+    }
+
+    #[test]
+    fn gradient_untouched_without_keyword() {
+        let base = Style::default().fg(Color::White);
+        let text = "just a plain prompt here";
+        let spans = styled_spans_with_keyword_gradient(text, base);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), text);
+        assert_eq!(spans[0].style.fg, Some(Color::White));
+        assert!(!spans[0].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn normal_keyword_gets_no_gradient() {
+        // `normal` is a reset; it functions as an inline keyword for the turn
+        // logic but must NOT be painted in the prompt box.
+        let base = Style::default().fg(Color::White);
+        let text = "back to normal now";
+        let spans = styled_spans_with_keyword_gradient(text, base);
+        assert_eq!(spans.len(), 1, "normal must not produce gradient spans");
+        assert!(!spans[0].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn rocky_and_caveman_get_their_own_gradients() {
+        let base = Style::default().fg(Color::White);
+
+        // Rocky: grey/stone, dithered — one bold span per char, colors vary.
+        let rocky = styled_spans_with_keyword_gradient("go rocky mode", base);
+        let (bold, colors) = bold_rgb_stats(&rocky);
+        assert_eq!(bold, "rocky".len());
+        assert!(colors.len() > 1, "rocky gradient should vary per character");
+        // Greyish: for at least one painted char, the channels are close together.
+        assert!(
+            colors.iter().any(|(r, g, b)| {
+                let max = *r.max(g).max(b) as i16;
+                let min = *r.min(g).min(b) as i16;
+                (max - min) < 40
+            }),
+            "rocky should look grey/stony"
+        );
+
+        // Caveman: brown → green.
+        let caveman = styled_spans_with_keyword_gradient("caveman please", base);
+        let (bold, colors) = bold_rgb_stats(&caveman);
+        assert_eq!(bold, "caveman".len());
+        assert!(colors.len() > 1, "caveman gradient should vary per character");
+        // First painted char leans brown (red channel dominant); the run ends
+        // leaning green (green channel dominant).
+        let first_painted = caveman
+            .iter()
+            .find_map(|s| match s.style.fg {
+                Some(Color::Rgb(r, g, b)) if s.style.add_modifier.contains(Modifier::BOLD) => {
+                    Some((r, g, b))
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(first_painted.0 > first_painted.1, "caveman starts brown");
+    }
+
+    #[test]
+    fn gradient_handles_multiple_keywords_and_preserves_text() {
+        let base = Style::default().fg(Color::White);
+        let text = "ultracode then rocky again";
+        let spans = styled_spans_with_keyword_gradient(text, base);
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, text, "text preserved across multiple matches");
+        let (bold, _) = bold_rgb_stats(&spans);
+        // "ultracode" (9) + "rocky" (5) painted chars.
+        assert_eq!(bold, "ultracode".len() + "rocky".len());
     }
 }

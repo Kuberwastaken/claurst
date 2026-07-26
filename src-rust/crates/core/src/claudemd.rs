@@ -227,15 +227,16 @@ fn load_scope_files(dir: &Path, scope: MemoryScope, files: &mut Vec<MemoryFileIn
 pub fn load_all_memory_files(project_root: &Path) -> Vec<MemoryFileInfo> {
     let mut files = Vec::new();
 
-    // 1. Managed: ~/.claurst/rules/*.md
-    if let Some(home) = dirs::home_dir() {
-        let rules_dir = home.join(".claurst/rules");
+    // 1. Managed: <claurst home>/rules/*.md
+    {
+        let claurst = crate::config::Settings::config_dir();
+        let rules_dir = claurst.join("rules");
         if let Ok(entries) = std::fs::read_dir(&rules_dir) {
             let mut paths: Vec<PathBuf> = entries
                 .flatten()
                 .filter_map(|e| {
                     let p = e.path();
-                    if p.extension().map_or(false, |x| x == "md") { Some(p) } else { None }
+                    if p.extension().is_some_and(|x| x == "md") { Some(p) } else { None }
                 })
                 .collect();
             paths.sort();
@@ -246,8 +247,8 @@ pub fn load_all_memory_files(project_root: &Path) -> Vec<MemoryFileInfo> {
             }
         }
 
-        // 2. User: ~/.claurst/AGENTS.md then ~/.claurst/CLAUDE.md
-        load_scope_files(&home.join(".claurst"), MemoryScope::User, &mut files);
+        // 2. User: <claurst home>/AGENTS.md then <claurst home>/CLAUDE.md
+        load_scope_files(&claurst, MemoryScope::User, &mut files);
     }
 
     // 3. Project: {project_root}/AGENTS.md then {project_root}/CLAUDE.md

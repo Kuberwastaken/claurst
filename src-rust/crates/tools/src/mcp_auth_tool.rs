@@ -24,6 +24,9 @@ struct McpAuthInput {
 
 #[async_trait]
 impl Tool for McpAuthTool {
+    // Gates itself: calls `ctx.check_permission` in `execute()` (#210).
+    fn self_gates(&self) -> bool { true }
+
     fn name(&self) -> &str {
         "mcp__auth"
     }

@@ -17,14 +17,14 @@ use std::pin::Pin;
 
 use async_stream::stream;
 use async_trait::async_trait;
-use claurst_core::provider_id::{ModelId, ProviderId};
+use claurst_core::provider_id::ProviderId;
 use claurst_core::types::{ContentBlock, MessageContent, Role, ToolResultContent, UsageInfo};
 use futures::Stream;
 use serde_json::{json, Value};
 use tracing::debug;
 
 use crate::error_handling::parse_error_response;
-use crate::provider::{LlmProvider, ModelInfo};
+use crate::provider::LlmProvider;
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
@@ -55,7 +55,7 @@ impl BedrockProvider {
             .unwrap_or_else(|_| "us-east-1".to_string());
 
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
+            .timeout(crate::request_timeout())
             .build()
             .expect("failed to build reqwest client");
 
@@ -226,13 +226,13 @@ impl BedrockProvider {
                 mac.update(service.as_bytes());
                 mac.finalize().into_bytes()
             };
-            let k_signing = {
+            
+            {
                 let mut mac = HmacSha256::new_from_slice(&k_service)
                     .expect("HMAC init failed");
                 mac.update(b"aws4_request");
                 mac.finalize().into_bytes()
-            };
-            k_signing
+            }
         };
 
         let signature = {
@@ -342,6 +342,10 @@ impl BedrockProvider {
         }
     }
 
+    // `role` is threaded through to the recursive calls for tool-result blocks
+    // to keep the Converse mapping symmetric; keep the parameter rather than
+    // dropping it and changing the recursion's shape.
+    #[allow(clippy::only_used_in_recursion)]
     fn content_block_to_converse(block: &ContentBlock, role: &Role) -> Option<Value> {
         match block {
             ContentBlock::Text { text } => Some(json!({ "text": text })),
@@ -369,7 +373,7 @@ impl BedrockProvider {
                     None
                 }
             }
-            ContentBlock::ToolUse { id, name, input } => Some(json!({
+            ContentBlock::ToolUse { id, name, input, .. } => Some(json!({
                 "toolUse": {
                     "toolUseId": id,
                     "name": name,
@@ -591,7 +595,12 @@ impl BedrockProvider {
                         .unwrap_or("")
                         .to_string();
                     let input = tu.get("input").cloned().unwrap_or(json!({}));
-                    return Some(ContentBlock::ToolUse { id, name, input });
+                    return Some(ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input,
+                        thought_signature: None,
+                    });
                 }
                 None
             })
@@ -658,19 +667,31 @@ impl LlmProvider for BedrockProvider {
         let resp = self.send_streaming(&request).await?;
         let provider_id = self.id.clone();
 
-        // Bedrock Converse streaming uses AWS EventStream binary framing.
-        // For simplicity we parse the JSON chunks that appear within the
-        // event payload bytes.  Each event is a binary-framed blob containing
-        // a JSON payload under the ":event-type" header.
+        // TODO(#228): this AWS event-stream framing + Converse event decode is the
+        // **BedrockConverse** wire protocol; it should move into a
+        // `protocol::bedrock_converse` decoder (its binary framing means it does
+        // not share the SSE byte-line decoder the other protocols use).
         //
-        // We fall back to text-based JSON parsing by scanning for JSON objects
-        // in the raw bytes, which works reliably for the common text delta events.
+        // Bedrock Converse streaming uses the AWS event-stream binary framing
+        // (`vnd.amazon.eventstream`). Each message on the wire is:
+        //
+        //   total_length(u32 BE) | headers_length(u32 BE) | prelude_crc(u32 BE)
+        //     | headers | payload | message_crc(u32 BE)
+        //
+        // The payload is the JSON body for the `:event-type` named in the
+        // headers (`messageStart`, `contentBlockDelta`, `messageStop`,
+        // `metadata`, ...). We parse the prelude to learn the exact frame
+        // length, extract the payload, advance the buffer by exactly
+        // `total_length` bytes, and hand a `{ <event-type>: <payload> }` object
+        // to parse_bedrock_event. Partial frames are kept in the buffer until a
+        // later chunk completes them. See `parse_event_stream_frame` below.
         let s = stream! {
             use futures::StreamExt;
 
             let mut byte_stream = resp.bytes_stream();
             let mut buf: Vec<u8> = Vec::new();
             let mut message_started = false;
+            let mut message_stopped = false;
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
@@ -687,106 +708,23 @@ impl LlmProvider for BedrockProvider {
 
                 buf.extend_from_slice(&chunk);
 
-                // Extract all complete JSON objects from the buffer.
-                // The AWS event-stream format prefixes each event with a
-                // 12-byte prelude (total-len + headers-len + crc32) followed
-                // by variable-length headers and then a JSON payload.  Rather
-                // than fully parsing the binary framing we scan for JSON
-                // object boundaries which is sufficient for the text events.
-                loop {
-                    // Find the first '{' in the buffer.
-                    let start = match buf.iter().position(|&b| b == b'{') {
-                        Some(p) => p,
-                        None => {
-                            buf.clear();
-                            break;
-                        }
-                    };
-
-                    // Drain everything before the opening brace.
-                    buf.drain(..start);
-
-                    // Try to parse a complete JSON object.
-                    match serde_json::from_slice::<Value>(&buf) {
-                        Ok(val) => {
-                            let consumed = serde_json::to_vec(&val)
-                                .map(|v| v.len())
-                                .unwrap_or(buf.len());
-                            buf.drain(..consumed);
-                            // Process the event.
-                            for ev in parse_bedrock_event(&val, &provider_id, &mut message_started) {
-                                yield ev;
-                            }
-                        }
-                        Err(e) if e.is_eof() => {
-                            // Incomplete — wait for more data.
-                            break;
-                        }
-                        Err(_) => {
-                            // Invalid JSON at this position — skip one byte and retry.
-                            if !buf.is_empty() {
-                                buf.drain(..1);
-                            } else {
-                                break;
-                            }
-                        }
+                // Pull every complete event-stream frame out of the buffer.
+                for ev in drain_event_stream_frames(&mut buf, &provider_id, &mut message_started) {
+                    if matches!(ev, Ok(StreamEvent::MessageStop)) {
+                        message_stopped = true;
                     }
+                    yield ev;
                 }
             }
 
-            // Drain any remaining complete JSON in the buffer.
-            loop {
-                let start = match buf.iter().position(|&b| b == b'{') {
-                    Some(p) => p,
-                    None => break,
-                };
-                buf.drain(..start);
-                match serde_json::from_slice::<Value>(&buf) {
-                    Ok(val) => {
-                        let consumed = serde_json::to_vec(&val)
-                            .map(|v| v.len())
-                            .unwrap_or(buf.len());
-                        buf.drain(..consumed);
-                        for ev in parse_bedrock_event(&val, &provider_id, &mut message_started) {
-                            yield ev;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            if message_started {
+            // Safety net: if the stream ended without an explicit `messageStop`
+            // event, close the message so downstream consumers still finalize.
+            if message_started && !message_stopped {
                 yield Ok(StreamEvent::MessageStop);
             }
         };
 
         Ok(Box::pin(s))
-    }
-
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
-        Ok(vec![
-            ModelInfo {
-                id: ModelId::new("anthropic.claude-opus-4-6"),
-                provider_id: self.id.clone(),
-                name: "Claude Opus 4.6 (Bedrock)".to_string(),
-                context_window: 200_000,
-                max_output_tokens: 32_000,
-            },
-            ModelInfo {
-                id: ModelId::new("anthropic.claude-sonnet-4-6"),
-                provider_id: self.id.clone(),
-                name: "Claude Sonnet 4.6 (Bedrock)".to_string(),
-                context_window: 200_000,
-                max_output_tokens: 16_000,
-            },
-            ModelInfo {
-                id: ModelId::new("anthropic.claude-haiku-4-5-20251001"),
-                provider_id: self.id.clone(),
-                name: "Claude Haiku 4.5 (Bedrock)".to_string(),
-                context_window: 200_000,
-                max_output_tokens: 8_192,
-            },
-        ])
     }
 
     async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
@@ -901,6 +839,7 @@ fn parse_bedrock_event(
                     id,
                     name,
                     input: json!({}),
+                    thought_signature: None,
                 },
             }));
         } else {
@@ -1028,4 +967,333 @@ fn parse_bedrock_event(
     }
 
     events
+}
+
+// ---------------------------------------------------------------------------
+// AWS event-stream (vnd.amazon.eventstream) framing parser
+// ---------------------------------------------------------------------------
+
+/// Parse a single AWS event-stream frame from the front of `buf`.
+///
+/// Wire layout of one message (all integers big-endian):
+///
+/// ```text
+///   total_length   : u32   whole frame, including this field and trailing CRC
+///   headers_length : u32
+///   prelude_crc    : u32   CRC32 of the first 8 bytes  (not validated here)
+///   headers        : headers_length bytes
+///   payload        : total_length - headers_length - 16 bytes
+///   message_crc    : u32   CRC32 of everything before it (not validated here)
+/// ```
+///
+/// Returns `Some((event_type, payload, frame_len))` once a whole frame is
+/// buffered, where `event_type` is the `:event-type` header value (falling back
+/// to `:exception-type` for error frames) and `frame_len == total_length`.
+/// Returns `None` when more bytes are required to complete the current frame.
+///
+/// We parse strictly by the length declared in the prelude — this is
+/// deterministic and keeps the buffer frame-aligned — and deliberately skip
+/// CRC32 validation. `crc32fast` is only present transitively in the workspace
+/// lockfile (not a direct dependency of this crate), and length-based framing is
+/// sufficient because the prelude gives the exact frame boundary.
+fn parse_event_stream_frame(buf: &[u8]) -> Option<(String, &[u8], usize)> {
+    // The 12-byte prelude must be present before we can learn the frame length.
+    if buf.len() < 12 {
+        return None;
+    }
+
+    let total_length = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let headers_length = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+
+    // A frame is at least prelude(12) + message_crc(4) = 16 bytes of fixed
+    // overhead, and the headers must fit between the prelude and the CRC. Bail
+    // on a structurally impossible prelude rather than slicing out of bounds.
+    if total_length < 16 || headers_length > total_length - 16 {
+        return None;
+    }
+
+    // Wait until the entire frame has arrived.
+    if buf.len() < total_length {
+        return None;
+    }
+
+    let headers = &buf[12..12 + headers_length];
+    let payload = &buf[12 + headers_length..total_length - 4];
+    let event_type = event_type_from_headers(headers).unwrap_or_default();
+
+    Some((event_type, payload, total_length))
+}
+
+/// Walk an AWS event-stream headers block and return the value of the
+/// `:event-type` header (or `:exception-type` for error frames).
+///
+/// Each header is `name_len(u8) | name | value_type(u8) | value`, where the
+/// value encoding depends on `value_type`. We only need the string headers but
+/// still skip the other value types by their fixed / length-prefixed sizes so
+/// the walk stays aligned across the whole block.
+fn event_type_from_headers(mut headers: &[u8]) -> Option<String> {
+    let mut event_type: Option<String> = None;
+    let mut exception_type: Option<String> = None;
+
+    while !headers.is_empty() {
+        let name_len = *headers.first()? as usize;
+        headers = headers.get(1..)?;
+        if headers.len() < name_len {
+            break;
+        }
+        let (name, rest) = headers.split_at(name_len);
+        headers = rest;
+
+        let value_type = *headers.first()?;
+        headers = headers.get(1..)?;
+
+        let value = match value_type {
+            // bool true / false: no value bytes.
+            0 | 1 => None,
+            // byte / short / int / long: fixed-width, skipped.
+            2 => {
+                headers = headers.get(1..)?;
+                None
+            }
+            3 => {
+                headers = headers.get(2..)?;
+                None
+            }
+            4 => {
+                headers = headers.get(4..)?;
+                None
+            }
+            5 => {
+                headers = headers.get(8..)?;
+                None
+            }
+            // byte-array (6) / string (7): u16 length prefix + that many bytes.
+            6 | 7 => {
+                if headers.len() < 2 {
+                    break;
+                }
+                let len = u16::from_be_bytes([headers[0], headers[1]]) as usize;
+                headers = headers.get(2..)?;
+                if headers.len() < len {
+                    break;
+                }
+                let (bytes, rest) = headers.split_at(len);
+                headers = rest;
+                if value_type == 7 {
+                    std::str::from_utf8(bytes).ok().map(str::to_string)
+                } else {
+                    None
+                }
+            }
+            // timestamp (8): i64, uuid (9): 16 bytes.
+            8 => {
+                headers = headers.get(8..)?;
+                None
+            }
+            9 => {
+                headers = headers.get(16..)?;
+                None
+            }
+            // Unknown value type — alignment can no longer be trusted.
+            _ => break,
+        };
+
+        match name {
+            b":event-type" => event_type = value,
+            b":exception-type" => exception_type = value,
+            _ => {}
+        }
+    }
+
+    event_type.or(exception_type)
+}
+
+/// Drain every complete event-stream frame currently buffered in `buf`, mapping
+/// each to zero or more [`StreamEvent`]s via [`parse_bedrock_event`]. Consumed
+/// frames are removed from `buf`; a trailing partial frame is left untouched for
+/// a later network chunk to complete.
+fn drain_event_stream_frames(
+    buf: &mut Vec<u8>,
+    provider_id: &ProviderId,
+    message_started: &mut bool,
+) -> Vec<Result<StreamEvent, ProviderError>> {
+    let mut out = Vec::new();
+
+    // Kept as an explicit `loop`: each frame's payload is parsed into an owned
+    // value inside the match arm to release the `buf` borrow before we drain the
+    // consumed frame below — a `while let` binding on `buf` would hold that
+    // borrow across the mutation and fail to compile.
+    #[allow(clippy::while_let_loop)]
+    loop {
+        // Parse the payload into an owned value inside the match arm so the
+        // borrow on `buf` is released before we drain the consumed frame below.
+        let (event_type, payload_val, frame_len) = match parse_event_stream_frame(buf) {
+            Some((event_type, payload, frame_len)) => (
+                event_type,
+                serde_json::from_slice::<Value>(payload).ok(),
+                frame_len,
+            ),
+            None => break,
+        };
+
+        // Skip control frames without an event type (e.g. an initial response)
+        // but still advance past them so the buffer stays frame-aligned.
+        if !event_type.is_empty() {
+            if let Some(payload_val) = payload_val {
+                // parse_bedrock_event expects the `{ <event-type>: <payload> }`
+                // shape, matching how events nest in the non-stream Converse
+                // response — so we re-wrap the payload under its event type.
+                let mut wrapped = serde_json::Map::new();
+                wrapped.insert(event_type, payload_val);
+                out.extend(parse_bedrock_event(
+                    &Value::Object(wrapped),
+                    provider_id,
+                    message_started,
+                ));
+            }
+        }
+
+        buf.drain(..frame_len);
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claurst_core::provider_id::ProviderId;
+    use serde_json::Value;
+
+    /// Build a valid AWS event-stream frame carrying a single `:event-type`
+    /// string header plus the given JSON payload (prelude + headers + payload +
+    /// trailing CRC). The CRC fields are zero-filled because the parser reads by
+    /// length and does not validate them.
+    fn build_event_stream_frame(event_type: &str, payload: &str) -> Vec<u8> {
+        // One header: `:event-type` as a string (value type 7).
+        let name = b":event-type";
+        let value = event_type.as_bytes();
+        let mut headers = Vec::new();
+        headers.push(name.len() as u8);
+        headers.extend_from_slice(name);
+        headers.push(7u8); // string value type
+        headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        headers.extend_from_slice(value);
+
+        let payload_bytes = payload.as_bytes();
+        let headers_len = headers.len();
+        let total_len = 12 + headers_len + payload_bytes.len() + 4;
+
+        let mut frame = Vec::with_capacity(total_len);
+        frame.extend_from_slice(&(total_len as u32).to_be_bytes());
+        frame.extend_from_slice(&(headers_len as u32).to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes()); // prelude CRC (unvalidated)
+        frame.extend_from_slice(&headers);
+        frame.extend_from_slice(payload_bytes);
+        frame.extend_from_slice(&0u32.to_be_bytes()); // message CRC (unvalidated)
+        frame
+    }
+
+    fn collect_text(events: &[Result<StreamEvent, ProviderError>]) -> String {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Ok(StreamEvent::TextDelta { text, .. }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parses_single_content_block_delta_frame() {
+        let frame = build_event_stream_frame(
+            "contentBlockDelta",
+            r#"{"contentBlockIndex":0,"delta":{"text":"Hello"}}"#,
+        );
+
+        // The framing parser reports the exact event type and frame length.
+        let (event_type, payload, frame_len) =
+            parse_event_stream_frame(&frame).expect("frame should be complete");
+        assert_eq!(event_type, "contentBlockDelta");
+        assert_eq!(frame_len, frame.len());
+        let payload_val: Value = serde_json::from_slice(payload).unwrap();
+        assert_eq!(payload_val["delta"]["text"], Value::from("Hello"));
+
+        // End-to-end: draining maps it to a TextDelta and consumes the frame.
+        let provider_id = ProviderId::new(ProviderId::AMAZON_BEDROCK);
+        let mut buf = frame.clone();
+        let mut started = false;
+        let events = drain_event_stream_frames(&mut buf, &provider_id, &mut started);
+        assert!(buf.is_empty(), "the frame should be fully consumed");
+        assert_eq!(collect_text(&events), "Hello");
+    }
+
+    #[test]
+    fn handles_frame_split_across_two_chunks() {
+        let frame = build_event_stream_frame(
+            "contentBlockDelta",
+            r#"{"contentBlockIndex":0,"delta":{"text":"world"}}"#,
+        );
+        let split = frame.len() / 2;
+
+        let provider_id = ProviderId::new(ProviderId::AMAZON_BEDROCK);
+        let mut buf: Vec<u8> = Vec::new();
+        let mut started = false;
+
+        // First chunk: an incomplete frame — nothing emitted, bytes retained.
+        buf.extend_from_slice(&frame[..split]);
+        assert!(
+            parse_event_stream_frame(&buf).is_none(),
+            "a partial frame must not parse"
+        );
+        let events = drain_event_stream_frames(&mut buf, &provider_id, &mut started);
+        assert!(events.is_empty());
+        assert_eq!(buf.len(), split, "the partial frame must be retained");
+
+        // Second chunk completes the frame.
+        buf.extend_from_slice(&frame[split..]);
+        let events = drain_event_stream_frames(&mut buf, &provider_id, &mut started);
+        assert!(buf.is_empty(), "the completed frame should be consumed");
+        assert_eq!(collect_text(&events), "world");
+    }
+
+    #[test]
+    fn consumes_multiple_frames_from_one_buffer() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&build_event_stream_frame(
+            "messageStart",
+            r#"{"role":"assistant"}"#,
+        ));
+        buf.extend_from_slice(&build_event_stream_frame(
+            "contentBlockDelta",
+            r#"{"contentBlockIndex":0,"delta":{"text":"hi"}}"#,
+        ));
+        buf.extend_from_slice(&build_event_stream_frame(
+            "messageStop",
+            r#"{"stopReason":"end_turn"}"#,
+        ));
+
+        let provider_id = ProviderId::new(ProviderId::AMAZON_BEDROCK);
+        let mut started = false;
+        let events = drain_event_stream_frames(&mut buf, &provider_id, &mut started);
+
+        assert!(buf.is_empty(), "all three frames should be consumed");
+        assert!(matches!(
+            events.first(),
+            Some(Ok(StreamEvent::MessageStart { .. }))
+        ));
+        assert_eq!(collect_text(&events), "hi");
+        // Exactly one MessageStop, from the explicit `messageStop` event.
+        let stops = events
+            .iter()
+            .filter(|e| matches!(e, Ok(StreamEvent::MessageStop)))
+            .count();
+        assert_eq!(stops, 1);
+    }
+
+    #[test]
+    fn reports_incomplete_when_prelude_missing() {
+        // Fewer than the 12 prelude bytes: cannot know the frame length yet.
+        assert!(parse_event_stream_frame(&[0, 0, 0]).is_none());
+    }
 }

@@ -14,106 +14,100 @@ use crate::overlays::{centered_rect, modal_search_line, CLAURST_PANEL_BG};
 // Effort level
 // ---------------------------------------------------------------------------
 
-/// Mirrors the TS `EffortLevel` enum and `effortLevelToSymbol()` helper.
+/// The effort level shown by the /model and /effort pickers.
 ///
-/// Effort controls the extended-thinking `budget_tokens` parameter sent to the
-/// API. Only models that support extended thinking honour this; for others it
-/// is silently ignored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EffortLevel {
-    Low,
-    Normal,
-    High,
-    Max,
-}
+/// This is a re-export of the single canonical [`claurst_core::effort::EffortLevel`]
+/// (`Low, Medium, High, XHigh, Max, Ultracode`). The former TUI-local enum's
+/// `Normal` variant is now [`EffortLevel::Medium`]; `symbol()`, `label()`,
+/// `next()`, and `prev()` all live on the core enum. Effort controls the
+/// extended-thinking budget / reasoning-effort sent to the API; only models that
+/// support reasoning honour it.
+pub use claurst_core::effort::EffortLevel;
 
-impl EffortLevel {
-    /// Unicode quarter-circle symbol used in the TS UI.
-    pub fn symbol(self) -> &'static str {
-        match self {
-            Self::Low    => "\u{25cb}", // ○  empty circle
-            Self::Normal => "\u{25d0}", // ◐  half
-            Self::High   => "\u{25d5}", // ◕  three-quarter
-            Self::Max    => "\u{25cf}", // ●  full
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Low    => "low",
-            Self::Normal => "normal",
-            Self::High   => "high",
-            Self::Max    => "max",
-        }
-    }
-
-    /// Returns the budget_tokens value to pass to the API, or `None` for the
-    /// default (no extended thinking).
-    pub fn budget_tokens(self) -> Option<u32> {
-        match self {
-            Self::Low    => Some(1_024),
-            Self::Normal => None,
-            Self::High   => Some(16_000),
-            Self::Max    => Some(32_000),
-        }
-    }
-
-    /// Cycle to next level; skips `Max` when the selected model does not
-    /// support it.
-    pub fn next(self, supports_max: bool) -> Self {
-        match self {
-            Self::Low    => Self::Normal,
-            Self::Normal => Self::High,
-            Self::High   => if supports_max { Self::Max } else { Self::Low },
-            Self::Max    => Self::Low,
-        }
-    }
-
-    /// Cycle to previous level.
-    pub fn prev(self, supports_max: bool) -> Self {
-        match self {
-            Self::Low    => if supports_max { Self::Max } else { Self::High },
-            Self::Normal => Self::Low,
-            Self::High   => Self::Normal,
-            Self::Max    => Self::High,
-        }
-    }
-}
-
-impl Default for EffortLevel {
-    fn default() -> Self { Self::Normal }
-}
 
 // ---------------------------------------------------------------------------
-// Model capability helpers
+// Model capability helpers — driven by the opencode variants() ladder
 // ---------------------------------------------------------------------------
+//
+// Both the /effort command and this /model picker now derive their effort
+// tiers from the single source of truth, `claurst_api::variant_ladder`
+// (a faithful port of opencode's `ProviderTransform.variants()`), instead of
+// the old name-string heuristics that disagreed between the two surfaces.
 
-/// Returns `true` for models that support extended thinking / effort levels.
+/// A process-wide bundled `ModelRegistry`, built once, used only to resolve the
+/// npm / release_date / reasoning fields that `variant_ladder` keys off.
+///
+/// The picker owns just a model id string (it does not carry the live registry
+/// the app holds), so the ladder is resolved against the compile-time bundled
+/// snapshot here. The `/effort` command path (`app.rs`) passes the *live*
+/// registry and is therefore exact; both funnel through the same port, so they
+/// agree tier-for-tier for every catalog model.
+fn picker_registry() -> &'static claurst_api::ModelRegistry {
+    static REG: std::sync::OnceLock<claurst_api::ModelRegistry> = std::sync::OnceLock::new();
+    REG.get_or_init(claurst_api::ModelRegistry::new)
+}
+
+/// The reasoning-effort ladder (ascending, no ultracode) a model exposes, per
+/// opencode's `variants()`. Empty for non-reasoning models.
+///
+/// The provider is inferred from the id: a `provider/model` prefix is trusted as
+/// the provider; a bare id is mapped to its canonical provider via the registry
+/// family heuristic. (Gateway upstream prefixes like `openai/…` are the one
+/// approximation — the picker's catalog providers use bare ids and resolve
+/// exactly.)
+fn picker_variant_ladder(id: &str) -> Vec<EffortLevel> {
+    let reg = picker_registry();
+    let provider = match id.split_once('/') {
+        Some((p, _)) => p.to_string(),
+        None => reg
+            .find_provider_for_model(id)
+            .map(|p| p.to_string())
+            .unwrap_or_default(),
+    };
+    claurst_api::variant_ladder(&provider, id, Some(reg))
+}
+
+/// Returns `true` when the model exposes more than one reasoning-effort tier —
+/// i.e. the picker's ←/→ selector has something to cycle through. A model with
+/// zero tiers (non-reasoning) or a single fixed tier (e.g. `gpt-5-pro` → only
+/// `high`) does not surface the selector.
 pub fn model_supports_effort(id: &str) -> bool {
-    id.starts_with("claude-3-7")
-        || id.starts_with("claude-opus-4")
-        || id.starts_with("claude-sonnet-4")
+    picker_variant_ladder(id).len() > 1
 }
 
-/// Returns `true` for models that support the maximum effort tier.
-pub fn model_supports_max_effort(id: &str) -> bool {
-    id.starts_with("claude-opus-4")
-}
-
-/// Returns a short description string based on the model family inferred from
-/// the model ID.  Used when converting API model entries to `ModelEntry`.
-pub fn model_family_description(id: &str) -> String {
-    let lower = id.to_lowercase();
-    if lower.contains("opus") {
-        "Most capable — best for complex reasoning and analysis".to_string()
-    } else if lower.contains("sonnet") {
-        "Balanced performance and speed — great for coding tasks".to_string()
-    } else if lower.contains("haiku") {
-        "Fast and efficient — ideal for quick completions".to_string()
-    } else {
-        "AI model".to_string()
+/// The index of the ladder rung nearest to `current`: the highest rung `<=`
+/// current, or the lowest rung when `current` sits below the whole ladder.
+/// `ladder` is assumed ascending (as `variant_ladder` returns it).
+fn nearest_ladder_index(ladder: &[EffortLevel], current: EffortLevel) -> usize {
+    let mut best = 0usize;
+    for (i, level) in ladder.iter().enumerate() {
+        if *level <= current {
+            best = i;
+        }
     }
+    best
+}
+
+/// Clamp `effort` onto `ladder`: itself if present, else the nearest rung.
+fn clamp_to_ladder(ladder: &[EffortLevel], effort: EffortLevel) -> EffortLevel {
+    if ladder.contains(&effort) {
+        effort
+    } else {
+        ladder[nearest_ladder_index(ladder, effort)]
+    }
+}
+
+/// Step one rung along `ladder` from `current` (`dir` = +1 / -1), wrapping.
+fn cycle_ladder(ladder: &[EffortLevel], current: EffortLevel, dir: isize) -> EffortLevel {
+    if ladder.is_empty() {
+        return current;
+    }
+    let idx = ladder
+        .iter()
+        .position(|l| *l == current)
+        .unwrap_or_else(|| nearest_ladder_index(ladder, current)) as isize;
+    let n = ladder.len() as isize;
+    ladder[(((idx + dir) % n + n) % n) as usize]
 }
 
 // ---------------------------------------------------------------------------
@@ -123,7 +117,7 @@ pub fn model_family_description(id: &str) -> String {
 /// Format context window tokens for display in the model picker.
 pub fn format_context_window(context_window: u32) -> String {
     if context_window >= 1_000_000 {
-        if context_window % 1_000_000 == 0 {
+        if context_window.is_multiple_of(1_000_000) {
             format!("{}M context", context_window / 1_000_000)
         } else {
             format!("{:.1}M context", context_window as f64 / 1_000_000.0)
@@ -263,9 +257,12 @@ pub fn models_for_provider_from_registry(
         return free_provider_models();
     }
     // Codex (ChatGPT-authenticated OpenAI) is not in the models.dev catalog —
-    // serve the curated CODEX_MODELS list so the picker isn't empty.
-    if provider_id == "codex" {
-        return codex_provider_models();
+    // serve the curated CODEX_MODELS list so the picker isn't empty.  Accept
+    // both the canonical id ("codex") and the connect-dialog alias
+    // ("openai-codex"); without the alias a fresh Codex login lands on the
+    // empty-registry fallback and the picker shows no models.
+    if is_codex_provider(provider_id) {
+        return codex_provider_models(registry);
     }
 
     let mut entries = registry.list_visible_by_provider(provider_id);
@@ -332,6 +329,16 @@ pub fn default_model_for_provider(
     if provider_id == "free" {
         return "free/auto".to_string();
     }
+    // Codex endpoints are not catalogued by models.dev, so the registry can
+    // never supply a default for them — pin the curated flagship Codex model,
+    // preserving whichever id alias ("codex" / "openai-codex") the caller used.
+    if is_codex_provider(provider_id) {
+        return format!(
+            "{}/{}",
+            provider_id,
+            claurst_core::codex_oauth::DEFAULT_CODEX_MODEL
+        );
+    }
     if let Some(best) = registry.best_model_for_provider(provider_id) {
         if provider_id == "anthropic" {
             best
@@ -343,22 +350,132 @@ pub fn default_model_for_provider(
     }
 }
 
-/// Curated Codex (ChatGPT-authenticated OpenAI) model list used by
-/// `models_for_provider_from_registry` because models.dev does not catalog
-/// these endpoints.
-fn codex_provider_models() -> Vec<ModelEntry> {
+/// Whether the picker list for `provider_id` is a pure read-only projection of
+/// the models.dev catalog — i.e. the provider has **no** live model-discovery
+/// endpoint and its `discover_models()` is the empty trait default.
+///
+/// For these providers the displayed list must come from
+/// [`models_for_provider_from_registry`] and nothing else; the event loop skips
+/// the background discovery fetch entirely so a provider return value can never
+/// replace the catalog projection. This is what makes a fresh `claude-opus-*`
+/// point-release surface the instant the snapshot ships it.
+///
+/// OpenAI/Google never had a live endpoint. Azure, Amazon Bedrock,
+/// Cohere and MiniMax used to ship a tiny hardcoded `discover_models()` list
+/// that clobbered the far richer catalog (108/85/12/6 rows); that override was
+/// removed, so they are projected from the models.dev catalog here too rather
+/// than fetched.
+///
+/// **Anthropic is intentionally NOT here**: it implements live discovery via
+/// `GET /v1/models`, which returns exactly the models the active credential can
+/// use (for a Claude Pro/Max OAuth token, the curated subscription set — no
+/// legacy claude-3.x). The event loop opens on the catalog projection, then
+/// intersects it with the discovered set (see the anthropic branch in the
+/// discovery spawn), falling back to the full projection if discovery fails.
+///
+/// Live-endpoint and curated-list providers are intentionally excluded. The
+/// event loop either replaces or merges the projection according to
+/// [`provider_has_authoritative_live_models`].
+pub fn provider_uses_catalog_projection(provider_id: &str) -> bool {
+    matches!(
+        provider_id,
+        "openai" | "google" | "azure" | "amazon-bedrock" | "cohere" | "minimax"
+    )
+}
+
+/// Whether live discovery is the complete set of models usable through a local
+/// runtime. Catalog rows describe models it could host, not what is loaded.
+pub fn provider_has_authoritative_live_models(provider_id: &str) -> bool {
+    matches!(
+        provider_id,
+        "ollama"
+            | "lmstudio"
+            | "lm-studio"
+            | "llamacpp"
+            | "llama-cpp"
+            | "llama-server"
+    )
+}
+
+/// Whether `provider_id` refers to the OpenAI Codex provider under either of
+/// its two id spellings: the canonical `"codex"` (used by `CodexProvider`,
+/// the model registry, and the runtime dispatch) or the `"openai-codex"`
+/// alias emitted by the /connect dialog's Codex entry. Both must resolve to
+/// the curated Codex catalog since models.dev does not list these endpoints.
+fn is_codex_provider(provider_id: &str) -> bool {
+    matches!(provider_id, "codex" | "openai-codex")
+}
+
+/// Codex (ChatGPT-authenticated OpenAI) model list.
+///
+/// Mirrors opencode's `provider.models()` hook exactly: instead of hardcoding a
+/// list, it takes the models.dev `openai` catalog and keeps only the ids that
+/// [`codex_model_allowed`] admits (gpt-5.5 / gpt-5.4 / gpt-5.4-mini /
+/// gpt-5.3-codex-spark today, plus any future gpt-5.5+). Costs are zeroed
+/// (subscription billing) and the gpt-5.5 context window is pinned to the Codex
+/// 400K limit. Falls back to the curated [`CODEX_MODELS`] constant only if the
+/// catalog yields nothing (e.g. an empty/old snapshot).
+///
+/// [`codex_model_allowed`]: claurst_core::codex_oauth::codex_model_allowed
+fn codex_provider_models(registry: &claurst_api::ModelRegistry) -> Vec<ModelEntry> {
+    use claurst_core::codex_oauth::{codex_limit_override, codex_model_allowed};
+
+    let mut entries: Vec<&claurst_api::ModelEntry> = registry
+        .list_by_provider("openai")
+        .into_iter()
+        .filter(|e| codex_model_allowed(&e.info.id))
+        .collect();
+
+    if entries.is_empty() {
+        return codex_fallback_models();
+    }
+
+    // Newest release first, then by id for stability — matches the picker's
+    // ordering for other providers.
+    entries.sort_by(|a, b| {
+        let rd_a = a.release_date.as_deref().unwrap_or("");
+        let rd_b = b.release_date.as_deref().unwrap_or("");
+        rd_b.cmp(rd_a).then_with(|| (*a.info.id).cmp(&*b.info.id))
+    });
+
+    entries
+        .iter()
+        .map(|e| {
+            let id: &str = &e.info.id;
+            let ctx = codex_limit_override(id)
+                .map(|(context, _, _)| context)
+                .unwrap_or(e.info.context_window);
+            ModelEntry {
+                id: id.to_string(),
+                display_name: e.info.name.clone(),
+                // Costs are zeroed under the ChatGPT subscription, so advertise
+                // "free" rather than the catalog's pay-as-you-go pricing.
+                description: format!(
+                    "{} | ChatGPT-authenticated · free",
+                    format_context_window(ctx)
+                ),
+                is_current: false,
+            }
+        })
+        .collect()
+}
+
+/// Static fallback used when the models.dev `openai` catalog is unavailable.
+fn codex_fallback_models() -> Vec<ModelEntry> {
+    use claurst_core::codex_oauth::codex_limit_override;
     claurst_core::codex_oauth::CODEX_MODELS
         .iter()
         .map(|(id, name)| {
-            let ctx = match *id {
-                "gpt-5.4" | "gpt-5.2" | "gpt-5.2-codex" | "gpt-5.1-codex"
-                | "gpt-5.1-codex-mini" | "gpt-5.1-codex-max" => "400K ctx",
-                _ => "128K ctx",
-            };
+            let ctx = codex_limit_override(id)
+                .map(|(context, _, _)| context)
+                .unwrap_or(400_000);
             ModelEntry {
                 id: id.to_string(),
                 display_name: name.to_string(),
-                description: format!("{} | ChatGPT-authenticated", ctx),
+                description: format!(
+                    "{} | ChatGPT-authenticated · free",
+                    format_context_window(ctx)
+                ),
                 is_current: false,
             }
         })
@@ -413,15 +530,23 @@ pub struct ModelPickerState {
 // ---------------------------------------------------------------------------
 
 impl ModelPickerState {
-    /// Create a new picker with the default model list (not yet visible).
+    /// Create a new picker (not yet visible).
+    ///
+    /// The model list starts empty; it is populated purely from the
+    /// models.dev-backed [`ModelRegistry`](claurst_api::ModelRegistry) via
+    /// [`set_models`](Self::set_models) (see
+    /// `models_for_provider_from_registry`) each time the picker opens for a
+    /// provider. There is deliberately no hardcoded fallback list — a hardcoded
+    /// Claude list previously clobbered the registry and hid newly-shipped
+    /// models (#228).
     pub fn new() -> Self {
         Self {
             visible: false,
             selected_idx: 0,
-            models: Self::default_models(),
+            models: Vec::new(),
             title: "Select model".to_string(),
             filter: String::new(),
-            effort_level: EffortLevel::Normal,
+            effort_level: EffortLevel::Medium,
             fast_mode: false,
             fast_mode_model: None,
             models_loaded: false,
@@ -435,7 +560,7 @@ impl ModelPickerState {
     /// `fast_mode` are carried over from app state so the user sees the live
     /// values.
     pub fn open(&mut self, current_model: &str) {
-        self.open_with_state(current_model, EffortLevel::Normal, false);
+        self.open_with_state(current_model, EffortLevel::Medium, false);
     }
 
     /// Open the overlay with full state context.
@@ -503,29 +628,36 @@ impl ModelPickerState {
         self.selected_idx = count.saturating_sub(1);
     }
 
-    /// Cycle effort level forward (→ key).
+    /// The reasoning-effort ladder of the currently highlighted model (ascending,
+    /// no ultracode). Empty when nothing is highlighted or the model is
+    /// non-reasoning.
+    fn selected_ladder(&self) -> Vec<EffortLevel> {
+        let filtered = self.filtered_models();
+        match filtered.get(self.selected_idx) {
+            Some(m) => picker_variant_ladder(&m.id),
+            None => Vec::new(),
+        }
+    }
+
+    /// Cycle effort level forward (→ key) along the model's variants ladder.
     pub fn effort_next(&mut self) {
-        let filtered = self.filtered_models();
-        let id = filtered.get(self.selected_idx).map(|m| m.id.as_str()).unwrap_or("");
-        let supports_max = model_supports_max_effort(id);
-        self.effort_level = self.effort_level.next(supports_max);
+        let ladder = self.selected_ladder();
+        self.effort_level = cycle_ladder(&ladder, self.effort_level, 1);
     }
 
-    /// Cycle effort level backward (← key).
+    /// Cycle effort level backward (← key) along the model's variants ladder.
     pub fn effort_prev(&mut self) {
-        let filtered = self.filtered_models();
-        let id = filtered.get(self.selected_idx).map(|m| m.id.as_str()).unwrap_or("");
-        let supports_max = model_supports_max_effort(id);
-        self.effort_level = self.effort_level.prev(supports_max);
+        let ladder = self.selected_ladder();
+        self.effort_level = cycle_ladder(&ladder, self.effort_level, -1);
     }
 
-    /// Returns the effective effort for the currently highlighted model:
-    /// `None` if the model does not support extended thinking.
+    /// Returns the effective effort for the currently highlighted model, clamped
+    /// onto its variants ladder; `None` if the model exposes no selectable effort
+    /// (a single-tier or non-reasoning model).
     pub fn effective_effort(&self) -> Option<EffortLevel> {
-        let filtered = self.filtered_models();
-        let id = filtered.get(self.selected_idx).map(|m| m.id.as_str()).unwrap_or("");
-        if model_supports_effort(id) {
-            Some(self.effort_level)
+        let ladder = self.selected_ladder();
+        if ladder.len() > 1 {
+            Some(clamp_to_ladder(&ladder, self.effort_level))
         } else {
             None
         }
@@ -551,7 +683,12 @@ impl ModelPickerState {
         }
         let entry = filtered.get(self.selected_idx)?;
         let id = entry.id.clone();
-        let effort = if model_supports_effort(&id) { Some(self.effort_level) } else { None };
+        let ladder = picker_variant_ladder(&id);
+        let effort = if ladder.len() > 1 {
+            Some(clamp_to_ladder(&ladder, self.effort_level))
+        } else {
+            None
+        };
         // If user chose a model other than the fast-mode model while fast mode is
         // active, the caller should turn off fast mode (mirrors TS behaviour).
         self.close();
@@ -601,103 +738,42 @@ impl ModelPickerState {
         }
     }
 
-    /// Fetch the list of available models from the Anthropic API and convert
-    /// them to `ModelEntry` values.
+    /// Additively merge live-discovered entries into the existing list.
     ///
-    /// On success, models are sorted newest-first (by `created_at` descending).
-    /// On any error, returns `default_models()` as a fallback so the picker is
-    /// never left empty.
-    pub async fn fetch_models(client: &claurst_api::AnthropicClient) -> Vec<ModelEntry> {
-        match client.fetch_available_models().await {
-            Ok(available) => {
-                if available.is_empty() {
-                    return Self::default_models();
-                }
-
-                let mut entries: Vec<(i64, ModelEntry)> = available
-                    .into_iter()
-                    .map(|m| {
-                        let display = m
-                            .display_name
-                            .clone()
-                            .unwrap_or_else(|| m.id.clone());
-                        let description = model_family_description(&m.id);
-                        let ts = m.created_at.unwrap_or(0);
-                        (ts, ModelEntry {
-                            id: m.id,
-                            display_name: display,
-                            description,
-                            is_current: false,
-                        })
-                    })
-                    .collect();
-
-                // Sort newest-first.
-                entries.sort_by(|a, b| b.0.cmp(&a.0));
-                entries.into_iter().map(|(_, e)| e).collect()
-            }
-            Err(_) => Self::default_models(),
+    /// Mirrors opencode's github-copilot `models.ts` merge (by id / api.id;
+    /// models.ts:229-255): the catalog projection already loaded into the picker
+    /// is authoritative — its richer cost/context/reasoning metadata is kept for
+    /// every id present in both — and only live models whose id isn't already
+    /// present are appended. A non-empty live result also clears the synthetic
+    /// "no catalog entry" placeholder that [`models_for_provider_from_registry`]
+    /// emits for providers with no catalog rows (e.g. self-hosted endpoints).
+    ///
+    /// Unlike copilot's merge this does **not** prune catalog ids missing from
+    /// the endpoint — the overlay is purely additive, so a stale catalog row is
+    /// preferred over dropping a model the user may still have access to.
+    pub fn merge_models(&mut self, entries: Vec<ModelEntry>) {
+        if entries.is_empty() {
+            self.loading_models = false;
+            return;
         }
-    }
+        // A real list supersedes the synthetic "no catalog" placeholder.
+        self.models
+            .retain(|m| !(m.id == "default" && m.display_name == "Default model"));
 
-    /// Hardcoded list of Claude models available as of 2025.
-    pub fn default_models() -> Vec<ModelEntry> {
-        vec![
-            ModelEntry {
-                id: "claude-opus-4-6".to_string(),
-                display_name: "Claude Opus 4.6".to_string(),
-                description: "Most capable model — best for complex reasoning and analysis".to_string(),
-                is_current: false,
-            },
-            ModelEntry {
-                id: "claude-sonnet-4-6".to_string(),
-                display_name: "Claude Sonnet 4.6".to_string(),
-                description: "Balanced performance and speed — great for coding tasks".to_string(),
-                is_current: false,
-            },
-            ModelEntry {
-                id: "claude-haiku-4-5-20251001".to_string(),
-                display_name: "Claude Haiku 4.5 (2025-10-01)".to_string(),
-                description: "Fast and efficient — ideal for quick completions".to_string(),
-                is_current: false,
-            },
-            ModelEntry {
-                id: "claude-opus-4-5".to_string(),
-                display_name: "Claude Opus 4.5".to_string(),
-                description: "Previous Opus generation — powerful multimodal reasoning".to_string(),
-                is_current: false,
-            },
-            ModelEntry {
-                id: "claude-sonnet-4-5".to_string(),
-                display_name: "Claude Sonnet 4.5".to_string(),
-                description: "Previous Sonnet generation — solid coding and writing".to_string(),
-                is_current: false,
-            },
-            ModelEntry {
-                id: "claude-haiku-4-5".to_string(),
-                display_name: "Claude Haiku 4.5".to_string(),
-                description: "Previous Haiku generation — lightweight and responsive".to_string(),
-                is_current: false,
-            },
-            ModelEntry {
-                id: "claude-3-7-sonnet-20250219".to_string(),
-                display_name: "Claude 3.7 Sonnet (2025-02-19)".to_string(),
-                description: "Sonnet 3.7 with enhanced instruction following".to_string(),
-                is_current: false,
-            },
-            ModelEntry {
-                id: "claude-3-5-sonnet-20241022".to_string(),
-                display_name: "Claude 3.5 Sonnet (2024-10-22)".to_string(),
-                description: "Highly capable 3.5 Sonnet — reliable and well-tested".to_string(),
-                is_current: false,
-            },
-            ModelEntry {
-                id: "claude-3-5-haiku-20241022".to_string(),
-                display_name: "Claude 3.5 Haiku (2024-10-22)".to_string(),
-                description: "Fast 3.5 Haiku — great for high-throughput pipelines".to_string(),
-                is_current: false,
-            },
-        ]
+        let existing: std::collections::HashSet<String> =
+            self.models.iter().map(|m| m.id.clone()).collect();
+        for e in entries {
+            if !existing.contains(&e.id) {
+                self.models.push(e);
+            }
+        }
+        self.loading_models = false;
+        self.models_loaded = true;
+        // Keep selected_idx in bounds.
+        let count = self.filtered_models().len();
+        if count > 0 && self.selected_idx >= count {
+            self.selected_idx = count - 1;
+        }
     }
 }
 
@@ -867,10 +943,12 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
 
             spans.push(Span::styled(model.display_name.clone(), Style::default().fg(fg).bg(bg)));
 
-            // Effort indicator
+            // Effort indicator — show the effort clamped onto this model's
+            // variants ladder so it never displays a tier the model can't do.
             if supports_effort && is_selected {
+                let shown = state.effective_effort().unwrap_or(state.effort_level);
                 spans.push(Span::styled(
-                    format!("  {} {}", state.effort_level.symbol(), state.effort_level.label()),
+                    format!("  {} {}", shown.symbol(), shown.label()),
                     Style::default().fg(Color::Rgb(200, 255, 200)).bg(bg),
                 ));
             }
@@ -937,27 +1015,93 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
 mod tests {
     use super::*;
 
-    fn make_picker_with_current(current: &str) -> ModelPickerState {
+    /// A small, controlled model list used to exercise the picker's selection /
+    /// filter / effort behaviour independently of both the (now-removed)
+    /// hardcoded list and the exact contents of the bundled registry snapshot.
+    /// In production this list comes from `set_models(models_for_provider_from_registry(..))`.
+    fn sample_models() -> Vec<ModelEntry> {
+        vec![
+            ModelEntry {
+                id: "claude-opus-4-6".to_string(),
+                display_name: "Claude Opus 4.6".to_string(),
+                description: "200K context".to_string(),
+                is_current: false,
+            },
+            ModelEntry {
+                id: "claude-sonnet-4-6".to_string(),
+                display_name: "Claude Sonnet 4.6".to_string(),
+                description: "200K context".to_string(),
+                is_current: false,
+            },
+            ModelEntry {
+                id: "claude-haiku-4-5".to_string(),
+                display_name: "Claude Haiku 4.5".to_string(),
+                description: "200K context".to_string(),
+                is_current: false,
+            },
+        ]
+    }
+
+    /// A picker seeded with `sample_models()` — the unit-test analogue of the
+    /// registry-projection seeding that happens when the picker opens.
+    fn make_picker() -> ModelPickerState {
         let mut p = ModelPickerState::new();
+        p.set_models(sample_models());
+        p
+    }
+
+    fn make_picker_with_current(current: &str) -> ModelPickerState {
+        let mut p = make_picker();
         p.open(current);
         p
     }
 
-    // 1. Default model list is non-empty and contains expected IDs.
+    // 1. A model newly added to the registry surfaces in the picker immediately.
+    //    The picker list is a pure projection of the models.dev registry, not a
+    //    hardcoded set — regression guard for #228 ("latest model won't show").
     #[test]
-    fn default_models_are_populated() {
-        let models = ModelPickerState::default_models();
-        assert!(!models.is_empty(), "default model list must not be empty");
-        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-        assert!(ids.contains(&"claude-sonnet-4-6"));
-        assert!(ids.contains(&"claude-opus-4-6"));
-        assert!(ids.contains(&"claude-3-5-haiku-20241022"));
+    fn newly_added_registry_model_surfaces_in_picker() {
+        let mut registry = claurst_api::ModelRegistry::new();
+
+        // A fabricated future id that cannot already be in the bundled snapshot.
+        let novel_id = "claude-opus-9-9-20991231";
+        assert!(
+            registry.get("anthropic", novel_id).is_none(),
+            "fixture id must not already exist in the snapshot"
+        );
+
+        // Inject it exactly as the background refresh does: a models.dev-format
+        // catalog fragment merged in via load_cache.
+        let json = format!(
+            r#"{{"anthropic":{{"id":"anthropic","name":"Anthropic","models":{{"{novel_id}":{{"id":"{novel_id}","name":"Claude Opus 9.9","release_date":"2099-12-31","limit":{{"context":200000,"output":64000}}}}}}}}}}"#
+        );
+        let path = std::env::temp_dir().join(format!(
+            "claurst_picker_{}_{}.json",
+            std::process::id(),
+            novel_id
+        ));
+        std::fs::write(&path, json).expect("write temp catalog");
+        registry.load_cache(&path);
+        let _ = std::fs::remove_file(&path);
+
+        let picker = models_for_provider_from_registry("anthropic", &registry);
+        let novel = picker.iter().find(|m| m.id == novel_id);
+        assert!(
+            novel.is_some(),
+            "a model added to the registry must surface in the picker"
+        );
+        assert_eq!(novel.unwrap().display_name, "Claude Opus 9.9");
+        // Newest release_date sorts to the top of the projection.
+        assert_eq!(
+            picker[0].id, novel_id,
+            "the freshest model must sort to the top of the picker"
+        );
     }
 
     // 2. open() marks exactly one model as current.
     #[test]
     fn open_marks_current_model() {
-        let mut p = ModelPickerState::new();
+        let mut p = make_picker();
         p.open("claude-sonnet-4-6");
         let current_count = p.models.iter().filter(|m| m.is_current).count();
         assert_eq!(current_count, 1);
@@ -967,14 +1111,14 @@ mod tests {
     #[test]
     fn open_with_title_updates_dialog_title() {
         let mut p = ModelPickerState::new();
-        p.open_with_title("Anthropic", "claude-sonnet-4-6", EffortLevel::Normal, false);
+        p.open_with_title("Anthropic", "claude-sonnet-4-6", EffortLevel::Medium, false);
         assert_eq!(p.title, "Anthropic");
     }
 
     #[test]
     fn open_with_fast_mode_tracks_locked_model() {
         let mut p = ModelPickerState::new();
-        p.open_with_state("gpt-4o-mini", EffortLevel::Normal, true);
+        p.open_with_state("gpt-4o-mini", EffortLevel::Medium, true);
         assert_eq!(p.fast_mode_model.as_deref(), Some("gpt-4o-mini"));
         assert!(p.is_selected_fast_mode_model("gpt-4o-mini"));
         assert!(!p.is_selected_fast_mode_model("gpt-4o"));
@@ -983,7 +1127,7 @@ mod tests {
     // 3. open() with an unknown model ID marks none as current and sets idx=0.
     #[test]
     fn open_unknown_model_selects_first() {
-        let mut p = ModelPickerState::new();
+        let mut p = make_picker();
         p.open("unknown-model");
         assert_eq!(p.selected_idx, 0);
         assert!(p.models.iter().all(|m| !m.is_current));
@@ -1065,41 +1209,81 @@ mod tests {
         assert!(p.filter.is_empty());
     }
 
-    // 11. effort cycling works for effort-supporting models.
+    // 11. effort cycling follows the model's actual variants ladder.
     #[test]
     fn effort_cycles_correctly() {
+        // sonnet-4-6's ladder is Low/Medium/High/Max (opencode adaptive).
         let mut p = make_picker_with_current("claude-sonnet-4-6");
-        // sonnet-4-6 supports effort but not max
-        assert_eq!(p.effort_level, EffortLevel::Normal);
+        assert_eq!(p.effort_level, EffortLevel::Medium);
         p.effort_next();
         assert_eq!(p.effort_level, EffortLevel::High);
         p.effort_next();
-        // no max for sonnet → wraps to Low
+        assert_eq!(p.effort_level, EffortLevel::Max);
+        p.effort_next();
+        // wraps back to the bottom of the ladder.
         assert_eq!(p.effort_level, EffortLevel::Low);
     }
 
-    // 12. Opus supports max effort.
+    // 12. The picker ladders match opencode's variants() (single source of
+    //     truth), not the old name heuristic.
     #[test]
-    fn opus_supports_max_effort() {
-        assert!(model_supports_max_effort("claude-opus-4-6"));
-        assert!(!model_supports_max_effort("claude-sonnet-4-6"));
-        assert!(!model_supports_max_effort("claude-haiku-4-5"));
+    fn ladders_match_opencode_for_known_models() {
+        use EffortLevel::*;
+        // 4.6-era opus/sonnet: low/medium/high/max.
+        assert_eq!(picker_variant_ladder("claude-opus-4-6"), vec![Low, Medium, High, Max]);
+        assert_eq!(picker_variant_ladder("claude-sonnet-4-6"), vec![Low, Medium, High, Max]);
+        // Haiku 4.5 is a thinking model: budget-based high/max.
+        assert_eq!(picker_variant_ladder("claude-haiku-4-5"), vec![High, Max]);
+        // gpt-4o is non-reasoning → no ladder, no selector.
+        assert!(picker_variant_ladder("gpt-4o").is_empty());
+        assert!(!model_supports_effort("gpt-4o"));
+        for id in ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"] {
+            assert!(model_supports_effort(id), "{id} should support effort");
+        }
     }
 
-    // 13. Non-effort models return None from effective_effort.
+    // 12b. GPT-5 reasoning models expose the multi-tier effort selector (incl.
+    //      xhigh); a single-tier pro snapshot does not.
     #[test]
-    fn haiku_has_no_effort() {
+    fn gpt5_reasoning_models_support_effort() {
+        use EffortLevel::*;
+        for id in ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"] {
+            let ladder = picker_variant_ladder(id);
+            assert!(ladder.len() > 1, "{id} should support effort: {ladder:?}");
+            assert!(model_supports_effort(id), "{id} should support effort");
+            assert!(ladder.contains(&XHigh), "{id} should reach xhigh: {ladder:?}");
+        }
+        // Version-less gpt-5-pro exposes only the fixed `high` tier → no selector.
+        assert_eq!(picker_variant_ladder("gpt-5-pro"), vec![High]);
+        assert!(!model_supports_effort("gpt-5-pro"));
+        // Chat snapshots have no reasoning variants.
+        assert!(!model_supports_effort("gpt-5-chat-latest"));
+        // Non-gpt5 stays unaffected.
+        assert!(!model_supports_effort("gpt-4o"));
+    }
+
+    // 13. Haiku 4.5 IS a thinking model (opencode high/max), so confirming it
+    //     carries an effort clamped onto its ladder.
+    #[test]
+    fn haiku_supports_effort() {
+        assert_eq!(
+            picker_variant_ladder("claude-haiku-4-5"),
+            vec![EffortLevel::High, EffortLevel::Max]
+        );
+        assert!(model_supports_effort("claude-haiku-4-5"));
         let mut p = make_picker_with_current("claude-haiku-4-5");
         p.selected_idx = p.models.iter().position(|m| m.id == "claude-haiku-4-5").unwrap();
-        assert!(!model_supports_effort("claude-haiku-4-5"));
-        let effort = p.confirm();
-        assert!(effort.is_some_and(|(_, e)| e.is_none()));
+        let confirmed = p.confirm();
+        assert!(
+            confirmed.is_some_and(|(_, e)| e.is_some()),
+            "haiku should carry a (clamped) effort"
+        );
     }
 
     // 14. render_model_picker does not panic for a default-area call.
     #[test]
     fn render_does_not_panic() {
-        let mut p = ModelPickerState::new();
+        let mut p = make_picker();
         p.open("claude-sonnet-4-6");
         let area = Rect::new(0, 0, 120, 40);
         let mut buf = Buffer::empty(area);
@@ -1147,6 +1331,92 @@ mod tests {
         );
     }
 
+    // The picker list for a catalog-backed provider must be exactly the
+    // read-only registry projection (release_date DESC, then id) — no provider
+    // return value is allowed to become the displayed list. This is what makes
+    // a fresh claude-opus point-release surface the moment the snapshot ships.
+    #[test]
+    fn picker_list_equals_registry_projection_for_catalog_providers() {
+        let registry = claurst_api::ModelRegistry::new();
+
+        // Catalog-backed providers skip live discovery; live ones do not.
+        // Anthropic now discovers via GET /v1/models, so it's on the live side;
+        // its sync projection below is still the pre-discovery/offline fallback.
+        assert!(!provider_uses_catalog_projection("anthropic"));
+        assert!(provider_uses_catalog_projection("openai"));
+        assert!(provider_uses_catalog_projection("google"));
+        assert!(!provider_uses_catalog_projection("ollama"));
+        assert!(!provider_uses_catalog_projection("github-copilot"));
+
+        for pid in ["anthropic", "openai"] {
+            let picker_ids: Vec<String> = models_for_provider_from_registry(pid, &registry)
+                .iter()
+                .map(|m| m.id.clone())
+                .collect();
+
+            let mut proj = registry.list_visible_by_provider(pid);
+            proj.sort_by(|a, b| {
+                let rd_a = a.release_date.as_deref().unwrap_or("");
+                let rd_b = b.release_date.as_deref().unwrap_or("");
+                rd_b.cmp(rd_a).then_with(|| (*a.info.id).cmp(&*b.info.id))
+            });
+            let proj_ids: Vec<String> = proj.iter().map(|e| e.info.id.to_string()).collect();
+
+            assert_eq!(picker_ids, proj_ids, "{pid} picker must equal catalog projection");
+        }
+
+        // Headline: the newest Opus is in the projected anthropic list.
+        let anthropic_ids: Vec<String> = models_for_provider_from_registry("anthropic", &registry)
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
+        assert!(
+            anthropic_ids.iter().any(|id| id == "claude-opus-4-8"),
+            "claude-opus-4-8 must appear in the projected list"
+        );
+    }
+
+    // Codex login lands on the "openai-codex" provider id (the /connect alias).
+    // Both that alias and the canonical "codex" must yield the curated Codex
+    // catalog — never the empty-registry "default" placeholder.
+    #[test]
+    fn models_for_provider_codex_aliases() {
+        let registry = claurst_api::ModelRegistry::new();
+        for pid in ["codex", "openai-codex"] {
+            let models = models_for_provider_from_registry(pid, &registry);
+            assert!(!models.is_empty(), "{pid} must yield Codex models");
+            assert_ne!(models[0].id, "default", "{pid} must not fall back to default");
+
+            let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+            // Opencode's exact allow-list (from the current snapshot).
+            assert!(ids.contains(&"gpt-5.5"), "{pid} must list gpt-5.5: {ids:?}");
+            assert!(ids.contains(&"gpt-5.4"), "{pid} must list gpt-5.4: {ids:?}");
+            assert!(ids.contains(&"gpt-5.4-mini"), "{pid} must list gpt-5.4-mini: {ids:?}");
+            // gpt-5.5 is the newest -> sorts first -> is the default highlight.
+            assert_eq!(models[0].id, "gpt-5.5", "{pid} newest model should sort first");
+            // Legacy / disallowed models must be gone.
+            for legacy in ["gpt-5.5-pro", "gpt-5.2-codex", "gpt-5.1-codex", "gpt-5.4-nano", "gpt-5"] {
+                assert!(!ids.contains(&legacy), "{pid} must not list {legacy}: {ids:?}");
+            }
+        }
+    }
+
+    // default_model_for_provider must pin a real Codex flagship (not
+    // "<id>/default") for both id spellings, preserving the caller's prefix.
+    #[test]
+    fn default_model_for_provider_codex_aliases() {
+        let registry = claurst_api::ModelRegistry::new();
+        for pid in ["codex", "openai-codex"] {
+            let m = default_model_for_provider(pid, &registry);
+            assert_eq!(
+                m,
+                format!("{}/{}", pid, claurst_core::codex_oauth::DEFAULT_CODEX_MODEL),
+                "{pid} default must pin the curated flagship Codex model"
+            );
+            assert!(!m.ends_with("/default"), "{pid} must not fall back to /default");
+        }
+    }
+
     #[test]
     fn models_for_provider_unknown_returns_default() {
         let registry = claurst_api::ModelRegistry::new();
@@ -1190,5 +1460,126 @@ mod tests {
         p.set_models(openai_models);
         let ids: Vec<&str> = p.models.iter().map(|m| m.id.as_str()).collect();
         assert!(!ids.iter().any(|id| id.contains("claude")));
+    }
+
+    // 19. merge_models is additive: it keeps the catalog projection (including
+    //     its richer metadata) for ids present in both, and appends only live
+    //     ids not already listed. Mirrors copilot models.ts merge-by-id.
+    #[test]
+    fn merge_models_is_additive_and_keeps_catalog_metadata() {
+        let mut p = ModelPickerState::new();
+        p.set_models(sample_models()); // catalog projection: opus/sonnet/haiku
+
+        let live = vec![
+            // Overlaps an existing catalog id but with poorer metadata —
+            // the catalog row must win (no overwrite).
+            ModelEntry {
+                id: "claude-opus-4-6".to_string(),
+                display_name: "LIVE OVERWRITE".to_string(),
+                description: "live desc".to_string(),
+                is_current: false,
+            },
+            // A brand-new live id absent from the catalog — must be appended.
+            ModelEntry {
+                id: "gpt-5.5-live".to_string(),
+                display_name: "GPT-5.5 (live)".to_string(),
+                description: "live only".to_string(),
+                is_current: false,
+            },
+        ];
+        p.merge_models(live);
+
+        let opus = p
+            .models
+            .iter()
+            .find(|m| m.id == "claude-opus-4-6")
+            .expect("catalog opus retained");
+        assert_eq!(
+            opus.display_name, "Claude Opus 4.6",
+            "catalog metadata must be kept for shared ids (no live overwrite)"
+        );
+        assert!(
+            p.models.iter().any(|m| m.id == "gpt-5.5-live"),
+            "new live id must be appended"
+        );
+        assert!(
+            p.models.iter().filter(|m| m.id == "claude-opus-4-6").count() == 1,
+            "no duplicate for a shared id"
+        );
+        // All three original catalog ids are still present.
+        for id in ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"] {
+            assert!(p.models.iter().any(|m| m.id == id), "catalog id {id} kept");
+        }
+    }
+
+    // 20. An empty live result never wipes the catalog projection.
+    #[test]
+    fn merge_models_empty_keeps_catalog() {
+        let mut p = ModelPickerState::new();
+        p.set_models(sample_models());
+        p.merge_models(Vec::new());
+        assert_eq!(p.models.len(), 3, "empty live merge must not clear the list");
+        assert!(!p.loading_models);
+    }
+
+    // 21. A non-empty live result clears the synthetic "no catalog" placeholder.
+    #[test]
+    fn merge_models_clears_placeholder() {
+        let mut p = ModelPickerState::new();
+        p.set_models(vec![model_entry(
+            "default",
+            "Default model",
+            "no catalog entry for this provider",
+        )]);
+        p.merge_models(vec![ModelEntry {
+            id: "llama3.3".to_string(),
+            display_name: "Llama 3.3".to_string(),
+            description: "local".to_string(),
+            is_current: false,
+        }]);
+        assert!(
+            !p.models.iter().any(|m| m.id == "default"),
+            "placeholder must be dropped once a real list arrives"
+        );
+        assert!(p.models.iter().any(|m| m.id == "llama3.3"));
+    }
+
+    // 22. The four providers whose hardcoded discover_models() was removed now
+    //     project from the catalog (no live fetch that could clobber it).
+    #[test]
+    fn hardcoded_list_providers_use_catalog_projection() {
+        for pid in ["azure", "amazon-bedrock", "cohere", "minimax"] {
+            assert!(
+                provider_uses_catalog_projection(pid),
+                "{pid} must project from the catalog after its hardcoded list was removed"
+            );
+        }
+        // Live/curated providers must NOT be treated as catalog projections.
+        // Anthropic joined this group: it discovers via GET /v1/models.
+        for pid in ["anthropic", "ollama", "github-copilot", "codex", "free"] {
+            assert!(
+                !provider_uses_catalog_projection(pid),
+                "{pid} must keep its live/curated discovery"
+            );
+        }
+    }
+
+    #[test]
+    fn local_runtime_models_are_authoritative() {
+        for pid in [
+            "ollama",
+            "lmstudio",
+            "lm-studio",
+            "llamacpp",
+            "llama-cpp",
+            "llama-server",
+        ] {
+            assert!(
+                provider_has_authoritative_live_models(pid),
+                "{pid} must replace catalog rows with its live model list"
+            );
+        }
+        assert!(!provider_has_authoritative_live_models("github-copilot"));
+        assert!(!provider_has_authoritative_live_models("openrouter"));
     }
 }

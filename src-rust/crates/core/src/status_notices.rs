@@ -91,6 +91,6 @@ pub fn compact_warning_notice(fill_pct: f64) -> StatusNotice {
 }
 
 /// Sort notices by priority (highest first), then by ID for stability.
-pub fn sort_notices(notices: &mut Vec<StatusNotice>) {
+pub fn sort_notices(notices: &mut [StatusNotice]) {
     notices.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.id.cmp(&b.id)));
 }

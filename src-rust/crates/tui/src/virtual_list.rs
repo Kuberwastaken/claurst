@@ -208,11 +208,7 @@ impl<T: VirtualItem> VirtualList<T> {
             }
 
             // Compute the portion of this item that's visible
-            let visible_start = if current_row < self.scroll_offset {
-                self.scroll_offset - current_row
-            } else {
-                0
-            };
+            let visible_start = self.scroll_offset.saturating_sub(current_row);
             let visible_rows = h
                 .saturating_sub(visible_start)
                 .min(area.y + area.height - screen_row);
@@ -228,6 +224,20 @@ impl<T: VirtualItem> VirtualList<T> {
                 width: area.width,
                 height: visible_rows,
             };
+
+            // Clear the row(s) this item occupies before painting it. Item
+            // renderers use ratatui's `Paragraph`, which only *styles* (never
+            // clears) the cells past the end of a line — so a shorter line that
+            // scrolls into a row previously holding a longer one would let the
+            // old trailing text ghost through. (The sticky-header path below
+            // already does this; regular rows need it too.)
+            for by in item_area.y..item_area.y.saturating_add(item_area.height) {
+                for bx in item_area.x..item_area.x.saturating_add(item_area.width) {
+                    if let Some(cell) = buf.cell_mut((bx, by)) {
+                        cell.reset();
+                    }
+                }
+            }
 
             let selected = self.selected_index == Some(idx);
             self.items[idx].render(item_area, buf, selected);
@@ -314,4 +324,98 @@ impl<T: VirtualItem> VirtualList<T> {
 
 impl<T: VirtualItem> Default for VirtualList<T> {
     fn default() -> Self { Self::new() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::text::Line;
+    use ratatui::widgets::{Paragraph, Widget};
+
+    /// Minimal item that renders one line via `Paragraph` — the same primitive
+    /// the transcript uses, so it reproduces the trailing-cell ghosting.
+    struct TextItem(String);
+    impl VirtualItem for TextItem {
+        fn measure_height(&self, _w: u16) -> u16 { 1 }
+        fn render(&self, area: Rect, buf: &mut Buffer, _sel: bool) {
+            Paragraph::new(Line::from(self.0.clone())).render(area, buf);
+        }
+        fn search_text(&self) -> String { self.0.clone() }
+    }
+
+    fn row_string(buf: &Buffer, y: u16, width: u16) -> String {
+        (0..width)
+            .map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()).unwrap_or_else(|| " ".into()))
+            .collect()
+    }
+
+    #[test]
+    fn shorter_row_does_not_ghost_previous_longer_row() {
+        let area = Rect::new(0, 0, 20, 1);
+        let mut buf = Buffer::empty(area);
+
+        let mut list: VirtualList<TextItem> = VirtualList::new();
+        list.sticky_bottom = false;
+        list.set_items(vec![TextItem("LONGLINECONTENT1234".to_string())]);
+        list.scroll_offset = 0;
+        list.render(area, &mut buf);
+        assert!(row_string(&buf, 0, 20).contains("LONGLINECONTENT"));
+
+        // Render a shorter line into the SAME buffer (no reset) — the exact
+        // situation a short line scrolling into a previously-long row creates.
+        list.set_items(vec![TextItem("hi".to_string())]);
+        list.scroll_offset = 0;
+        list.render(area, &mut buf);
+
+        let row = row_string(&buf, 0, 20);
+        assert!(row.starts_with("hi"), "new content should render: {row:?}");
+        // "CONTENT" sits well past the new "hi", entirely in the ghost region —
+        // without the row clear it would survive and this would fail.
+        assert!(!row.contains("CONTENT"), "old text must not ghost through: {row:?}");
+        assert_eq!(row.trim_end(), "hi");
+    }
+}
+
+#[cfg(test)]
+mod reset_probe {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend, text::Line, widgets::{Paragraph, Widget}};
+
+    struct Item(String);
+    impl VirtualItem for Item {
+        fn measure_height(&self, _w: u16) -> u16 { 1 }
+        fn render(&self, area: Rect, buf: &mut Buffer, _s: bool) {
+            Paragraph::new(Line::from(self.0.clone())).render(area, buf);
+        }
+        fn search_text(&self) -> String { self.0.clone() }
+    }
+    fn row0(t: &Terminal<TestBackend>) -> String {
+        let b = t.backend().buffer();
+        (0..b.area.width).map(|x| b.cell((x,0)).map(|c| c.symbol().to_string()).unwrap_or_default()).collect()
+    }
+
+    #[test]
+    fn does_terminal_draw_reset_between_frames() {
+        let mut t = Terminal::new(TestBackend::new(20, 3)).unwrap();
+        let area = Rect::new(0,0,20,1);
+        // Frame 1: long content
+        t.draw(|f| {
+            let mut l: VirtualList<Item> = VirtualList::new();
+            l.sticky_bottom = false;
+            l.set_items(vec![Item("LONGLINECONTENT1234".into())]);
+            l.scroll_offset = 0;
+            l.render(area, f.buffer_mut());
+        }).unwrap();
+        // Frame 2: SHORT content at the same row — if draw() resets, no ghost.
+        t.draw(|f| {
+            let mut l: VirtualList<Item> = VirtualList::new();
+            l.sticky_bottom = false;
+            l.set_items(vec![Item("hi".into())]);
+            l.scroll_offset = 0;
+            l.render(area, f.buffer_mut());
+        }).unwrap();
+        let r = row0(&t);
+        eprintln!("ROW0 AFTER FRAME2 = {:?}", r);
+        assert_eq!(r.trim_end(), "hi", "terminal.draw did NOT reset → ghost: {r:?}");
+    }
 }

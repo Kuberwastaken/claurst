@@ -39,7 +39,7 @@ use crate::messages::{
     render_thinking_live_content,
     RenderContext,
 };
-use crate::notifications::render_notification_banner;
+use crate::notifications::{render_notification_banner, Notification, NotificationKind};
 use crate::overlays::{
     render_global_search, render_help_overlay, render_history_search_overlay, render_rewind_flow,
     CLAURST_ACCENT,
@@ -71,70 +71,174 @@ const SPINNER: &[char] = &['\u{00b7}', '\u{2722}', '*', '\u{2736}', '\u{273b}', 
 const SPINNER: &[char] = &['\u{00b7}', '\u{2722}', '\u{2733}', '\u{2736}', '\u{273b}', '\u{273d}',
                             '\u{273d}', '\u{273b}', '\u{2736}', '\u{2733}', '\u{2722}', '\u{00b7}'];
 const CLAUDE_ORANGE: Color = Color::Rgb(233, 30, 99);
-const WELCOME_BOX_HEIGHT: u16 = 12;
+const WELCOME_BOX_HEIGHT: u16 = 9;
+const STATUS_THINKING: &str = "thinking";
+const STATUS_THINKING_ELLIPSIS: &str = "thinking\u{2026}";
 
 fn spinner_char(frame_count: u64) -> char {
     SPINNER[(frame_count as usize) % SPINNER.len()]
 }
 
-/// Returns the colour to use for the streaming spinner.
-/// Turns red when no stream data has arrived for more than 3 seconds.
+/// Returns the colour to use for the streaming spinner: claurst red normally,
+/// brightening to a hot red when no stream data has arrived for over 3 seconds.
 fn spinner_color(app: &App) -> Color {
     if let Some(start) = app.stall_start {
         if start.elapsed() > std::time::Duration::from_secs(3) {
-            return Color::Red;
+            return Color::Rgb(255, 70, 70);
         }
     }
-    Color::Yellow
+    CLAUDE_ORANGE
 }
 
 fn is_modal_open(app: &App) -> bool {
-    app.permission_request.is_some()
-        || app.rewind_flow.visible
-        || app.tasks_overlay.visible
-        || app.help_overlay.visible
-        || app.show_help
-        || app.history_search_overlay.visible
-        || app.history_search.is_some()
-        || app.settings_screen.visible
-        || app.theme_screen.visible
-        || app.stats_dialog.open
-        || app.mcp_view.open
-        || app.agents_menu.open
-        || app.diff_viewer.open
-        || app.global_search.open
-        || app.feedback_survey.visible
-        || app.memory_file_selector.visible
-        || app.hooks_config_menu.visible
-        || app.overage_upsell.visible
-        || app.voice_mode_notice.visible
-        || app.memory_update_notification.visible
-        || app.desktop_upsell.visible
-        || app.import_config_dialog.visible
-        || app.invalid_config_dialog.visible
-        || app.bypass_permissions_dialog.visible
-        || app.ask_user_dialog.visible
-        || app.onboarding_dialog.visible
-        || app.import_config_picker.visible
-        || app.import_config_dialog.visible
-        || app.connect_dialog.visible
-        || app.key_input_dialog.visible
-        || app.custom_provider_dialog.visible
-        || app.free_mode_dialog.visible
-        || app.device_auth_dialog.visible
-        || app.command_palette.visible
-        || app.elicitation.visible
-        || app.model_picker.visible
-        || app.session_browser.visible
-        || app.session_branching.visible
-        || app.export_dialog.visible
-        || app.context_viz.visible
-        || app.mcp_approval.visible
+    app.any_modal_open()
+}
+
+// -----------------------------------------------------------------------
+// Error modal rendering
+// -----------------------------------------------------------------------
+
+/// Render an error modal dialog with wrapped content.
+fn render_error_modal(frame: &mut Frame, area: Rect, notification: &Notification, _scroll_offset: usize, footer_area: Rect, is_welcome_screen: bool) {
+    // When the footer anchor is inside the welcome box (y < WELCOME_BOX_HEIGHT), or explicitly on
+    // the welcome screen, center the modal so it doesn't awkwardly overlap the welcome box.
+    let anchored_in_welcome_box = footer_area.width > 0 && footer_area.y < WELCOME_BOX_HEIGHT;
+    let modal_area = if is_welcome_screen || anchored_in_welcome_box {
+        let modal_width = (area.width * 2 / 3).max(40).min(area.width);
+        let modal_height = (area.height / 3).max(8).min(area.height.saturating_sub(2));
+        Rect {
+            x: area.x + (area.width.saturating_sub(modal_width)) / 2,
+            y: area.y + (area.height.saturating_sub(modal_height)) / 2,
+            width: modal_width,
+            height: modal_height,
+        }
+    } else if footer_area.width > 0 {
+        let desired_height = (area.height / 3).max(8)
+            .min(area.height.saturating_sub(footer_area.y));
+        Rect {
+            x: footer_area.x,
+            y: footer_area.y,
+            width: footer_area.width,
+            height: desired_height,
+        }
+    } else {
+        let modal_width = area.width / 2;
+        let modal_height = area.height.saturating_sub(4);
+        Rect {
+            x: area.x + modal_width,
+            y: area.y,
+            width: modal_width,
+            height: modal_height,
+        }
+    };
+
+    frame.render_widget(Clear, modal_area);
+
+    let modal_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .style(Style::default().fg(Color::Red));
+    frame.render_widget(modal_block, modal_area);
+
+    let header_bg_area = Rect {
+        x: modal_area.x + 1,
+        y: modal_area.y + 1,
+        width: modal_area.width.saturating_sub(2),
+        height: 1,
+    };
+    let header_style = Style::default().bg(Color::Rgb(60, 15, 15)).fg(Color::Red);
+    let header_para = Paragraph::new("  ⚠ Error  ")
+        .style(header_style.add_modifier(Modifier::BOLD));
+    frame.render_widget(header_para, header_bg_area);
+
+    let sep_area = Rect {
+        x: modal_area.x + 1,
+        y: modal_area.y + 2,
+        width: modal_area.width.saturating_sub(2),
+        height: 1,
+    };
+    let sep_line = Paragraph::new(Line::from(Span::styled(
+        "─".repeat(sep_area.width as usize),
+        Style::default().fg(Color::Rgb(80, 20, 20)),
+    )));
+    frame.render_widget(sep_line, sep_area);
+
+    // Chrome: border(1) + header(1) + sep(1) + blank(1) + border(1) = 5 rows
+    let body_start_y = modal_area.y + 4;
+    let body_height = modal_area.height.saturating_sub(5).max(1);
+    let body_area = Rect {
+        x: modal_area.x + 2,
+        y: body_start_y,
+        width: modal_area.width.saturating_sub(4),
+        height: body_height,
+    };
+
+    let body_para = Paragraph::new(notification.message.as_str())
+        .style(Style::default().fg(Color::Rgb(220, 220, 220)))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(body_para, body_area);
 }
 
 // -----------------------------------------------------------------------
 // Text truncation helpers
 // -----------------------------------------------------------------------
+
+/// Short relative timestamp for the welcome screen's recent-activity list:
+/// "just now", "5m ago", "2h ago", "3d ago". Clock skew (mtime in the future)
+/// degrades gracefully to "just now".
+fn short_relative_time(mtime: std::time::SystemTime) -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(mtime)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    short_relative_secs(secs)
+}
+
+/// Formatter split out from [`short_relative_time`] so it can be unit-tested
+/// without depending on the wall clock.
+fn short_relative_secs(secs: u64) -> String {
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3_600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3_600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
+/// Build the body lines for the welcome box's "Recent activity" section.
+///
+/// Renders up to five recent sessions as `<label> <relative-time>` (the label
+/// truncated to fit `width`), or a single dimmed "No recent activity" line when
+/// there are none. Split out from [`render_welcome_box`] so it can be unit
+/// tested from controlled state without the surrounding layout.
+fn recent_activity_lines(recent: &[crate::app::RecentSession], width: usize) -> Vec<Line<'static>> {
+    if recent.is_empty() {
+        return vec![Line::from(Span::styled(
+            "No recent activity",
+            Style::default().fg(Color::DarkGray),
+        ))];
+    }
+
+    recent
+        .iter()
+        .take(5)
+        .map(|s| {
+            let when = short_relative_time(s.mtime);
+            // Reserve room for the trailing " <time>" so the label truncates
+            // instead of wrapping onto a second line.
+            let label_w = width.saturating_sub(when.chars().count() + 1);
+            let label = truncate_end(&s.label, label_w.max(1));
+            Line::from(vec![
+                Span::styled(label, Style::default().fg(Color::Gray)),
+                Span::raw(" "),
+                Span::styled(when, Style::default().fg(Color::DarkGray)),
+            ])
+        })
+        .collect()
+}
 
 fn truncate_end(text: &str, max_width: usize) -> String {
     if max_width == 0 {
@@ -343,12 +447,25 @@ struct MessageLinesCache {
     lines: Vec<RenderedLineItem>,
 }
 
-/// Cache key for completed messages only (no ptr — len change = new message).
+/// Cache key for the *committed prefix* served during streaming: all messages
+/// before the live (actively-streaming) turn.
+///
+/// Deliberately keyed by message/annotation identity — NOT by
+/// `transcript_version`, which bumps on every streaming token and would churn
+/// the entry away each frame (issue #222). During streaming the committed
+/// messages do not change, so `messages_ptr`/`messages_len` stay stable and the
+/// prefix is a cache hit every frame; when the committed set changes (a turn
+/// completes, session switch/fork/revert/compaction) the pointer, length, or
+/// `prefix_len` shifts and the entry is rebuilt. `prefix_len` is the number of
+/// committed messages that precede the live turn, so growing the transcript by
+/// one turn re-keys the prefix cleanly.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct CompletedMsgCacheKey {
     width: u16,
-    transcript_version: u64,
+    prefix_len: usize,
+    messages_ptr: usize,
     messages_len: usize,
+    annotations_ptr: usize,
     annotations_len: usize,
     thinking_expanded_len: usize,
 }
@@ -361,8 +478,53 @@ struct CompletedMsgCache {
 
 thread_local! {
     static MESSAGE_LINES_CACHE: RefCell<Option<MessageLinesCache>> = const { RefCell::new(None) };
-    /// Stores rendered lines for committed messages only; valid even during streaming.
+    /// Stores rendered lines for the committed prefix (all messages before the
+    /// live turn); valid and reused across streaming deltas.
     static COMPLETED_MSG_CACHE: RefCell<Option<CompletedMsgCache>> = const { RefCell::new(None) };
+}
+
+// Instrumentation so tests can prove the committed prefix is served from cache
+// (a hit) rather than rebuilt on every streaming frame. Compiled out of release
+// builds.
+#[cfg(test)]
+thread_local! {
+    static PREFIX_CACHE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static PREFIX_CACHE_MISSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_prefix_cache_hit() {
+    PREFIX_CACHE_HITS.with(|c| c.set(c.get() + 1));
+}
+#[cfg(test)]
+fn record_prefix_cache_miss() {
+    PREFIX_CACHE_MISSES.with(|c| c.set(c.get() + 1));
+}
+#[cfg(not(test))]
+#[inline(always)]
+fn record_prefix_cache_hit() {}
+#[cfg(not(test))]
+#[inline(always)]
+fn record_prefix_cache_miss() {}
+
+/// Test-only: `(hits, misses)` for the committed-prefix cache.
+#[cfg(test)]
+fn prefix_cache_counts() -> (u64, u64) {
+    (
+        PREFIX_CACHE_HITS.with(|c| c.get()),
+        PREFIX_CACHE_MISSES.with(|c| c.get()),
+    )
+}
+
+/// Test-only: reset the render caches and counters so a test starts clean and
+/// is not affected by cache state left over from a previous render on this
+/// thread.
+#[cfg(test)]
+fn reset_render_caches() {
+    MESSAGE_LINES_CACHE.with(|c| *c.borrow_mut() = None);
+    COMPLETED_MSG_CACHE.with(|c| *c.borrow_mut() = None);
+    PREFIX_CACHE_HITS.with(|c| c.set(0));
+    PREFIX_CACHE_MISSES.with(|c| c.set(0));
 }
 
 // -----------------------------------------------------------------------
@@ -382,7 +544,13 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     );
 
     let prompt_focused =
-        !app.is_streaming && app.permission_request.is_none() && !app.history_search_overlay.visible;
+        app.permission_request.is_none() && !app.history_search_overlay.visible;
+    // Suggestions popup tracks whether the prompt accepts input, not whether
+    // it is the focused widget. Text entry is allowed during streaming so the
+    // user can queue the next message, so the typeahead popup must follow
+    // that same affordance.
+    let suggestions_visible =
+        app.permission_request.is_none() && !app.history_search_overlay.visible;
     let status_visible = should_render_status_row(app);
     // One blank separator row above the status/input area when status is active,
     // matching the visual breathing room in the TS layout.
@@ -397,14 +565,14 @@ pub fn render_app(frame: &mut Frame, app: &App) {
             // instead of overflowing the input area.  Cap at 3 lines.
             let usable_width = size.width.max(1) as usize;
             let char_count = text.chars().count();
-            ((char_count + usable_width - 1) / usable_width).max(1).min(3) as u16
+            char_count.div_ceil(usable_width).clamp(1, 3) as u16
         } else {
             1
         }
     } else {
         0
     };
-    let suggestions_height = if prompt_focused && !app.prompt_input.suggestions.is_empty() {
+    let suggestions_height = if suggestions_visible && !app.prompt_input.suggestions.is_empty() {
         app.prompt_input.suggestions.len().min(5) as u16
     } else {
         0
@@ -413,7 +581,14 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     // ("> ") and the right-margin padding used inside `render_prompt_input`.
     // Keep this in sync with prefix_width=2 + right_pad=2 there.
     let prompt_text_width = size.width.saturating_sub(4);
-    let prompt_height = input_height(&app.prompt_input, prompt_text_width) + 1; // +1 for model/mode status line
+    // While the `/effort` selector is open it DOCKS into the prompt area, fully
+    // replacing the prompt box, so the row budget follows the docked panel height
+    // (clamped by the layout below) instead of the prompt's own line count.
+    let prompt_height = if app.effort_picker.visible {
+        crate::effort_picker::DOCK_HEIGHT
+    } else {
+        input_height(&app.prompt_input, prompt_text_width) + 1 // +1 for model/mode status line
+    };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -432,7 +607,19 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     if status_height > 0 {
         render_status_row(frame, app, chunks[2]);
     }
-    render_input(frame, app, chunks[3], prompt_focused);
+    // The `/effort` selector replaces the prompt box while open: render it into
+    // the input area (full width) and SKIP the prompt input. The prompt returns
+    // when the picker closes on confirm/cancel.
+    if app.effort_picker.visible {
+        crate::effort_picker::render_effort_picker(
+            frame,
+            &app.effort_picker,
+            chunks[3],
+            app.frame_count,
+        );
+    } else {
+        render_input(frame, app, chunks[3], prompt_focused);
+    }
     app.last_input_area.set(chunks[3]);
     if suggestions_height > 0 {
         render_prompt_suggestions(frame, app, chunks[4]);
@@ -487,24 +674,28 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_theme_screen(frame, &app.theme_screen, size);
     }
 
-    if app.stats_dialog.open {
+    if app.stats_dialog.visible {
         render_stats_dialog(&app.stats_dialog, size, frame.buffer_mut());
     }
 
-    if app.mcp_view.open {
+    if app.mcp_view.visible {
         render_mcp_view(&app.mcp_view, size, frame.buffer_mut());
     }
 
-    if app.agents_menu.open {
+    if app.agents_menu.visible {
         render_agents_menu(&app.agents_menu, size, frame.buffer_mut());
     }
 
-    if app.diff_viewer.open {
+    if app.diff_viewer.visible {
         let mut state = app.diff_viewer.clone();
         render_diff_dialog(&mut state, size, frame.buffer_mut());
     }
 
-    if app.global_search.open {
+    if app.paste_viewer.visible {
+        crate::paste_viewer::render_paste_viewer_buf(&app.paste_viewer, size, frame.buffer_mut());
+    }
+
+    if app.global_search.visible {
         render_global_search(&app.global_search, size, frame.buffer_mut());
     }
 
@@ -589,10 +780,8 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_onboarding_dialog(frame, &app.onboarding_dialog, size);
     }
 
-    // /effort picker
-    if app.effort_picker.visible {
-        crate::effort_picker::render_effort_picker(frame, &app.effort_picker, size);
-    }
+    // The `/effort` selector is NOT an overlay — it docks into the prompt input
+    // area (see the input dispatch above), replacing the prompt box while open.
 
     // Import-config source picker
     if app.import_config_picker.visible {
@@ -673,10 +862,22 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_mcp_approval_dialog(&app.mcp_approval, size, frame.buffer_mut());
     }
 
+    // Always show error modals on top of everything (highest priority)
+    if let Some(notif) = app.notifications.current() {
+        if notif.kind == NotificationKind::Error {
+            let is_welcome_screen = app.messages.is_empty()
+                && app.streaming_text.is_empty()
+                && app.streaming_thinking.is_empty()
+                && app.tool_use_blocks.is_empty();
+            render_error_modal(frame, size, notif, app.error_modal_scroll_offset, app.footer_right_column_area.get(), is_welcome_screen);
+            return; // Don't render other overlays/notifications when error modal is showing
+        }
+    }
+
     let modal_active = is_modal_open(app);
 
-    // Notification banner stays out of the way when a modal owns the screen.
-    if !modal_active && !app.notifications.is_empty() {
+    // Render non-error notifications as toast banners (unless another modal is open)
+    if !modal_active && app.notifications.current().is_some() {
         render_notification_banner(frame, &app.notifications, size);
     }
 
@@ -917,46 +1118,41 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
         render_plugin_hints(frame, &app.plugin_hints, ha);
     }
 
-    let notice_lines = startup_notice_lines(app, content_area.width);
-    let header_height = WELCOME_BOX_HEIGHT + notice_lines.len() as u16;
-    let show_logo_header = content_area.height >= header_height + 3 && content_area.width >= 60;
-    let (logo_area, notices_area, msg_area) = if show_logo_header {
-        let splits = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(header_height), Constraint::Min(1)])
-            .split(content_area);
-        if notice_lines.is_empty() {
-            (Some(splits[0]), None, splits[1])
-        } else {
-            let header_splits = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(WELCOME_BOX_HEIGHT),
-                    Constraint::Length(notice_lines.len() as u16),
-                ])
-                .split(splits[0]);
-            (Some(header_splits[0]), Some(header_splits[1]), splits[1])
-        }
-    } else {
-        (None, None, content_area)
-    };
-
-    if let Some(la) = logo_area {
-        render_welcome_box(frame, app, la);
-        if let Some(na) = notices_area {
-            render_startup_notices(frame, app, na);
-        }
-    } else if app.messages.is_empty()
+    // The rich two-column welcome box is a full welcome SCREEN, shown only while
+    // the transcript is empty. Once a conversation starts it is NOT kept as a
+    // fixed header (which permanently ate ~9 rows, issue #310); instead a compact
+    // banner is prepended to the transcript (see `welcome_banner_lines`) so it
+    // scrolls away with the content and the conversation reclaims the space.
+    let transcript_empty = app.messages.is_empty()
         && app.streaming_text.is_empty()
         && app.streaming_thinking.is_empty()
-        && app.tool_use_blocks.is_empty()
-    {
+        && app.tool_use_blocks.is_empty();
+
+    if transcript_empty {
         app.last_msg_area.set(Rect::default());
         app.message_row_map.borrow_mut().clear();
         app.thinking_row_map.borrow_mut().clear();
         render_welcome_box(frame, app, content_area);
+        // Startup notices (remote session, +dir, away summary) sit just below
+        // the welcome box on the empty screen.
+        let notice_lines = startup_notice_lines(app, content_area.width);
+        if !notice_lines.is_empty() && content_area.height > WELCOME_BOX_HEIGHT {
+            let notices_area = Rect {
+                x: content_area.x,
+                y: content_area.y + WELCOME_BOX_HEIGHT,
+                width: content_area.width,
+                height: content_area.height - WELCOME_BOX_HEIGHT,
+            };
+            render_startup_notices(frame, app, notices_area);
+        }
         return;
     }
+
+    // Active conversation: the whole content area is the (scrollable) transcript.
+    // The welcome box is no longer on screen, so clear the anchor rect used to
+    // position error modals against its right column.
+    app.footer_right_column_area.set(Rect::default());
+    let msg_area = content_area;
 
     // Store the actual message pane bounds for mouse event handling (text selection, scrolling).
     app.last_msg_area.set(msg_area);
@@ -964,7 +1160,7 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     let lines = render_message_items(app, msg_area.width);
 
     // Highlight search matches in transcript when global search is active
-    let lines = if app.global_search.open && !app.global_search.query.is_empty() {
+    let lines = if app.global_search.visible && !app.global_search.query.is_empty() {
         let query_lc = app.global_search.query.to_lowercase();
         lines.into_iter().map(|mut item| {
             if item.search_text.to_lowercase().contains(query_lc.as_str()) {
@@ -993,6 +1189,11 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     let content_height = lines.len() as u16;
     let visible_height = msg_area.height;  // no borders, full height available
     let max_scroll = content_height.saturating_sub(visible_height) as usize;
+    // Publish the max meaningful scroll offset so the next scroll event can
+    // clamp `scroll_offset` against it (the content height is only known here,
+    // at render time). Prevents unbounded inflation when scrolling past the top
+    // (#223).
+    app.last_max_scroll.set(max_scroll);
     // scroll_offset counts lines above the bottom (0 = at bottom).
     // ratatui scroll() takes an absolute top-row index, so convert:
     //   top_row = max_scroll - scroll_offset  (clamped to [0, max_scroll])
@@ -1145,12 +1346,11 @@ fn render_live_thinking_lines(turn: &TranscriptTurn<'_>, frame_count: u64, width
 fn append_turn_items(
     items: &mut Vec<RenderedLineItem>,
     turn: &TranscriptTurn<'_>,
-    width: u16,
-    tool_names: &std::collections::HashMap<String, String>,
-    expanded_thinking: &std::collections::HashSet<u64>,
+    ctx: &RenderContext,
     frame_count: u64,
     accent: Color,
 ) {
+    let width = ctx.width;
     push_rendered_items(
         items,
         render_transcript_user_message(turn.user_message, turn.metadata, width),
@@ -1165,16 +1365,7 @@ fn append_turn_items(
 
     let mut sections: Vec<(SectionContent, Option<usize>)> = Vec::new();
     for (message_index, message) in &turn.assistant_messages {
-        let tagged = render_transcript_assistant_message_tagged(
-            message,
-            &RenderContext {
-                width,
-                highlight: true,
-                show_thinking: false,
-                tool_names: tool_names.clone(),
-                expanded_thinking: expanded_thinking.clone(),
-            },
-        );
+        let tagged = render_transcript_assistant_message_tagged(message, ctx);
         if !tagged.is_empty() {
             sections.push((SectionContent::Tagged(tagged), Some(*message_index)));
         }
@@ -1243,6 +1434,103 @@ fn append_turn_items(
     push_blank_item(items);
 }
 
+/// Append rendered items for the transcript messages in `[start, end)` to
+/// `items`, mirroring the single linear pass used by the full transcript build.
+///
+/// System annotations are emitted at the top of each landed index exactly as
+/// the full pass does; `emit_end_annotations` additionally flushes the
+/// annotations anchored at `end` (used when `end` is the true message count so
+/// trailing annotations are not lost).
+///
+/// Splitting the pass at a turn boundary is byte-identical to building the whole
+/// range in one shot: `range(0, k, false)` followed by `range(k, total, true)`
+/// produces exactly the same items as `range(0, total, true)` whenever `k` is an
+/// index the linear pass lands on (i.e. a turn's user index). This is what lets
+/// the streaming path serve the committed prefix from cache and rebuild only the
+/// live tail without any risk of ghosting.
+#[allow(clippy::too_many_arguments)]
+fn build_message_items_range(
+    app: &App,
+    width: u16,
+    ctx: &RenderContext,
+    turn_map: &std::collections::HashMap<usize, &TranscriptTurn<'_>>,
+    start: usize,
+    end: usize,
+    emit_end_annotations: bool,
+    items: &mut Vec<RenderedLineItem>,
+) {
+    let mut index = start;
+    while index < end {
+        for ann in app.system_annotations.iter().filter(|ann| ann.after_index == index) {
+            let mut lines = Vec::new();
+            render_system_annotation_lines(&mut lines, ann, width as usize);
+            push_rendered_items(items, lines, None, false);
+        }
+
+        let message = &app.messages[index];
+        if message.role == Role::User {
+            if let Some(&turn) = turn_map.get(&index) {
+                append_turn_items(items, turn, ctx, app.frame_count, app.accent_color);
+                index = turn.end_message_index + 1;
+                continue;
+            }
+        }
+
+        let tagged = render_transcript_assistant_message_tagged(message, ctx);
+        push_rendered_items_tagged(items, tagged, Some(index));
+        push_blank_item(items);
+        index += 1;
+    }
+
+    if emit_end_annotations {
+        for ann in app.system_annotations.iter().filter(|ann| ann.after_index == end) {
+            let mut lines = Vec::new();
+            render_system_annotation_lines(&mut lines, ann, width as usize);
+            push_rendered_items(items, lines, None, false);
+        }
+    }
+}
+
+/// Build the full transcript item list from scratch (no caching). Used for the
+/// non-streaming path, the streaming fallback, and as the correctness reference
+/// in tests.
+fn build_all_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
+    // Build `tool_names` and the render context ONCE per rebuild and lend them
+    // to every message renderer (issue #222).
+    let tool_names = build_tool_names(&app.messages);
+    let ctx = RenderContext {
+        width,
+        highlight: true,
+        show_thinking: false,
+        tool_names: &tool_names,
+        expanded_thinking: &app.thinking_expanded,
+    };
+    let turns = build_transcript_turns(app);
+    let mut turn_map = std::collections::HashMap::new();
+    for turn in &turns {
+        turn_map.insert(turn.user_index, turn);
+    }
+
+    let total = app.messages.len();
+    let mut items = Vec::new();
+    // Prepend the compact welcome banner as ordinary scrollable content so it
+    // scrolls away with the conversation instead of sitting in a fixed header
+    // (issue #310).
+    push_rendered_items(&mut items, welcome_banner_lines(app, width), None, false);
+    build_message_items_range(app, width, &ctx, &turn_map, 0, total, true, &mut items);
+
+    if total == 0 && !app.tool_use_blocks.is_empty() {
+        for block in &app.tool_use_blocks {
+            let mut lines = Vec::new();
+            render_tool_block_lines(&mut lines, block, app.frame_count);
+            push_rendered_items(&mut items, lines, None, false);
+            push_blank_item(&mut items);
+        }
+    }
+
+    items
+}
+
 fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
     let streaming = app.is_streaming
         || !app.streaming_text.is_empty()
@@ -1252,6 +1540,13 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         .iter()
         .any(|block| block.status == ToolStatus::Running);
     let cacheable = !streaming && !has_running_tool_blocks;
+
+    if !cacheable {
+        // Live content is on screen. Instead of re-rendering the whole backlog
+        // every frame (the O(messages^2) hot path from issue #222), serve the
+        // committed prefix from cache and rebuild only the live tail.
+        return render_streaming_items(app, width);
+    }
 
     // Fast path: nothing live — use the full-result cache (ptr-stable check).
     let full_key = MessageLinesCacheKey {
@@ -1263,151 +1558,117 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         annotations_len: app.system_annotations.len(),
         thinking_expanded_len: app.thinking_expanded.len(),
     };
-    if cacheable {
-        if let Some(lines) = MESSAGE_LINES_CACHE.with(|cache| {
-            cache
-                .borrow()
-                .as_ref()
-                .filter(|c| c.key == full_key)
-                .map(|c| c.lines.clone())
-        }) {
-            return lines;
-        }
+    if let Some(lines) = MESSAGE_LINES_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|c| c.key == full_key)
+            .map(|c| c.lines.clone())
+    }) {
+        return lines;
     }
 
-    let completed_key = CompletedMsgCacheKey {
+    let items = build_all_items(app, width);
+    MESSAGE_LINES_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some(MessageLinesCache {
+            key: full_key,
+            lines: items.clone(),
+        });
+    });
+    items
+}
+
+/// Render the transcript while there is live content on screen.
+///
+/// The only part of the transcript that changes between streaming frames is the
+/// last turn (its live text/thinking and any running tool blocks). Every earlier
+/// turn is already committed and byte-identical to a full rebuild, so we serve
+/// that committed prefix from `COMPLETED_MSG_CACHE` and rebuild only the live
+/// tail. Because `build_message_items_range` splits the exact same linear pass
+/// at a turn boundary, `prefix ++ tail` is identical to `build_all_items` — no
+/// ghosting, no missing content.
+fn render_streaming_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
+    let tool_names = build_tool_names(&app.messages);
+    let ctx = RenderContext {
         width,
-        transcript_version: app.transcript_version.get(),
-        messages_len: app.messages.len(),
+        highlight: true,
+        show_thinking: false,
+        tool_names: &tool_names,
+        expanded_thinking: &app.thinking_expanded,
+    };
+    let turns = build_transcript_turns(app);
+
+    // The live tail is the last turn; its user index is the prefix boundary.
+    // Without a turn (e.g. tool-blocks-only welcome state) there is no stable
+    // prefix to reuse, so fall back to a full rebuild.
+    let split_idx = match turns.last() {
+        Some(last) => last.user_index,
+        None => return build_all_items(app, width),
+    };
+
+    let mut turn_map = std::collections::HashMap::new();
+    for turn in &turns {
+        turn_map.insert(turn.user_index, turn);
+    }
+
+    let total = app.messages.len();
+    let prefix_key = CompletedMsgCacheKey {
+        width,
+        prefix_len: split_idx,
+        messages_ptr: app.messages.as_ptr() as usize,
+        messages_len: total,
+        annotations_ptr: app.system_annotations.as_ptr() as usize,
         annotations_len: app.system_annotations.len(),
         thinking_expanded_len: app.thinking_expanded.len(),
     };
-    let build_items = || {
-        let tool_names = build_tool_names(&app.messages);
-        let turns = build_transcript_turns(app);
-        let mut turn_map = std::collections::HashMap::new();
-        for turn in &turns {
-            turn_map.insert(turn.user_index, turn);
-        }
 
-        let mut items = Vec::new();
-        let total = app.messages.len();
-        let mut index = 0usize;
-        while index <= total {
-            for ann in app.system_annotations.iter().filter(|ann| ann.after_index == index) {
-                let mut lines = Vec::new();
-                render_system_annotation_lines(&mut lines, ann, width as usize);
-                push_rendered_items(&mut items, lines, None, false);
-            }
-
-            if index >= total {
-                break;
-            }
-
-            let message = &app.messages[index];
-            if message.role == Role::User {
-                if let Some(&turn) = turn_map.get(&index) {
-                    append_turn_items(
-                        &mut items,
-                        turn,
-                        width,
-                        &tool_names,
-                        &app.thinking_expanded,
-                        app.frame_count,
-                        app.accent_color,
-                    );
-                    index = turn.end_message_index + 1;
-                    continue;
-                }
-            }
-
-            let tagged = render_transcript_assistant_message_tagged(
-                message,
-                &RenderContext {
-                    width,
-                    highlight: true,
-                    show_thinking: false,
-                    tool_names: tool_names.clone(),
-                    expanded_thinking: app.thinking_expanded.clone(),
-                },
-            );
-            push_rendered_items_tagged(&mut items, tagged, Some(index));
-            push_blank_item(&mut items);
-            index += 1;
-        }
-
-        if total == 0 && !app.tool_use_blocks.is_empty() {
-            for block in &app.tool_use_blocks {
-                let mut lines = Vec::new();
-                render_tool_block_lines(&mut lines, block, app.frame_count);
-                push_rendered_items(&mut items, lines, None, false);
-                push_blank_item(&mut items);
-            }
-        }
-
-        items
-    };
-    let completed_lines: Vec<RenderedLineItem> = if cacheable {
-        if let Some(lines) = COMPLETED_MSG_CACHE.with(|cache| {
-            cache
-                .borrow()
-                .as_ref()
-                .filter(|c| c.key == completed_key)
-                .map(|c| c.lines.clone())
-        }) {
-            lines
-        } else {
-            let items = build_items();
-            COMPLETED_MSG_CACHE.with(|cache| {
-                *cache.borrow_mut() = Some(CompletedMsgCache {
-                    key: completed_key,
-                    lines: items.clone(),
-                });
-            });
-            items
-        }
+    // Committed prefix: messages before the live turn. Stable across streaming
+    // deltas, so keyed by identity (not `transcript_version`) and served from
+    // cache every frame after the first. The cached prefix does NOT include the
+    // welcome banner, so the entry stays byte-identical to the non-streaming
+    // build's committed range.
+    let prefix = if let Some(lines) = COMPLETED_MSG_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|c| c.key == prefix_key)
+            .map(|c| c.lines.clone())
+    }) {
+        record_prefix_cache_hit();
+        lines
     } else {
-        build_items()
-    };
-
-    // If there is no live content, store in the full cache and return.
-    if cacheable {
-        MESSAGE_LINES_CACHE.with(|cache| {
-            *cache.borrow_mut() = Some(MessageLinesCache {
-                key: full_key,
-                lines: completed_lines.clone(),
+        record_prefix_cache_miss();
+        let mut prefix = Vec::new();
+        build_message_items_range(app, width, &ctx, &turn_map, 0, split_idx, false, &mut prefix);
+        COMPLETED_MSG_CACHE.with(|cache| {
+            *cache.borrow_mut() = Some(CompletedMsgCache {
+                key: prefix_key,
+                lines: prefix.clone(),
             });
         });
-        return completed_lines;
-    }
+        prefix
+    };
 
-    completed_lines
+    // The welcome banner leads the transcript and scrolls away with content
+    // (issue #310). Prepended here, outside the committed-prefix cache, so
+    // banner ++ prefix ++ tail stays byte-identical to `build_all_items`.
+    let mut items = Vec::new();
+    push_rendered_items(&mut items, welcome_banner_lines(app, width), None, false);
+    items.extend(prefix);
+
+    // Live tail: the actively-streaming turn, rebuilt fresh every frame.
+    build_message_items_range(app, width, &ctx, &turn_map, split_idx, total, true, &mut items);
+    items
 }
 
 // â”€â”€ Welcome / startup screen â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Render the two-column orange round-bordered welcome box (matches TS LogoV2).
 fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
-    // Shorten cwd: replace $USERPROFILE/$HOME prefix with ~
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|p| {
-            let home = std::env::var("USERPROFILE")
-                .or_else(|_| std::env::var("HOME"))
-                .ok();
-            if let Some(h) = home {
-                let hs = p.display().to_string();
-                if hs.starts_with(&h) {
-                    return Some(format!("~{}", &hs[h.len()..]));
-                }
-            }
-            Some(p.display().to_string())
-        })
-        .unwrap_or_else(|| ".".to_string());
 
     // --- Box dimensions ---
     // The box should be at most the full area width, and a fixed height.
-    let box_width = area.width.min(area.width);
+    let box_width = area.width;
     let box_height: u16 = WELCOME_BOX_HEIGHT;
     if area.height < box_height || box_width < 30 {
         // Too small: fall back to a single line
@@ -1442,7 +1703,7 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
 
     // Split inner into left | divider(1) | right
     // Left width: ~28 chars or half the inner width, whichever is smaller
-    let left_w = (inner.width / 2).max(22).min(32).min(inner.width.saturating_sub(3));
+    let left_w = (inner.width / 2).clamp(22, 32).min(inner.width.saturating_sub(3));
     let right_w = inner.width.saturating_sub(left_w + 1);
     let h_chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -1452,6 +1713,9 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(right_w),
         ])
         .split(inner);
+
+    // Store the right column area for error modal positioning
+    app.footer_right_column_area.set(h_chunks[2]);
 
     // Draw vertical divider in accent color
     let divider_lines: Vec<Line> = (0..inner.height)
@@ -1484,28 +1748,6 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
         spans.extend(cl.spans.iter().cloned());
         left_lines.push(Line::from(spans));
     }
-    left_lines.push(Line::from(""));
-    // Only show model line if credentials are configured
-    if app.has_credentials {
-        let model_display = if let Some((provider, model)) = app.model_name.split_once('/') {
-            if provider == "anthropic" {
-                model.to_string()
-            } else {
-                format!("{} [{}]", model, provider)
-            }
-        } else {
-            app.model_name.clone()
-        };
-        left_lines.push(Line::from(Span::styled(
-            format!("{} \u{00b7} API Usage", model_display),
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-    left_lines.push(Line::from(Span::styled(
-        cwd,
-        Style::default().fg(Color::DarkGray),
-    )));
-
     frame.render_widget(Paragraph::new(left_lines).wrap(Wrap { trim: false }), h_chunks[0]);
 
     // --- Right column ---
@@ -1528,12 +1770,106 @@ fn render_welcome_box(frame: &mut Frame, app: &App, area: Rect) {
         "Recent activity",
         Style::default().fg(accent).add_modifier(Modifier::BOLD),
     )));
-    right_lines.push(Line::from(Span::styled(
-        "No recent activity",
-        Style::default().fg(Color::DarkGray),
-    )));
+    right_lines.extend(recent_activity_lines(&app.recent_sessions, right_w_usize));
 
     frame.render_widget(Paragraph::new(right_lines).wrap(Wrap { trim: false }), h_chunks[2]);
+}
+
+/// Build the compact welcome banner shown at the very top of the transcript.
+///
+/// Unlike the full two-column welcome box (which is a whole welcome *screen*
+/// rendered only while the transcript is empty), this banner is prepended to the
+/// message list as ordinary scrollable content, so it scrolls away with the
+/// conversation instead of occupying a permanent fixed header (issue #310). It
+/// carries the greeting the box led with plus a getting-started hint and any
+/// startup notices, in just a few rows.
+///
+/// Deliberately free of disk/IO or per-frame state (no `select_tip`, which reads
+/// the tip history from disk) so it is cheap to rebuild every streaming frame and
+/// byte-identical between the full and cached-prefix render paths.
+fn welcome_banner_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let accent = app.accent_color;
+
+    let username = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok()
+        .filter(|u| !u.is_empty());
+    let greeting = match username {
+        Some(ref name) => format!("Welcome back, {}!", name),
+        None => "Welcome to Claurst".to_string(),
+    };
+
+    // Too narrow for a bordered box: fall back to a single title line + notices.
+    if width < 24 {
+        let mut lines = vec![Line::from(vec![
+            Span::styled(
+                "Claurst ",
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("v{}", APP_VERSION),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])];
+        lines.extend(startup_notice_lines(app, width));
+        lines.push(Line::from(""));
+        return lines;
+    }
+
+    let box_w = width as usize;
+    let inner_w = box_w.saturating_sub(4); // "│ " + content + " │"
+
+    // Top border with an embedded title: ╭─ Claurst vX.Y ─…─╮
+    // Span widths: "╭─"=2, " Claurst "=9, "v{ver} "=ver+2, dashes=fill, "╮"=1.
+    let used = 2 + 9 + (APP_VERSION.len() + 2) + 1;
+    let fill = box_w.saturating_sub(used);
+    let top = Line::from(vec![
+        Span::styled("\u{256d}\u{2500}", Style::default().fg(accent)),
+        Span::styled(
+            " Claurst ",
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("v{} ", APP_VERSION),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            format!("{}\u{256e}", "\u{2500}".repeat(fill)),
+            Style::default().fg(accent),
+        ),
+    ]);
+
+    let content_row = |text: String, style: Style| -> Line<'static> {
+        let text = truncate_end(&text, inner_w);
+        let pad = inner_w.saturating_sub(UnicodeWidthStr::width(text.as_str()));
+        Line::from(vec![
+            Span::styled("\u{2502} ", Style::default().fg(accent)),
+            Span::styled(text, style),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(" \u{2502}", Style::default().fg(accent)),
+        ])
+    };
+
+    let bottom = Line::from(Span::styled(
+        format!("\u{2570}{}\u{256f}", "\u{2500}".repeat(box_w.saturating_sub(2))),
+        Style::default().fg(accent),
+    ));
+
+    let mut lines = vec![
+        top,
+        content_row(
+            greeting,
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        content_row(
+            "/help for commands  \u{00b7}  ? for shortcuts".to_string(),
+            Style::default().fg(Color::Gray),
+        ),
+        bottom,
+    ];
+    lines.extend(startup_notice_lines(app, width));
+    lines.push(Line::from(""));
+    lines
 }
 
 // â”€â”€ Per-message rendering â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1610,50 +1946,111 @@ fn render_system_annotation_lines(
 
 // â”€â”€ Tool use block â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+/// Per-tool marker shown at the head of a tool block (the marker conveys the
+/// tool, the line then shows the primary argument). Falls back to the generic
+/// `~` for unmapped tools.
+///
+/// These are deliberately ASCII: many terminals render "pretty" Unicode glyphs
+/// (arrows, ✱, ☰, …) two cells wide while ratatui's layout counts them as one,
+/// which both breaks header alignment and desyncs the scroll redraw. ASCII is
+/// guaranteed one cell everywhere, and the shell-flavoured choices read well in
+/// context (`<` read, `>` write, `*` glob, `/` grep).
+fn tool_icon(normalized: &str) -> &'static str {
+    match normalized {
+        "bash" | "powershell" => "$",
+        "read" => "<",
+        "write" | "apply_patch" | "edit" => ">",
+        "glob" | "list" => "*",
+        "grep" | "codesearch" => "/",
+        "webfetch" => "@",
+        "websearch" => "?",
+        "todowrite" | "todo_write" | "todo" => ":",
+        "task" | "agent" => "+",
+        _ => "~",
+    }
+}
+
+/// Replace a leading home-directory prefix with `~` for compact display
+/// (mirrors pi's `shortenPath`). Works on Windows too via `dirs::home_dir`.
+fn shorten_home_path(s: &str) -> String {
+    if let Some(home) = dirs::home_dir() {
+        let home = home.to_string_lossy();
+        let home = home.trim_end_matches(['/', '\\']);
+        if !home.is_empty() && s.starts_with(home) {
+            let rest = &s[home.len()..];
+            return format!("~{}", rest);
+        }
+    }
+    s.to_string()
+}
+
+/// Running-state verb shown (with shimmer) while a tool is in flight.
+fn tool_running_label(normalized: &str, fallback: &str) -> String {
+    match normalized {
+        "bash" | "powershell" => "Running command",
+        "read" => "Reading file",
+        "write" | "apply_patch" => "Writing file",
+        "edit" => "Editing file",
+        "glob" | "list" => "Listing files",
+        "grep" | "codesearch" => "Searching code",
+        "webfetch" => "Fetching page",
+        "websearch" => "Searching web",
+        "todowrite" | "todo_write" | "todo" => "Updating todos",
+        _ => fallback,
+    }
+    .to_string()
+}
+
 fn render_tool_block_lines(lines: &mut Vec<Line<'static>>, block: &crate::app::ToolUseBlock, frame_count: u64) {
     let input_val: serde_json::Value =
         serde_json::from_str(&block.input_json).unwrap_or(serde_json::Value::Null);
     let normalized = block.name.to_ascii_lowercase();
     let running = block.status == ToolStatus::Running;
-    let mut summary = crate::messages::extract_tool_summary(&block.name, &input_val);
-    let title = if normalized == "task" || normalized == "agent" {
-        if let Some(description) = input_val.get("description").and_then(|value| value.as_str()) {
-            summary = description.to_string();
-        }
-        crate::messages::subagent_title(&input_val)
-    } else {
-        match (normalized.as_str(), running) {
-            ("bash" | "powershell", true) => "Running command".to_string(),
-            ("bash" | "powershell", false) => "Ran command".to_string(),
-            ("read", true) => "Reading file".to_string(),
-            ("read", false) => "Read file".to_string(),
-            ("write" | "apply_patch", true) => "Writing file".to_string(),
-            ("write" | "apply_patch", false) => "Wrote file".to_string(),
-            ("edit", true) => "Editing file".to_string(),
-            ("edit", false) => "Edited file".to_string(),
-            ("glob" | "list", true) => "Listing files".to_string(),
-            ("glob" | "list", false) => "Listed files".to_string(),
-            ("grep" | "codesearch", true) => "Searching code".to_string(),
-            ("grep" | "codesearch", false) => "Searched code".to_string(),
-            ("webfetch", true) => "Fetching page".to_string(),
-            ("webfetch", false) => "Fetched page".to_string(),
-            ("websearch", true) => "Searching web".to_string(),
-            ("websearch", false) => "Searched web".to_string(),
-            _ => block.name.clone(),
-        }
-    };
-
     let accent = if block.status == ToolStatus::Error {
         Color::Rgb(255, 140, 0)
     } else {
         CLAUDE_ORANGE
     };
-    let mut header_spans = vec![Span::styled("   ~ ".to_string(), Style::default().fg(accent))];
-    if running {
-        header_spans.extend(shimmer_spans(&title, frame_count));
+    let icon = tool_icon(&normalized);
+
+    // TodoWrite renders as a real checklist rather than a generic tool block.
+    if matches!(normalized.as_str(), "todowrite" | "todo_write" | "todo")
+        && render_todo_block(lines, &input_val, icon, accent, running, frame_count)
+    {
+        return;
+    }
+
+    // Primary argument shown on the header line (icon + arg), opencode-style.
+    let mut summary = crate::messages::extract_tool_summary(&block.name, &input_val);
+    let running_label = if normalized == "task" || normalized == "agent" {
+        if let Some(description) = input_val.get("description").and_then(|value| value.as_str()) {
+            summary = description.to_string();
+        }
+        crate::messages::subagent_title(&input_val)
     } else {
+        tool_running_label(&normalized, &block.name)
+    };
+
+    // Shorten home paths in path-bearing summaries.
+    if matches!(
+        normalized.as_str(),
+        "read" | "edit" | "write" | "apply_patch" | "glob" | "list"
+    ) {
+        summary = shorten_home_path(&summary);
+    }
+
+    let mut header_spans = vec![Span::styled(format!("   {} ", icon), Style::default().fg(accent))];
+    if running {
+        header_spans.extend(shimmer_spans(&running_label, frame_count));
+    } else {
+        // Show the primary argument; fall back to the tool name when there is none.
+        let primary = if summary.is_empty() {
+            block.name.clone()
+        } else {
+            summary
+        };
         header_spans.push(Span::styled(
-            title,
+            primary,
             Style::default()
                 .fg(if block.status == ToolStatus::Error { accent } else { Color::White })
                 .add_modifier(Modifier::BOLD),
@@ -1661,39 +2058,7 @@ fn render_tool_block_lines(lines: &mut Vec<Line<'static>>, block: &crate::app::T
     }
     lines.push(Line::from(header_spans));
 
-    if !summary.is_empty() {
-        lines.push(Line::from(vec![
-            Span::raw("     "),
-            Span::styled(summary, Style::default().fg(Color::DarkGray)),
-        ]));
-    }
-
-    if normalized == "bash" || normalized == "powershell" {
-        let command = input_val
-            .get("command")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        for (i, cmd_line) in command.lines().enumerate() {
-            if i >= 2 {
-                break;
-            }
-            let display: String = cmd_line.chars().take(160).collect();
-            let display = if cmd_line.chars().count() > 160 {
-                format!("{}\u{2026}", display)
-            } else {
-                display
-            };
-            lines.push(Line::from(vec![
-                Span::styled("     $ ".to_string(), Style::default().fg(Color::Green)),
-                Span::styled(
-                    display,
-                    Style::default().fg(Color::White),
-                ),
-            ]));
-        }
-    }
-
-    // Output preview (done/error state)
+    // Output preview (done/error state) — home paths shortened, dimmed.
     if let Some(ref preview) = block.output_preview {
         let preview_style = match block.status {
             ToolStatus::Error => Style::default().fg(Color::Rgb(255, 140, 0)),
@@ -1713,11 +2078,97 @@ fn render_tool_block_lines(lines: &mut Vec<Line<'static>>, block: &crate::app::T
             } else {
                 lines.push(Line::from(vec![
                     Span::raw("     "),
-                    Span::styled(line_text.to_string(), preview_style),
+                    Span::styled(shorten_home_path(line_text), preview_style),
                 ]));
             }
         }
     }
+}
+
+/// Render a TodoWrite call as a checklist. Returns `false` (so the caller can
+/// fall back to the generic block) when the input carries no `todos` array.
+fn render_todo_block(
+    lines: &mut Vec<Line<'static>>,
+    input_val: &serde_json::Value,
+    icon: &str,
+    accent: Color,
+    running: bool,
+    frame_count: u64,
+) -> bool {
+    let Some(todos) = input_val.get("todos").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    if todos.is_empty() {
+        return false;
+    }
+
+    fn status_of(t: &serde_json::Value) -> &str {
+        t.get("status").and_then(|s| s.as_str()).unwrap_or("pending")
+    }
+    let done = todos.iter().filter(|t| status_of(t) == "completed").count();
+    let total = todos.len();
+
+    // Header: ☰ Todos   <done>/<total>
+    let mut header = vec![Span::styled(format!("   {} ", icon), Style::default().fg(accent))];
+    if running {
+        header.extend(shimmer_spans("Updating todos", frame_count));
+    } else {
+        header.push(Span::styled(
+            "Todos".to_string(),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ));
+        header.push(Span::styled(
+            format!("  {}/{} done", done, total),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    lines.push(Line::from(header));
+
+    // Checklist items: ✓ done (green/dim) · • in-progress (orange) · ○ pending.
+    const MAX_ITEMS: usize = 12;
+    for t in todos.iter().take(MAX_ITEMS) {
+        let content = t
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .trim();
+        if content.is_empty() {
+            continue;
+        }
+        // ASCII checkboxes (markdown-style) so alignment holds on every
+        // terminal: [x] done, [>] in-progress, [ ] pending.
+        let (glyph, glyph_color, text_style) = match status_of(t) {
+            "completed" => (
+                "[x]",
+                Color::Rgb(120, 200, 120),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            ),
+            "in_progress" => (
+                "[>]",
+                accent,
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ),
+            _ => (
+                "[ ]",
+                Color::Rgb(150, 150, 150),
+                Style::default().fg(Color::Rgb(170, 170, 170)),
+            ),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("     {} ", glyph), Style::default().fg(glyph_color)),
+            Span::styled(content.to_string(), text_style),
+        ]));
+    }
+    if total > MAX_ITEMS {
+        lines.push(Line::from(vec![
+            Span::raw("     "),
+            Span::styled(
+                format!("... {} more", total - MAX_ITEMS),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            ),
+        ]));
+    }
+    true
 }
 
 // -----------------------------------------------------------------------
@@ -1797,17 +2248,39 @@ fn render_input(frame: &mut Frame, app: &App, area: Rect, focused: bool) {
         };
 
         // `?` opens the shortcuts overlay which already lists Ctrl+A / Ctrl+K
-        // and friends — surfacing them again here is redundant clutter.
-        let right_hint = if app.has_credentials {
-            Line::from(vec![Span::styled("? shortcuts", Style::default().fg(dim))])
+        // and friends — surfacing them again here is redundant clutter. It is
+        // also suppressed once the prompt has text, so the hint doesn't compete
+        // with what the user is typing (matches the footer contract).
+        let right_hint = if app.has_credentials && app.prompt_input.text.is_empty() {
+            Line::from(vec![
+                Span::styled("? shortcuts", Style::default().fg(dim)),
+            ])
+        } else if app.prompt_input.has_expandable_paste_ref() {
+            // A [Pasted text #N ...] placeholder is in the buffer — tell the
+            // user how to view the full pasted body before submitting.
+            Line::from(vec![
+                Span::styled("click to view paste · alt+e expands", Style::default().fg(dim)),
+            ])
         } else {
             Line::from(Vec::<Span>::new())
         };
 
-        frame.render_widget(Paragraph::new(vec![left_line]), chunks[0]);
+        let left_padded = Rect {
+            x: chunks[0].x + 1,
+            y: chunks[0].y,
+            width: chunks[0].width.saturating_sub(1),
+            height: chunks[0].height,
+        };
+        let right_padded = Rect {
+            x: chunks[1].x,
+            y: chunks[1].y,
+            width: chunks[1].width.saturating_sub(1),
+            height: chunks[1].height,
+        };
+        frame.render_widget(Paragraph::new(vec![left_line]), left_padded);
         frame.render_widget(
             Paragraph::new(vec![right_hint]).alignment(Alignment::Right),
-            chunks[1],
+            right_padded,
         );
     }
 
@@ -1835,13 +2308,17 @@ fn should_render_status_row(app: &App) -> bool {
         .map(|status| {
             let trimmed = status.trim();
             !trimmed.is_empty()
-                && !trimmed.eq_ignore_ascii_case("thinking")
-                && !trimmed.eq_ignore_ascii_case("thinking…")
+                && !trimmed.eq_ignore_ascii_case(STATUS_THINKING)
+                && !trimmed.eq_ignore_ascii_case(STATUS_THINKING_ELLIPSIS)
         })
         .unwrap_or(false);
 
+    // Note: a completed turn's "Worked for Xs" summary (`last_turn_elapsed`) is
+    // intentionally NOT a reason to keep the status row on — it stays set until
+    // the next submit, so gating on it pinned the idle spinner glyph on screen
+    // permanently after the first turn. The row now shows only while actually
+    // active (voice, streaming, or an idle status message).
     app.voice_recording
-        || app.last_turn_elapsed.is_some()
         || (!app.is_streaming && app.status_message.is_some())
         || (app.is_streaming && interesting_stream_status)
 }
@@ -1864,10 +2341,10 @@ fn render_status_row(frame: &mut Frame, app: &App, area: Rect) {
             .filter(|s| {
                 let t = s.trim();
                 !t.is_empty()
-                    && !t.eq_ignore_ascii_case("thinking")
-                    && !t.eq_ignore_ascii_case("thinking…")
+                    && !t.eq_ignore_ascii_case(STATUS_THINKING)
+                    && !t.eq_ignore_ascii_case(STATUS_THINKING_ELLIPSIS)
             })
-            .or_else(|| app.spinner_verb.as_deref())
+            .or(app.spinner_verb.as_deref())
             .unwrap_or("Thinking");
 
         let mut s = vec![Span::styled(
@@ -1955,6 +2432,14 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 {
         return;
     }
+
+    // Use only the first line of the footer area, leaving bottom padding
+    let footer_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 1,
+    };
 
     // Left side: ordered pills — voice > PR badge > background task > vim > hint
     let left_spans: Vec<Span> = if app.voice_recording {
@@ -2150,7 +2635,8 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         }
 
         // 3. Cost — mirrors TS formatCost: 4 decimal places for costs < $0.50, else 2.
-        if app.cost_usd > 0.0 {
+        // Display cost if it's >= 0.0, so free models show $0.00
+        if app.cost_usd >= 0.0 {
             if !parts.is_empty() {
                 parts.push(Span::raw("  "));
             }
@@ -2271,10 +2757,17 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 if !parts.is_empty() {
                     parts.push(Span::raw("  "));
                 }
-                let display_dir = if dir.starts_with(std::env::var("HOME").as_deref().unwrap_or("")) {
-                    dir.replace(std::env::var("HOME").as_deref().unwrap_or(""), "~")
-                } else {
-                    dir.clone()
+                // Use dirs::home_dir() so this works on Windows (where $HOME
+                // is unset and the home is $USERPROFILE). Guard against an
+                // empty home string: `str::replace("", "~")` inserts "~"
+                // between every character, producing the infamous
+                // `~X~:~\~B~i~g~g~e~r~…` output.
+                let home = dirs::home_dir()
+                    .and_then(|p| p.to_str().map(|s| s.to_string()))
+                    .filter(|s| !s.is_empty());
+                let display_dir = match home {
+                    Some(h) if dir.starts_with(&h) => dir.replacen(&h, "~", 1),
+                    _ => dir.clone(),
                 };
                 parts.push(Span::styled(
                     display_dir,
@@ -2335,13 +2828,20 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .sum();
-    let gap = (area.width as usize).saturating_sub(left_len + right_len);
+    let gap = (footer_area.width.saturating_sub(2) as usize).saturating_sub(left_len + right_len);
 
     let mut spans = left_spans;
     spans.push(Span::raw(" ".repeat(gap)));
     spans.extend(right_spans);
 
-    frame.render_widget(Paragraph::new(vec![Line::from(spans)]), area);
+    // Add padding: 1 char on each side
+    let padded_area = Rect {
+        x: footer_area.x + 1,
+        y: footer_area.y,
+        width: footer_area.width.saturating_sub(2),
+        height: footer_area.height,
+    };
+    frame.render_widget(Paragraph::new(vec![Line::from(spans)]), padded_area);
 }
 
 fn render_prompt_suggestions(frame: &mut Frame, app: &App, area: Rect) {
@@ -2556,13 +3056,11 @@ fn render_legacy_history_search(
                 .map(String::as_str)
                 .unwrap_or("");
 
-            let truncated = if UnicodeWidthStr::width(entry) > (dialog_width as usize - 6) {
-                let mut s = entry.to_string();
-                s.truncate(dialog_width as usize - 9);
-                format!("{}\u{2026}", s)
-            } else {
-                entry.to_string()
-            };
+            // truncate_end is width-aware, cuts on char boundaries, and appends
+            // its own ellipsis. The old code did `String::truncate` on a raw
+            // byte index (panics mid-codepoint) after a `usize` subtraction that
+            // could underflow-panic on a narrow terminal (#221).
+            let truncated = truncate_end(entry, (dialog_width as usize).saturating_sub(6));
 
             let (prefix, style) = if is_selected {
                 (
@@ -2884,4 +3382,532 @@ pub fn render_teammate_header(
     }
 
     Line::from(spans)
+}
+
+// ---------------------------------------------------------------------------
+// Tests — tool-block rendering (icon headers, path shortening, todo checklist)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tool_block_tests {
+    use super::*;
+    use crate::app::{ToolStatus, ToolUseBlock};
+
+    fn block(name: &str, status: ToolStatus, input: &str, preview: Option<&str>) -> ToolUseBlock {
+        ToolUseBlock {
+            id: "t".into(),
+            name: name.into(),
+            turn_index: None,
+            status,
+            output_preview: preview.map(|s| s.to_string()),
+            input_json: input.into(),
+        }
+    }
+
+    fn render(b: &ToolUseBlock) -> Vec<String> {
+        let mut lines = Vec::new();
+        render_tool_block_lines(&mut lines, b, 0);
+        lines.iter().map(flatten_line_text).collect()
+    }
+
+    #[test]
+    fn icons_are_per_tool_and_ascii() {
+        assert_eq!(tool_icon("bash"), "$");
+        assert_eq!(tool_icon("read"), "<");
+        assert_eq!(tool_icon("write"), ">");
+        assert_eq!(tool_icon("glob"), "*");
+        assert_eq!(tool_icon("grep"), "/");
+        assert_eq!(tool_icon("todowrite"), ":");
+        assert_eq!(tool_icon("something-unknown"), "~");
+        // All markers must be single-byte ASCII (guaranteed one terminal cell).
+        for t in ["bash", "read", "write", "glob", "grep", "webfetch", "websearch", "todo", "task", "x"] {
+            let icon = tool_icon(t);
+            assert_eq!(icon.len(), 1, "{t} icon {icon:?} must be 1 ASCII byte");
+            assert!(icon.is_ascii(), "{t} icon {icon:?} must be ASCII");
+        }
+    }
+
+    #[test]
+    fn shorten_home_replaces_prefix() {
+        if let Some(home) = dirs::home_dir() {
+            let p = home.join("projects").join("x.yaml");
+            let shortened = shorten_home_path(&p.to_string_lossy());
+            assert!(shortened.starts_with("~"), "got {shortened:?}");
+            assert!(shortened.ends_with("x.yaml"));
+            assert!(!shortened.contains(home.to_string_lossy().as_ref()));
+        }
+        // A non-home path is left untouched.
+        assert_eq!(shorten_home_path("/etc/hosts"), "/etc/hosts");
+    }
+
+    #[test]
+    fn bash_header_is_icon_led_and_not_duplicated() {
+        let b = block(
+            "bash",
+            ToolStatus::Done,
+            r#"{"command":"python3 - <<'PY'\nfrom pathlib import Path"}"#,
+            Some("218183\nMarketing Outbound OS"),
+        );
+        let lines = render(&b);
+        // Header: "$ python3 - <<'PY'"
+        assert!(lines[0].contains('$'), "header should be icon-led: {:?}", lines[0]);
+        assert!(lines[0].contains("python3 - <<'PY'"), "header shows command: {:?}", lines[0]);
+        // The command must appear exactly once (no summary + $-line duplication).
+        let joined = lines.join("\n");
+        assert_eq!(joined.matches("python3 - <<'PY'").count(), 1, "no dup: {joined:?}");
+        // Output preview still shown.
+        assert!(joined.contains("218183"));
+    }
+
+    #[test]
+    fn read_header_shortens_home_path() {
+        if let Some(home) = dirs::home_dir() {
+            let path = home.join("FOLLOWUPS.md");
+            let input = serde_json::json!({
+                "file_path": path.to_string_lossy().to_string(),
+            })
+            .to_string();
+            let b = block("read", ToolStatus::Done, &input, None);
+            let lines = render(&b);
+            assert!(lines[0].contains('<'), "read icon: {:?}", lines[0]);
+            assert!(lines[0].contains('~'), "home shortened: {:?}", lines[0]);
+            assert!(!lines[0].contains(home.to_string_lossy().as_ref()));
+        }
+    }
+
+    #[test]
+    fn todo_renders_checklist_with_glyphs_and_counts() {
+        let b = block(
+            "TodoWrite",
+            ToolStatus::Done,
+            r#"{"todos":[
+                {"content":"Locate files","status":"completed"},
+                {"content":"Build importer","status":"in_progress"},
+                {"content":"Wire adapter","status":"pending"}
+            ]}"#,
+            Some("Todo list updated (3 total)"),
+        );
+        let lines = render(&b);
+        let joined = lines.join("\n");
+        // Header shows count, not the raw "Todo list updated (...)".
+        assert!(joined.contains("Todos"), "{joined:?}");
+        assert!(joined.contains("1/3 done"), "{joined:?}");
+        // Each status has its ASCII checkbox + content.
+        assert!(joined.contains("[x] Locate files"), "done marker: {joined:?}");
+        assert!(joined.contains("[>] Build importer"), "in-progress marker: {joined:?}");
+        assert!(joined.contains("[ ] Wire adapter"), "pending marker: {joined:?}");
+        // The raw result-preview string must NOT leak into the checklist view.
+        assert!(!joined.contains("Todo list updated"), "preview suppressed: {joined:?}");
+    }
+
+    #[test]
+    fn legacy_history_search_narrow_multibyte_no_panic() {
+        use crate::app::{App, HistorySearch};
+        use claurst_core::config::Config;
+        use claurst_core::cost::CostTracker;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.prompt_input.history = vec!["\u{4f60}\u{597d}\u{4e16}\u{754c}".repeat(6)]; // wide CJK
+        let mut hs = HistorySearch::new();
+        hs.matches = vec![0];
+
+        // width 10 -> dialog_width 6 -> `dialog_width - 9` underflow-panicked
+        // pre-fix, and `String::truncate` on a byte index sliced the CJK entry
+        // mid-codepoint (#221). No panic == pass.
+        let mut terminal = Terminal::new(TestBackend::new(10, 12)).unwrap();
+        terminal
+            .draw(|frame| render_legacy_history_search(frame, &hs, &app, frame.area()))
+            .unwrap();
+    }
+}
+
+/// Tests for the streaming transcript cache (issue #222): the committed prefix
+/// must be reused across streaming deltas, and streaming output must be
+/// byte-identical to a full (non-cached) rebuild.
+#[cfg(test)]
+mod stream_cache_tests {
+    use super::*;
+    use crate::app::App;
+    use claurst_core::config::Config;
+    use claurst_core::cost::CostTracker;
+    use claurst_core::types::Message;
+
+    const WIDTH: u16 = 80;
+
+    fn test_app() -> App {
+        App::new(Config::default(), CostTracker::new())
+    }
+
+    /// A per-item signature that captures the rendered spans+styles (via Debug)
+    /// plus all metadata, so equality means byte-identical rendering.
+    fn item_sig(item: &RenderedLineItem) -> (String, bool, Option<usize>, Option<u64>) {
+        (
+            format!("{:?}", item.line),
+            item.is_header,
+            item.message_index,
+            item.thinking_hash,
+        )
+    }
+
+    fn sigs(items: &[RenderedLineItem]) -> Vec<(String, bool, Option<usize>, Option<u64>)> {
+        items.iter().map(item_sig).collect()
+    }
+
+    fn joined_text(items: &[RenderedLineItem]) -> String {
+        items
+            .iter()
+            .map(|i| i.search_text.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The completed-message items are reused (served from cache) across a
+    /// streaming delta, while the live tail updates.
+    #[test]
+    fn completed_prefix_reused_across_streaming_delta() {
+        let mut app = test_app();
+        // Turn 0 is fully committed; turn 1 is the live/streaming turn.
+        app.messages.push(Message::user("user one prompt"));
+        app.messages.push(Message::assistant("assistant one committed reply"));
+        app.messages.push(Message::user("user two prompt"));
+        app.is_streaming = true;
+        app.streaming_text = "streaming tail alpha".to_string();
+
+        reset_render_caches();
+
+        // First render: prefix is built fresh (a miss).
+        let render1 = render_message_items(&app, WIDTH);
+        assert_eq!(prefix_cache_counts(), (0, 1), "first render builds the prefix");
+
+        // A streaming delta arrives: only the live text grows. Real code bumps
+        // transcript_version on every delta — assert that does NOT evict the
+        // committed-prefix entry.
+        app.streaming_text.push_str(" beta");
+        app.invalidate_transcript();
+
+        let render2 = render_message_items(&app, WIDTH);
+        let (hits, misses) = prefix_cache_counts();
+        assert_eq!(
+            (hits, misses),
+            (1, 1),
+            "committed prefix served from cache after the delta (no rebuild)"
+        );
+
+        // The committed content is identical in both renders and appears before
+        // the live tail diverges.
+        let sig1 = sigs(&render1);
+        let sig2 = sigs(&render2);
+        let common = sig1
+            .iter()
+            .zip(sig2.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        assert!(common > 0, "some leading items must be identical");
+        let leading_text = joined_text(&render1[..common]);
+        assert!(
+            leading_text.contains("user one prompt")
+                && leading_text.contains("assistant one committed reply"),
+            "the reused prefix contains the whole committed turn: {leading_text:?}"
+        );
+        // The reused prefix must not contain any live tail content.
+        assert!(
+            !leading_text.contains("streaming tail alpha"),
+            "prefix must not include the live tail: {leading_text:?}"
+        );
+
+        // The live tail updated between renders.
+        let text1 = joined_text(&render1);
+        let text2 = joined_text(&render2);
+        assert!(text1.contains("streaming tail alpha"));
+        assert!(!text1.contains("streaming tail alpha beta"));
+        assert!(text2.contains("streaming tail alpha beta"), "tail rebuilt with the delta");
+    }
+
+    /// Streaming render (cached prefix + rebuilt tail) is byte-identical to a
+    /// full rebuild for a multi-message transcript — no ghosting, no missing or
+    /// stale content — both on the first (cold) frame and after a delta (warm).
+    #[test]
+    fn streaming_render_matches_full_rebuild() {
+        let mut app = test_app();
+        app.messages.push(Message::user("first user question"));
+        app.messages.push(Message::assistant("first assistant answer with **markdown**"));
+        app.messages.push(Message::user("second user question"));
+        app.messages.push(Message::assistant("second assistant answer"));
+        app.messages.push(Message::user("third user question"));
+        app.is_streaming = true;
+        app.streaming_thinking = "pondering the third answer".to_string();
+        app.streaming_text = "third answer so far".to_string();
+
+        reset_render_caches();
+
+        // Cold frame: streaming path vs a direct full rebuild.
+        let streamed_cold = render_message_items(&app, WIDTH);
+        let full_cold = build_all_items(&app, WIDTH);
+        assert_eq!(
+            sigs(&streamed_cold),
+            sigs(&full_cold),
+            "cold streaming render must match a full rebuild"
+        );
+
+        // Warm frame: after a delta, the prefix is served from cache but the
+        // concatenation must still equal a full rebuild.
+        app.streaming_text.push_str(" plus more tokens");
+        app.invalidate_transcript();
+        let streamed_warm = render_message_items(&app, WIDTH);
+        let (hits, _) = prefix_cache_counts();
+        assert!(hits >= 1, "warm frame served the prefix from cache");
+        let full_warm = build_all_items(&app, WIDTH);
+        assert_eq!(
+            sigs(&streamed_warm),
+            sigs(&full_warm),
+            "warm streaming render must match a full rebuild"
+        );
+    }
+
+    /// Swapping the transcript (session switch / fork / revert / compaction)
+    /// must NOT serve a stale committed prefix, even mid-stream.
+    #[test]
+    fn transcript_swap_does_not_ghost_stale_prefix() {
+        let mut app = test_app();
+        app.messages.push(Message::user("session A user"));
+        app.messages.push(Message::assistant("session A assistant reply"));
+        app.messages.push(Message::user("session A live turn"));
+        app.is_streaming = true;
+        app.streaming_text = "A tail".to_string();
+
+        reset_render_caches();
+        let render_a = render_message_items(&app, WIDTH);
+        assert!(joined_text(&render_a).contains("session A assistant reply"));
+
+        // Swap in a different transcript (new Vec) while still streaming. The
+        // prefix cache must be re-keyed by identity, so no session-A content
+        // leaks through.
+        app.messages = vec![
+            Message::user("session B user"),
+            Message::assistant("session B assistant reply"),
+            Message::user("session B live turn"),
+        ];
+        app.streaming_text = "B tail".to_string();
+        app.invalidate_transcript();
+
+        let render_b = render_message_items(&app, WIDTH);
+        let text_b = joined_text(&render_b);
+        assert!(text_b.contains("session B assistant reply"), "shows swapped content");
+        assert!(
+            !text_b.contains("session A"),
+            "no stale session-A content ghosts through: {text_b:?}"
+        );
+        // And the swapped render equals a full rebuild.
+        assert_eq!(sigs(&render_b), sigs(&build_all_items(&app, WIDTH)));
+    }
+
+    /// The last message toggling streaming -> completed moves cleanly into the
+    /// cached (non-streaming) set with identical content.
+    #[test]
+    fn streaming_to_completed_transition_is_clean() {
+        let mut app = test_app();
+        app.messages.push(Message::user("q1"));
+        app.messages.push(Message::assistant("a1 committed"));
+        app.messages.push(Message::user("q2"));
+        app.is_streaming = true;
+        app.streaming_text = "live answer body".to_string();
+
+        reset_render_caches();
+        let _streaming = render_message_items(&app, WIDTH);
+
+        // Commit the streamed message (as flush_streamed_assistant_message would)
+        // and end streaming.
+        app.messages.push(Message::assistant("live answer body"));
+        app.is_streaming = false;
+        app.streaming_text.clear();
+        app.invalidate_transcript();
+
+        let completed = render_message_items(&app, WIDTH);
+        // Non-streaming render equals a full rebuild (correct committed set).
+        assert_eq!(sigs(&completed), sigs(&build_all_items(&app, WIDTH)));
+        let text = joined_text(&completed);
+        assert!(text.contains("a1 committed"));
+        assert!(text.contains("live answer body"));
+    }
+}
+
+/// The `/effort` selector docks into the prompt area and replaces the prompt box
+/// while open (issue #275).
+#[cfg(test)]
+mod effort_dock_tests {
+    use super::*;
+    use crate::app::App;
+    use crate::model_picker::EffortLevel;
+    use claurst_core::config::Config;
+    use claurst_core::cost::CostTracker;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// The prompt pointer glyph drawn by `render_prompt_input`.
+    const PROMPT_POINTER: char = '\u{276f}';
+
+    fn render_screen(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render_app(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    out.push_str(cell.symbol());
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn effort_picker_replaces_prompt_box_when_open() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+
+        // Closed: the prompt box (its pointer) is drawn; no selector chrome.
+        let closed = render_screen(&app);
+        assert!(
+            closed.contains(PROMPT_POINTER),
+            "prompt pointer should be visible when the picker is closed"
+        );
+        assert!(
+            !closed.contains("ultracode"),
+            "selector labels must not show while the picker is closed"
+        );
+
+        // Open: the selector takes over the prompt area; the prompt box is gone.
+        app.effort_picker.open(
+            EffortLevel::High,
+            vec![
+                EffortLevel::Low,
+                EffortLevel::Medium,
+                EffortLevel::High,
+                EffortLevel::XHigh,
+                EffortLevel::Max,
+                EffortLevel::Ultracode,
+            ],
+        );
+        let open = render_screen(&app);
+        assert!(
+            open.contains("Effort") && open.contains("ultracode"),
+            "the docked Effort selector should render in the prompt area"
+        );
+        assert!(
+            !open.contains(PROMPT_POINTER),
+            "prompt input must NOT be drawn while the picker is open"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Welcome screen: recent activity (issue #277)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod recent_activity_tests {
+    use super::*;
+    use crate::app::{App, RecentSession};
+    use claurst_core::config::Config;
+    use claurst_core::cost::CostTracker;
+    use ratatui::{backend::TestBackend, Terminal};
+    use std::time::{Duration, SystemTime};
+
+    fn recent(label: &str, secs_ago: u64) -> RecentSession {
+        RecentSession {
+            label: label.to_string(),
+            mtime: SystemTime::now() - Duration::from_secs(secs_ago),
+        }
+    }
+
+    fn lines_text(recent: &[RecentSession], width: usize) -> Vec<String> {
+        recent_activity_lines(recent, width)
+            .iter()
+            .map(flatten_line_text)
+            .collect()
+    }
+
+    // -- relative-time formatter ------------------------------------------
+
+    #[test]
+    fn short_relative_secs_buckets() {
+        assert_eq!(short_relative_secs(0), "just now");
+        assert_eq!(short_relative_secs(59), "just now");
+        assert_eq!(short_relative_secs(60), "1m ago");
+        assert_eq!(short_relative_secs(5 * 60), "5m ago");
+        assert_eq!(short_relative_secs(2 * 3_600), "2h ago");
+        assert_eq!(short_relative_secs(3 * 86_400), "3d ago");
+    }
+
+    #[test]
+    fn short_relative_time_handles_future_mtime() {
+        // Clock skew (mtime slightly in the future) must not panic.
+        let future = SystemTime::now() + Duration::from_secs(120);
+        assert_eq!(short_relative_time(future), "just now");
+    }
+
+    // -- render-from-state path -------------------------------------------
+
+    #[test]
+    fn empty_state_shows_placeholder() {
+        let out = lines_text(&[], 40);
+        assert_eq!(out, vec!["No recent activity".to_string()]);
+    }
+
+    #[test]
+    fn populated_state_shows_titles_and_relative_times() {
+        let sessions = vec![
+            recent("Fix the parser bug", 2 * 3_600),
+            recent("Wire up onboarding", 3 * 86_400),
+        ];
+        let out = lines_text(&sessions, 40).join("\n");
+        assert!(out.contains("Fix the parser bug"), "first title: {out:?}");
+        assert!(out.contains("2h ago"), "first time: {out:?}");
+        assert!(out.contains("Wire up onboarding"), "second title: {out:?}");
+        assert!(out.contains("3d ago"), "second time: {out:?}");
+        // The placeholder must NOT appear when there is real activity.
+        assert!(!out.contains("No recent activity"), "no placeholder: {out:?}");
+    }
+
+    #[test]
+    fn caps_at_five_entries() {
+        let sessions: Vec<RecentSession> =
+            (0..8).map(|i| recent(&format!("session {i}"), 60)).collect();
+        assert_eq!(recent_activity_lines(&sessions, 40).len(), 5);
+    }
+
+    #[test]
+    fn long_label_is_truncated_and_leaves_room_for_time() {
+        let sessions = vec![recent(
+            "an extremely long session title that should be truncated to fit",
+            60,
+        )];
+        let out = lines_text(&sessions, 20);
+        assert_eq!(out.len(), 1);
+        let line = &out[0];
+        assert!(line.contains('\u{2026}'), "should be ellipsised: {line:?}");
+        assert!(line.ends_with("1m ago"), "time preserved at end: {line:?}");
+    }
+
+    #[test]
+    fn welcome_box_renders_recent_activity_from_state() {
+        // Full-widget smoke test: the section header renders and, when state is
+        // populated, a session label reaches the screen buffer without panic.
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.recent_sessions = vec![recent("Sortable label ABCDEF", 2 * 3_600)];
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| render_welcome_box(frame, &app, frame.area()))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(screen.contains("Recent activity"), "header rendered: present");
+        assert!(screen.contains("Sortable label"), "session label rendered");
+    }
 }

@@ -16,6 +16,10 @@ impl SqliteSessionStore {
     pub fn open(db_path: &Path) -> anyhow::Result<Self> {
         let conn = rusqlite::Connection::open(db_path)?;
 
+        // The DB file holds session titles and full message content, which may
+        // contain secrets read into context. Keep it owner-only (issue #212).
+        crate::accounts::set_user_only_perms(db_path);
+
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS sessions (

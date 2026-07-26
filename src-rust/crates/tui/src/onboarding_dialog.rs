@@ -340,13 +340,13 @@ fn render_keybindings_page(frame: &mut Frame, area: Rect) {
         kb("Enter", "send message"),
         kb("Shift+Enter", "newline"),
         kb("Ctrl+C", "interrupt / cancel"),
-        kb("Tab", "cycle mode (build/plan/explore)"),
+        kb("Tab", "cycle mode (build/plan)"),
         kb("\u{2191}\u{2193}", "history"),
         Line::from(""),
         Line::from(Span::styled("  Navigation", Style::default().fg(pink).add_modifier(Modifier::BOLD))),
         kb("PgUp/PgDn", "scroll transcript"),
         kb("Ctrl+K", "command palette"),
-        kb("Ctrl+A", "model picker"),
+        kb("Ctrl+Shift+A", "model picker"),
         Line::from(""),
         Line::from(Span::styled("  Permissions", Style::default().fg(pink).add_modifier(Modifier::BOLD))),
         kb("y", "allow tool once"),
@@ -386,8 +386,11 @@ mod tests {
     #[test]
     fn onboarding_defaults_hidden() {
         let state = OnboardingDialogState::new();
+        // The dialog starts hidden; the app calls show()/show_provider_setup()
+        // to pick the entry page, so the default page is just the enum default
+        // (ProviderSetup — the no-credentials path).
         assert!(!state.visible);
-        assert_eq!(state.page, OnboardingPage::Welcome);
+        assert_eq!(state.page, OnboardingPage::ProviderSetup);
     }
 
     #[test]

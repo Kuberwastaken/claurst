@@ -31,7 +31,7 @@ open = { workspace = true }
 qrcode = { workspace = true }
 claurst-bridge = { workspace = true }
 hostname = "0.4"
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 futures = { workspace = true }
 once_cell = { workspace = true }
 parking_lot = { workspace = true }

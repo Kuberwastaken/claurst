@@ -137,9 +137,7 @@ static STATE: once_cell::sync::Lazy<Mutex<HistoryState>> =
 // ---------------------------------------------------------------------------
 
 fn claude_home() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".claurst")
+    crate::config::Settings::config_dir()
 }
 
 fn history_path() -> PathBuf {
@@ -572,8 +570,11 @@ pub fn parse_references(input: &str) -> Vec<u32> {
         .collect()
 }
 
-/// Internal: return `(id, matched_string, byte_offset)` for each reference.
-fn parse_references_with_positions(input: &str) -> Vec<(u32, String, usize)> {
+/// Return `(id, matched_string, byte_offset)` for each reference in `input`.
+///
+/// Callers that need to distinguish reference kinds can inspect the matched
+/// string's prefix (`[Pasted text #`, `[Image #`, `[...Truncated text #`).
+pub fn parse_references_with_positions(input: &str) -> Vec<(u32, String, usize)> {
     // Recognised prefixes (from the TS regex):
     //   [Pasted text #N]
     //   [Pasted text #N +X lines]

@@ -66,6 +66,22 @@ pub fn check_and_continue_goal(
         None => return GoalContinuation::NoGoal,
     };
 
+    decide_goal_continuation(&store, session_id, total_tokens_used, turn_elapsed_secs)
+}
+
+/// Guard/decision core of [`check_and_continue_goal`], operating on an explicit
+/// [`GoalStore`] so the runaway / budget guards can be exercised against an
+/// in-memory store in tests. `check_and_continue_goal` is the production wrapper
+/// that opens the default store.
+///
+/// The guards are unchanged from the original cross-turn implementation — this
+/// function only relocates WHERE the store is obtained.
+pub fn decide_goal_continuation(
+    store: &GoalStore,
+    session_id: &str,
+    total_tokens_used: u64,
+    turn_elapsed_secs: u64,
+) -> GoalContinuation {
     let goal = match store.get_goal(session_id) {
         Some(g) => g,
         None => return GoalContinuation::NoGoal,

@@ -16,9 +16,9 @@ use std::path::{Path, PathBuf};
 // Public helpers
 // ---------------------------------------------------------------------------
 
-/// Return the default user-level plugins directory: `~/.claurst/plugins`.
+/// Return the default user-level plugins directory: `<claurst home>/plugins`.
 pub fn default_user_plugins_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".claurst").join("plugins"))
+    Some(claurst_core::config::Settings::config_dir().join("plugins"))
 }
 
 /// Return the project-level plugins directory: `<project>/.claurst/plugins`.

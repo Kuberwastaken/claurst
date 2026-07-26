@@ -113,7 +113,7 @@ pub async fn marketplace_install(name_or_url: &str) -> Result<InstalledPlugin, S
         MarketplaceEntry {
             name: name_or_url
                 .split('/')
-                .last()
+                .next_back()
                 .unwrap_or("plugin")
                 .trim_end_matches(".zip")
                 .to_string(),
@@ -208,9 +208,7 @@ pub async fn marketplace_update(name: &str) -> Result<Option<String>, String> {
 
 /// List all installed plugins.
 pub fn list_installed() -> Vec<InstalledPlugin> {
-    let plugins_dir = dirs::home_dir()
-        .map(|h| h.join(".claurst").join("plugins"))
-        .unwrap_or_default();
+    let plugins_dir = claurst_core::config::Settings::config_dir().join("plugins");
 
     let Ok(entries) = std::fs::read_dir(&plugins_dir) else {
         return Vec::new();
@@ -268,9 +266,7 @@ pub fn marketplace_uninstall(name: &str) -> Result<(), String> {
 }
 
 fn plugin_install_dir(name: &str) -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".claurst")
+    claurst_core::config::Settings::config_dir()
         .join("plugins")
         .join(name)
 }

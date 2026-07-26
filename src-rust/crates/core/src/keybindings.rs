@@ -3,6 +3,7 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use tracing::warn;
 
 /// All keybinding contexts
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -83,6 +84,29 @@ pub fn parse_keystroke(s: &str) -> Option<ParsedKeystroke> {
     })
 }
 
+fn format_chord_string(chord: &Chord) -> String {
+    chord
+        .iter()
+        .map(|ks| {
+            let mut parts = Vec::new();
+            if ks.ctrl {
+                parts.push("ctrl");
+            }
+            if ks.alt {
+                parts.push("alt");
+            }
+            if ks.shift {
+                parts.push("shift");
+            }
+            if ks.meta {
+                parts.push("meta");
+            }
+            parts.push(&ks.key);
+            parts.join("+")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 fn normalize_key(k: &str) -> String {
     match k {
         "esc" | "escape" => "escape".to_string(),
@@ -121,13 +145,12 @@ pub const NON_REBINDABLE: &[&str] = &["ctrl+c", "ctrl+d", "ctrl+m"];
 ///
 /// # Standard Keybindings (Phase 1 Implementation)
 /// - **Ctrl+L**: Clear current input line (like bash) [Chat context only due to conflict]
-/// - **Ctrl+A**: Open the model picker
+/// - **Ctrl+Shift+A**: Open the model picker
 /// - **Ctrl+K**: Open the command palette
 /// - **Ctrl+U**: Kill input from cursor to start of line (Emacs-style)
 /// - **Alt+←/Alt+→**: Navigate to previous/next message in transcript
 /// - **Ctrl+. (Ctrl+>)**: Jump to next error/issue in messages
 /// - **Ctrl+Shift+.**: Jump to previous error/issue
-/// - **Ctrl+M**: Send message (alternative to Enter)
 /// - **Shift+Tab**: Reverse indent/unindent in input (cycle permission mode)
 /// - **Ctrl+H**: Delete character before cursor (Chat context, Emacs-style)
 /// - **Alt+H**: Open help (alternative to F1)
@@ -146,13 +169,10 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("alt+h", "openHelp", KeyContext::Global),
 
         // ========== CHAT / INPUT CONTEXT ==========
+        // Message submission
         ("enter", "submit", KeyContext::Chat),
-        ("up", "historyPrev", KeyContext::Chat),
-        ("down", "historyNext", KeyContext::Chat),
-        ("shift+tab", "reverseIndent", KeyContext::Chat),
-        ("pageup", "scrollUp", KeyContext::Chat),
-        ("pagedown", "scrollDown", KeyContext::Chat),
-        ("tab", "indent", KeyContext::Chat),
+
+        // Newline insertion (Shift+Enter / Ctrl+J for multi-line composing)
         ("shift+enter", "newline", KeyContext::Chat),
         // Fallback for terminals that do not support the kitty keyboard protocol
         // (e.g. Terminal.app, older iTerm2, Windows Terminal, or SSH sessions).
@@ -164,37 +184,71 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // fallback is not needed there. Keep it as a compatibility belt-and-braces
         // for terminals that do not support the protocol.
         ("ctrl+j", "newline", KeyContext::Chat),
+        // Alt+Enter is the other conventional newline escape (many terminals,
+        // e.g. legacy iTerm2 / xterm modifyOtherKeys, send Alt+Enter as
+        // \x1b\r). Kept as an additional fallback alongside Shift+Enter/Ctrl+J.
+        ("alt+enter", "newline", KeyContext::Chat),
+
+        // Line start/end navigation
         ("home", "goLineStart", KeyContext::Chat),
+        ("cmd+left", "goLineStart", KeyContext::Chat),
+        ("ctrl+a", "goLineStart", KeyContext::Chat),
         ("end", "goLineEnd", KeyContext::Chat),
-
-        // Text Editing (Emacs-style) + app shortcuts
-        ("ctrl+a", "openModelPicker", KeyContext::Chat),
+        ("cmd+right", "goLineEnd", KeyContext::Chat),
         ("ctrl+e", "goLineEnd", KeyContext::Chat),
-        ("ctrl+h", "deleteCharBefore", KeyContext::Chat),
-        ("ctrl+k", "openCommandPalette", KeyContext::Chat),
-        ("ctrl+u", "killToStart", KeyContext::Chat),
-        ("ctrl+w", "killWord", KeyContext::Chat),
-        ("alt+d", "deleteWord", KeyContext::Chat),
-        ("alt+backspace", "killWord", KeyContext::Chat),
 
-        // New Text Editing & Navigation
-        ("ctrl+m", "sendMessage", KeyContext::Chat),
+        // Word navigation
+        ("ctrl+left", "moveWordBackward", KeyContext::Chat),
+        ("ctrl+right", "moveWordForward", KeyContext::Chat),
+
+        // Word deletion
+        ("ctrl+w", "killWord", KeyContext::Chat),
+        ("alt+backspace", "killWord", KeyContext::Chat),
+        ("alt+d", "deleteWord", KeyContext::Chat),
+
+        // Character/line deletion
+        ("ctrl+h", "deleteCharBefore", KeyContext::Chat),
+        ("ctrl+u", "killToStart", KeyContext::Chat),
         ("ctrl+l", "clearLine", KeyContext::Chat),
-        ("ctrl+.", "jumpToNextError", KeyContext::Chat),
-        ("ctrl+shift+.", "jumpToPreviousError", KeyContext::Chat),
+
+        // History navigation
+        ("up", "historyPrev", KeyContext::Chat),
+        ("ctrl+o", "historyPrev", KeyContext::Chat),
+        ("down", "historyNext", KeyContext::Chat),
+        ("ctrl+i", "historyNext", KeyContext::Chat),
+
+        // Message navigation
         ("alt+left", "previousMessage", KeyContext::Chat),
         ("alt+right", "nextMessage", KeyContext::Chat),
-        ("ctrl+o", "historyPrev", KeyContext::Chat),
-        ("ctrl+i", "historyNext", KeyContext::Chat),
+
+        // Error/issue navigation
+        ("ctrl+.", "jumpToNextError", KeyContext::Chat),
+        ("ctrl+shift+.", "jumpToPreviousError", KeyContext::Chat),
 
         // Searching
         ("ctrl+f", "findInMessage", KeyContext::Chat),
         ("ctrl+shift+f", "globalSearch", KeyContext::Chat),
-        ("ctrl+g", "goToLine", KeyContext::Chat),
         ("f3", "findNext", KeyContext::Chat),
         ("ctrl+]", "findNext", KeyContext::Chat),
         ("shift+f3", "findPrev", KeyContext::Chat),
         ("ctrl+[", "findPrev", KeyContext::Chat),
+        ("ctrl+g", "goToLine", KeyContext::Chat),
+
+        // Indentation
+        ("tab", "indent", KeyContext::Chat),
+        ("shift+tab", "reverseIndent", KeyContext::Chat),
+
+        // Paste placeholders — expand `[Pasted text #N ...]` back into the
+        // full pasted body (clicking the placeholder does the same).
+        ("alt+e", "expandPaste", KeyContext::Chat),
+
+        // Scrolling
+        ("pageup", "scrollUp", KeyContext::Chat),
+        ("pagedown", "scrollDown", KeyContext::Chat),
+
+        // App shortcuts
+        ("ctrl+shift+a", "openModelPicker", KeyContext::Chat),
+        ("ctrl+k", "openCommandPalette", KeyContext::Chat),
 
         // ========== CONFIRMATION DIALOGS ==========
         ("y", "yes", KeyContext::Confirmation),
@@ -213,10 +267,10 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("pagedown", "pageDown", KeyContext::Help),
 
         // ========== HISTORY SEARCH ==========
-        ("enter", "select", KeyContext::HistorySearch),
-        ("escape", "cancel", KeyContext::HistorySearch),
         ("up", "prevResult", KeyContext::HistorySearch),
         ("down", "nextResult", KeyContext::HistorySearch),
+        ("enter", "select", KeyContext::HistorySearch),
+        ("escape", "cancel", KeyContext::HistorySearch),
         ("tab", "togglePreview", KeyContext::HistorySearch),
 
         // ========== TRANSCRIPT / MESSAGE SELECTION ==========
@@ -232,20 +286,20 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // ========== MESSAGE SELECTOR OVERLAY ==========
         ("up", "prevMessage", KeyContext::MessageSelector),
         ("down", "nextMessage", KeyContext::MessageSelector),
+        ("k", "prevMessage", KeyContext::MessageSelector),
+        ("j", "nextMessage", KeyContext::MessageSelector),
         ("enter", "select", KeyContext::MessageSelector),
         ("escape", "cancel", KeyContext::MessageSelector),
-        ("j", "nextMessage", KeyContext::MessageSelector),
-        ("k", "prevMessage", KeyContext::MessageSelector),
 
         // ========== THEME & MODEL PICKERS ==========
         ("up", "prev", KeyContext::ThemePicker),
         ("down", "next", KeyContext::ThemePicker),
+        ("k", "prev", KeyContext::ThemePicker),
+        ("j", "next", KeyContext::ThemePicker),
         ("pageup", "pageUp", KeyContext::ThemePicker),
         ("pagedown", "pageDown", KeyContext::ThemePicker),
         ("enter", "select", KeyContext::ThemePicker),
         ("escape", "cancel", KeyContext::ThemePicker),
-        ("j", "next", KeyContext::ThemePicker),
-        ("k", "prev", KeyContext::ThemePicker),
 
         // ========== TASK LIST ==========
         ("up", "prevTask", KeyContext::Task),
@@ -257,22 +311,22 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // ========== DIFF DIALOG ==========
         ("up", "prevDiff", KeyContext::DiffDialog),
         ("down", "nextDiff", KeyContext::DiffDialog),
+        ("a", "acceptDiff", KeyContext::DiffDialog),
+        ("enter", "acceptDiff", KeyContext::DiffDialog),
+        ("r", "rejectDiff", KeyContext::DiffDialog),
+        ("escape", "rejectDiff", KeyContext::DiffDialog),
         ("pageup", "pageUp", KeyContext::DiffDialog),
         ("pagedown", "pageDown", KeyContext::DiffDialog),
-        ("enter", "acceptDiff", KeyContext::DiffDialog),
-        ("escape", "rejectDiff", KeyContext::DiffDialog),
-        ("r", "rejectDiff", KeyContext::DiffDialog),
-        ("a", "acceptDiff", KeyContext::DiffDialog),
 
         // ========== MODAL SELECT (Generic) ==========
         ("up", "prev", KeyContext::Select),
         ("down", "next", KeyContext::Select),
+        ("k", "prev", KeyContext::Select),
+        ("j", "next", KeyContext::Select),
         ("pageup", "pageUp", KeyContext::Select),
         ("pagedown", "pageDown", KeyContext::Select),
         ("enter", "select", KeyContext::Select),
         ("escape", "cancel", KeyContext::Select),
-        ("j", "next", KeyContext::Select),
-        ("k", "prev", KeyContext::Select),
         ("/", "search", KeyContext::Select),
 
         // ========== PLUGIN & ATTACHMENTS ==========
@@ -297,12 +351,28 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         .collect()
 }
 
+/// Current schema version for keybindings
+pub const KEYBINDINGS_SCHEMA_VERSION: u32 = 1;
 /// User keybindings loaded from ~/.claurst/keybindings.json
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserKeybindings {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub bindings: Vec<UserBinding>,
 }
 
+fn default_schema_version() -> u32 {
+    KEYBINDINGS_SCHEMA_VERSION
+}
+
+impl Default for UserKeybindings {
+    fn default() -> Self {
+        Self {
+            schema_version: KEYBINDINGS_SCHEMA_VERSION,
+            bindings: Vec::new(),
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JsonKeybindingConfig {
     #[serde(default)]
@@ -324,15 +394,48 @@ pub struct UserBinding {
 
 impl UserKeybindings {
     pub fn from_json_str(content: &str) -> Self {
-        serde_json::from_str(content)
+        let mut kb = serde_json::from_str(content)
             .or_else(|_| Self::from_block_config(content))
-            .unwrap_or_default()
+            .unwrap_or_default();
+
+        // Warn about and filter out non-rebindable keys
+        let original_len = kb.bindings.len();
+        kb.bindings.retain(|binding| {
+            let normalized = binding.chord.to_lowercase();
+            if NON_REBINDABLE.iter().any(|protected| normalized == *protected) {
+                warn!("Cannot rebind protected key '{}' in keybindings.json", binding.chord);
+                return false;
+            }
+            true
+        });
+
+        if kb.bindings.len() < original_len {
+            let filtered_count = original_len - kb.bindings.len();
+            warn!(
+                "Filtered out {} protected keybinding(s). Protected keys: {}",
+                filtered_count,
+                NON_REBINDABLE.join(", ")
+            );
+        }
+
+        kb
     }
 
     pub fn load(config_dir: &Path) -> Self {
         let path = config_dir.join("keybindings.json");
         if let Ok(content) = std::fs::read_to_string(&path) {
-            Self::from_json_str(&content)
+            let mut kb = Self::from_json_str(&content);
+            let old_version = kb.schema_version;
+            kb.smart_merge_with_defaults();
+
+            // Save back if schema was updated
+            if kb.schema_version > old_version {
+                if let Err(e) = kb.save(config_dir) {
+                    warn!("Failed to save updated keybindings: {}", e);
+                }
+            }
+
+            kb
         } else {
             Self::default()
         }
@@ -359,7 +462,84 @@ impl UserKeybindings {
                 })
             })
             .collect();
-        Ok(Self { bindings })
+        Ok(Self {
+            schema_version: 0,
+            bindings,
+        })
+    }
+
+    /// Smart merge: preserve user customizations while adding new defaults
+    pub fn smart_merge_with_defaults(&mut self) {
+        if self.schema_version >= KEYBINDINGS_SCHEMA_VERSION {
+            return; // Already up to date
+        }
+
+        let old_version = self.schema_version;
+        self.schema_version = KEYBINDINGS_SCHEMA_VERSION;
+
+        // Build a set of user-customized bindings (those that differ from old defaults)
+        // and bindings user explicitly unbound
+        let mut user_customizations: std::collections::HashMap<String, Option<String>> =
+            std::collections::HashMap::new();
+        for binding in &self.bindings {
+            // Migration: remove old bindings that have changed in defaults
+            // This distinguishes between "user customized" and "old default that changed"
+
+            // Old: ctrl+a -> openModelPicker (moved to ctrl+shift+a)
+            if binding.chord == "ctrl+a" && binding.action.as_deref() == Some("openModelPicker") {
+                continue;
+            }
+
+            // Old: tab -> togglePreview in Chat context (changed to indent)
+            if binding.chord == "tab"
+                && binding.context.as_deref() == Some("Chat")
+                && binding.action.as_deref() == Some("togglePreview")
+            {
+                continue;
+            }
+
+            user_customizations
+                .insert(binding.chord.clone(), binding.action.clone());
+        }
+
+        // Get current defaults and integrate customizations
+        let mut merged_bindings = Vec::new();
+        for default in default_bindings() {
+            let chord_str = format_chord_string(&default.chord);
+            let context_str = format!("{:?}", default.context);
+
+            if let Some(custom_action) = user_customizations.get(&chord_str) {
+                // User has customized this binding, use their version
+                merged_bindings.push(UserBinding {
+                    chord: chord_str.clone(),
+                    action: custom_action.clone(),
+                    context: Some(context_str),
+                });
+                user_customizations.remove(&chord_str);
+            } else {
+                // Use the default
+                merged_bindings.push(UserBinding {
+                    chord: chord_str,
+                    action: default.action.clone(),
+                    context: Some(context_str),
+                });
+            }
+        }
+
+        // Add any remaining user customizations that aren't in current defaults
+        for (chord, action) in user_customizations {
+            merged_bindings.push(UserBinding {
+                chord,
+                action,
+                context: None,
+            });
+        }
+
+        self.bindings = merged_bindings;
+        warn!(
+            "Keybindings schema upgraded from v{} to v{}. User customizations preserved.",
+            old_version, KEYBINDINGS_SCHEMA_VERSION
+        );
     }
 }
 
@@ -543,25 +723,32 @@ mod tests {
     }
 
     #[test]
-    fn test_default_bindings_contains_ctrl_c() {
+    fn test_default_bindings_omit_ctrl_c_and_ctrl_d() {
+        // Ctrl+C and Ctrl+D are intentionally NOT in the resolver table: since
+        // commit 270947d they are handled directly in handle_key_event for the
+        // alternating two-press exit/interrupt confirmation. The resolver must
+        // not shadow that special handling, so the table must omit them.
         let bindings = default_bindings();
-        let ctrl_c = bindings.iter().find(|b| {
-            b.chord.len() == 1
-                && b.chord[0].ctrl
-                && b.chord[0].key == "c"
-                && b.context == KeyContext::Global
-        });
-        assert!(ctrl_c.is_some());
-        assert_eq!(ctrl_c.unwrap().action.as_deref(), Some("interrupt"));
+        let has = |key: &str| {
+            bindings.iter().any(|b| {
+                b.chord.len() == 1
+                    && b.chord[0].ctrl
+                    && b.chord[0].key == key
+                    && b.context == KeyContext::Global
+            })
+        };
+        assert!(!has("c"), "ctrl+c must be handled directly, not via the resolver");
+        assert!(!has("d"), "ctrl+d must be handled directly, not via the resolver");
     }
 
     #[test]
-    fn test_default_bindings_map_ctrl_a_and_ctrl_k_to_app_shortcuts() {
+    fn test_default_bindings_map_ctrl_shift_a_and_ctrl_k_to_app_shortcuts() {
         let bindings = default_bindings();
 
-        let ctrl_a = bindings.iter().find(|b| {
+        let ctrl_shift_a = bindings.iter().find(|b| {
             b.chord.len() == 1
                 && b.chord[0].ctrl
+                && b.chord[0].shift
                 && b.chord[0].key == "a"
                 && b.context == KeyContext::Chat
         });
@@ -572,7 +759,7 @@ mod tests {
                 && b.context == KeyContext::Chat
         });
 
-        assert_eq!(ctrl_a.and_then(|b| b.action.as_deref()), Some("openModelPicker"));
+        assert_eq!(ctrl_shift_a.and_then(|b| b.action.as_deref()), Some("openModelPicker"));
         assert_eq!(
             ctrl_k.and_then(|b| b.action.as_deref()),
             Some("openCommandPalette")
@@ -583,9 +770,11 @@ mod tests {
     fn test_resolver_simple_action() {
         let user = UserKeybindings::default();
         let mut resolver = KeybindingResolver::new(&user);
-        let ks = parse_keystroke("ctrl+c").unwrap();
+        // ctrl+l is a single-chord Global binding ("redraw"); ctrl+c is no
+        // longer resolver-routed (see test_default_bindings_omit_ctrl_c_and_ctrl_d).
+        let ks = parse_keystroke("ctrl+l").unwrap();
         let result = resolver.process(ks, &KeyContext::Global);
-        assert!(matches!(result, KeybindingResult::Action(ref a) if a == "interrupt"));
+        assert!(matches!(result, KeybindingResult::Action(ref a) if a == "redraw"));
     }
 
     #[test]
@@ -662,6 +851,31 @@ mod tests {
     }
 
     #[test]
+    fn test_shift_enter_and_alt_enter_map_to_newline() {
+        // The multi-line composing fallbacks (#224): Shift+Enter (kitty),
+        // plus Alt+Enter and Ctrl+J for terminals that can't distinguish
+        // Shift+Enter from a bare Enter.
+        let bindings = default_bindings();
+        let find = |ctrl: bool, alt: bool, shift: bool, key: &str| {
+            bindings
+                .iter()
+                .find(|b| {
+                    b.chord.len() == 1
+                        && b.chord[0].ctrl == ctrl
+                        && b.chord[0].alt == alt
+                        && b.chord[0].shift == shift
+                        && b.chord[0].key == key
+                        && b.context == KeyContext::Chat
+                })
+                .and_then(|b| b.action.as_deref())
+        };
+        assert_eq!(find(false, false, true, "enter"), Some("newline"), "shift+enter");
+        assert_eq!(find(false, true, false, "enter"), Some("newline"), "alt+enter");
+        // And a bare Enter still submits.
+        assert_eq!(find(false, false, false, "enter"), Some("submit"), "enter");
+    }
+
+    #[test]
     fn test_new_phase1_keybindings_registered() {
         // Verify that all Phase 1 keybindings are registered
         let bindings = default_bindings();
@@ -674,7 +888,7 @@ mod tests {
 
         // Check Phase 1 keybinding actions exist
         assert!(actions.contains(&"clearLine".to_string()), "clearLine action not found");
-        assert!(actions.contains(&"sendMessage".to_string()), "sendMessage action not found");
+        assert!(actions.contains(&"submit".to_string()), "submit action not found");
         assert!(actions.contains(&"jumpToNextError".to_string()), "jumpToNextError action not found");
         assert!(actions.contains(&"jumpToPreviousError".to_string()), "jumpToPreviousError action not found");
         assert!(actions.contains(&"previousMessage".to_string()), "previousMessage action not found");
@@ -689,5 +903,58 @@ mod tests {
             "Expected at least 40 keybindings, found {}",
             actions.len()
         );
+    }
+
+    #[test]
+    fn test_old_format_keybindings_get_upgraded() {
+        let old_format_json = r#"{
+            "bindings": [
+                {
+                    "context": "Chat",
+                    "bindings": {
+                        "ctrl+shift+a": "openModelPicker",
+                        "ctrl+e": "goLineEnd"
+                    }
+                }
+            ]
+        }"#;
+
+        let mut kb = UserKeybindings::from_json_str(old_format_json);
+        assert_eq!(kb.schema_version, 0, "Old format should start at version 0");
+
+        kb.smart_merge_with_defaults();
+
+        assert_eq!(kb.schema_version, 1, "Should be upgraded to version 1");
+        assert!(
+            kb.bindings.iter().any(|b| b.chord == "meta+left"),
+            "meta+left (cmd+left) should be added from defaults after merge"
+        );
+        assert!(
+            kb.bindings.iter().any(|b| b.chord == "ctrl+shift+a" && b.action.as_deref() == Some("openModelPicker")),
+            "User customization (ctrl+shift+a -> openModelPicker) should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_cmd_left_resolves_to_go_line_start() {
+        let user = UserKeybindings::default();
+        let mut resolver = KeybindingResolver::new(&user);
+
+        // Create a keystroke for CMD+Left (SUPER modifier + left arrow)
+        let keystroke = ParsedKeystroke {
+            key: "left".to_string(),
+            ctrl: false,
+            alt: false,
+            shift: false,
+            meta: true,
+        };
+
+        let result = resolver.process(keystroke, &KeyContext::Chat);
+        match result {
+            KeybindingResult::Action(action) => {
+                assert_eq!(action, "goLineStart", "CMD+Left should map to goLineStart");
+            }
+            other => panic!("Expected Action(\"goLineStart\"), got {:?}", other),
+        }
     }
 }

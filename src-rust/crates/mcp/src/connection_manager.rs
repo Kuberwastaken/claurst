@@ -392,6 +392,7 @@ mod tests {
                         env: std::collections::HashMap::new(),
                         url: None,
                         server_type: "stdio".to_string(),
+                        origin: Default::default(),
                     },
                 )
             })

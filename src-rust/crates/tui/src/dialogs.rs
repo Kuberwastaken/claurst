@@ -5,7 +5,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 use ratatui::Frame;
 
 // ---------------------------------------------------------------------------
@@ -15,8 +15,10 @@ use ratatui::Frame;
 /// Distinguishes what kind of action the permission dialog is for.
 /// This drives how many options are shown and what the command block looks like.
 #[derive(Debug, Clone, PartialEq)]
+#[derive(Default)]
 pub enum PermissionDialogKind {
     /// Generic four-option dialog (the previous default).
+    #[default]
     Generic,
     /// Bash command execution — optionally carries a suggested prefix for a
     /// 5th "allow prefix*" option.
@@ -32,11 +34,6 @@ pub enum PermissionDialogKind {
     FileWrite { path: String },
 }
 
-impl Default for PermissionDialogKind {
-    fn default() -> Self {
-        PermissionDialogKind::Generic
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Permission dialog types
@@ -160,7 +157,7 @@ impl PermissionRequest {
         }
     }
 
-    /// Build a FileRead-specific dialog (3 options: once / session / deny).
+    /// Build a FileRead-specific dialog (4 options: once / session / persistent / deny).
     pub fn file_read(
         tool_use_id: String,
         tool_name: String,
@@ -245,11 +242,12 @@ impl PermissionRequest {
         opts
     }
 
-    /// FileRead options (3): once / session / deny.
+    /// FileRead options (4): once / session / persistent / deny.
     pub fn file_read_options() -> Vec<PermissionOption> {
         vec![
             PermissionOption { label: "Yes, allow once".to_string(), key: 'y' },
             PermissionOption { label: "Yes, allow this session".to_string(), key: 'Y' },
+            PermissionOption { label: "Yes, always allow (persistent)".to_string(), key: 'p' },
             PermissionOption { label: "No, deny".to_string(), key: 'n' },
         ]
     }
@@ -306,16 +304,65 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     }
 }
 
+/// Wrap `text` to fit within `width` display columns, preferring whitespace
+/// breaks but falling back to a hard character break when a single token is
+/// longer than `width`. Without the hard-break fallback, long unbreakable
+/// tokens (Windows paths, base64 blobs, URLs, …) overflow the dialog border.
 fn word_wrap(text: &str, width: usize) -> Vec<String> {
-    use unicode_width::UnicodeWidthStr;
-    if width == 0 || UnicodeWidthStr::width(text) <= width {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if width == 0 {
         return vec![text.to_string()];
     }
+    if UnicodeWidthStr::width(text) <= width {
+        return vec![text.to_string()];
+    }
+
+    // Hard-break a token that doesn't fit on a line of `width` columns,
+    // returning the chunks each ≤ `width` cells wide. Splits at character
+    // boundaries — never inside a grapheme cluster.
+    fn break_long_token(token: &str, width: usize) -> Vec<String> {
+        let mut chunks: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut current_w = 0usize;
+        for ch in token.chars() {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if current_w + cw > width && !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+                current_w = 0;
+            }
+            current.push(ch);
+            current_w += cw;
+        }
+        if !current.is_empty() {
+            chunks.push(current);
+        }
+        chunks
+    }
+
     let mut result = Vec::new();
     let mut current_line = String::new();
     let mut current_width = 0usize;
     for word in text.split_whitespace() {
         let word_w = UnicodeWidthStr::width(word);
+
+        // Long unbreakable token — flush the current line then hard-break the
+        // token across multiple lines.
+        if word_w > width {
+            if !current_line.is_empty() {
+                result.push(std::mem::take(&mut current_line));
+                current_width = 0;
+            }
+            let mut chunks = break_long_token(word, width);
+            if let Some(last) = chunks.pop() {
+                for chunk in chunks {
+                    result.push(chunk);
+                }
+                current_width = UnicodeWidthStr::width(last.as_str());
+                current_line = last;
+            }
+            continue;
+        }
+
         if current_width == 0 {
             current_line.push_str(word);
             current_width = word_w;
@@ -363,25 +410,40 @@ fn word_wrap(text: &str, width: usize) -> Vec<String> {
 /// For `Bash` with a `suggested_prefix`, a 5th option is shown:
 ///   │  [5] Allow commands matching git*              │
 ///
-/// For `FileRead`, only 3 options (once / session / deny).
+/// For `FileRead`, 4 options (once / session / persistent / deny).
 /// For `FileWrite`, 4 options (once / session / project / deny).
 pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area: Rect) {
-    let inner_width = 62u16;
-    let dialog_width = inner_width.min(area.width.saturating_sub(4));
+    // Scale dialog width with the terminal: minimum 40 cols for narrow screens,
+    // maximum 80 cols on wide ones, otherwise leave a 4-col margin on each side.
+    // Without this the dialog was pinned at 62 cols, which made long commands
+    // (Windows paths, multi-segment shell pipelines) overflow even when the
+    // terminal had plenty of room.
+    let dialog_width = area
+        .width
+        .saturating_sub(8)
+        .clamp(40, 80)
+        .min(area.width.saturating_sub(4));
     let text_width = (dialog_width as usize).saturating_sub(4); // 2 border + 2 padding
 
     // Build a command block for Bash / PowerShell dialogs to prominently display the command.
+    // The chevron-prefix is only painted on the FIRST wrapped line; continuation
+    // lines align under the command body so the eye can scan the full command
+    // without the prompt-arrow repeating on every row.
     let bash_command_lines: Option<Vec<Line>> = match &pr.kind {
         PermissionDialogKind::Bash { command, .. }
         | PermissionDialogKind::PowerShell { command } => {
-            let wrapped = word_wrap(command, text_width.saturating_sub(4));
+            let cmd_indent = "    ";
+            let wrap_width = text_width.saturating_sub(cmd_indent.len());
+            let wrapped = word_wrap(command, wrap_width);
             Some(
                 wrapped
                     .into_iter()
-                    .map(|line| {
+                    .enumerate()
+                    .map(|(i, line)| {
+                        let prefix = if i == 0 { "  \u{276F} " } else { cmd_indent };
                         Line::from(vec![
                             Span::styled(
-                                "  \u{276F} ",
+                                prefix,
                                 Style::default()
                                     .fg(Color::Green)
                                     .add_modifier(Modifier::BOLD),
@@ -551,7 +613,13 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
         ))
         .border_style(Style::default().fg(border_color));
 
-    let para = Paragraph::new(lines).block(block);
+    // `Wrap { trim: false }` is a defensive safety net: word_wrap already
+    // breaks every span to fit, but if a future change introduces an
+    // un-wrapped line (e.g. a tool-emitted preview), ratatui will still wrap
+    // it at the dialog border instead of letting it bleed past the right edge.
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(para, dialog_area);
 }
 
@@ -615,7 +683,6 @@ pub fn handle_permission_key(pr: &mut PermissionRequest, key: KeyEvent) -> bool 
 // ---------------------------------------------------------------------------
 
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::widgets::Wrap;
 
 /// Which tool-specific permission dialog is active.
 #[derive(Debug, Clone)]
@@ -1320,10 +1387,49 @@ mod tests {
 
     #[test]
     fn word_wrap_long_text_splits() {
+        use unicode_width::UnicodeWidthStr;
         let text = "one two three four five six seven eight";
         let wrapped = word_wrap(text, 10);
         for line in &wrapped {
-            assert!(line.len() <= 10, "Line too long: {:?}", line);
+            assert!(
+                UnicodeWidthStr::width(line.as_str()) <= 10,
+                "Line too long: {:?}",
+                line
+            );
+        }
+    }
+
+    #[test]
+    fn word_wrap_hard_breaks_token_longer_than_width() {
+        use unicode_width::UnicodeWidthStr;
+        // A single token wider than the available width must be hard-broken at
+        // character boundaries — otherwise it overflows the dialog border (the
+        // bug that produced `~X~:~\~B~i~g~g~e~r~…`-style wrapping reports).
+        let path = "'X:\\Bigger-Projects\\some-very-long-directory-name'";
+        let wrapped = word_wrap(path, 16);
+        assert!(wrapped.len() >= 2, "expected hard-break, got: {wrapped:?}");
+        for line in &wrapped {
+            assert!(
+                UnicodeWidthStr::width(line.as_str()) <= 16,
+                "hard-broken chunk too wide: {line:?}"
+            );
+        }
+        // Round-trip: concatenating chunks should rebuild the token verbatim.
+        assert_eq!(wrapped.join(""), path);
+    }
+
+    #[test]
+    fn word_wrap_mixed_short_and_long_tokens() {
+        use unicode_width::UnicodeWidthStr;
+        // The realistic shape that broke claurst dialogs: a normal command
+        // followed by a path longer than the column budget.
+        let cmd = "git diff 'X:\\Bigger-Projects\\Claurst\\very\\deep\\nested\\path.rs'";
+        let wrapped = word_wrap(cmd, 24);
+        for line in &wrapped {
+            assert!(
+                UnicodeWidthStr::width(line.as_str()) <= 24,
+                "line wider than width: {line:?}"
+            );
         }
     }
 
@@ -1367,17 +1473,18 @@ mod tests {
     }
 
     #[test]
-    fn file_read_has_three_options() {
+    fn file_read_has_four_options() {
         let pr = PermissionRequest::file_read(
             "id-fr".to_string(),
             "ReadFile".to_string(),
             "Wants to read /etc/hosts".to_string(),
             "/etc/hosts".to_string(),
         );
-        assert_eq!(pr.options.len(), 3);
+        assert_eq!(pr.options.len(), 4);
         assert_eq!(pr.options[0].key, 'y');
         assert_eq!(pr.options[1].key, 'Y');
-        assert_eq!(pr.options[2].key, 'n');
+        assert_eq!(pr.options[2].key, 'p'); // persistent allow
+        assert_eq!(pr.options[3].key, 'n');
         assert!(matches!(pr.kind, PermissionDialogKind::FileRead { .. }));
     }
 
@@ -1409,19 +1516,19 @@ mod tests {
     }
 
     #[test]
-    fn permission_key_digit_out_of_range_ignored_for_three_option_dialog() {
+    fn permission_key_digit_out_of_range_ignored_for_four_option_dialog() {
         let mut pr = PermissionRequest::file_read(
             "id".to_string(),
             "ReadFile".to_string(),
             "desc".to_string(),
             "/foo".to_string(),
         );
-        assert_eq!(pr.options.len(), 3);
-        // Press '4' — out of range for a 3-option dialog, should NOT confirm.
-        let confirmed = handle_permission_key(&mut pr, key(KeyCode::Char('4')));
-        assert!(!confirmed);
-        // Press '5' — also out of range.
+        assert_eq!(pr.options.len(), 4);
+        // Press '5' — out of range for a 4-option dialog, should NOT confirm.
         let confirmed = handle_permission_key(&mut pr, key(KeyCode::Char('5')));
+        assert!(!confirmed);
+        // Press '6' — also out of range.
+        let confirmed = handle_permission_key(&mut pr, key(KeyCode::Char('6')));
         assert!(!confirmed);
     }
 

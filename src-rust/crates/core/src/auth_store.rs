@@ -30,33 +30,60 @@ pub struct AuthStore {
 impl AuthStore {
     /// Path to the auth store file.
     pub fn path() -> PathBuf {
-        let dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".claurst");
-        dir.join("auth.json")
+        crate::config::Settings::config_dir().join("auth.json")
     }
 
     /// Load the store from disk (returns default if missing or invalid).
     pub fn load() -> Self {
         let path = Self::path();
         if path.exists() {
-            std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default()
+            match std::fs::read_to_string(&path) {
+                Ok(s) => match serde_json::from_str(&s) {
+                    Ok(store) => store,
+                    Err(e) => {
+                        tracing::warn!(
+                            "auth store at {} is corrupt ({}); starting with an empty store. \
+                             The corrupt file is left in place until the next save.",
+                            path.display(),
+                            e
+                        );
+                        Self::default()
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("failed to read auth store at {}: {}", path.display(), e);
+                    Self::default()
+                }
+            }
         } else {
             Self::default()
         }
     }
 
     /// Persist the store to disk (best-effort).
+    ///
+    /// Writes to a temp file then renames over the destination so a crash or
+    /// disk-full mid-write can never truncate `auth.json` (which would
+    /// silently wipe the user's stored credentials on the next load).
     pub fn save(&self) {
         let path = Self::path();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
+            crate::accounts::set_user_only_dir_perms(parent);
         }
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(&path, json);
+        let json = match serde_json::to_string_pretty(self) {
+            Ok(j) => j,
+            Err(_) => return,
+        };
+        let tmp = path.with_file_name(format!(".auth.json.claurst-tmp-{}", std::process::id()));
+        if std::fs::write(&tmp, &json).is_ok() {
+            // auth.json holds API keys + OAuth tokens. Lock the temp file to
+            // 0o600 *before* the rename so the live credential file is never
+            // even momentarily world/group readable (issue #212).
+            crate::accounts::set_user_only_perms(&tmp);
+            if std::fs::rename(&tmp, &path).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
         }
     }
 

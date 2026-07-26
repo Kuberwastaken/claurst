@@ -98,15 +98,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # Linux native: install system libraries for ALSA (voice feature) and OpenSSL.
+      # Linux native: install system libraries for ALSA (voice feature).
       - name: Install Linux system dependencies
         if: runner.os == 'Linux' && !matrix.cross
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libssl-dev pkg-config
+          sudo apt-get install -y libasound2-dev pkg-config
 
       # Linux ARM64: use cross for reliable cross-compilation (handles
-      # sysroot, OpenSSL, pkg-config, ALSA automatically via Docker).
+      # sysroot, pkg-config, ALSA automatically via Docker).
       - name: Install cross (aarch64-linux)
         if: matrix.cross
         run: cargo install cross --git https://github.com/cross-rs/cross
@@ -135,7 +135,7 @@ jobs:
           pre-build = [
             "dpkg --add-architecture $CROSS_DEB_ARCH",
             "apt-get update",
-            "apt-get install -y pkg-config libssl-dev:$CROSS_DEB_ARCH libasound2-dev:$CROSS_DEB_ARCH"
+            "apt-get install -y pkg-config libasound2-dev:$CROSS_DEB_ARCH"
           ]
           EOF
 
@@ -238,6 +238,20 @@ jobs:
 
           echo "Release assets:"
           ls -lh release/
+
+      # Generate SHA256 checksums covering every asset in release/ so the
+      # install scripts can verify download integrity (supply-chain
+      # protection).  We write SHA256SUMS to a temp path OUTSIDE release/
+      # first so it never hashes itself, then move it in.  Because the
+      # gh-release step publishes `files: release/*`, SHA256SUMS ships
+      # automatically alongside the archives.
+      - name: Generate SHA256SUMS
+        run: |
+          cd release
+          sha256sum * > "$RUNNER_TEMP/SHA256SUMS"
+          mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
+          echo "── SHA256SUMS ──────────────────────────────────────"
+          cat SHA256SUMS
 
       # Build release notes in two passes:
       #   1. Pull GitHub's auto-generated notes via the API — this gives us

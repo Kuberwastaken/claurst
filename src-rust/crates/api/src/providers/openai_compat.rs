@@ -9,10 +9,10 @@ use std::pin::Pin;
 use async_stream::stream;
 use async_trait::async_trait;
 use claurst_core::provider_id::{ModelId, ProviderId};
-use claurst_core::types::{ContentBlock, UsageInfo};
+use claurst_core::types::ContentBlock;
 use futures::Stream;
+use serde::Deserialize;
 use serde_json::{json, Value};
-use tracing::debug;
 
 use crate::error_handling::parse_error_response;
 use crate::provider::{LlmProvider, ModelInfo};
@@ -64,6 +64,12 @@ pub struct ProviderQuirks {
     /// reasoning output.  Example: `Some("reasoning_content")` for DeepSeek.
     pub reasoning_field: Option<String>,
 
+    /// Whether this provider requires reasoning_content to be echoed back on
+    /// subsequent turns in multi-turn conversations.  DeepSeek V4 is currently
+    /// the only provider with this requirement; most providers ignore this field.
+    /// When false, reasoning is not included in outbound messages to save tokens.
+    pub requires_reasoning_roundtrip: bool,
+
     /// Hard cap on `max_tokens` sent to this provider.  When the request
     /// carries a higher value it is silently clamped down to this limit.
     /// Use this for providers whose models have a lower output ceiling than
@@ -77,12 +83,16 @@ pub struct ProviderQuirks {
     /// "No API key configured".
     pub no_api_key_required: bool,
 
-    /// When set, `list_models()` uses Ollama's native `/api/tags` endpoint
+    /// When set, `discover_models()` uses Ollama's native `/api/tags` endpoint
     /// (and optionally `/api/show` for per-model metadata) instead of the
     /// OpenAI-compatible `/v1/models` endpoint.  The value is the Ollama host
     /// root (e.g. `"http://localhost:11434"`) so the native API can be called
     /// independently of the `/v1` base URL used for chat completions.
     pub ollama_native_host: Option<String>,
+
+    /// Native LM Studio host used to discover loaded model instances and their
+    /// configured context lengths from `/api/v1/models`.
+    pub lm_studio_native_host: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +109,37 @@ pub struct OpenAiCompatProvider {
     http_client: reqwest::Client,
 }
 
+#[derive(Debug, Deserialize)]
+struct LmStudioModelsResponse {
+    #[serde(default)]
+    models: Vec<LmStudioModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LmStudioModel {
+    #[serde(rename = "type")]
+    model_type: String,
+    key: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    loaded_instances: Vec<LmStudioLoadedInstance>,
+    #[serde(default)]
+    max_context_length: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LmStudioLoadedInstance {
+    id: String,
+    config: LmStudioInstanceConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct LmStudioInstanceConfig {
+    #[serde(default)]
+    context_length: Option<u32>,
+}
+
 impl OpenAiCompatProvider {
     /// Create a new compat provider.  `base_url` should already include any
     /// path prefix (e.g. `"https://api.groq.com/openai/v1"`).
@@ -108,7 +149,7 @@ impl OpenAiCompatProvider {
         base_url: impl Into<String>,
     ) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
+            .timeout(crate::request_timeout())
             .build()
             .expect("failed to build reqwest client");
 
@@ -146,8 +187,26 @@ impl OpenAiCompatProvider {
     }
 
     /// Override the base URL (e.g. from a user-supplied --api-base flag).
+    ///
+    /// Keep any native API host in sync with the OpenAI-compatible base URL.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        if self.quirks.ollama_native_host.is_some()
+            || self.quirks.lm_studio_native_host.is_some()
+        {
+            let native_host = self
+                .base_url
+                .trim_end_matches('/')
+                .trim_end_matches("/v1")
+                .trim_end_matches('/')
+                .to_string();
+            if self.quirks.ollama_native_host.is_some() {
+                self.quirks.ollama_native_host = Some(native_host.clone());
+            }
+            if self.quirks.lm_studio_native_host.is_some() {
+                self.quirks.lm_studio_native_host = Some(native_host);
+            }
+        }
         self
     }
 
@@ -175,7 +234,7 @@ impl OpenAiCompatProvider {
 
     /// Apply `scrub_tool_id` to every tool-call id/tool_call_id in a messages
     /// array that was already built by `OpenAiProvider::to_openai_messages`.
-    fn apply_tool_id_quirks(&self, messages: &mut Vec<Value>) {
+    fn apply_tool_id_quirks(&self, messages: &mut [Value]) {
         if self.quirks.tool_id_max_len.is_none() && !self.quirks.tool_id_alphanumeric_only {
             return;
         }
@@ -241,21 +300,23 @@ impl OpenAiCompatProvider {
             Self::apply_fix_tool_user_sequence(&mut messages);
         }
 
-        // For providers with a reasoning field (e.g. DeepSeek's
-        // "reasoning_content"), inject reasoning text back into assistant
-        // messages that contain tool calls. Non-tool-call turns omit the
-        // field to save tokens.
-        if let Some(ref field) = self.quirks.reasoning_field {
-            Self::inject_reasoning_for_tool_turns(
-                &mut messages,
-                &request.messages,
-                field,
-            );
+        // For providers that require reasoning_content in multi-turn conversations
+        // (e.g. DeepSeek V4), inject reasoning text back into assistant messages
+        // that contain tool calls. Non-tool-call turns omit the field to save tokens.
+        // Only providers with requires_reasoning_roundtrip=true need this.
+        if self.quirks.requires_reasoning_roundtrip {
+            if let Some(ref field) = self.quirks.reasoning_field {
+                Self::inject_reasoning_for_tool_turns(
+                    &mut messages,
+                    &request.messages,
+                    field,
+                );
+            }
         }
 
-        // Some providers (DeepSeek, Ollama) reject `content: null` on
-        // assistant messages — replace with an empty string.
-        if self.quirks.reasoning_field.is_some() || self.quirks.no_api_key_required {
+        // Some providers (DeepSeek when reasoning_roundtrip enabled, Ollama) reject
+        // `content: null` on assistant messages — replace with an empty string.
+        if self.quirks.requires_reasoning_roundtrip || self.quirks.no_api_key_required {
             Self::ensure_content_not_null(&mut messages);
         }
 
@@ -269,7 +330,7 @@ impl OpenAiCompatProvider {
     /// on turns where tool calls occurred. Turns without tool calls omit it —
     /// the API ignores it anyway and skipping saves tokens.
     fn inject_reasoning_for_tool_turns(
-        json_messages: &mut Vec<Value>,
+        json_messages: &mut [Value],
         original_messages: &[claurst_core::types::Message],
         field: &str,
     ) {
@@ -344,7 +405,7 @@ impl OpenAiCompatProvider {
     /// (it treats null as absent and then complains that neither content nor
     /// tool_calls is set).  Replacing with an empty string satisfies the
     /// validation while preserving semantics.
-    fn ensure_content_not_null(messages: &mut Vec<Value>) {
+    fn ensure_content_not_null(messages: &mut [Value]) {
         for msg in messages.iter_mut() {
             let is_assistant =
                 msg.get("role").and_then(|r| r.as_str()) == Some("assistant");
@@ -552,7 +613,7 @@ impl OpenAiCompatProvider {
     /// Models are sorted with coding-oriented models first (names containing
     /// "code" or "coder"), then by parameter size descending, so the best
     /// local coding model naturally appears at the top.
-    async fn list_models_ollama_native(
+    async fn discover_models_ollama_native(
         &self,
         ollama_host: &str,
     ) -> Result<Vec<ModelInfo>, ProviderError> {
@@ -614,6 +675,7 @@ impl OpenAiCompatProvider {
                     name: Self::ollama_display_name(name),
                     context_window,
                     max_output_tokens: max_output,
+                    ..Default::default()
                 },
                 is_coder,
                 param_size,
@@ -627,6 +689,56 @@ impl OpenAiCompatProvider {
         });
 
         Ok(models.into_iter().map(|(info, _, _)| info).collect())
+    }
+
+    /// Return loaded LM Studio LLM instances. `None` means the native endpoint
+    /// is unavailable, so the caller should fall back to `/v1/models`.
+    async fn discover_models_lm_studio_native(
+        &self,
+        lm_studio_host: &str,
+    ) -> Option<Vec<ModelInfo>> {
+        let url = format!("{}/api/v1/models", lm_studio_host.trim_end_matches('/'));
+        let builder = self.apply_auth(self.http_client.get(url));
+        let response = self.apply_extra_headers(builder).send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let response: LmStudioModelsResponse = response.json().await.ok()?;
+        Some(Self::parse_lm_studio_native_models(response, &self.id))
+    }
+
+    fn parse_lm_studio_native_models(
+        response: LmStudioModelsResponse,
+        provider_id: &ProviderId,
+    ) -> Vec<ModelInfo> {
+        let mut discovered = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for model in response.models {
+            if model.model_type != "llm" {
+                continue;
+            }
+            let display_name = model.display_name.unwrap_or(model.key);
+            let max_context = model.max_context_length.unwrap_or(128_000);
+
+            for instance in model.loaded_instances {
+                if !seen.insert(instance.id.clone()) {
+                    continue;
+                }
+                let context_window = instance
+                    .config
+                    .context_length
+                    .unwrap_or(max_context);
+                discovered.push(ModelInfo {
+                    id: ModelId::new(instance.id),
+                    provider_id: provider_id.clone(),
+                    name: display_name.clone(),
+                    context_window,
+                    max_output_tokens: (context_window / 2).min(16_384),
+                    ..Default::default()
+                });
+            }
+        }
+        discovered
     }
 
     /// Call `/api/show` for a single model to extract its actual context
@@ -746,8 +858,7 @@ impl OpenAiCompatProvider {
         let (base, tag) = raw.split_once(':').unwrap_or((raw, "latest"));
 
         let pretty_base = base
-            .replace('-', " ")
-            .replace('_', " ")
+            .replace(['-', '_'], " ")
             .split_whitespace()
             .map(|word| {
                 let mut chars = word.chars();
@@ -827,17 +938,44 @@ impl LlmProvider for OpenAiCompatProvider {
             use futures::StreamExt;
 
             let mut byte_stream = resp.bytes_stream();
-            let mut leftover = String::new();
+            // Byte-buffering line decoder (#228): complete UTF-8 lines only, so
+            // a multibyte codepoint straddling a chunk boundary is never lost.
+            let mut byte_decoder = crate::SseByteDecoder::new();
+            // Sans-IO OpenAI-Chat protocol decoder (#228): owns all message /
+            // reasoning / tool-call / finish-reason decoding for this wire
+            // format (extracted from this loop into `protocol::openai_chat`).
+            let mut chat_decoder = crate::OpenAiChatDecoder::new(reasoning_field);
 
-            let mut message_started = false;
-            let mut message_id = String::from("unknown");
-            let mut model_name = String::new();
-            let mut tool_call_buffers: std::collections::HashMap<
-                usize,
-                (String, String, String),
-            > = std::collections::HashMap::new();
-
-            while let Some(chunk_result) = byte_stream.next().await {
+            // Bound infinite mid-stream stalls (issue #185): some
+            // OpenAI-compatible providers begin a streamed tool call and then
+            // pause indefinitely before sending the arguments. Wrap each chunk
+            // read in a generous idle timeout so a stall surfaces as an error
+            // instead of hanging forever. Each chunk resets the timer, so
+            // slow-but-progressing local models are never cut off.
+            let idle_timeout = crate::stream_idle_timeout();
+            loop {
+                let chunk_result = match tokio::time::timeout(
+                    idle_timeout,
+                    byte_stream.next(),
+                )
+                .await
+                {
+                    Ok(Some(chunk_result)) => chunk_result,
+                    // Stream ended normally.
+                    Ok(None) => break,
+                    // No bytes for `idle_timeout` — provider stalled mid-stream.
+                    Err(_) => {
+                        yield Err(ProviderError::StreamError {
+                            provider: provider_id.clone(),
+                            message: format!(
+                                "Stream stalled: no data received for {}s; aborting to avoid hanging",
+                                idle_timeout.as_secs()
+                            ),
+                            partial_response: None,
+                        });
+                        return;
+                    }
+                };
                 let chunk = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {
@@ -850,232 +988,44 @@ impl LlmProvider for OpenAiCompatProvider {
                     }
                 };
 
-                let text = String::from_utf8_lossy(&chunk);
-                let combined = if leftover.is_empty() {
-                    text.to_string()
-                } else {
-                    let mut s = std::mem::take(&mut leftover);
-                    s.push_str(&text);
-                    s
-                };
-
-                let mut lines: Vec<&str> = combined.split('\n').collect();
-                if !combined.ends_with('\n') {
-                    leftover = lines.pop().unwrap_or("").to_string();
-                }
-
-                for line in lines {
-                    let line = line.trim_end_matches('\r').trim();
-
-                    if line.is_empty() || line.starts_with(':') {
-                        continue;
+                for line in byte_decoder.push(&chunk) {
+                    let mut events = Vec::new();
+                    let stop = chat_decoder.feed_line(&line, &mut events);
+                    for event in events {
+                        yield Ok(event);
                     }
-
-                    let data = if let Some(rest) = line.strip_prefix("data:") {
-                        rest.trim()
-                    } else {
-                        continue;
-                    };
-
-                    if data == "[DONE]" {
-                        yield Ok(StreamEvent::MessageStop);
+                    if stop {
                         return;
-                    }
-
-                    let chunk_json: Value = match serde_json::from_str(data) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            debug!("Failed to parse SSE chunk: {}: {}", e, data);
-                            continue;
-                        }
-                    };
-
-                    if !message_started {
-                        if let Some(id) = chunk_json.get("id").and_then(|v| v.as_str()) {
-                            message_id = id.to_string();
-                        }
-                        if let Some(m) = chunk_json.get("model").and_then(|v| v.as_str()) {
-                            model_name = m.to_string();
-                        }
-                        yield Ok(StreamEvent::MessageStart {
-                            id: message_id.clone(),
-                            model: model_name.clone(),
-                            usage: UsageInfo::default(),
-                        });
-                        yield Ok(StreamEvent::ContentBlockStart {
-                            index: 0,
-                            content_block: ContentBlock::Text { text: String::new() },
-                        });
-                        message_started = true;
-                    }
-
-                    let choices = match chunk_json.get("choices").and_then(|c| c.as_array()) {
-                        Some(c) => c,
-                        None => {
-                            if let Some(usage_val) = chunk_json.get("usage") {
-                                let usage = OpenAiProvider::parse_usage_pub(Some(usage_val));
-                                yield Ok(StreamEvent::MessageDelta {
-                                    stop_reason: None,
-                                    usage: Some(usage),
-                                });
-                            }
-                            continue;
-                        }
-                    };
-
-                    let choice = match choices.first() {
-                        Some(c) => c,
-                        None => continue,
-                    };
-
-                    let delta = match choice.get("delta") {
-                        Some(d) => d,
-                        None => continue,
-                    };
-
-                    // Reasoning / thinking extraction.
-                    // Check the provider-specific field first (e.g. DeepSeek's
-                    // "reasoning_content"), then fall back to common field names
-                    // used by other providers (Copilot "reasoning_text", generic
-                    // "reasoning", etc.).  This allows reasoning traces to show
-                    // for any provider that emits them without needing explicit
-                    // per-provider configuration.
-                    {
-                        const COMMON_REASONING_FIELDS: &[&str] = &[
-                            "reasoning_content",  // DeepSeek
-                            "reasoning_text",     // GitHub Copilot
-                            "reasoning",          // Generic / future
-                        ];
-                        let fields_to_check: Vec<&str> = if let Some(ref f) = reasoning_field {
-                            // Provider-specific field first, then common ones
-                            let mut v = vec![f.as_str()];
-                            for common in COMMON_REASONING_FIELDS {
-                                if *common != f.as_str() {
-                                    v.push(common);
-                                }
-                            }
-                            v
-                        } else {
-                            COMMON_REASONING_FIELDS.to_vec()
-                        };
-                        for field in &fields_to_check {
-                            if let Some(reasoning) = delta.get(*field).and_then(|v| v.as_str()) {
-                                if !reasoning.is_empty() {
-                                    yield Ok(StreamEvent::ReasoningDelta {
-                                        index: 0,
-                                        reasoning: reasoning.to_string(),
-                                    });
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    // Text content delta
-                    if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                        if !content.is_empty() {
-                            yield Ok(StreamEvent::TextDelta {
-                                index: 0,
-                                text: content.to_string(),
-                            });
-                        }
-                    }
-
-                    // Tool call deltas
-                    if let Some(tool_calls) =
-                        delta.get("tool_calls").and_then(|t| t.as_array())
-                    {
-                        for tc in tool_calls {
-                            let tc_index = tc
-                                .get("index")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0) as usize;
-                            if let Some(tc_id) =
-                                tc.get("id").and_then(|v| v.as_str())
-                            {
-                                let name = tc
-                                    .get("function")
-                                    .and_then(|f| f.get("name"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let block_index = 1 + tc_index;
-                                tool_call_buffers.insert(
-                                    block_index,
-                                    (tc_id.to_string(), name.clone(), String::new()),
-                                );
-                                yield Ok(StreamEvent::ContentBlockStart {
-                                    index: block_index,
-                                    content_block: ContentBlock::ToolUse {
-                                        id: tc_id.to_string(),
-                                        name,
-                                        input: json!({}),
-                                    },
-                                });
-                            }
-                            if let Some(args_frag) = tc
-                                .get("function")
-                                .and_then(|f| f.get("arguments"))
-                                .and_then(|v| v.as_str())
-                            {
-                                if !args_frag.is_empty() {
-                                    let block_index = 1 + tc_index;
-                                    if let Some((_, _, buf)) =
-                                        tool_call_buffers.get_mut(&block_index)
-                                    {
-                                        buf.push_str(args_frag);
-                                    }
-                                    yield Ok(StreamEvent::InputJsonDelta {
-                                        index: block_index,
-                                        partial_json: args_frag.to_string(),
-                                    });
-                                }
-                            }
-                        }
-                    }
-
-                    // finish_reason
-                    if let Some(finish_reason) =
-                        choice.get("finish_reason").and_then(|v| v.as_str())
-                    {
-                        if !finish_reason.is_empty() && finish_reason != "null" {
-                            yield Ok(StreamEvent::ContentBlockStop { index: 0 });
-                            let mut tc_indices: Vec<usize> =
-                                tool_call_buffers.keys().cloned().collect();
-                            tc_indices.sort();
-                            for idx in tc_indices {
-                                yield Ok(StreamEvent::ContentBlockStop { index: idx });
-                            }
-
-                            let stop_reason =
-                                OpenAiProvider::map_finish_reason_pub(finish_reason);
-
-                            let usage_val = chunk_json.get("usage");
-                            let usage = usage_val.map(|u| OpenAiProvider::parse_usage_pub(Some(u)));
-
-                            yield Ok(StreamEvent::MessageDelta {
-                                stop_reason: Some(stop_reason),
-                                usage,
-                            });
-                        }
                     }
                 }
             }
 
-            if message_started {
-                yield Ok(StreamEvent::MessageStop);
+            // Byte stream ended: flush a trailing MessageStop if content began
+            // but no explicit `[DONE]` sentinel arrived.
+            let mut tail = Vec::new();
+            chat_decoder.finish(&mut tail);
+            for event in tail {
+                yield Ok(event);
             }
         };
 
         Ok(Box::pin(s))
     }
 
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+    async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         // Use Ollama native API when configured — provides richer metadata
         // (parameter size, quantization, actual context window) than the
         // generic OpenAI-compat /v1/models endpoint.
         if let Some(ref ollama_host) = self.quirks.ollama_native_host {
-            return self.list_models_ollama_native(ollama_host).await;
+            return self.discover_models_ollama_native(ollama_host).await;
+        }
+        if let Some(ref lm_studio_host) = self.quirks.lm_studio_native_host {
+            if let Some(models) = self
+                .discover_models_lm_studio_native(lm_studio_host)
+                .await
+            {
+                return Ok(models);
+            }
         }
 
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
@@ -1133,6 +1083,7 @@ impl LlmProvider for OpenAiCompatProvider {
                         _ => 128_000,
                     },
                     max_output_tokens: 16_384,
+                    ..Default::default()
                 })
             })
             .collect();
@@ -1234,5 +1185,94 @@ mod tests {
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[1]["role"], json!("assistant"));
         assert_eq!(messages[1]["content"], json!("Done."));
+    }
+
+    #[test]
+    fn with_base_url_retargets_ollama_native_host() {
+        // Mirror the ollama() factory default: both the /v1 base URL and the
+        // native host point at localhost initially.
+        let provider = OpenAiCompatProvider::new("ollama", "Ollama", "http://localhost:11434/v1")
+            .with_quirks(ProviderQuirks {
+                no_api_key_required: true,
+                ollama_native_host: Some("http://localhost:11434".to_string()),
+                ..Default::default()
+            });
+
+        // Overriding the base URL with a configured remote api_base (as the
+        // registry does for `providers.ollama.api_base`) must also retarget the
+        // native host used by health_check() and native model discovery.
+        let provider = provider.with_base_url("http://192.0.2.10:11434/v1");
+
+        assert_eq!(provider.base_url, "http://192.0.2.10:11434/v1");
+        assert_eq!(
+            provider.quirks.ollama_native_host.as_deref(),
+            Some("http://192.0.2.10:11434"),
+        );
+    }
+
+    #[test]
+    fn lm_studio_native_models_only_include_loaded_llms() {
+        let response = json!({
+            "models": [
+                {
+                    "type": "llm",
+                    "key": "qwen/unloaded",
+                    "display_name": "Unloaded Qwen",
+                    "loaded_instances": [],
+                    "max_context_length": 262144
+                },
+                {
+                    "type": "llm",
+                    "key": "organization/omnicoder-9b",
+                    "display_name": "Omnicoder 9B",
+                    "loaded_instances": [{
+                        "id": "omnicoder-9b",
+                        "config": { "context_length": 131072 }
+                    }],
+                    "max_context_length": 262144
+                },
+                {
+                    "type": "embedding",
+                    "key": "nomic-embed",
+                    "loaded_instances": [{
+                        "id": "nomic-embed",
+                        "config": { "context_length": 2048 }
+                    }]
+                }
+            ]
+        });
+
+        let response: LmStudioModelsResponse =
+            serde_json::from_value(response).expect("valid LM Studio fixture");
+        let models = OpenAiCompatProvider::parse_lm_studio_native_models(
+            response,
+            &ProviderId::new(ProviderId::LM_STUDIO),
+        );
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(&*models[0].id, "omnicoder-9b");
+        assert_eq!(models[0].name, "Omnicoder 9B");
+        assert_eq!(models[0].context_window, 131_072);
+    }
+
+    #[test]
+    fn with_base_url_retargets_lm_studio_native_host() {
+        let provider = OpenAiCompatProvider::new(
+            ProviderId::LM_STUDIO,
+            "LM Studio",
+            "http://localhost:1234/v1",
+        )
+        .with_quirks(ProviderQuirks {
+            include_usage_in_stream: true,
+            lm_studio_native_host: Some("http://localhost:1234".to_string()),
+            ..Default::default()
+        })
+        .with_base_url("http://192.0.2.20:1234/v1");
+
+        assert_eq!(
+            provider.quirks.lm_studio_native_host.as_deref(),
+            Some("http://192.0.2.20:1234"),
+        );
+        assert!(provider.quirks.include_usage_in_stream);
     }
 }

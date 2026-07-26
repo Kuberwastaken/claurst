@@ -8,6 +8,7 @@ on:
       - 'CNAME'
       - 'docs/**'
       - 'public/**'
+      - 'session/**'
   workflow_dispatch:
 
 permissions:

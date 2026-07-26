@@ -587,6 +587,8 @@ mod tests {
 
     #[test]
     fn test_no_tokens_requires_oauth() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(KILL_SWITCH_ENV);
         let result = check_voice_availability(None);
         assert_eq!(result, VoiceAvailability::RequiresOAuth);
         assert!(!result.is_available());
@@ -595,6 +597,8 @@ mod tests {
 
     #[test]
     fn test_available_with_all_scopes() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(KILL_SWITCH_ENV);
         let tokens = tokens_with_scopes(vec!["user:inference", "user:profile"]);
         let result = check_voice_availability(Some(&tokens));
         assert_eq!(result, VoiceAvailability::Available);
@@ -604,6 +608,8 @@ mod tests {
 
     #[test]
     fn test_missing_one_scope() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(KILL_SWITCH_ENV);
         let tokens = tokens_with_scopes(vec!["user:inference"]);
         let result = check_voice_availability(Some(&tokens));
         assert!(matches!(result, VoiceAvailability::MissingScopes { .. }));
@@ -624,6 +630,8 @@ mod tests {
 
     #[test]
     fn test_empty_scopes_missing() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(KILL_SWITCH_ENV);
         let tokens = tokens_with_scopes(vec![]);
         let result = check_voice_availability(Some(&tokens));
         assert!(
@@ -662,6 +670,8 @@ mod tests {
 
     #[test]
     fn test_extra_scopes_still_available() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(KILL_SWITCH_ENV);
         let tokens = tokens_with_scopes(vec![
             "user:inference",
             "user:profile",

@@ -9,6 +9,9 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
+# wreq = client BoringSSL avec impersonation TLS (profil Bun) pour le chemin Anthropic.
+wreq = { workspace = true }
+wreq-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
@@ -17,8 +20,8 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
 once_cell = { workspace = true }
+regex = { workspace = true }
 parking_lot = { workspace = true }
-xxhash-rust = { version = "0.8", features = ["xxh64"] }
 async-stream = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }

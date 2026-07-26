@@ -12,6 +12,11 @@
 // - Bridge connection status badge
 // - Plugin hint banners
 
+// too_many_arguments: a handful of render/context helpers take many parameters
+// (layout rects, styles, state slices); grouping them is a larger refactor out
+// of scope for this cleanup.
+#![allow(clippy::too_many_arguments)]
+
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -30,6 +35,29 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::{self, Stdout};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Whether the active terminal speaks the kitty keyboard protocol (progressive
+/// keyboard enhancement). Detected once during [`setup_terminal`]. Defaults to
+/// `false` so that, until proven otherwise, we treat printable key presses as
+/// already-final characters (the behaviour of conhost / CMD / legacy PowerShell
+/// and most default terminals) instead of re-applying a US-QWERTY shift map —
+/// see `App::shift_normalize` and issue #183.
+static KEYBOARD_ENHANCEMENT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Returns whether the terminal's kitty keyboard protocol is active, as detected
+/// during [`setup_terminal`]. The run loop copies this onto the `App` so input
+/// normalization can be gated on it.
+pub fn keyboard_enhancement_active() -> bool {
+    KEYBOARD_ENHANCEMENT_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Whether app-level mouse capture was enabled during [`setup_terminal`].
+/// Mirrors [`KEYBOARD_ENHANCEMENT_ACTIVE`]: set once at setup from the user's
+/// `mouseCapture` config so the panic hook and restore path know whether to
+/// emit `DisableMouseCapture` (issue #104). Defaults to `true` so a restore
+/// that runs before setup keeps the historical always-disable behaviour.
+static MOUSE_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(true);
 
 // ---------------------------------------------------------------------------
 // Sub-modules
@@ -53,6 +81,8 @@ pub mod app;
 pub mod input;
 /// All ratatui rendering logic.
 pub mod render;
+/// Post-paint OSC 8 hyperlink emission — makes URLs Ctrl/Cmd-clickable.
+pub mod osc8;
 /// Permission dialogs and confirmation dialogs.
 pub mod dialogs;
 /// Notification / banner system.
@@ -71,6 +101,8 @@ pub mod theme_screen;
 pub mod theme_colors;
 /// Diff viewer dialog (two-pane: file list + unified diff detail).
 pub mod diff_viewer;
+/// Read-only viewer for [Pasted text #N ...] placeholders.
+pub mod paste_viewer;
 /// Virtual scrollable list for efficient message rendering.
 pub mod virtual_list;
 /// Message type renderers (assistant, user, tool use, etc.).
@@ -184,10 +216,13 @@ pub use file_injection_dialog::{FileInjectionDialogState, FileInjectionOutcome, 
 /// Used by both restore_terminal and the panic hook.
 fn restore_terminal_cleanup() -> io::Result<()> {
     #[cfg(not(target_os = "windows"))]
+    if MOUSE_CAPTURE_ACTIVE.load(Ordering::Relaxed) {
+        execute!(io::stdout(), DisableMouseCapture)?;
+    }
+    #[cfg(not(target_os = "windows"))]
     execute!(
         io::stdout(),
         LeaveAlternateScreen,
-        DisableMouseCapture,
         DisableBracketedPaste,
         PopKeyboardEnhancementFlags,
     )?;
@@ -200,7 +235,10 @@ fn restore_terminal_cleanup() -> io::Result<()> {
         // Pop may fail on legacy Windows conhost where the push was a no-op;
         // do it best-effort so cleanup never errors out the process.
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
-        execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+        if MOUSE_CAPTURE_ACTIVE.load(Ordering::Relaxed) {
+            let _ = execute!(io::stdout(), DisableMouseCapture);
+        }
+        execute!(io::stdout(), LeaveAlternateScreen)?;
     }
 
     Ok(())
@@ -212,13 +250,16 @@ fn restore_terminal_cleanup() -> io::Result<()> {
 /// panic message.  Without this, any panic in rendering code leaves the
 /// terminal in raw mode with mouse capture enabled — the user sees garbage
 /// input until they run `reset`.
-pub fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
+pub fn setup_terminal(mouse_capture: bool) -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     // Chain on top of any existing hook (e.g. from a previous call or test harness).
     // Only restore the terminal when the panic originates on the main thread.
     // Tokio worker threads also trigger this process-wide hook (Tokio catches
     // the panic internally but the hook still fires), so without this guard any
     // panicking background task would destroy the live TUI display while the
     // main render loop is still running.
+    // Record whether mouse capture is on so the panic hook / restore path
+    // know whether to emit DisableMouseCapture (issue #104).
+    MOUSE_CAPTURE_ACTIVE.store(mouse_capture, Ordering::Relaxed);
     let main_thread_id = std::thread::current().id();
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -238,13 +279,19 @@ pub fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     execute!(
         stdout,
         EnterAlternateScreen,
-        EnableMouseCapture,
         EnableBracketedPaste,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
         ),
     )?;
+    // Mouse capture is opt-out (issue #104): when on, the app handles scroll /
+    // right-click menu / drag-select but the terminal can no longer do native
+    // text selection. Skip it when the user set mouseCapture: false.
+    #[cfg(not(target_os = "windows"))]
+    if mouse_capture {
+        execute!(stdout, EnableMouseCapture)?;
+    }
 
     // On Windows, keyboard enhancement is best-effort: conhost and older
     // terminal builds do not support the kitty keyboard protocol.
@@ -252,7 +299,10 @@ pub fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     // configurations.  Warn the user when it fails, then continue.
     #[cfg(target_os = "windows")]
     {
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(stdout, EnterAlternateScreen)?;
+        if mouse_capture {
+            execute!(stdout, EnableMouseCapture)?;
+        }
         // Kitty keyboard protocol is unsupported on legacy Windows conhost;
         // best-effort — modern Windows Terminal accepts it, conhost returns
         // "Keyboard progressive enhancement not implemented for the legacy
@@ -266,6 +316,15 @@ pub fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
         );
     }
 
+    // Detect whether the terminal actually speaks the kitty keyboard protocol.
+    // This decides how we interpret printable key presses: kitty terminals report
+    // the unshifted base key + a SHIFT modifier (so we apply the shift map), while
+    // everything else (conhost / CMD / legacy PowerShell, default macOS Terminal,
+    // older xterms) reports the final, layout-correct character (so we must not
+    // re-shift it — issue #183). Failure to query is treated as "no kitty".
+    let kitty_active = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    KEYBOARD_ENHANCEMENT_ACTIVE.store(kitty_active, Ordering::Relaxed);
+
     set_terminal_title("\u{1f980} Claurst");
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
@@ -275,6 +334,8 @@ pub fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 /// Restore the terminal to its original state.
 pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
     disable_raw_mode()?;
+    // Clear any terminal "busy" progress indicator (OSC 9;4) we may have set.
+    set_terminal_progress(false);
     // Restore the original title by clearing it (terminals fall back to default).
     let _ = execute!(
         terminal.backend_mut(),
@@ -288,6 +349,54 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io
 /// Set the terminal window title via OSC escape sequence.
 pub fn set_terminal_title(title: &str) {
     let _ = execute!(io::stdout(), crossterm::terminal::SetTitle(title));
+}
+
+/// Whether the current terminal is known to render the OSC 9;4 "progress"
+/// sequence. Most terminals silently ignore an unknown OSC, but a bare
+/// tmux/screen passthrough can leak it as visible text, so we require a real
+/// tty and an allow-listed terminal (iTerm2, WezTerm, Ghostty, Windows
+/// Terminal, ConEmu).
+pub fn supports_progress_osc() -> bool {
+    use std::io::IsTerminal;
+    if !io::stdout().is_terminal() {
+        return false;
+    }
+    // tmux/screen don't forward OSC 9;4 to the outer terminal by default.
+    if std::env::var_os("TMUX").is_some() {
+        return false;
+    }
+    if let Ok(term) = std::env::var("TERM") {
+        if term.starts_with("screen") || term.starts_with("tmux") {
+            return false;
+        }
+    }
+    if std::env::var_os("WT_SESSION").is_some() || std::env::var_os("ConEmuPID").is_some() {
+        return true;
+    }
+    matches!(
+        std::env::var("TERM_PROGRAM").unwrap_or_default().as_str(),
+        "iTerm.app" | "WezTerm" | "ghostty"
+    )
+}
+
+/// Emit the OSC 9;4 progress sequence. `active = true` shows an indeterminate
+/// "busy" indicator (e.g. iTerm2's progress bar, the Windows Terminal taskbar);
+/// `false` clears it. No-op on terminals that don't support it.
+///
+/// Safe alongside the ratatui alternate screen: OSC 9;4 addresses terminal
+/// chrome (title bar / taskbar), not the cell grid, so it doesn't disturb the
+/// rendered frame.
+pub fn set_terminal_progress(active: bool) {
+    if !supports_progress_osc() {
+        return;
+    }
+    use std::io::Write;
+    // state 3 = indeterminate/busy, state 0 = clear; the progress value is
+    // unused for the indeterminate state.
+    let seq: &[u8] = if active { b"\x1b]9;4;3;0\x07" } else { b"\x1b]9;4;0;0\x07" };
+    let mut out = io::stdout();
+    let _ = out.write_all(seq);
+    let _ = out.flush();
 }
 
 /// Update the terminal title to reflect the current session context.
@@ -398,13 +507,13 @@ mod tests {
     fn test_stats_slash_command_opens_dialog_and_closes_other_views() {
         let mut app = make_app();
         app.mcp_view.open(vec![]);
-        app.agents_menu.open = true;
+        app.agents_menu.visible = true;
 
         assert!(app.intercept_slash_command("stats"));
-        assert!(app.stats_dialog.open);
-        assert!(!app.mcp_view.open);
-        assert!(!app.agents_menu.open);
-        assert!(!app.diff_viewer.open);
+        assert!(app.stats_dialog.visible);
+        assert!(!app.mcp_view.visible);
+        assert!(!app.agents_menu.visible);
+        assert!(!app.diff_viewer.visible);
     }
 
     #[test]
@@ -417,7 +526,7 @@ mod tests {
         ];
 
         assert!(app.intercept_slash_command("agents"));
-        assert!(app.agents_menu.open);
+        assert!(app.agents_menu.visible);
         assert_eq!(app.agents_menu.active_agents.len(), 3);
         assert_eq!(app.agents_menu.active_agents[0].status, AgentStatus::Running);
         assert_eq!(
@@ -477,7 +586,7 @@ mod tests {
         let mut app = make_app();
 
         assert!(app.intercept_slash_command("changes"));
-        assert!(app.diff_viewer.open);
+        assert!(app.diff_viewer.visible);
         assert_eq!(app.diff_viewer.diff_type, DiffType::TurnDiff);
     }
 
@@ -710,7 +819,7 @@ mod tests {
     fn test_ctrl_p_opens_global_search() {
         let mut app = make_app();
         app.handle_key_event(ctrl(KeyCode::Char('p')));
-        assert!(app.global_search.open);
+        assert!(app.global_search.visible);
     }
 
     #[test]
@@ -727,13 +836,17 @@ mod tests {
         }];
         app.handle_key_event(key(KeyCode::Enter));
 
-        assert!(!app.global_search.open);
+        assert!(!app.global_search.visible);
         assert_eq!(app.input, "src/main.rs:42");
         assert_eq!(app.prompt_input.text, "src/main.rs:42");
     }
 
     #[test]
-    fn test_render_app_keeps_logo_header_after_first_message() {
+    fn test_render_app_shows_scrollable_banner_after_first_message() {
+        // Once a conversation starts, the welcome box is no longer pinned as a
+        // fixed header (issue #310): a compact banner leads the transcript (and
+        // scrolls away with content), while the rich two-column welcome box — its
+        // mascot and "Recent activity" panel — is only the empty-screen welcome.
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = make_app();
@@ -752,8 +865,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
 
+        // The compact banner (title + hint) and the message both render.
         assert!(rendered.contains("Claurst"));
+        assert!(rendered.contains("? for shortcuts"));
         assert!(rendered.contains("hello"));
+        // The full welcome box's recent-activity panel must NOT be drawn during
+        // a conversation — that would mean the old fixed header is still there.
+        assert!(!rendered.contains("Recent activity"));
     }
 
     #[test]
@@ -957,7 +1075,7 @@ mod tests {
     #[test]
     fn test_render_diff_dialog_shows_turn_empty_state() {
         let mut state = DiffViewerState::new();
-        state.open = true;
+        state.visible = true;
         state.diff_type = DiffType::TurnDiff;
         let area = Rect { x: 0, y: 0, width: 80, height: 20 };
         let mut buf = Buffer::empty(area);
@@ -976,6 +1094,9 @@ mod tests {
     #[test]
     fn test_page_scroll() {
         let mut app = make_app();
+        // A render must have established a scrollable range; otherwise a
+        // scroll-up is correctly a no-op (offset is clamped to max_scroll, #223).
+        app.last_max_scroll.set(100);
         app.handle_key_event(key(KeyCode::PageUp));
         assert_eq!(app.scroll_offset, 10);
         app.handle_key_event(key(KeyCode::PageDown));
@@ -995,13 +1116,13 @@ mod tests {
     #[test]
     fn test_stats_dialog_keys_switch_tab_and_close() {
         let mut app = make_app();
-        app.stats_dialog.open = true;
+        app.stats_dialog.visible = true;
 
         app.handle_key_event(key(KeyCode::Right));
         assert_eq!(app.stats_dialog.tab, StatsTab::DailyTokens);
 
         app.handle_key_event(key(KeyCode::Esc));
-        assert!(!app.stats_dialog.open);
+        assert!(!app.stats_dialog.visible);
     }
 
     #[test]
@@ -1039,7 +1160,7 @@ mod tests {
         assert_eq!(app.mcp_view.tool_search, "");
 
         app.handle_key_event(key(KeyCode::Esc));
-        assert!(!app.mcp_view.open);
+        assert!(!app.mcp_view.visible);
     }
 
     #[test]
@@ -1104,7 +1225,7 @@ mod tests {
         assert!(!submit);
         assert_eq!(app.prompt_input.text, "");
         assert_eq!(app.take_pending_mcp_panel_auth().as_deref(), Some("mcphub"));
-        assert!(!app.mcp_view.open);
+        assert!(!app.mcp_view.visible);
         assert_eq!(app.mcp_view.tool_search, "");
     }
 
@@ -1115,7 +1236,7 @@ mod tests {
 
         let submit = app.handle_key_event(key(KeyCode::Char('a')));
         assert!(!submit);
-        assert!(app.mcp_view.open);
+        assert!(app.mcp_view.visible);
         assert_eq!(app.prompt_input.text, "");
         assert!(app.take_pending_mcp_panel_auth().is_none());
     }
@@ -1144,7 +1265,7 @@ mod tests {
 
         let submit = app.handle_key_event(key(KeyCode::Char('a')));
         assert!(!submit);
-        assert!(app.mcp_view.open);
+        assert!(app.mcp_view.visible);
         assert_eq!(app.mcp_view.tool_search, "a");
         assert!(app.take_pending_mcp_panel_auth().is_none());
     }
@@ -1169,6 +1290,7 @@ mod tests {
                 id: "toolu_1".to_string(),
                 name: "read_file".to_string(),
                 input: serde_json::json!({ "path": "README.md" }),
+                thought_signature: None,
             },
             ContentBlock::Text {
                 text: "Done".to_string(),
@@ -1308,6 +1430,12 @@ mod tests {
         let mut app = make_app();
         app.push_message(claurst_core::types::Message::user("hello".to_string()));
         app.push_message(claurst_core::types::Message::assistant("hi there".to_string()));
+        // Mode/model/duration moved to the status line, so the turn-metadata
+        // line (the ▣ glyph) now renders only for interrupted turns. Mark this
+        // turn interrupted to exercise that metadata path.
+        if let Some(meta) = app.turn_metadata.first_mut() {
+            meta.interrupted = true;
+        }
 
         terminal
             .draw(|frame| crate::render::render_app(frame, &app))
@@ -1322,8 +1450,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
 
+        // Turn metadata uses the ▣ glyph, never the legacy ◆.
         assert!(!rendered.contains("◆"));
-        assert!(rendered.contains("▣"));
+        assert!(rendered.contains("\u{25a3}"));
     }
 
     // ---- HistorySearch --------------------------------------------------

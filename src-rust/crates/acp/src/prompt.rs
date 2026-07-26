@@ -67,6 +67,10 @@ pub async fn handle(
         pending_permissions: Some(session.pending_permissions.clone()),
         permission_manager: Some(runtime.permission_manager.clone()),
         user_question_tx: None,
+        // Bind to this turn's cancel token so the parallel tool executor and any
+        // sub-agents observe cancellation (issue #218). `run_query_loop` also
+        // rebinds this to the token it is driven by.
+        cancel_token: cancel.clone(),
     };
 
     // Spawn the permission drainer for this turn.

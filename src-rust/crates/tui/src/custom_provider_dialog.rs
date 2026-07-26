@@ -27,6 +27,12 @@ pub struct CustomProviderDialogState {
     pub active_field: CustomProviderField,
 }
 
+impl Default for CustomProviderDialogState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CustomProviderDialogState {
     pub fn new() -> Self {
         Self {

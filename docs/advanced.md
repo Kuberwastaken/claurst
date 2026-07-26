@@ -117,7 +117,7 @@ Opens an interactive visualisation of which parts of the context are consuming t
 
 ## Session management
 
-Sessions are stored as JSONL files under `~/.claude/projects/<sanitized-cwd>/<session-id>.jsonl`. Each line in the file is a JSON object representing a message or event in the conversation.
+Sessions are stored as JSONL files under `~/.claurst/projects/<base64url(project-root)>/<session-id>.jsonl`. Each line in the file is a JSON object representing a message or event in the conversation. The per-session metadata index lives at `~/.claurst/sessions/<id>.json`.
 
 The transcript directory is derived from the working directory at session start. Worktrees and path sanitisation mean the per-project folder name is a normalised representation of the absolute path.
 
@@ -508,11 +508,11 @@ SSH sessions work similarly: `claurst --ssh` enables a remote-accessible session
 
 Claurst reads instruction files from the filesystem before every session and whenever a relevant file changes. The lookup order is:
 
-1. **Managed** — `/etc/claude-code/CLAUDE.md` (administrator-controlled, always loaded).
-2. **User** — `~/.claude/CLAUDE.md` and `~/.claude/rules/*.md` (personal global instructions).
-3. **Project** — `CLAUDE.md`, `.claude/CLAUDE.md`, and `.claude/rules/*.md` in each directory from the filesystem root down to the current working directory. Files are loaded from the root toward the CWD so that parent-directory rules are visible when processing child-directory rules.
+1. **Managed** — `/etc/claude-code/AGENTS.md` and `/etc/claude-code/CLAUDE.md` (administrator-controlled, always loaded).
+2. **User** — `~/.claurst/AGENTS.md` then `~/.claurst/CLAUDE.md` (personal global instructions).
+3. **Project** — `AGENTS.md`, `CLAUDE.md`, `.claurst/AGENTS.md`, and `.claurst/CLAUDE.md` in each directory from the filesystem root down to the current working directory. Files are loaded from the root toward the CWD so that parent-directory rules are visible when processing child-directory rules.
 
-`AGENTS.md` is treated equivalently to `CLAUDE.md` for compatibility with other AI coding tools.
+`AGENTS.md` is preferred (universal cross-tool standard); `CLAUDE.md` is loaded next at every scope for compatibility with other Claude tooling. If both exist at the same scope, both are loaded.
 
 Files can `@include` other files using a frontmatter include directive. Included files are resolved relative to the including file.
 

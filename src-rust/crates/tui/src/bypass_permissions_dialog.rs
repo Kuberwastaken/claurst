@@ -63,6 +63,10 @@ impl BypassPermissionsDialogState {
 // ---------------------------------------------------------------------------
 
 /// Render the bypass-permissions confirmation dialog over the frame.
+// The dialog body is built as a long, sequential run of `lines.push(...)` calls
+// interleaved with per-option style computation; a single `vec!` literal would
+// be far less readable, so keep the imperative builder here.
+#[allow(clippy::vec_init_then_push)]
 pub fn render_bypass_permissions_dialog(
     frame: &mut Frame,
     state: &BypassPermissionsDialogState,

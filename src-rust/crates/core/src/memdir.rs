@@ -113,7 +113,7 @@ pub fn scan_memory_dir(dir: &Path) -> Vec<MemoryFileMeta> {
     collect_md_files(dir, dir, &mut files);
 
     // Sort newest-first.
-    files.sort_by(|a, b| b.modified_secs.cmp(&a.modified_secs));
+    files.sort_by_key(|b| std::cmp::Reverse(b.modified_secs));
     files.truncate(MAX_MEMORY_FILES);
     files
 }
@@ -346,11 +346,7 @@ pub fn auto_memory_path(project_root: &Path) -> PathBuf {
     // 2. Determine the memory base directory.
     let memory_base = std::env::var("CLAURST_REMOTE_MEMORY_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".claurst")
-        });
+        .unwrap_or_else(|_| crate::config::Settings::config_dir());
 
     // 3. Sanitize the project root into a safe directory name.
     let sanitized = sanitize_path_component(&project_root.to_string_lossy());

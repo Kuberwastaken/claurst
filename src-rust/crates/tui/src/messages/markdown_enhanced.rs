@@ -266,9 +266,9 @@ pub fn parse_inline_formatting(text: &str) -> Vec<Span<'static>> {
         }
 
         // Check for ** or __ (bold) - with limited nesting support
-        if idx + 1 < chars.len() {
-            if (chars[idx] == '*' && chars[idx + 1] == '*') ||
-               (chars[idx] == '_' && chars[idx + 1] == '_') {
+        if idx + 1 < chars.len()
+            && ((chars[idx] == '*' && chars[idx + 1] == '*') ||
+               (chars[idx] == '_' && chars[idx + 1] == '_')) {
                 let marker = chars[idx];
 
                 // Flush current text
@@ -300,7 +300,6 @@ pub fn parse_inline_formatting(text: &str) -> Vec<Span<'static>> {
                 ));
                 continue;
             }
-        }
 
         // Check for ~~ (strikethrough) - no nesting
         if idx + 1 < chars.len() && chars[idx] == '~' && chars[idx + 1] == '~' {

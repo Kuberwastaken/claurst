@@ -76,9 +76,7 @@ pub struct ModelBreakdown {
 
 /// Load and aggregate stats from ~/.claurst/stats.jsonl
 pub fn load_stats() -> AggregatedStats {
-    let path = dirs::home_dir()
-        .map(|h| h.join(".claurst").join("stats.jsonl"))
-        .unwrap_or_default();
+    let path = claurst_core::config::Settings::config_dir().join("stats.jsonl");
 
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
@@ -130,7 +128,7 @@ fn timestamp_to_date(ts_ms: u64) -> String {
 }
 
 fn is_leap_year(year: u32) -> bool {
-    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
 }
 
 fn day_of_year_to_month_day(doy: u32, leap: bool) -> (u32, u32) {
@@ -163,7 +161,7 @@ pub enum StatsTab {
 
 #[derive(Debug, Clone)]
 pub struct StatsDialogState {
-    pub open: bool,
+    pub visible: bool,
     pub tab: StatsTab,
     pub range_days: u32,  // 7, 30, or 0 = all
     pub data: Option<AggregatedStats>,
@@ -179,7 +177,7 @@ pub struct StatsDialogState {
 impl StatsDialogState {
     pub fn new() -> Self {
         Self {
-            open: false,
+            visible: false,
             tab: StatsTab::Overview,
             range_days: 30,
             data: None,
@@ -197,11 +195,11 @@ impl StatsDialogState {
         self.current_streak_days = current;
         self.longest_streak_days = longest;
         self.data = Some(stats);
-        self.open = true;
+        self.visible = true;
         self.scroll = 0;
     }
 
-    pub fn close(&mut self) { self.open = false; }
+    pub fn close(&mut self) { self.visible = false; }
 
     pub fn next_tab(&mut self) {
         self.tab = match self.tab {
@@ -349,7 +347,7 @@ fn date_to_days_since_epoch(date: &str) -> Option<u64> {
 
 /// Render the stats dialog overlay.
 pub fn render_stats_dialog(state: &StatsDialogState, area: Rect, buf: &mut Buffer) {
-    if !state.open { return; }
+    if !state.visible { return; }
 
     let layout = begin_modal_buf(buf, area, 92, 30, 2, 1);
     render_modal_title_buf(buf, layout.header_area, "Cost & stats", "esc");
@@ -601,7 +599,7 @@ fn render_cost_heatmap(data: &AggregatedStats, area: Rect, buf: &mut Buffer) {
     // and place week columns right-to-left from the most-recent week.
     let chunks: Vec<_> = sorted_dates.chunks(7).collect();
     let total_chunks = chunks.len();
-    let start_chunk = if total_chunks > 12 { total_chunks - 12 } else { 0 };
+    let start_chunk = total_chunks.saturating_sub(12);
 
     for (display_col, chunk) in chunks[start_chunk..].iter().enumerate() {
         let x = heatmap_area.x + display_col as u16 * 2;

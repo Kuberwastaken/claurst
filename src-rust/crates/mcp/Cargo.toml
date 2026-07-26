@@ -28,4 +28,7 @@ dirs = { workspace = true }
 chrono = { workspace = true }
 open = { workspace = true }
 urlencoding = { workspace = true }
-rmcp = { version = "1.4.0", default-features = false, features = ["client", "auth", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-native-tls"] }
+rmcp = { version = "1.4.0", default-features = false, features = ["client", "auth", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

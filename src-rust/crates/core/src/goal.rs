@@ -163,7 +163,7 @@ impl GoalStore {
 
     /// Default path: `~/.claurst/goals.sqlite`.
     pub fn default_path() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join(".claurst").join("goals.sqlite"))
+        Some(crate::config::Settings::config_dir().join("goals.sqlite"))
     }
 
     /// Open using the default path (best-effort; returns None on failure).
@@ -346,7 +346,7 @@ fn uuid_v4() -> String {
     format!(
         "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
         (h1 >> 32) as u32,
-        (h1 >> 16) as u16 & 0xffff,
+        ((h1 >> 16) as u16),
         (h1) as u16 & 0x0fff,
         ((h2 >> 48) as u16 & 0x3fff) | 0x8000,
         h2 & 0x0000_ffff_ffff_ffff,

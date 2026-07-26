@@ -122,6 +122,7 @@ mod tests {
                 id: "call:1/abc".to_string(),
                 name: "search".to_string(),
                 input: json!({"q": "test"}),
+                thought_signature: None,
             }]),
             Message::user_blocks(vec![ContentBlock::ToolResult {
                 tool_use_id: "call:1/abc".to_string(),

@@ -565,13 +565,10 @@ impl LspClient {
             .await?;
 
         let mut symbols = Vec::new();
-        match &result {
-            serde_json::Value::Array(arr) => {
-                for sym in arr {
-                    collect_symbol(sym, 0, &mut symbols);
-                }
+        if let serde_json::Value::Array(arr) = &result {
+            for sym in arr {
+                collect_symbol(sym, 0, &mut symbols);
             }
-            _ => {}
         }
         Ok(symbols)
     }

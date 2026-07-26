@@ -25,7 +25,6 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::{run_query_loop, QueryConfig, QueryOutcome};
@@ -273,7 +272,7 @@ impl Tool for AgentTool {
                     if let Ok(entries) = std::fs::read_dir(&agent_dir) {
                         for entry in entries.flatten() {
                             let p = entry.path();
-                            if p.extension().map_or(false, |e| e == "md") {
+                            if p.extension().is_some_and(|e| e == "md") {
                                 if let Ok(content) = std::fs::read_to_string(&p) {
                                     let name = p
                                         .file_stem()
@@ -367,6 +366,12 @@ impl Tool for AgentTool {
             agent_definition: None,
             model_registry: Some(model_registry),
             managed_agents: None,
+            // Progressive tool disclosure (issue #233): the sub-agent's system
+            // prompt only needs guideline blocks for the tools it actually has.
+            enabled_tools: Some(agent_tools.iter().map(|t| t.name().to_string()).collect()),
+            // Sub-agents run to their own completion and never drive goal
+            // continuation — stop after one turn like every non-goal run.
+            continuation: crate::continuation::ContinuationMode::Default,
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.
@@ -377,6 +382,14 @@ impl Tool for AgentTool {
                 params.description
             ));
             task.id = agent_id.clone();
+            // Cancellation token shared between the registry and the spawned
+            // sub-agent loop: signalling it via TaskRegistry::cancel (e.g. from a
+            // monitor cancel) actually stops the loop instead of only relabeling
+            // the task (issue #219). Derive it as a CHILD of the parent's token
+            // so cancelling the parent query also cancels this sub-agent, while
+            // the registry can still cancel this sub-agent independently (#218).
+            let cancel = ctx.cancel_token.child_token();
+            task.cancel_token = Some(cancel.clone());
             let _ = claurst_core::tasks::global_registry().register(task);
 
             // Re-create the tool list inside the closure so it is owned and Send.
@@ -394,7 +407,6 @@ impl Tool for AgentTool {
             let agent_id_bg = agent_id.clone();
 
             tokio::spawn(async move {
-                let cancel = CancellationToken::new();
                 let mut messages = vec![Message::user(prompt_bg)];
                 let outcome = run_query_loop(
                     client_bg.as_ref(),
@@ -460,7 +472,9 @@ impl Tool for AgentTool {
         // Synchronous mode: run the sub-agent loop and wait for completion.
         // -----------------------------------------------------------------------
         let mut messages = vec![Message::user(params.prompt)];
-        let cancel = CancellationToken::new();
+        // Derive the sub-agent's token as a CHILD of the parent's so a parent
+        // cancel propagates into this sub-agent's own run_query_loop (issue #218).
+        let cancel = ctx.cancel_token.child_token();
 
         let outcome = run_query_loop(
             client.as_ref(),
@@ -627,10 +641,17 @@ pub fn init_team_swarm_runner() {
                     output_style_prompt: ctx.config.resolve_output_style_prompt(),
                     provider_registry: Some(Arc::new(provider_registry)),
                     model_registry: Some(model_registry),
+                    // Progressive tool disclosure (issue #233): only emit
+                    // per-tool guidance for tools this team sub-agent has.
+                    enabled_tools: Some(
+                        agent_tools.iter().map(|t| t.name().to_string()).collect(),
+                    ),
                     ..Default::default()
                 };
 
-                let cancel = tokio_util::sync::CancellationToken::new();
+                // Child of the parent's token so a parent cancel propagates into
+                // this team sub-agent as well (issue #218).
+                let cancel = ctx.cancel_token.child_token();
                 let mut messages = vec![claurst_core::types::Message::user(prompt)];
                 let outcome = crate::run_query_loop(
                     client.as_ref(),

@@ -402,6 +402,7 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
         ("Enter",           "Submit message"),
         ("Up / Down",       "Input history"),
         ("Ctrl+R",          "Search history"),
+        ("Alt+E",           "Expand pasted text"),
         ("Esc",             "Cancel / close"),
     ] {
         left_lines.push(kb_line(key, desc));
@@ -415,7 +416,7 @@ pub fn render_help_overlay(frame: &mut Frame, overlay: &HelpOverlay, area: Rect)
     )));
     for (key, desc) in &[
         ("F1 / ?",          "Toggle help"),
-        ("Ctrl+A",          "Model picker"),
+        ("Ctrl+Shift+A",    "Model picker"),
         ("Ctrl+K",          "Command palette"),
         ("Ctrl+C",          "Cancel / quit"),
         ("Ctrl+D",          "Quit (empty input)"),
@@ -586,10 +587,7 @@ impl HistoryEntry {
 // ---------------------------------------------------------------------------
 
 fn pins_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".claurst")
-        .join("history_pins.json")
+    claurst_core::config::Settings::config_dir().join("history_pins.json")
 }
 
 /// Load the set of pinned entry texts from `~/.claurst/history_pins.json`.
@@ -846,8 +844,8 @@ impl HistorySearchOverlay {
         // Sort: pinned entries always first, then by score descending.
         // Stable sort preserves insertion order for ties within each group.
         scored.sort_by(|a, b| {
-            let a_pinned = self.snapshot.get(a.snapshot_idx).map_or(false, |e| e.pinned);
-            let b_pinned = self.snapshot.get(b.snapshot_idx).map_or(false, |e| e.pinned);
+            let a_pinned = self.snapshot.get(a.snapshot_idx).is_some_and(|e| e.pinned);
+            let b_pinned = self.snapshot.get(b.snapshot_idx).is_some_and(|e| e.pinned);
             match (b_pinned, a_pinned) {
                 (true, false) => std::cmp::Ordering::Greater,
                 (false, true) => std::cmp::Ordering::Less,
@@ -1008,7 +1006,7 @@ pub fn render_history_search_overlay(
                 })
                 .unwrap_or("");
 
-            let is_pinned = snap_entry.map_or(false, |e| e.pinned);
+            let is_pinned = snap_entry.is_some_and(|e| e.pinned);
 
             // Relative timestamp (right-aligned suffix)
             let time_suffix: String = snap_entry
@@ -1109,10 +1107,9 @@ fn build_highlighted_spans<'a>(
     let mut spans: Vec<Span<'a>> = Vec::new();
     let mut current_text = String::new();
     let mut current_highlighted = false;
-    let mut char_count = 0usize;
     let mut truncated = false;
 
-    for (byte_off, ch) in &chars {
+    for (char_count, (byte_off, ch)) in chars.iter().enumerate() {
         if char_count >= max_chars {
             truncated = true;
             break;
@@ -1131,7 +1128,6 @@ fn build_highlighted_spans<'a>(
         }
         current_highlighted = is_hl;
         current_text.push(*ch);
-        char_count += 1;
     }
     if !current_text.is_empty() {
         let style = if current_highlighted {
@@ -1232,6 +1228,80 @@ impl MessageSelectorOverlay {
     }
 }
 
+/// Truncate `s` to at most `max_width` display columns, cutting on char
+/// boundaries and appending an ellipsis when truncated.
+///
+/// Byte-slicing here panics when a multibyte char straddles the cut, and a raw
+/// `usize` width subtraction underflow-panics on narrow terminals (#221).
+fn truncate_to_width(s: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(s) <= max_width {
+        return s.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "\u{2026}".to_string();
+    }
+    let mut out = String::new();
+    let mut width = 0usize;
+    for ch in s.chars() {
+        let cw = UnicodeWidthStr::width(ch.encode_utf8(&mut [0u8; 4]));
+        // Reserve one column for the trailing ellipsis.
+        if width + cw > max_width - 1 {
+            break;
+        }
+        out.push(ch);
+        width += cw;
+    }
+    out.push('\u{2026}');
+    out
+}
+
+/// Find the first case-insensitive occurrence of `needle_lc` (already
+/// lowercased) inside `haystack`, returning the byte range **in the original**
+/// `haystack`.
+///
+/// Never indexes one string with another string's byte offsets, so it is safe
+/// for lossy / length-changing lowercase mappings such as `İ` (U+0130 → "i̇"),
+/// `K` (U+212A → "k"), and `ẞ`/`ß` (#221). Both returned offsets are guaranteed
+/// char boundaries of `haystack`.
+fn case_insensitive_find(haystack: &str, needle_lc: &str) -> Option<(usize, usize)> {
+    if needle_lc.is_empty() {
+        return None;
+    }
+    for (start, _) in haystack.char_indices() {
+        let mut hay_chars = haystack[start..].chars();
+        let need_chars = needle_lc.chars();
+        // Lowercase expansion of one haystack char may yield several chars.
+        let mut pending: std::collections::VecDeque<char> = std::collections::VecDeque::new();
+        let mut end = start;
+        let mut matched = true;
+        'need: for nc in need_chars {
+            while pending.is_empty() {
+                match hay_chars.next() {
+                    Some(hc) => {
+                        end += hc.len_utf8();
+                        pending.extend(hc.to_lowercase());
+                    }
+                    None => {
+                        matched = false;
+                        break 'need;
+                    }
+                }
+            }
+            if pending.pop_front() != Some(nc) {
+                matched = false;
+                break 'need;
+            }
+        }
+        if matched {
+            return Some((start, end));
+        }
+    }
+    None
+}
+
 /// Render the message selector overlay.
 pub fn render_message_selector(frame: &mut Frame, overlay: &MessageSelectorOverlay, area: Rect) {
     if !overlay.visible {
@@ -1275,12 +1345,10 @@ pub fn render_message_selector(frame: &mut Frame, overlay: &MessageSelectorOverl
 
             let tool_tag = if msg.has_tool_use { " [tool]" } else { "" };
 
-            let preview_max = dialog_width as usize - 20;
-            let preview = if UnicodeWidthStr::width(msg.preview.as_str()) > preview_max {
-                format!("{}…", &msg.preview[..preview_max.saturating_sub(1)])
-            } else {
-                msg.preview.clone()
-            };
+            // saturating_sub avoids an underflow panic on narrow terminals, and
+            // truncate_to_width cuts on char boundaries by display width (#221).
+            let preview_max = (dialog_width as usize).saturating_sub(20);
+            let preview = truncate_to_width(&msg.preview, preview_max);
 
             let prefix = if is_selected { "  \u{25BA} " } else { "    " };
             let idx_style = if is_selected {
@@ -1500,7 +1568,7 @@ fn kb_line<'a>(key: &str, desc: &str) -> Line<'a> {
 /// State for the global ripgrep search dialog.
 #[derive(Debug, Clone, Default)]
 pub struct GlobalSearchState {
-    pub open: bool,
+    pub visible: bool,
     pub query: String,
     pub results: Vec<SearchResult>,
     pub selected: usize,
@@ -1521,13 +1589,13 @@ pub struct SearchResult {
 
 impl GlobalSearchState {
     pub fn open(&mut self) {
-        self.open = true;
+        self.visible = true;
         self.query.clear();
         self.results.clear();
         self.selected = 0;
     }
 
-    pub fn close(&mut self) { self.open = false; }
+    pub fn close(&mut self) { self.visible = false; }
 
     pub fn select_prev(&mut self) {
         let count = self.results.len();
@@ -1584,25 +1652,22 @@ impl GlobalSearchState {
         if let Ok(out) = output {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-                    match val["type"].as_str() {
-                        Some("match") => {
-                            let data = &val["data"];
-                            let file = data["path"]["text"].as_str().unwrap_or("").to_string();
-                            let line_no = data["line_number"].as_u64().unwrap_or(0) as u32;
-                            let text = data["lines"]["text"].as_str().unwrap_or("").trim_end_matches('\n').to_string();
-                            let col = data["submatches"][0]["start"].as_u64().unwrap_or(0) as u32;
-                            self.results.push(SearchResult {
-                                file,
-                                line: line_no,
-                                col,
-                                text,
-                                context_before: Vec::new(),
-                                context_after: Vec::new(),
-                            });
-                            self.total_matches += 1;
-                            if self.results.len() >= 500 { break; }
-                        }
-                        _ => {}
+                    if let Some("match") = val["type"].as_str() {
+                        let data = &val["data"];
+                        let file = data["path"]["text"].as_str().unwrap_or("").to_string();
+                        let line_no = data["line_number"].as_u64().unwrap_or(0) as u32;
+                        let text = data["lines"]["text"].as_str().unwrap_or("").trim_end_matches('\n').to_string();
+                        let col = data["submatches"][0]["start"].as_u64().unwrap_or(0) as u32;
+                        self.results.push(SearchResult {
+                            file,
+                            line: line_no,
+                            col,
+                            text,
+                            context_before: Vec::new(),
+                            context_after: Vec::new(),
+                        });
+                        self.total_matches += 1;
+                        if self.results.len() >= 500 { break; }
                     }
                 }
             }
@@ -1625,7 +1690,7 @@ pub fn render_global_search(state: &GlobalSearchState, area: ratatui::layout::Re
     };
     use std::path::Path;
 
-    if !state.open { return; }
+    if !state.visible { return; }
 
     let w = (area.width * 4 / 5).max(40).min(area.width);
     let h = (area.height * 3 / 4).max(10).min(area.height);
@@ -1763,13 +1828,14 @@ pub fn render_global_search(state: &GlobalSearchState, area: ratatui::layout::Re
                 let text_trimmed = result.text.trim();
                 let query_lc = state.query.to_lowercase();
                 let text_spans: Vec<Span<'static>> = if !query_lc.is_empty() {
-                    let text_lc = text_trimmed.to_lowercase();
-                    if let Some(pos) = text_lc.find(query_lc.as_str()) {
-                        let before: String = text_trimmed.chars().take(
-                            text_trimmed[..pos].chars().count()
-                        ).collect();
-                        let matched: String = text_trimmed[pos..pos + query_lc.len()].to_string();
-                        let after: String = text_trimmed[pos + query_lc.len()..].chars().take(30).collect();
+                    // Match case-insensitively but slice the ORIGINAL string on
+                    // its own char boundaries. to_lowercase() is not length- or
+                    // boundary-preserving (İ, K U+212A, ß), so indexing the
+                    // original with the lowercased copy's offsets panics (#221).
+                    if let Some((start, end)) = case_insensitive_find(text_trimmed, &query_lc) {
+                        let before: String = text_trimmed[..start].to_string();
+                        let matched: String = text_trimmed[start..end].to_string();
+                        let after: String = text_trimmed[end..].chars().take(30).collect();
                         vec![
                             Span::styled(before, style),
                             Span::styled(matched, style.bg(Color::Rgb(60, 50, 0)).fg(Color::Yellow)),
@@ -2099,5 +2165,83 @@ mod tests {
         flow.reject_confirm();
         assert_eq!(flow.step, RewindStep::Selecting);
         assert!(flow.visible);
+    }
+
+    // --- #221: char-boundary / width-underflow safety ------------------
+
+    #[test]
+    fn truncate_to_width_is_char_safe_and_no_underflow() {
+        // CJK (width-2) chars: byte slicing would panic mid-codepoint, and the
+        // widths 0/1 exercise the underflow-prone branches (#221).
+        let s = "\u{4f60}\u{597d}\u{4e16}\u{754c}"; // 你好世界
+        for w in 0..=10usize {
+            let out = truncate_to_width(s, w);
+            assert!(UnicodeWidthStr::width(out.as_str()) <= w.max(1));
+        }
+        assert_eq!(truncate_to_width("hi", 10), "hi");
+    }
+
+    #[test]
+    fn case_insensitive_find_handles_lossy_lowercase() {
+        // İ (U+0130) -> "i̇" (2 chars); K (U+212A) -> "k"; ẞ (U+1E9E) -> "ß".
+        // Indexing the original with the lowercased copy's offsets panics.
+        let cases = [
+            ("\u{0130}", "i"),          // İ
+            ("\u{212A}", "k"),          // K (Kelvin sign)
+            ("\u{1E9E}", "\u{00df}"),   // ẞ matched by ß
+            ("abc\u{0130}def", "i"),    // match in the middle
+        ];
+        for (hay, needle_lc) in cases {
+            let (start, end) = case_insensitive_find(hay, needle_lc)
+                .unwrap_or_else(|| panic!("expected a match in {hay:?}"));
+            assert!(hay.is_char_boundary(start));
+            assert!(hay.is_char_boundary(end));
+            // All three slices used by the highlighter must be panic-free.
+            let _ = &hay[..start];
+            let _ = &hay[start..end];
+            let _ = &hay[end..];
+        }
+        assert!(case_insensitive_find("hello", "z").is_none());
+    }
+
+    #[test]
+    fn render_global_search_ci_highlight_no_panic() {
+        // Original text carries İ / K / ẞ; query "i" matches case-insensitively.
+        // Pre-fix, the slice used the lowercased copy's offset and panicked.
+        let state = GlobalSearchState {
+            visible: true,
+            query: "i".to_string(),
+            results: vec![SearchResult {
+                file: "a.txt".to_string(),
+                line: 1,
+                col: 1,
+                text: "\u{0130}stanbul \u{212A}elvin \u{1E9E}harp".to_string(),
+                context_before: vec![],
+                context_after: vec![],
+            }],
+            selected: 0,
+            total_matches: 1,
+            searching: false,
+        };
+        let area = Rect { x: 0, y: 0, width: 60, height: 20 };
+        let mut buf = Buffer::empty(area);
+        render_global_search(&state, area, &mut buf); // no panic == pass
+    }
+
+    #[test]
+    fn render_message_selector_cjk_narrow_terminal_no_panic() {
+        use ratatui::{backend::TestBackend, Terminal};
+        // width 23 -> dialog_width 19 -> preview_max = 19 - 20 underflowed
+        // (panic) pre-fix, and byte-slicing the CJK preview panicked too (#221).
+        let overlay = MessageSelectorOverlay::open(vec![SelectorMessage {
+            idx: 0,
+            role: "user".to_string(),
+            preview: "\u{4f60}\u{597d}\u{4e16}\u{754c}".repeat(8), // long CJK
+            has_tool_use: false,
+        }]);
+        let mut terminal = Terminal::new(TestBackend::new(23, 20)).unwrap();
+        terminal
+            .draw(|frame| render_message_selector(frame, &overlay, frame.area()))
+            .unwrap(); // no panic == pass
     }
 }

@@ -27,7 +27,12 @@ pub use markdown_enhanced::{
 };
 
 /// Context passed to all renderers.
-pub struct RenderContext {
+///
+/// `tool_names` and `expanded_thinking` are borrowed rather than owned: the
+/// transcript builder holds a single copy of each per render pass and lends it
+/// to every message renderer, so the hot path no longer clones a `HashMap` and
+/// a `HashSet` for every assistant message (see issue #222).
+pub struct RenderContext<'a> {
     /// Current terminal width (for word-wrap decisions).
     pub width: u16,
     /// Whether syntax highlighting is enabled.
@@ -36,19 +41,26 @@ pub struct RenderContext {
     pub show_thinking: bool,
     /// Maps `tool_use_id` → `tool_name` so ToolResult blocks can dispatch to
     /// the correct specialized renderer (e.g. Bash output vs. generic result).
-    pub tool_names: HashMap<String, String>,
+    pub tool_names: &'a HashMap<String, String>,
     /// Set of thinking block content hashes that are expanded per-block.
-    pub expanded_thinking: std::collections::HashSet<u64>,
+    pub expanded_thinking: &'a std::collections::HashSet<u64>,
 }
 
-impl Default for RenderContext {
+/// Shared empty collections so `RenderContext::default()` can hand out
+/// `'static` borrows without allocating.
+static EMPTY_TOOL_NAMES: std::sync::LazyLock<HashMap<String, String>> =
+    std::sync::LazyLock::new(HashMap::new);
+static EMPTY_EXPANDED_THINKING: std::sync::LazyLock<std::collections::HashSet<u64>> =
+    std::sync::LazyLock::new(std::collections::HashSet::new);
+
+impl Default for RenderContext<'static> {
     fn default() -> Self {
         Self {
             width: 80,
             highlight: true,
             show_thinking: false,
-            tool_names: HashMap::new(),
-            expanded_thinking: std::collections::HashSet::new(),
+            tool_names: &EMPTY_TOOL_NAMES,
+            expanded_thinking: &EMPTY_EXPANDED_THINKING,
         }
     }
 }
@@ -189,30 +201,23 @@ fn apply_block_style(mut line: Line<'static>, width: u16) -> Line<'static> {
 fn empty_block_line(width: u16) -> Line<'static> {
     apply_block_style(Line::from(""), width)
 }
-
-fn short_model_name(model: &str) -> String {
-    model
-        .split_once('/')
-        .map(|(_, model)| model)
-        .unwrap_or(model)
-        .to_string()
-}
-
-fn title_case_mode(mode: &str) -> String {
-    let mut chars = mode.chars();
-    match chars.next() {
-        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
-        None => String::new(),
-    }
-}
-
 fn render_attachment_chip(kind: &str, label: String) -> Line<'static> {
+    render_attachment_chip_colored(kind, label, CLAUDE_ORANGE, Color::Black)
+}
+
+fn render_file_chip(label: String) -> Line<'static> {
+    // Use a steel-blue badge with white text for file injections — distinct from
+    // the orange img/doc chips and readable on dark terminal backgrounds.
+    render_attachment_chip_colored("file", label, Color::Rgb(51, 102, 170), Color::White)
+}
+
+fn render_attachment_chip_colored(kind: &str, label: String, badge_bg: Color, badge_fg: Color) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!(" {} ", kind),
             Style::default()
-                .fg(Color::Black)
-                .bg(CLAUDE_ORANGE)
+                .fg(badge_fg)
+                .bg(badge_bg)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -231,47 +236,24 @@ fn user_metadata_line(_meta: Option<&TurnMetadata>) -> Option<Line<'static>> {
 pub fn render_transcript_assistant_meta(meta: Option<&TurnMetadata>, accent: Color) -> Option<Line<'static>> {
     let meta = meta?;
 
-    // Always show at least mode — matches OpenCode's "Build · Model · Duration"
-    let mode = meta
-        .agent_mode
-        .as_deref()
-        .filter(|m| !m.is_empty())
-        .map(title_case_mode)
-        .unwrap_or_else(|| "Build".to_string());
+    // Only show interrupted status — mode, model, and duration are already
+    // displayed in the status line above the prompt.
+    if !meta.interrupted {
+        return None;
+    }
 
-    let mut spans = vec![
+    let spans = vec![
         Span::styled(
             "   \u{25a3} ",
             Style::default()
                 .fg(accent)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(mode, Style::default().fg(TRANSCRIPT_TEXT)),
-    ];
-
-    if let Some(model) = meta.model_name.as_deref().filter(|m| !m.is_empty()) {
-        spans.push(Span::styled(" \u{00b7} ", Style::default().fg(TRANSCRIPT_SUBTLE)));
-        spans.push(Span::styled(
-            short_model_name(model),
-            Style::default().fg(TRANSCRIPT_MUTED),
-        ));
-    }
-
-    if let Some(duration) = meta.duration.as_deref().filter(|d| !d.is_empty()) {
-        spans.push(Span::styled(" \u{00b7} ", Style::default().fg(TRANSCRIPT_SUBTLE)));
-        spans.push(Span::styled(
-            duration.to_string(),
-            Style::default().fg(TRANSCRIPT_MUTED),
-        ));
-    }
-
-    if meta.interrupted {
-        spans.push(Span::styled(" \u{00b7} ", Style::default().fg(TRANSCRIPT_SUBTLE)));
-        spans.push(Span::styled(
+        Span::styled(
             "interrupted",
             Style::default().fg(TRANSCRIPT_MUTED),
-        ));
-    }
+        ),
+    ];
 
     Some(Line::from(spans))
 }
@@ -283,6 +265,98 @@ pub fn render_transcript_live_text(text: &str, width: u16) -> Vec<Line<'static>>
         Style::default(),
         TRANSCRIPT_TEXT,
     )
+}
+
+/// Segments of a potentially file-injected text block.
+enum TextSegment {
+    Plain(String),
+    FileBlock(String), // path attribute value
+}
+
+/// Normalize `@token` references in user text when those files were already shown
+/// as chips. Replaces `@long/absolute/path/file.rs` with just `@file.rs` so the
+/// text stays readable ("Delete @file.rs" still makes sense) without showing the
+/// full path noise.
+fn normalize_at_tokens(
+    text: &str,
+    injected: &std::collections::HashSet<String>,
+) -> String {
+    let mut result = String::with_capacity(text.len());
+    for word in text.split_inclusive(|c: char| c.is_whitespace()) {
+        let trimmed = word.trim_end_matches(|c: char| c.is_whitespace());
+        let trailing: &str = &word[trimmed.len()..];
+
+        if trimmed.starts_with('@') && trimmed.len() > 1 {
+            let mut path_part = trimmed[1..].to_string();
+            // Strip trailing punctuation (same logic as parse_at_refs)
+            while !path_part.is_empty() && path_part.ends_with(|c: char| c.is_ascii_punctuation()) && !path_part.ends_with('/') {
+                path_part.pop();
+            }
+            let punct_suffix = &trimmed[1 + path_part.len()..];
+
+            let basename = std::path::Path::new(&path_part)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path_part.clone());
+
+            let matches = injected.iter().any(|p| {
+                p == &path_part
+                    || std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().as_ref() == path_part.as_str()).unwrap_or(false)
+                    || p.ends_with(&format!("/{}", path_part))
+            });
+
+            if matches && basename != path_part {
+                // Shorten to just the filename
+                result.push('@');
+                result.push_str(&basename);
+                result.push_str(punct_suffix);
+                result.push_str(trailing);
+                continue;
+            }
+        }
+        result.push_str(word);
+    }
+    result
+}
+
+/// Split text that may contain `<file path="...">...</file>` injection blocks
+/// into alternating Plain and FileBlock segments.
+fn extract_file_segments(text: &str) -> Vec<TextSegment> {
+    let mut result = Vec::new();
+    let mut remaining = text;
+    const OPEN: &str = "<file path=\"";
+    const CLOSE: &str = "</file>";
+
+    while let Some(start) = remaining.find(OPEN) {
+        if start > 0 {
+            result.push(TextSegment::Plain(remaining[..start].to_string()));
+        }
+        let after = &remaining[start + OPEN.len()..];
+        if let Some(path_end) = after.find('"') {
+            let path = after[..path_end].to_string();
+            let after_open_tag = &remaining[start..];
+            if let Some(close_pos) = after_open_tag.find(CLOSE) {
+                let consumed = start + close_pos + CLOSE.len();
+                // skip one trailing newline if present
+                let consumed = if remaining[consumed..].starts_with('\n') { consumed + 1 } else { consumed };
+                result.push(TextSegment::FileBlock(path));
+                remaining = &remaining[consumed..];
+            } else {
+                result.push(TextSegment::Plain(remaining[start..].to_string()));
+                remaining = "";
+                break;
+            }
+        } else {
+            result.push(TextSegment::Plain(remaining[start..].to_string()));
+            remaining = "";
+            break;
+        }
+    }
+
+    if !remaining.is_empty() {
+        result.push(TextSegment::Plain(remaining.to_string()));
+    }
+    result
 }
 
 pub fn render_transcript_user_message(
@@ -308,6 +382,24 @@ pub fn render_transcript_user_message(
     let mut lines = Vec::new();
     let mut pending_text = String::new();
 
+    // Collect the absolute paths of every injected file so we can strip the
+    // corresponding @token references from the user's original text block.
+    let injected_paths: std::collections::HashSet<String> = msg.content_blocks()
+        .iter()
+        .filter_map(|b| {
+            if let ContentBlock::Text { text } = b {
+                if text.contains("<file path=\"") { Some(text) } else { None }
+            } else {
+                None
+            }
+        })
+        .flat_map(|text| {
+            extract_file_segments(text).into_iter().filter_map(|s| {
+                if let TextSegment::FileBlock(p) = s { Some(p) } else { None }
+            })
+        })
+        .collect();
+
     let flush_text = |buffer: &mut String, target: &mut Vec<Line<'static>>| {
         if buffer.is_empty() {
             return;
@@ -322,10 +414,44 @@ pub fn render_transcript_user_message(
     for block in msg.content_blocks() {
         match block {
             ContentBlock::Text { text } => {
-                if !pending_text.is_empty() {
-                    pending_text.push('\n');
+                if text.contains("<file path=\"") {
+                    flush_text(&mut pending_text, &mut lines);
+                    for segment in extract_file_segments(&text) {
+                        match segment {
+                            TextSegment::FileBlock(path) => {
+                                let label = std::path::Path::new(&path)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or(path);
+                                lines.push(render_file_chip(label));
+                            }
+                            TextSegment::Plain(t) => {
+                                if !t.trim().is_empty() {
+                                    if !pending_text.is_empty() {
+                                        pending_text.push('\n');
+                                    }
+                                    pending_text.push_str(&t);
+                                }
+                            }
+                        }
+                    }
+                } else if !injected_paths.is_empty() {
+                    // Shorten @long/path/file.rs → @file.rs since the chips already
+                    // show the full path context.
+                    let cleaned = normalize_at_tokens(&text, &injected_paths);
+                    let trimmed = cleaned.trim();
+                    if !trimmed.is_empty() {
+                        if !pending_text.is_empty() {
+                            pending_text.push('\n');
+                        }
+                        pending_text.push_str(trimmed);
+                    }
+                } else {
+                    if !pending_text.is_empty() {
+                        pending_text.push('\n');
+                    }
+                    pending_text.push_str(&text);
                 }
-                pending_text.push_str(&text);
             }
             ContentBlock::Image { source } => {
                 flush_text(&mut pending_text, &mut lines);
@@ -1068,7 +1194,7 @@ pub fn render_tool_result_rejected(tool_name: &str, reason: &str) -> Vec<Line<'s
 pub fn render_attachment_message(kind_label: &str, content: &str, width: u16) -> Vec<Line<'static>> {
     // Reserve space for the "  [label] " prefix and a small margin.
     let prefix_len = kind_label.len() + 6; // "  [label] "
-    let preview_max = (width as usize).saturating_sub(prefix_len).max(20).min(120);
+    let preview_max = (width as usize).saturating_sub(prefix_len).clamp(20, 120);
     let preview: String = content.chars().take(preview_max).collect();
     let preview = if content.chars().count() > preview_max {
         format!("{preview}\u{2026}")
@@ -1338,9 +1464,14 @@ fn truncate_user_prompt_text(text: &str) -> String {
         return text.to_string();
     }
 
-    let head = &text[..TRUNCATE_USER_PROMPT_HEAD_CHARS.min(text.len())];
-    let tail_start = text.len().saturating_sub(TRUNCATE_USER_PROMPT_TAIL_CHARS);
-    let tail = &text[tail_start..];
+    // The *_CHARS constants count characters, not bytes. Slice by chars so a
+    // multibyte codepoint straddling the cut never panics (#221).
+    let head: String = text.chars().take(TRUNCATE_USER_PROMPT_HEAD_CHARS).collect();
+    let tail: String = {
+        let total_chars = text.chars().count();
+        let skip = total_chars.saturating_sub(TRUNCATE_USER_PROMPT_TAIL_CHARS);
+        text.chars().skip(skip).collect()
+    };
     let hidden_lines = text
         .chars()
         .take(TRUNCATE_USER_PROMPT_HEAD_CHARS)
@@ -1496,7 +1627,7 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
                     ctx.width,
                 ));
             }
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse { id, name, input, .. } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
                 let rendered = render_tool_use_inner(&name, &input);
                 // Silence unused-variable warning on id — kept for symmetry with ToolResult lookup.
@@ -1686,9 +1817,7 @@ fn extract_goal_objective_from_args(args: &str) -> Option<String> {
     // doesn't include the budget flag.
     let rest = if let Some(after_flag) = trimmed.strip_prefix("--tokens") {
         let after_flag = after_flag.trim_start();
-        after_flag
-            .splitn(2, char::is_whitespace)
-            .nth(1)
+        after_flag.split_once(char::is_whitespace).map(|x| x.1)
             .unwrap_or("")
             .trim()
     } else {
@@ -1961,6 +2090,7 @@ mod tests {
                 id: "tool-1".to_string(),
                 name: "read_file".to_string(),
                 input: serde_json::json!({ "path": "README.md" }),
+                thought_signature: None,
             },
             ContentBlock::ToolResult {
                 tool_use_id: "tool-1".to_string(),
@@ -2160,6 +2290,7 @@ mod tests {
             id: "tu-1".to_string(),
             name: "Bash".to_string(),
             input: serde_json::json!({"command": "ls -la"}),
+            thought_signature: None,
         }]);
         let rendered = render_message(&msg, &RenderContext::default())
             .into_iter()
@@ -2177,6 +2308,7 @@ mod tests {
             id: "tu-2".to_string(),
             name: "Read".to_string(),
             input: serde_json::json!({"file_path": "/tmp/foo.txt"}),
+            thought_signature: None,
         }]);
         let rendered = render_message(&msg, &RenderContext::default())
             .into_iter()
@@ -2197,6 +2329,7 @@ mod tests {
                 "subagent_type": "explore",
                 "description": "Trace the auth flow"
             }),
+            thought_signature: None,
         }]);
         let rendered = render_message(&msg, &RenderContext::default())
             .into_iter()
@@ -2211,7 +2344,7 @@ mod tests {
     fn bash_tool_result_renders_as_bash_output_with_tool_names_context() {
         let mut tool_names = HashMap::new();
         tool_names.insert("tu-bash-1".to_string(), "Bash".to_string());
-        let ctx = RenderContext { tool_names, ..Default::default() };
+        let ctx = RenderContext { tool_names: &tool_names, ..Default::default() };
 
         let msg = Message::user_blocks(vec![ContentBlock::ToolResult {
             tool_use_id: "tu-bash-1".to_string(),
@@ -2524,7 +2657,19 @@ mod tests {
         let b_text: Vec<_> = b.iter().map(|l| line_text(l)).collect();
         assert_eq!(a_text, b_text);
     }
+
+    #[test]
+    fn truncate_user_prompt_text_handles_multibyte_over_limit() {
+        // >10K chars of a 3-byte codepoint. Pre-fix, the *_CHARS constants were
+        // used as BYTE offsets, slicing mid-codepoint (2500 % 3 == 1) (#221).
+        let text = "\u{2705}".repeat(11_000); // ✅ (3 bytes), 11K chars > 10K limit
+        let out = truncate_user_prompt_text(&text);
+        assert!(out.starts_with('\u{2705}'));
+        assert!(out.contains("lines"));
+        assert!(out.chars().count() < text.chars().count());
+
+        // Mixed multibyte content around both cut points must also be safe.
+        let mixed = "😀é✅ん".repeat(3_000);
+        let _ = truncate_user_prompt_text(&mixed); // no panic == pass
+    }
 }
-
-
-

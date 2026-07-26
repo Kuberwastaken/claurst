@@ -50,6 +50,12 @@ pub struct FeatureFlagManager {
     http_client: reqwest::Client,
 }
 
+impl Default for FeatureFlagManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FeatureFlagManager {
     /// Create a new feature flag manager
     ///
@@ -70,8 +76,7 @@ impl FeatureFlagManager {
 
     /// Get the cache file path (~/.claurst/feature_flags.json)
     fn get_cache_path() -> PathBuf {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        home.join(".claurst").join("feature_flags.json")
+        crate::config::Settings::config_dir().join("feature_flags.json")
     }
 
     /// Check if a feature flag is enabled
@@ -229,7 +234,9 @@ mod tests {
     #[test]
     fn test_cache_path() {
         let path = FeatureFlagManager::get_cache_path();
-        assert!(path.to_string_lossy().contains(".claurst"));
+        // "claurst" (not ".claurst"): the config dir is legacy ~/.claurst on
+        // existing installs but XDG ~/.config/claurst on fresh ones (#207).
+        assert!(path.to_string_lossy().contains("claurst"));
         assert!(path.to_string_lossy().contains("feature_flags.json"));
     }
 

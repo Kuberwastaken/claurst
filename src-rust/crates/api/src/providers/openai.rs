@@ -17,7 +17,7 @@
 use std::pin::Pin;
 use async_stream::stream;
 use async_trait::async_trait;
-use claurst_core::provider_id::{ModelId, ProviderId};
+use claurst_core::provider_id::ProviderId;
 use claurst_core::types::{
     ContentBlock, ImageSource, MessageContent, Role, ToolResultContent, UsageInfo,
 };
@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use tracing::debug;
 
 use crate::error_handling::parse_error_response;
-use crate::provider::{LlmProvider, ModelInfo};
+use crate::provider::LlmProvider;
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
@@ -51,7 +51,7 @@ pub struct OpenAiProvider {
 impl OpenAiProvider {
     pub fn new(api_key: String) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
+            .timeout(crate::request_timeout())
             .build()
             .expect("failed to build reqwest client");
 
@@ -249,7 +249,7 @@ impl OpenAiProvider {
                 ContentBlock::Text { text } => {
                     text_parts.push(text.as_str());
                 }
-                ContentBlock::ToolUse { id, name, input } => {
+                ContentBlock::ToolUse { id, name, input, .. } => {
                     let args = serde_json::to_string(input).unwrap_or_default();
                     tool_calls.push(json!({
                         "id": id,
@@ -492,7 +492,12 @@ impl OpenAiProvider {
                     .unwrap_or("{}");
                 let input: Value =
                     serde_json::from_str(args_str).unwrap_or(json!({}));
-                content_blocks.push(ContentBlock::ToolUse { id, name, input });
+                content_blocks.push(ContentBlock::ToolUse {
+                    id,
+                    name,
+                    input,
+                    thought_signature: None,
+                });
             }
         }
 
@@ -532,17 +537,31 @@ impl OpenAiProvider {
             Some(v) => v,
             None => return UsageInfo::default(),
         };
+        let prompt_tokens = u
+            .get("prompt_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        // OpenAI-compatible servers report prompt-cache hits under
+        // `prompt_tokens_details.cached_tokens` (OpenAI spec; llama.cpp >= b4600
+        // mirrors it when prompt caching is enabled). Unlike Anthropic, whose
+        // `input_tokens` excludes cached tokens, OpenAI's `prompt_tokens` is
+        // *inclusive* of the cached count, so we split it back out to keep the
+        // additive convention (`input_tokens + cache_read_input_tokens ==
+        // prompt_tokens`) used by the cost tracker and context accounting.
+        let cache_read = u
+            .get("prompt_tokens_details")
+            .and_then(|v| v.get("cached_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            .min(prompt_tokens);
         UsageInfo {
-            input_tokens: u
-                .get("prompt_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
+            input_tokens: prompt_tokens.saturating_sub(cache_read),
             output_tokens: u
                 .get("completion_tokens")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
             cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
+            cache_read_input_tokens: cache_read,
         }
     }
 
@@ -612,7 +631,11 @@ impl OpenAiProvider {
     }
 }
 
+// The `LlmProvider` impl and capability helpers below are declared after this
+// module; keeping these wire-format tests next to the helpers they exercise is
+// intentional, so allow the item-ordering lint here.
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use claurst_core::types::Message;
@@ -624,6 +647,7 @@ mod tests {
                 id: "call_1".to_string(),
                 name: "search".to_string(),
                 input: json!({ "q": "test" }),
+                thought_signature: None,
             }]),
             Message::user_blocks(vec![ContentBlock::ToolResult {
                 tool_use_id: "call_1".to_string(),
@@ -658,6 +682,69 @@ mod tests {
         assert_eq!(wire[0].get("role").and_then(|v| v.as_str()), Some("user"));
         assert_eq!(wire[1].get("role").and_then(|v| v.as_str()), Some("tool"));
         assert_eq!(wire[1].get("tool_call_id").and_then(|v| v.as_str()), Some("call_2"));
+    }
+
+    #[test]
+    fn parse_usage_none_is_all_zero() {
+        let usage = OpenAiProvider::parse_usage(None);
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn parse_usage_without_cache_details_reports_zero_cache() {
+        let usage = OpenAiProvider::parse_usage(Some(&json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 42,
+        })));
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.output_tokens, 42);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn parse_usage_reads_cached_tokens_from_prompt_details() {
+        // OpenAI spec / llama.cpp: prompt_tokens is inclusive of cached_tokens.
+        let usage = OpenAiProvider::parse_usage(Some(&json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 50,
+            "prompt_tokens_details": { "cached_tokens": 800 },
+        })));
+        assert_eq!(usage.cache_read_input_tokens, 800);
+        // input_tokens is the non-cached remainder so the two never double-count.
+        assert_eq!(usage.input_tokens, 200);
+        assert_eq!(
+            usage.input_tokens + usage.cache_read_input_tokens,
+            1000,
+            "input + cache_read must reconstruct the reported prompt_tokens"
+        );
+        assert_eq!(usage.output_tokens, 50);
+    }
+
+    #[test]
+    fn parse_usage_cache_details_present_but_zero() {
+        let usage = OpenAiProvider::parse_usage(Some(&json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 10,
+            "prompt_tokens_details": { "cached_tokens": 0 },
+        })));
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn parse_usage_cached_tokens_clamped_to_prompt_tokens() {
+        // Defensive: a malformed server that reports cached > prompt must not
+        // underflow input_tokens.
+        let usage = OpenAiProvider::parse_usage(Some(&json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "prompt_tokens_details": { "cached_tokens": 999 },
+        })));
+        assert_eq!(usage.cache_read_input_tokens, 100);
+        assert_eq!(usage.input_tokens, 0);
     }
 }
 
@@ -730,7 +817,34 @@ impl LlmProvider for OpenAiProvider {
                 (String, String, String),
             > = std::collections::HashMap::new();
 
-            while let Some(chunk_result) = byte_stream.next().await {
+            // Bound infinite mid-stream stalls (issue #185): wrap each chunk
+            // read in a generous idle timeout so a provider that pauses
+            // indefinitely surfaces an error instead of hanging. Each chunk
+            // resets the timer, so slow-but-progressing models are never cut off.
+            let idle_timeout = crate::stream_idle_timeout();
+            loop {
+                let chunk_result = match tokio::time::timeout(
+                    idle_timeout,
+                    byte_stream.next(),
+                )
+                .await
+                {
+                    Ok(Some(chunk_result)) => chunk_result,
+                    // Stream ended normally.
+                    Ok(None) => break,
+                    // No bytes for `idle_timeout` — provider stalled mid-stream.
+                    Err(_) => {
+                        yield Err(ProviderError::StreamError {
+                            provider: provider_id.clone(),
+                            message: format!(
+                                "Stream stalled: no data received for {}s; aborting to avoid hanging",
+                                idle_timeout.as_secs()
+                            ),
+                            partial_response: None,
+                        });
+                        return;
+                    }
+                };
                 let chunk = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {
@@ -874,6 +988,7 @@ impl LlmProvider for OpenAiProvider {
                                         id: tc_id.to_string(),
                                         name,
                                         input: json!({}),
+                                        thought_signature: None,
                                     },
                                 });
                             }
@@ -937,81 +1052,6 @@ impl LlmProvider for OpenAiProvider {
         };
 
         Ok(Box::pin(s))
-    }
-
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
-        let (auth_key, auth_val) = self.auth_header();
-        let url = format!("{}/v1/models", self.base_url);
-
-        let resp = self
-            .http_client
-            .get(&url)
-            .header(auth_key, auth_val)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("HTTP request failed: {}", e),
-                status: None,
-                body: None,
-            })?;
-
-        let status = resp.status().as_u16();
-        let text = resp.text().await.map_err(|e| ProviderError::Other {
-            provider: self.id.clone(),
-            message: format!("Failed to read response body: {}", e),
-            status: Some(status),
-            body: None,
-        })?;
-
-        if !(200..300).contains(&(status as usize)) {
-            return Err(self.map_http_error(status, &text));
-        }
-
-        let json: Value =
-            serde_json::from_str(&text).map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("Failed to parse models JSON: {}", e),
-                status: Some(status),
-                body: Some(text),
-            })?;
-
-        let data = match json.get("data").and_then(|d| d.as_array()) {
-            Some(d) => d,
-            None => return Ok(vec![]),
-        };
-
-        let provider_id = self.id.clone();
-        let models: Vec<ModelInfo> = data
-            .iter()
-            .filter_map(|m| {
-                let id = m.get("id").and_then(|v| v.as_str())?;
-                // Only return GPT, O3, O4 family models.
-                if !id.starts_with("gpt-")
-                    && !id.starts_with("o3")
-                    && !id.starts_with("o4")
-                    && !id.starts_with("o1")
-                {
-                    return None;
-                }
-                Some(ModelInfo {
-                    id: ModelId::new(id),
-                    provider_id: provider_id.clone(),
-                    name: id.to_string(),
-                    context_window: match id {
-                        "gpt-5" | "gpt-5.4" | "gpt-5.2" | "gpt-5-mini" | "gpt-5-nano"
-                        | "gpt-5-chat-latest"
-                        | "gpt-5.2-codex" | "gpt-5.1-codex" | "gpt-5.1-codex-mini"
-                        | "gpt-5.1-codex-max" => 400_000,
-                        "o3" | "o3-mini" | "o4-mini" => 200_000,
-                        _ => 128_000,
-                    },
-                    max_output_tokens: 16_384,
-                })
-            })
-            .collect();
-
-        Ok(models)
     }
 
     async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {

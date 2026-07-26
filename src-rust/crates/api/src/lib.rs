@@ -23,7 +23,7 @@ use tracing::{debug, warn};
 // ---------------------------------------------------------------------------
 // Modules
 // ---------------------------------------------------------------------------
-pub mod cch;
+pub mod bun_tls;
 pub mod codex_adapter;
 
 // Provider-agnostic unified types (Phase 1A).
@@ -36,6 +36,10 @@ pub mod auth;
 pub mod stream_parser;
 pub mod transform;
 
+// Wire-format protocol layer (#228): request-building + stream decoding owned
+// once per wire format, shared across the providers that speak it.
+pub mod protocol;
+
 // Provider registry (Phase 1C).
 pub mod registry;
 
@@ -44,6 +48,12 @@ pub mod providers;
 
 // Model Registry (Phase 3).
 pub mod model_registry;
+
+// Model-adaptive effort ladders (#267).
+pub mod effort_support;
+
+// opencode variants() effort ladder port (Phase 2, #268).
+pub mod variants;
 
 // Provider-aware error handling (Phase 6).
 pub mod error_handling;
@@ -65,8 +75,11 @@ pub use provider_error::ProviderError;
 // Phase 1B re-exports — provider abstraction traits.
 pub use provider::{LlmProvider, ModelInfo};
 pub use auth::{AuthProvider, LoginFlow};
-pub use stream_parser::{StreamParser, SseStreamParser, JsonLinesStreamParser};
+pub use stream_parser::{SseByteDecoder, StreamParser, SseStreamParser, JsonLinesStreamParser};
 pub use transform::MessageTransformer;
+
+// #228 protocol layer re-exports.
+pub use protocol::{LineStreamDecoder, OpenAiChatDecoder};
 
 // Phase 1C re-exports — provider registry.
 pub use registry::ProviderRegistry;
@@ -79,8 +92,13 @@ pub use providers::OpenAiProvider;
 
 // Phase 3 re-exports — model registry.
 pub use model_registry::{
-    CostBreakdown, ExperimentalMode, InterleavedReasoning, Modality, ModelEntry, ModelRegistry,
-    ModelStatus, ProviderEntry, ProviderOverride, effective_model_for_config,
+    CostBreakdown, CostTier, CostTierCondition, ExperimentalMode, InterleavedReasoning, Modality,
+    ModelEntry, ModelRegistry, ModelStatus, ProviderEntry, ProviderOverride,
+    effective_model_for_config,
+};
+pub use effort_support::{model_is_reasoning, supported_efforts, variant_ladder};
+pub use variants::{
+    variant_efforts, OPENAI_NONE_EFFORT_RELEASE_DATE, OPENAI_XHIGH_EFFORT_RELEASE_DATE,
 };
 
 // Phase 6 re-exports — provider-aware error handling.
@@ -96,6 +114,57 @@ pub use providers::{
     OpenAiCompatProvider,
     ollama, lm_studio, deepseek, groq, xai, openrouter, mistral, opencode_zen,
 };
+
+// ---------------------------------------------------------------------------
+// Request timeout configuration (issue #175)
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Default total request timeout in seconds when the user has not configured
+/// one. Kept in sync with [`claurst_core::config::DEFAULT_REQUEST_TIMEOUT_SECS`].
+pub use claurst_core::config::DEFAULT_REQUEST_TIMEOUT_SECS;
+
+/// Process-wide total request timeout (seconds) applied to provider HTTP
+/// clients that are constructed lazily without access to the user `Config`
+/// (OpenAI, OpenAI-compatible, Cohere, MiniMax, Copilot, Azure, Bedrock, …).
+///
+/// Set once at startup from the resolved configuration via
+/// [`set_request_timeout_secs`]; defaults to [`DEFAULT_REQUEST_TIMEOUT_SECS`].
+/// A process-wide value is used because providers are built in many places via
+/// builder chains that do not thread the user `Config` through.
+static REQUEST_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(DEFAULT_REQUEST_TIMEOUT_SECS);
+
+/// Override the process-wide request timeout. A value of `0` resets to
+/// [`DEFAULT_REQUEST_TIMEOUT_SECS`]. Idempotent; safe to call multiple times.
+pub fn set_request_timeout_secs(secs: u64) {
+    let value = if secs == 0 { DEFAULT_REQUEST_TIMEOUT_SECS } else { secs };
+    REQUEST_TIMEOUT_SECS.store(value, Ordering::Relaxed);
+}
+
+/// Current process-wide request timeout in seconds.
+pub fn request_timeout_secs() -> u64 {
+    REQUEST_TIMEOUT_SECS.load(Ordering::Relaxed)
+}
+
+/// Current process-wide request timeout as a [`Duration`].
+pub fn request_timeout() -> Duration {
+    Duration::from_secs(request_timeout_secs())
+}
+
+/// Per-chunk idle timeout used to bound infinite mid-stream stalls (issue #185).
+///
+/// An OpenAI-compatible provider can begin a streamed tool call and then pause
+/// indefinitely before sending the tool arguments. The streaming loops wrap
+/// each `byte_stream.next()` in `tokio::time::timeout(stream_idle_timeout(), …)`
+/// so such stalls surface as a stream error instead of hanging forever.
+///
+/// The value is GENEROUS and never smaller than the configured request timeout,
+/// so legitimately slow-but-progressing local models (whose chunks reset the
+/// timer) are never cut off — the goal is only to bound true infinite stalls.
+pub fn stream_idle_timeout() -> Duration {
+    request_timeout().max(Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))
+}
 
 // Composite "Free" provider — stacks many free-tier upstreams behind one
 // `free/auto` model id.
@@ -140,7 +209,12 @@ pub mod types {
     pub struct ThinkingConfig {
         #[serde(rename = "type")]
         pub thinking_type: String,
+        #[serde(default, skip_serializing_if = "is_zero")]
         pub budget_tokens: u32,
+    }
+
+    fn is_zero(value: &u32) -> bool {
+        *value == 0
     }
 
     impl ThinkingConfig {
@@ -148,6 +222,13 @@ pub mod types {
             Self {
                 thinking_type: "enabled".to_string(),
                 budget_tokens: budget,
+            }
+        }
+
+        pub fn adaptive() -> Self {
+            Self {
+                thinking_type: "adaptive".to_string(),
+                budget_tokens: 0,
             }
         }
     }
@@ -405,18 +486,16 @@ pub mod client {
 
     /// Provider selection for API calls.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Default)]
     pub enum Provider {
         /// Use Anthropic's API
+        #[default]
         Anthropic,
         /// Use OpenAI Codex via OAuth
         Codex,
     }
 
-    impl Default for Provider {
-        fn default() -> Self {
-            Provider::Anthropic
-        }
-    }
+    
 
     /// Configuration for the HTTP client.
     #[derive(Debug, Clone)]
@@ -446,7 +525,9 @@ pub mod client {
                 max_retries: 5,
                 initial_retry_delay: Duration::from_secs(1),
                 max_retry_delay: Duration::from_secs(60),
-                request_timeout: Duration::from_secs(600),
+                // Honour the process-wide configured timeout (issue #175);
+                // falls back to DEFAULT_REQUEST_TIMEOUT_SECS when unset.
+                request_timeout: crate::request_timeout(),
                 use_bearer_auth: false,
                 provider: Provider::Anthropic,
             }
@@ -455,8 +536,11 @@ pub mod client {
 
     /// The main Anthropic API client.
     pub struct AnthropicClient {
-        http: reqwest::Client,
+        http: wreq::Client,
         config: ClientConfig,
+        /// Stable per-client session id; the official client reuses one id for
+        /// the whole session, in both the header and `metadata.user_id`.
+        session_id: String,
     }
 
     impl AnthropicClient {
@@ -468,16 +552,119 @@ pub mod client {
             self.config.api_key.is_empty()
         }
 
-        /// Build a new client.  Panics if `config.api_key` is empty.
-        pub fn new(config: ClientConfig) -> anyhow::Result<Self> {
-            // Allow empty key at construction — validation is deferred to
-            // the first API call, so non-Anthropic provider setups can still
-            // create this client without an Anthropic key configured.
-            let http = reqwest::Client::builder()
-                .timeout(config.request_timeout)
-                .build()?;
+        /// Returns `true` when this client is configured to use a Claude Code
+        /// OAuth Bearer token (Claude.ai Pro/Max). The query path and the
+        /// request builders check this to enable stealth-impersonation.
+        pub fn is_oauth(&self) -> bool {
+            self.config.use_bearer_auth
+        }
 
-            Ok(Self { http, config })
+        /// First user (non-meta) message text — input to the `cc_version` client
+        /// hash. Mirrors the official `juA`: skips `<system-reminder>` blocks.
+        fn first_user_message_text(messages: &[ApiMessage]) -> String {
+            let is_meta = |s: &str| s.trim_start().starts_with("<system-reminder>");
+            for m in messages {
+                if m.role != "user" {
+                    continue;
+                }
+                match &m.content {
+                    serde_json::Value::String(s) if !is_meta(s) => return s.clone(),
+                    serde_json::Value::Array(blocks) => {
+                        for b in blocks {
+                            if b.get("type").and_then(|v| v.as_str()) != Some("text") {
+                                continue;
+                            }
+                            if let Some(text) = b.get("text").and_then(|v| v.as_str()) {
+                                if !is_meta(text) {
+                                    return text.to_string();
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            String::new()
+        }
+
+        /// Make an OAuth request look like Claude Code: prepend the
+        /// `x-anthropic-billing-header` block (`system[0]`) then the
+        /// `"You are Claude Code…"` identity block (`system[1]`), and strip
+        /// Claurst's own attribution so the official identity is the only one the
+        /// server sees. No-op for API-key auth.
+        fn apply_oauth_stealth(&self, request: &mut CreateMessageRequest) {
+            if !self.config.use_bearer_auth {
+                return;
+            }
+
+            let first_user_text = Self::first_user_message_text(&request.messages);
+            let text_block = |text: String| SystemBlock {
+                block_type: "text".to_string(),
+                text,
+                cache_control: None,
+            };
+            let billing_block =
+                text_block(claurst_core::oauth_config::claude_code_billing_header(&first_user_text));
+            let identity_block =
+                text_block(claurst_core::oauth_config::CLAUDE_CODE_SYSTEM_PROMPT_PREFIX.to_string());
+
+            // Drop a leading "You are Claurst…" / "You are a Claude agent…" line:
+            // the injected official identity must be the only one the server sees.
+            let strip_attr = |text: &str| -> String {
+                let t = text.trim_start();
+                if t.starts_with("You are Claurst") || t.starts_with("You are a Claude agent") {
+                    if let Some(i) = t.find("\n\n") {
+                        return t[i + 2..].to_string();
+                    }
+                    if let Some(i) = t.find('\n') {
+                        return t[i + 1..].to_string();
+                    }
+                    return String::new();
+                }
+                text.to_string()
+            };
+
+            request.system = match request.system.take() {
+                None => Some(SystemPrompt::Blocks(vec![billing_block, identity_block])),
+                Some(SystemPrompt::Text(existing)) => {
+                    let mut blocks = vec![billing_block, identity_block];
+                    let stripped = strip_attr(&existing);
+                    if !stripped.is_empty() {
+                        blocks.push(text_block(stripped));
+                    }
+                    Some(SystemPrompt::Blocks(blocks))
+                }
+                Some(SystemPrompt::Blocks(mut blocks)) => {
+                    let has_billing = blocks
+                        .first()
+                        .is_some_and(|b| b.text.starts_with("x-anthropic-billing-header:"));
+                    if !has_billing {
+                        if let Some(first) = blocks.first_mut() {
+                            first.text = strip_attr(&first.text);
+                        }
+                        let has_identity = blocks.first().is_some_and(|b| {
+                            b.text == claurst_core::oauth_config::CLAUDE_CODE_SYSTEM_PROMPT_PREFIX
+                        });
+                        if !has_identity {
+                            blocks.insert(0, identity_block);
+                        }
+                        blocks.insert(0, billing_block);
+                    }
+                    Some(SystemPrompt::Blocks(blocks))
+                }
+            };
+        }
+
+        /// Build a new client. Uses a `wreq`/BoringSSL client whose TLS
+        /// fingerprint matches Bun (the official client). An empty key is
+        /// allowed; validation is deferred to the first call.
+        pub fn new(config: ClientConfig) -> anyhow::Result<Self> {
+            let http = crate::bun_tls::build_anthropic_client(config.request_timeout)?;
+            Ok(Self {
+                http,
+                config,
+                session_id: uuid::Uuid::new_v4().to_string(),
+            })
         }
 
         /// Convenience constructor that resolves the key from config/env.
@@ -556,11 +743,12 @@ pub mod client {
             }
 
             request.stream = false;
+            self.apply_oauth_stealth(&mut request);
             let body = serde_json::to_value(&request).map_err(ClaudeError::Json)?;
 
             let resp = self.send_with_retry(&body).await?;
             let status = resp.status();
-            let text = resp.text().await.map_err(ClaudeError::Http)?;
+            let text = resp.text().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
 
             if !status.is_success() {
                 return Err(self.parse_api_error(status.as_u16(), &text));
@@ -590,7 +778,7 @@ pub mod client {
                 .map_err(|e| ClaudeError::Other(format!("Codex request failed: {}", e)))?;
 
             let status = resp.status();
-            let text = resp.text().await.map_err(ClaudeError::Http)?;
+            let text = resp.text().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
 
             if !status.is_success() {
                 return Err(self.parse_api_error(status.as_u16(), &text));
@@ -661,13 +849,14 @@ pub mod client {
             }
 
             request.stream = true;
+            self.apply_oauth_stealth(&mut request);
             let body = serde_json::to_value(&request).map_err(ClaudeError::Json)?;
 
             let resp = self.send_with_retry(&body).await?;
             let status = resp.status();
 
             if !status.is_success() {
-                let text = resp.text().await.map_err(ClaudeError::Http)?;
+                let text = resp.text().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
                 return Err(self.parse_api_error(status.as_u16(), &text));
             }
 
@@ -704,11 +893,21 @@ pub mod client {
                 .get(&url)
                 .header("anthropic-version", &self.config.api_version)
                 .header("content-type", "application/json");
-            req = if self.config.use_bearer_auth {
-                req.header("Authorization", format!("Bearer {}", &self.config.api_key))
+            if self.config.use_bearer_auth {
+                req = req
+                    .header(
+                        "anthropic-beta",
+                        claurst_core::oauth_config::OAUTH_BETA_FLAGS.join(","),
+                    )
+                    .header(
+                        "user-agent",
+                        claurst_core::oauth_config::claude_code_user_agent(),
+                    )
+                    .header("x-app", "cli")
+                    .header("Authorization", format!("Bearer {}", self.config.api_key));
             } else {
-                req.header("x-api-key", &self.config.api_key)
-            };
+                req = req.header("x-api-key", &self.config.api_key);
+            }
 
             let resp = req.send().await?;
 
@@ -731,40 +930,149 @@ pub mod client {
         async fn send_with_retry(
             &self,
             body: &Value,
-        ) -> Result<reqwest::Response, ClaudeError> {
+        ) -> Result<wreq::Response, ClaudeError> {
             let url = format!("{}/v1/messages", self.config.api_base);
             let mut attempts = 0u32;
             let mut delay = self.config.initial_retry_delay;
 
-            // Serialize body to JSON string for CCH signing
-            let body_str = serde_json::to_string(body)
-                .map_err(|e| ClaudeError::Api(format!("Failed to serialize request: {}", e)))?;
-            let body_bytes = body_str.as_bytes();
+            let use_oauth = self.config.use_bearer_auth;
+            let session_id = self.session_id.clone();
+
+            // Active OAuth account, fetched once and cached for the process
+            // lifetime. `account_uuid` -> `metadata.user_id`; `has_premium`
+            // selects the account-tier `anthropic-beta` set.
+            let (account_uuid, has_premium): (String, bool) = if use_oauth {
+                use tokio::sync::OnceCell;
+                static CACHE: OnceCell<Option<(String, bool)>> = OnceCell::const_new();
+                CACHE
+                    .get_or_init(claurst_core::oauth::current_anthropic_account_meta)
+                    .await
+                    .clone()
+                    .unwrap_or_default()
+            } else {
+                (String::new(), false)
+            };
+
+            // On the OAuth path, inject `metadata.user_id`. There is no `cch`
+            // step: the interactive CLI sends a literal `cch=00000` and its real
+            // client hash rides in the `cc_version` suffix (set in
+            // `apply_oauth_stealth`). See `claude-re/findings/CCH-NATIVE.md`.
+            let body_str = if use_oauth {
+                let mut body_val = body.clone();
+                if let serde_json::Value::Object(map) = &mut body_val {
+                    let device_id = {
+                        use sha2::{Digest, Sha256};
+                        let user = std::env::var("USER")
+                            .or_else(|_| std::env::var("USERNAME"))
+                            .unwrap_or_default();
+                        let home = std::env::var("HOME")
+                            .or_else(|_| std::env::var("USERPROFILE"))
+                            .unwrap_or_default();
+                        let mut h = Sha256::new();
+                        h.update(user.as_bytes());
+                        h.update(b":");
+                        h.update(home.as_bytes());
+                        format!("{:x}", h.finalize())
+                    };
+                    let user_id = serde_json::json!({
+                        "device_id": device_id,
+                        "account_uuid": account_uuid,
+                        "session_id": session_id,
+                    })
+                    .to_string();
+                    match map.get_mut("metadata") {
+                        Some(serde_json::Value::Object(m)) => {
+                            m.insert("user_id".to_string(), serde_json::Value::String(user_id));
+                        }
+                        _ => {
+                            map.insert(
+                                "metadata".to_string(),
+                                serde_json::json!({ "user_id": user_id }),
+                            );
+                        }
+                    }
+                }
+                serde_json::to_string(&body_val)
+            } else {
+                serde_json::to_string(body)
+            }
+            .map_err(|e| ClaudeError::Api(format!("Failed to serialize request: {}", e)))?;
+
+            // Account-tier `anthropic-beta` set (Pro vs Max), stable across retries.
+            let anthropic_beta = if use_oauth {
+                let mut s = claurst_core::oauth_config::oauth_beta_flags(has_premium).join(",");
+                if !self.config.beta_features.is_empty() {
+                    if !s.is_empty() {
+                        s.push(',');
+                    }
+                    s.push_str(&self.config.beta_features);
+                }
+                s
+            } else {
+                self.config.beta_features.clone()
+            };
+            // Map Rust's target triple onto the Stainless SDK's OS/arch labels.
+            let stainless_os = match std::env::consts::OS {
+                "macos" => "MacOS",
+                "linux" => "Linux",
+                "windows" => "Windows",
+                "freebsd" => "FreeBSD",
+                "openbsd" => "OpenBSD",
+                other => other,
+            };
+            let stainless_arch = match std::env::consts::ARCH {
+                "aarch64" => "arm64",
+                "x86_64" => "x64",
+                "x86" => "x32",
+                other => other,
+            };
 
             loop {
                 attempts += 1;
 
-                // Compute CCH hash and build billing header
-                let cch_hash = cch::compute_cch(body_bytes);
-                let billing_header = format!("cc_version=0.1; cc_entrypoint=claude_code; {}; cc_workload=claude_code;", cch_hash);
-
-                // Use Bearer auth for Claude.ai OAuth tokens; x-api-key for regular keys.
                 let mut req = self
                     .http
                     .post(&url)
                     .header("anthropic-version", &self.config.api_version)
-                    .header("anthropic-beta", &self.config.beta_features)
+                    .header("anthropic-beta", &anthropic_beta)
                     .header("content-type", "application/json")
-                    .header("accept", "text/event-stream")
-                    .header("x-anthropic-billing-header", billing_header);
-                req = if self.config.use_bearer_auth {
-                    req.header("Authorization", format!("Bearer {}", &self.config.api_key))
+                    .header("accept", "text/event-stream");
+
+                if use_oauth {
+                    // Official UA, `x-app` and Stainless telemetry headers so the
+                    // server treats this as a first-party request. The billing
+                    // header already rides in `system[0]` of the body.
+                    req = req
+                        .header(
+                            "user-agent",
+                            claurst_core::oauth_config::claude_code_user_agent(),
+                        )
+                        .header("x-app", "cli")
+                        .header("anthropic-dangerous-direct-browser-access", "true")
+                        .header("x-stainless-lang", "js")
+                        .header("x-stainless-runtime", "node")
+                        .header("x-stainless-os", stainless_os)
+                        .header("x-stainless-arch", stainless_arch)
+                        .header("x-stainless-runtime-version", "v22.0.0")
+                        .header("x-stainless-package-version", "0.94.0")
+                        .header("x-stainless-retry-count", (attempts - 1).to_string())
+                        .header(
+                            "x-stainless-timeout",
+                            self.config.request_timeout.as_secs().to_string(),
+                        )
+                        .header("x-claude-code-session-id", &session_id)
+                        .header("x-client-request-id", uuid::Uuid::new_v4().to_string())
+                        .header("Authorization", format!("Bearer {}", self.config.api_key));
                 } else {
-                    req.header("x-api-key", &self.config.api_key)
-                };
+                    // API-key path: no `x-anthropic-billing-header` (it is a
+                    // Claude Code / subscription artefact, not emitted by the
+                    // direct-API SDK).
+                    req = req.header("x-api-key", &self.config.api_key);
+                }
+
                 let req = req.body(body_str.clone());
 
-                let resp = req.send().await.map_err(ClaudeError::Http)?;
+                let resp = req.send().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
                 let status = resp.status().as_u16();
 
                 // 200-299: success
@@ -823,39 +1131,36 @@ pub mod client {
             }
         }
 
+        // TODO(#228): this SSE loop + `frame_to_event` below are the decode half
+        // of the **AnthropicMessages** wire protocol. They should be hoisted into
+        // a sans-IO `protocol::anthropic_messages` decoder (mirroring
+        // `protocol::openai_chat::OpenAiChatDecoder`) and shared with
+        // `providers::anthropic::AnthropicProvider`, collapsing the two Anthropic
+        // stacks. Remaining step / risk: this path decodes into the Anthropic-typed
+        // `AnthropicStreamEvent` consumed by `StreamHandler`/`StreamAccumulator`
+        // and the TUI, whereas the protocol decoders emit the provider-agnostic
+        // `provider_types::StreamEvent`; unifying requires either a decoder generic
+        // over its output event or migrating those consumers. Deferred to keep the
+        // TUI and all tests green.
         /// Read an SSE byte stream, parse frames, and emit `AnthropicStreamEvent`s.
         async fn process_sse_stream(
-            resp: reqwest::Response,
+            resp: wreq::Response,
             handler: Arc<dyn StreamHandler>,
             tx: mpsc::Sender<streaming::AnthropicStreamEvent>,
         ) -> Result<(), ClaudeError> {
             use sse_parser::SseLineParser;
 
             let mut parser = SseLineParser::new();
+            // Shared byte-buffering decoder (#228): buffers raw bytes and only
+            // decodes complete lines, so a multibyte codepoint split across a
+            // network chunk boundary is never corrupted.
+            let mut decoder = crate::SseByteDecoder::new();
             let mut byte_stream = resp.bytes_stream();
-            let mut leftover = String::new();
 
             while let Some(chunk_result) = byte_stream.next().await {
-                let chunk = chunk_result.map_err(ClaudeError::Http)?;
-                let text = String::from_utf8_lossy(&chunk);
+                let chunk = chunk_result.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
 
-                // Prepend any leftover from the previous chunk
-                let combined = if leftover.is_empty() {
-                    text.to_string()
-                } else {
-                    let mut s = std::mem::take(&mut leftover);
-                    s.push_str(&text);
-                    s
-                };
-
-                // Split into lines.  If the chunk doesn't end with a newline
-                // the last piece is an incomplete line – stash it.
-                let mut lines: Vec<&str> = combined.split('\n').collect();
-                if !combined.ends_with('\n') {
-                    leftover = lines.pop().unwrap_or("").to_string();
-                }
-
-                for line in lines {
+                for line in decoder.push(&chunk) {
                     let line = line.trim_end_matches('\r');
                     if let Some(frame) = parser.feed_line(line) {
                         if let Some(event) =
@@ -1099,6 +1404,12 @@ enum PartialBlock {
     },
 }
 
+impl Default for StreamAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StreamAccumulator {
     pub fn new() -> Self {
         Self {
@@ -1177,7 +1488,7 @@ impl StreamAccumulator {
                         PartialBlock::ToolUse { id, name, json_buf } => {
                             let input = serde_json::from_str(&json_buf)
                                 .unwrap_or(Value::Object(Default::default()));
-                            ContentBlock::ToolUse { id, name, input }
+                            ContentBlock::ToolUse { id, name, input, thought_signature: None }
                         }
                         PartialBlock::Thinking {
                             thinking_buf,
@@ -1290,5 +1601,66 @@ mod tests {
         let (msg, _usage, stop) = acc.finish();
         assert_eq!(msg.get_text(), Some("Hello world!"));
         assert_eq!(stop.as_deref(), Some("end_turn"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Request timeout (#175) + stream idle timeout (#185)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn request_timeout_threads_through_to_client_config() {
+        // Reset to the default and confirm the generous 600s fallback.
+        set_request_timeout_secs(0);
+        assert_eq!(request_timeout_secs(), DEFAULT_REQUEST_TIMEOUT_SECS);
+        assert_eq!(request_timeout(), Duration::from_secs(600));
+
+        // An override threads through request_timeout() and ClientConfig::default.
+        set_request_timeout_secs(1800);
+        assert_eq!(request_timeout_secs(), 1800);
+        assert_eq!(
+            client::ClientConfig::default().request_timeout,
+            Duration::from_secs(1800)
+        );
+        // Idle timeout is generous and never smaller than the request timeout.
+        assert!(stream_idle_timeout() >= request_timeout());
+        assert_eq!(stream_idle_timeout(), Duration::from_secs(1800));
+
+        // A short request timeout still keeps a generous idle floor (#185:
+        // bound stalls without cutting off slow-but-progressing streams).
+        set_request_timeout_secs(60);
+        assert_eq!(
+            stream_idle_timeout(),
+            Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS)
+        );
+
+        // Restore the default so we do not leak state into other tests.
+        set_request_timeout_secs(0);
+    }
+
+    #[tokio::test]
+    async fn stalled_stream_elapses_instead_of_hanging() {
+        use futures::StreamExt;
+
+        // A byte stream that never yields models a provider that begins a
+        // streamed response and then pauses indefinitely (issue #185).
+        let mut stalled =
+            futures::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
+
+        // The exact construct used by the streaming loops: wrapping the chunk
+        // read in tokio::time::timeout must elapse rather than hang forever.
+        // A short duration keeps the test fast; production uses the generous
+        // stream_idle_timeout() value asserted below.
+        let result =
+            tokio::time::timeout(Duration::from_millis(50), stalled.next()).await;
+        assert!(
+            result.is_err(),
+            "a stalled stream must hit the idle timeout, not hang"
+        );
+
+        // Invariants that hold for any configured value: the production idle
+        // timeout is finite, never below the request timeout, and never below
+        // the generous default floor.
+        assert!(stream_idle_timeout() >= request_timeout());
+        assert!(stream_idle_timeout() >= Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS));
     }
 }

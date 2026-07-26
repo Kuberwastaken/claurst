@@ -38,6 +38,9 @@ fn default_edit_mode() -> String {
 
 #[async_trait]
 impl Tool for NotebookEditTool {
+    // Gates itself: calls `ctx.check_permission` in `execute()` (#210).
+    fn self_gates(&self) -> bool { true }
+
     fn name(&self) -> &str {
         claurst_core::constants::TOOL_NAME_NOTEBOOK_EDIT
     }
@@ -156,7 +159,7 @@ impl Tool for NotebookEditTool {
                     Ok(s) => s,
                     Err(e) => return ToolResult::error(format!("Failed to serialize notebook: {}", e)),
                 };
-                if let Err(e) = tokio::fs::write(&path, &updated).await {
+                if let Err(e) = crate::write_atomic(&path, updated.as_bytes()).await {
                     return ToolResult::error(format!("Failed to write notebook: {}", e));
                 }
                 ctx.record_file_change(
@@ -301,4 +304,64 @@ fn delete_cell(notebook: &mut Value, cell_id: &str) -> Result<String, String> {
     cells.remove(idx);
 
     Ok(format!("Deleted cell '{}' (was at index {})", cell_id, idx))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::allow_all_context;
+
+    /// #226: NotebookEdit writes the updated notebook through `write_atomic`.
+    /// A successful edit must persist the new cell source and leave no
+    /// `.claurst-tmp-*` scratch file behind in the notebook's directory.
+    #[tokio::test]
+    async fn notebook_edit_writes_atomically_no_tmp_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nb.ipynb");
+        let notebook = json!({
+            "cells": [
+                {
+                    "cell_type": "code",
+                    "id": "c1",
+                    "metadata": {},
+                    "source": ["print('hi')\n"],
+                    "outputs": [],
+                    "execution_count": null
+                }
+            ],
+            "metadata": {},
+            "nbformat": 4,
+            "nbformat_minor": 5
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&notebook).unwrap()).unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let res = NotebookEditTool
+            .execute(
+                json!({
+                    "notebook_path": path.to_string_lossy(),
+                    "cell_id": "cell-0",
+                    "new_source": "print('bye')",
+                    "edit_mode": "replace"
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(!res.is_error, "notebook edit failed: {}", res.content);
+
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let src = &written["cells"][0]["source"];
+        assert_eq!(src, &json!(["print('bye')"]), "cell source updated");
+
+        let tmp_left = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".claurst-tmp-"));
+        assert!(!tmp_left, "atomic write must not leave a temp file behind");
+    }
 }

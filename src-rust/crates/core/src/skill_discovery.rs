@@ -42,8 +42,7 @@ pub fn parse_skill_file(content: &str, path: &Path) -> Option<DiscoveredSkill> {
         return None;
     }
 
-    let (name, description, template) = if content.starts_with("---") {
-        let after_open = &content[3..];
+    let (name, description, template) = if let Some(after_open) = content.strip_prefix("---") {
         // Accept both `\n---` and `\r\n---` as closing delimiter.
         if let Some(close_pos) = after_open.find("\n---") {
             let frontmatter = &after_open[..close_pos];
@@ -172,10 +171,10 @@ pub fn discover_skills(
         }
     }
 
-    // ---- 2. Global skills: ~/.claurst/skills/ --------------------------------
-    if let Some(home) = dirs::home_dir() {
-        add(scan_dir(&home.join(".claurst").join("skills")));
-    }
+    // ---- 2. Global skills: <claurst home>/skills/ ---------------------------
+    add(scan_dir(
+        &crate::config::Settings::config_dir().join("skills"),
+    ));
 
     // ---- 3. Configured extra paths ------------------------------------------
     for path_str in &config_skills.paths {
@@ -218,7 +217,7 @@ fn fetch_git_skills(url: &str) -> Option<Vec<DiscoveredSkill>> {
     // Use the last path segment of the URL as the local directory name.
     let repo_name = url
         .split('/')
-        .last()?
+        .next_back()?
         .trim_end_matches(".git");
 
     if repo_name.is_empty() {

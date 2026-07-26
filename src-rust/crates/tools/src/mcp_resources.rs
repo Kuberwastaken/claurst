@@ -25,6 +25,9 @@ struct ListMcpResourcesInput {
 
 #[async_trait]
 impl Tool for ListMcpResourcesTool {
+    // Gates itself: calls `ctx.check_permission` in `execute()` (#210).
+    fn self_gates(&self) -> bool { true }
+
     fn name(&self) -> &str { "ListMcpResources" }
 
     fn description(&self) -> &str {
@@ -106,6 +109,9 @@ struct ReadMcpResourceInput {
 
 #[async_trait]
 impl Tool for ReadMcpResourceTool {
+    // Gates itself: calls `ctx.check_permission` in `execute()` (#210).
+    fn self_gates(&self) -> bool { true }
+
     fn name(&self) -> &str { "ReadMcpResource" }
 
     fn description(&self) -> &str {

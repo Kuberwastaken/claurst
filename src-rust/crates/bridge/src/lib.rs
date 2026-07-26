@@ -56,11 +56,7 @@ impl JwtClaims {
     /// Returns an error if the token is malformed or the JSON is invalid.
     pub fn decode(token: &str) -> anyhow::Result<Self> {
         // Strip session-ingress prefix used by Anthropic's ingress tokens.
-        let jwt = if token.starts_with("sk-ant-si-") {
-            &token["sk-ant-si-".len()..]
-        } else {
-            token
-        };
+        let jwt = token.strip_prefix("sk-ant-si-").unwrap_or(token);
 
         let parts: Vec<&str> = jwt.split('.').collect();
         if parts.len() < 2 {
@@ -1632,7 +1628,9 @@ mod tests {
     #[test]
     fn test_jwt_decode_invalid() {
         assert!(JwtClaims::decode("notajwt").is_err());
-        assert!(JwtClaims::decode("only.two").is_ok() == false || true); // either way, must not panic
+        // Malformed-but-two-segment input: either Ok or Err is acceptable, the
+        // contract is only that decoding must not panic.
+        let _ = JwtClaims::decode("only.two");
     }
 
     #[test]
@@ -1649,8 +1647,7 @@ mod tests {
 
     #[test]
     fn test_bridge_config_with_token_still_needs_enabled() {
-        let mut cfg = BridgeConfig::default();
-        cfg.session_token = Some("tok".into());
+        let mut cfg = BridgeConfig { session_token: Some("tok".into()), ..Default::default() };
         assert!(!cfg.is_active(), "needs enabled=true too");
         cfg.enabled = true;
         assert!(cfg.is_active());

@@ -195,6 +195,8 @@ impl PluginRegistry {
                     env: mcp.env.clone(),
                     url: mcp.url.clone(),
                     server_type: mcp.server_type.clone(),
+                    // Plugins are enabled explicitly by the user: trusted.
+                    origin: Default::default(),
                 });
             }
         }

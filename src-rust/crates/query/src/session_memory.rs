@@ -476,6 +476,7 @@ mod tests {
             id: "tool-123".to_string(),
             name: "bash".to_string(),
             input: serde_json::json!({"command": "ls"}),
+            thought_signature: None,
         }]);
         // Last assistant has tool_use → extraction should be deferred
         assert!(!SessionMemoryExtractor::should_extract(&msgs));

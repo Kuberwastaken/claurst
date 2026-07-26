@@ -402,11 +402,9 @@ pub fn merge_remote_into_local(local: &Value, remote: &Value) -> Value {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Return the ~/.claurst directory, falling back to the current directory.
+/// Return the canonical claurst home directory.
 fn claude_config_dir() -> PathBuf {
-    dirs::home_dir()
-        .map(|h| h.join(".claurst"))
-        .unwrap_or_else(|| PathBuf::from(".claurst"))
+    crate::config::Settings::config_dir()
 }
 
 /// Exponential backoff delay for retry attempt `n` (1-indexed).

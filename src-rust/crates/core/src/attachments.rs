@@ -85,12 +85,12 @@ pub fn get_attachments(ctx: &AttachmentContext<'_>) -> Vec<Attachment> {
 /// Returns a formatted string like:
 /// `IDE: VS Code, workspace: /path/to/project, selection: L10-L20 in foo.rs`
 pub fn get_ide_context() -> Option<String> {
-    let lockfile_dir = dirs::home_dir()?.join(".claurst").join("ide");
+    let lockfile_dir = crate::config::Settings::config_dir().join("ide");
     let entries = std::fs::read_dir(&lockfile_dir).ok()?;
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().map_or(false, |e| e == "lock") {
+        if path.extension().is_some_and(|e| e == "lock") {
             if let Ok(content) = std::fs::read_to_string(&path) {
                 if let Ok(info) = serde_json::from_str::<serde_json::Value>(&content) {
                     let pid = info["pid"].as_u64().unwrap_or(0);

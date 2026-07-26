@@ -77,7 +77,7 @@ impl AgentRuntime {
         // visible to every session. Per-session MCP servers supplied via
         // `session/new` params are additive on top of this (v1: ignored,
         // tracked in plan/migration-todo).
-        let mcp_manager = build_mcp_manager(&config).await;
+        let mcp_manager = build_mcp_manager(&config, &settings, &working_dir).await;
 
         // Build tools: built-ins + AgentTool. MCP tool wrappers are NOT
         // attached here — the wrapper type lives in the CLI crate today and
@@ -106,11 +106,39 @@ impl AgentRuntime {
     }
 }
 
-async fn build_mcp_manager(config: &Config) -> Option<Arc<claurst_mcp::McpManager>> {
+async fn build_mcp_manager(
+    config: &Config,
+    settings: &Settings,
+    working_dir: &std::path::Path,
+) -> Option<Arc<claurst_mcp::McpManager>> {
     if config.mcp_servers.is_empty() {
         return None;
     }
-    let mgr = Arc::new(claurst_mcp::McpManager::connect_all(&config.mcp_servers).await);
+    // SECURITY (issue #123): never auto-launch project-defined MCP servers in
+    // this non-interactive runtime unless they have been trusted. The ACP
+    // runtime loads only global settings today (so all servers are user-origin
+    // and pass through), but gating here keeps the invariant if project config
+    // is ever merged in.
+    let project_root = claurst_core::mcp_trust::project_root_for(working_dir);
+    let store = claurst_core::mcp_trust::McpTrustStore::load();
+    let decision = claurst_core::mcp_trust::partition_mcp_servers(
+        &config.mcp_servers,
+        project_root.as_deref(),
+        settings.trust_project_mcp_servers,
+        &std::collections::HashSet::new(),
+        &store,
+    );
+    if !decision.pending.is_empty() {
+        let names: Vec<&str> = decision.pending.iter().map(|s| s.name.as_str()).collect();
+        tracing::warn!(
+            servers = ?names,
+            "Skipping untrusted project-defined MCP server(s) in ACP runtime"
+        );
+    }
+    if decision.allowed.is_empty() {
+        return None;
+    }
+    let mgr = Arc::new(claurst_mcp::McpManager::connect_all(&decision.allowed).await);
     mgr.clone().spawn_notification_poll_loop();
     Some(mgr)
 }

@@ -5,9 +5,10 @@
 // autoCompact / compact service behaviour.
 //
 // Strategy:
-//   1. Keep the last KEEP_RECENT_MESSAGES messages verbatim.
-//   2. Group messages by API round (same assistant message ID) and summarise
-//      all groups except the most recent KEEP_RECENT_MESSAGES worth.
+//   1. Keep as many recent messages as fit a `KEEP_RECENT_TOKENS` budget
+//      verbatim (mirrors pi's `keepRecentTokens`), rather than a fixed message
+//      COUNT. The cut is snapped to a tool_use↔tool_result-safe round boundary.
+//   2. Summarise everything older than that recent tail.
 //   3. Replace the head of the conversation with a single synthetic
 //      <compact-summary> user message, followed by the recent tail.
 //
@@ -24,6 +25,7 @@ use claurst_api::{AnthropicStreamEvent, ApiMessage, CreateMessageRequest, Stream
 use claurst_core::error::ClaudeError;
 use claurst_core::types::{ContentBlock, Message, MessageContent, Role};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -41,8 +43,15 @@ const WARNING_THRESHOLD_BUFFER_TOKENS: u64 = 20_000;
 /// Fraction of the context window at which auto-compact triggers.
 const AUTOCOMPACT_TRIGGER_FRACTION: f64 = 0.90;
 
-/// How many recent messages to preserve verbatim after compaction.
-const KEEP_RECENT_MESSAGES: usize = 10;
+/// Token budget for the recent tail we preserve verbatim after compaction.
+///
+/// Instead of keeping a fixed COUNT of recent messages, we keep as many recent
+/// messages as fit within this many tokens (mirrors pi's `keepRecentTokens`,
+/// which defaults to 20k). Keeping the tail token-budgeted means a handful of
+/// huge tool results don't blow the kept context, and many tiny turns aren't
+/// prematurely summarised. The cut is always snapped to a
+/// tool_use↔tool_result-safe boundary via [`compute_keep_split_index`].
+const KEEP_RECENT_TOKENS: u64 = 16_000;
 
 /// Max consecutive auto-compact failures before giving up (circuit breaker).
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
@@ -134,20 +143,17 @@ fn extract_topic_hint(messages: &[Message]) -> Option<String> {
             _ => continue,
         };
         for block in blocks {
-            match block {
-                ContentBlock::ToolUse { name, input, .. } => {
-                    // Try to get a file_path from input, else use tool name
-                    if let Some(fp) = input.get("file_path").and_then(|v| v.as_str()) {
-                        return Some(fp.to_string());
-                    }
-                    if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
-                        // Use first word of command as hint
-                        let first_word = cmd.split_whitespace().next().unwrap_or(cmd);
-                        return Some(first_word.to_string());
-                    }
-                    return Some(name.clone());
+            if let ContentBlock::ToolUse { name, input, .. } = block {
+                // Try to get a file_path from input, else use tool name
+                if let Some(fp) = input.get("file_path").and_then(|v| v.as_str()) {
+                    return Some(fp.to_string());
                 }
-                _ => {}
+                if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+                    // Use first word of command as hint
+                    let first_word = cmd.split_whitespace().next().unwrap_or(cmd);
+                    return Some(first_word.to_string());
+                }
+                return Some(name.clone());
             }
         }
     }
@@ -162,7 +168,7 @@ fn estimate_tokens_for_messages(messages: &[Message]) -> usize {
             MessageContent::Text(t) => t.len(),
             MessageContent::Blocks(blocks) => blocks
                 .iter()
-                .map(|b| estimate_block_chars(b))
+                .map(estimate_block_chars)
                 .sum(),
         })
         .sum();
@@ -179,7 +185,7 @@ fn estimate_block_chars(block: &ContentBlock) -> usize {
         ContentBlock::ToolResult { content, .. } => match content {
             claurst_core::types::ToolResultContent::Text(t) => t.len(),
             claurst_core::types::ToolResultContent::Blocks(blocks) => {
-                blocks.iter().map(|b| estimate_block_chars(b)).sum()
+                blocks.iter().map(estimate_block_chars).sum()
             }
         },
         ContentBlock::Thinking { thinking, .. } => thinking.len(),
@@ -418,9 +424,101 @@ Format your output as:\n\
 Please provide your summary based on the conversation so far, following this structure and \
 ensuring precision and thoroughness in your response.";
 
+/// The iterative UPDATE compaction prompt (mirrors UPDATE_SUMMARIZATION_PROMPT
+/// from the TypeScript reference). Used when a prior `<compact-summary>` already
+/// exists in the history: instead of re-summarising everything from scratch, the
+/// model folds the NEW activity into the PREVIOUS summary (provided in
+/// `<previous-summary>` tags), preserving the exact same structured sections.
+const UPDATE_COMPACT_PROMPT: &str = "Your task is to UPDATE an existing conversation summary by folding in \
+the new activity since it was written. The previous summary is provided in <previous-summary> tags; the new \
+messages to incorporate are in the <conversation_to_summarize> block.\n\
+\n\
+Do NOT re-summarise from scratch. Instead:\n\
+- PRESERVE all still-relevant information from the previous summary verbatim (file names, code snippets, \
+function signatures, decisions, user messages, error fixes).\n\
+- ADD new progress, decisions, files, errors, and user messages from the new activity.\n\
+- UPDATE the state: move finished items out of Pending Tasks / Current Work; refresh Optional Next Step to \
+reflect what is happening NOW.\n\
+- You may drop something only if it is clearly no longer relevant.\n\
+- Preserve exact file paths, function names, and error messages.\n\
+\n\
+Before providing your final summary, wrap your reasoning in <analysis> tags: reconcile the previous summary \
+with the new messages, note what changed, what completed, and what is now pending.\n\
+\n\
+Your summary MUST use the SAME sections as before:\n\
+\n\
+1. Primary Request and Intent: Preserve existing intent; add new requests if the task expanded.\n\
+2. Key Technical Concepts: Preserve existing; add newly-introduced concepts.\n\
+3. Files and Code Sections: Preserve existing entries; add newly examined/modified/created files with full \
+code snippets where applicable and why each matters.\n\
+4. Errors and fixes: Preserve existing; add new errors and how they were fixed, plus any user feedback.\n\
+5. Problem Solving: Update with newly-solved problems and ongoing troubleshooting.\n\
+6. All user messages: Preserve the existing list AND append every new non-tool-result user message.\n\
+7. Pending Tasks: Update — remove completed tasks, add newly-requested ones.\n\
+8. Current Work: Replace with a precise description of what was being worked on immediately before this \
+summary request.\n\
+9. Optional Next Step: Update to the next step directly in line with the user's most recent explicit request. \
+Include verbatim quotes from the most recent conversation where applicable.\n\
+\n\
+Format your output as:\n\
+\n\
+<analysis>\n\
+[Reconciliation of the previous summary with the new activity]\n\
+</analysis>\n\
+\n\
+<summary>\n\
+1. Primary Request and Intent:\n\
+   [Detailed description]\n\
+\n\
+2. Key Technical Concepts:\n\
+   - [Concept 1]\n\
+\n\
+3. Files and Code Sections:\n\
+   - [File Name 1]\n\
+      - [Why important]\n\
+      - [Changes made, if any]\n\
+      - [Important Code Snippet]\n\
+\n\
+4. Errors and fixes:\n\
+    - [Error]: [How fixed]\n\
+\n\
+5. Problem Solving:\n\
+   [Solved problems and ongoing troubleshooting]\n\
+\n\
+6. All user messages:\n\
+    - [Non-tool-use user message]\n\
+\n\
+7. Pending Tasks:\n\
+   - [Task 1]\n\
+\n\
+8. Current Work:\n\
+   [Precise description of current work]\n\
+\n\
+9. Optional Next Step:\n\
+   [Optional next step]\n\
+</summary>\n\
+\n\
+Please provide the UPDATED summary now, following this structure and preserving the previous summary's content.";
+
 /// Build the compaction prompt, optionally with custom instructions appended.
-pub fn get_compact_prompt(custom_instructions: Option<&str>) -> String {
-    let mut prompt = format!("{}{}", NO_TOOLS_PREAMBLE, BASE_COMPACT_PROMPT);
+///
+/// When `previous_summary` is a non-empty prior summary, the iterative
+/// [`UPDATE_COMPACT_PROMPT`] variant is selected so the model folds the previous
+/// summary forward rather than re-summarising from scratch. Otherwise the
+/// from-scratch [`BASE_COMPACT_PROMPT`] is used.
+pub fn get_compact_prompt(
+    custom_instructions: Option<&str>,
+    previous_summary: Option<&str>,
+) -> String {
+    let is_update = previous_summary
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let base = if is_update {
+        UPDATE_COMPACT_PROMPT
+    } else {
+        BASE_COMPACT_PROMPT
+    };
+    let mut prompt = format!("{}{}", NO_TOOLS_PREAMBLE, base);
 
     if let Some(instructions) = custom_instructions {
         let trimmed = instructions.trim();
@@ -431,6 +529,222 @@ pub fn get_compact_prompt(custom_instructions: Option<&str>) -> String {
 
     prompt.push_str(NO_TOOLS_TRAILER);
     prompt
+}
+
+/// Scan a slice of messages for the most recent `<compact-summary>…</compact-summary>`
+/// block and return its inner text. This is how a compaction detects that a
+/// PRIOR summary already exists in the history (injected by an earlier
+/// compaction), so it can fold it forward via the UPDATE prompt instead of
+/// re-summarising from zero.
+fn extract_previous_summary(messages: &[Message]) -> Option<String> {
+    const OPEN: &str = "<compact-summary>";
+    const CLOSE: &str = "</compact-summary>";
+    // Search newest-first so the most recent summary wins.
+    for msg in messages.iter().rev() {
+        let text = msg.get_all_text();
+        if let (Some(start), Some(end)) = (text.find(OPEN), text.find(CLOSE)) {
+            if end > start {
+                let inner = text[start + OPEN.len()..end].trim();
+                if !inner.is_empty() {
+                    return Some(inner.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Files-touched manifest (mirrors extractFileOperations / formatFileOperations)
+// ---------------------------------------------------------------------------
+
+/// Set of files the agent read / wrote / edited across a batch of history.
+///
+/// Sorted (`BTreeSet`) so the emitted manifest is deterministic, and unioned
+/// across successive compactions so the agent never forgets what it worked on.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct FileOps {
+    read: BTreeSet<String>,
+    written: BTreeSet<String>,
+    edited: BTreeSet<String>,
+}
+
+impl FileOps {
+    fn is_empty(&self) -> bool {
+        self.read.is_empty() && self.written.is_empty() && self.edited.is_empty()
+    }
+
+    /// Merge another manifest into this one (used to carry a prior manifest
+    /// forward across compactions).
+    fn union(&mut self, other: &FileOps) {
+        self.read.extend(other.read.iter().cloned());
+        self.written.extend(other.written.iter().cloned());
+        self.edited.extend(other.edited.iter().cloned());
+    }
+
+    /// Compute the final `(read_only, modified)` lists: a file that was written
+    /// or edited is "modified" (and dropped from the read-only list even if it
+    /// was also read). Mirrors pi's `computeFileLists`.
+    fn computed_lists(&self) -> (Vec<String>, Vec<String>) {
+        let mut modified: BTreeSet<String> = self.edited.clone();
+        modified.extend(self.written.iter().cloned());
+        let read_only: Vec<String> = self
+            .read
+            .iter()
+            .filter(|f| !modified.contains(*f))
+            .cloned()
+            .collect();
+        (read_only, modified.into_iter().collect())
+    }
+}
+
+/// Cap on how many files to list per bucket in the manifest; the overflow is
+/// summarised as "(+N more)" so the manifest stays bounded across compactions.
+const MAX_MANIFEST_FILES: usize = 20;
+
+/// Header line that introduces the files-touched manifest inside a summary.
+const FILES_TOUCHED_HEADER: &str = "Files touched:";
+
+/// Delimiter between file paths in a manifest line. A ` | ` separator keeps the
+/// manifest re-parseable (paths effectively never contain it).
+const MANIFEST_SEP: &str = " | ";
+
+/// Extract file read/write/edit operations from the tool calls in `messages`.
+///
+/// Classifies by tool name (`Read` → read, `Write` → written, `Edit` /
+/// `BatchEdit` / `NotebookEdit` / `ApplyPatch` → edited) and pulls the path from
+/// the tool input (`file_path`, falling back to `path` / `notebook_path`, and
+/// the per-edit `file_path`s inside a `BatchEdit`).
+fn extract_file_operations(messages: &[Message]) -> FileOps {
+    let mut ops = FileOps::default();
+    for msg in messages {
+        if let MessageContent::Blocks(blocks) = &msg.content {
+            for block in blocks {
+                if let ContentBlock::ToolUse { name, input, .. } = block {
+                    collect_file_op(name, input, &mut ops);
+                }
+            }
+        }
+    }
+    ops
+}
+
+/// Pull the file path(s) touched by a single tool call into `ops`.
+fn collect_file_op(name: &str, input: &Value, ops: &mut FileOps) {
+    use claurst_core::constants::{
+        TOOL_NAME_APPLY_PATCH, TOOL_NAME_BATCH_EDIT, TOOL_NAME_FILE_EDIT, TOOL_NAME_FILE_READ,
+        TOOL_NAME_FILE_WRITE, TOOL_NAME_NOTEBOOK_EDIT,
+    };
+
+    // BatchEdit carries an array of edits, each with its own file_path.
+    if name == TOOL_NAME_BATCH_EDIT {
+        if let Some(edits) = input.get("edits").and_then(|v| v.as_array()) {
+            for edit in edits {
+                if let Some(p) = edit.get("file_path").and_then(|v| v.as_str()) {
+                    ops.edited.insert(p.to_string());
+                }
+            }
+        }
+        return;
+    }
+
+    let path = input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .or_else(|| input.get("path").and_then(|v| v.as_str()))
+        .or_else(|| input.get("notebook_path").and_then(|v| v.as_str()));
+    let path = match path {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => return,
+    };
+
+    match name {
+        TOOL_NAME_FILE_READ => {
+            ops.read.insert(path);
+        }
+        TOOL_NAME_FILE_WRITE => {
+            ops.written.insert(path);
+        }
+        TOOL_NAME_FILE_EDIT | TOOL_NAME_NOTEBOOK_EDIT | TOOL_NAME_APPLY_PATCH => {
+            ops.edited.insert(path);
+        }
+        _ => {}
+    }
+}
+
+/// Render one bounded, capped manifest line from a sorted file list.
+fn format_manifest_line(files: &[String]) -> String {
+    if files.len() <= MAX_MANIFEST_FILES {
+        files.join(MANIFEST_SEP)
+    } else {
+        let shown = files[..MAX_MANIFEST_FILES].join(MANIFEST_SEP);
+        format!("{} (+{} more)", shown, files.len() - MAX_MANIFEST_FILES)
+    }
+}
+
+/// Format a compact "Files touched" manifest to append to a summary, or an
+/// empty string when no files were touched. Bounded via [`MAX_MANIFEST_FILES`].
+fn format_files_touched(ops: &FileOps) -> String {
+    let (read_only, modified) = ops.computed_lists();
+    if read_only.is_empty() && modified.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("\n\n{}\n", FILES_TOUCHED_HEADER);
+    if !modified.is_empty() {
+        out.push_str(&format!("Modified: {}\n", format_manifest_line(&modified)));
+    }
+    if !read_only.is_empty() {
+        out.push_str(&format!("Read: {}\n", format_manifest_line(&read_only)));
+    }
+    out.trim_end().to_string()
+}
+
+/// Split a manifest line's value back into paths, dropping any `(+N more)` tail.
+fn split_manifest_line(rest: &str) -> impl Iterator<Item = String> + '_ {
+    let core = match rest.rfind("(+") {
+        Some(idx) => rest[..idx].trim_end(),
+        None => rest.trim(),
+    };
+    core.split(MANIFEST_SEP)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Parse a previously-emitted "Files touched" manifest out of a summary so it
+/// can be carried forward and unioned with the current batch. Only the capped
+/// (visible) entries survive — that is what keeps the manifest bounded.
+fn parse_files_touched(summary: &str) -> FileOps {
+    let mut ops = FileOps::default();
+    let mut in_section = false;
+    for line in summary.lines() {
+        let trimmed = line.trim();
+        if trimmed == FILES_TOUCHED_HEADER {
+            in_section = true;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("Modified:") {
+            ops.edited.extend(split_manifest_line(rest));
+        } else if let Some(rest) = trimmed.strip_prefix("Read:") {
+            ops.read.extend(split_manifest_line(rest));
+        } else {
+            // Any other line (blank or the start of a new section) ends it.
+            in_section = false;
+        }
+    }
+    ops
+}
+
+/// Drop a trailing "Files touched" manifest from a summary. Used to keep the
+/// prior manifest out of the UPDATE prompt (it is re-appended deterministically
+/// from the parsed + unioned `FileOps`, so echoing it would only risk drift).
+fn strip_files_touched_section(summary: &str) -> String {
+    match summary.find(FILES_TOUCHED_HEADER) {
+        Some(idx) => summary[..idx].trim_end().to_string(),
+        None => summary.to_string(),
+    }
 }
 
 /// Format the raw compact summary by stripping `<analysis>` and cleaning up
@@ -486,24 +800,120 @@ pub fn format_compact_summary(raw: &str) -> String {
 
 /// Return the effective context-window size in tokens for the given model.
 /// These are approximate; the API enforces the real limits server-side.
+///
+/// This is a Claude-centric heuristic and only recognises Anthropic models —
+/// every other provider collapses to the ~100k default. Prefer
+/// [`resolve_context_window`], which consults the models.dev-backed registry
+/// first and only falls back to this heuristic.
 pub fn context_window_for_model(model: &str) -> u64 {
-    if model.contains("opus-4") || model.contains("sonnet-4") || model.contains("haiku-4") {
-        200_000
-    } else if model.contains("claude-3-5") || model.contains("claude-3.5") {
+    if model.contains("opus-4")
+        || model.contains("sonnet-4")
+        || model.contains("haiku-4")
+        || model.contains("claude-3-5")
+        || model.contains("claude-3.5")
+    {
         200_000
     } else {
         100_000
     }
 }
 
+/// Smallest registry context-window value we treat as real.
+///
+/// When models.dev omits a limit, `ModelRegistry` stores a `4096` placeholder
+/// (see `model_registry.rs`). Compacting a live session at ~3.7k tokens would
+/// be absurd, so any registry value below this threshold is treated as
+/// "unknown" and we fall back to the model-name heuristic instead.
+const MIN_PLAUSIBLE_REGISTRY_WINDOW: u64 = 8192;
+
+/// Look up a plausible context-window value in the registry for a given
+/// `(provider, model_id)` pair. Returns `None` when there is no entry or the
+/// stored window is an implausible placeholder.
+fn registry_context_window(
+    registry: &claurst_api::ModelRegistry,
+    provider: &str,
+    model_id: &str,
+) -> Option<u64> {
+    let window = registry.get(provider, model_id)?.info.context_window as u64;
+    (window >= MIN_PLAUSIBLE_REGISTRY_WINDOW).then_some(window)
+}
+
+/// Resolve the effective context window for the active provider + model.
+///
+/// The models.dev-backed [`claurst_api::ModelRegistry`] is the source of truth:
+/// it carries real per-model context windows for *every* provider (Gemini/GPT
+/// 1M windows, 32k local models, …), so we prefer it. We fall back to the
+/// Claude-only [`context_window_for_model`] heuristic only when the registry is
+/// absent, has no matching entry, or only holds a placeholder value.
+///
+/// `model` may be either a bare model id (`"gemini-3-pro"`) or a canonical
+/// `"provider/model"` string; both forms are handled.
+pub fn resolve_context_window(
+    registry: Option<&claurst_api::ModelRegistry>,
+    provider: &str,
+    model: &str,
+) -> u64 {
+    if let Some(registry) = registry {
+        // The registry is keyed by bare model id, so strip a matching
+        // `"<provider>/"` prefix if the caller passed a canonical string.
+        let stripped = model
+            .strip_prefix(&format!("{}/", provider))
+            .unwrap_or(model);
+        if let Some(window) = registry_context_window(registry, provider, stripped) {
+            return window;
+        }
+        // Fall back to interpreting the model string itself as
+        // `"provider/model"` (e.g. when no explicit provider was supplied).
+        if let Some((embedded_provider, embedded_model)) = model.split_once('/') {
+            if let Some(window) =
+                registry_context_window(registry, embedded_provider, embedded_model)
+            {
+                return window;
+            }
+        }
+    }
+    context_window_for_model(model)
+}
+
+/// Best-effort estimate of the CURRENT context size in tokens.
+///
+/// Prefers the REAL context-token count the provider reported for the last
+/// assistant turn (`last_real_usage`, typically `UsageInfo::total_input()` =
+/// input + cache-read + cache-creation), because that is what the model
+/// actually saw. The chars/4 heuristic can be off by a wide margin, and with
+/// prompt caching the bare `input_tokens` field massively *undercounts* — the
+/// bulk of the context is billed as cache reads. We fall back to the chars/4
+/// estimate ([`estimate_tokens_for_messages`]) only before the first response,
+/// or when the provider reported no usage (`None` / `0`).
+///
+/// Mirrors pi's `estimateContextTokens`, which likewise prefers the last
+/// assistant usage and only estimates when it is absent.
+pub fn estimate_context_tokens(messages: &[Message], last_real_usage: Option<u64>) -> u64 {
+    match last_real_usage {
+        Some(tokens) if tokens > 0 => tokens,
+        _ => estimate_tokens_for_messages(messages) as u64,
+    }
+}
+
 /// Determine token-warning state given current input token count and model.
+///
+/// Convenience wrapper that derives the window from the model-name heuristic.
+/// Prefer [`calculate_token_warning_state_for_window`] with a window resolved
+/// via [`resolve_context_window`] so non-Claude providers size correctly.
+pub fn calculate_token_warning_state(input_tokens: u64, model: &str) -> TokenWarningState {
+    calculate_token_warning_state_for_window(input_tokens, context_window_for_model(model))
+}
+
+/// Determine token-warning state against an explicit context window.
 ///
 /// Thresholds (mirrors TypeScript autoCompact.ts):
 ///   ≥ 95 % → Critical (red warning)
 ///   ≥ 80 % → Warning  (yellow warning)
 ///   <  80 % → Ok
-pub fn calculate_token_warning_state(input_tokens: u64, model: &str) -> TokenWarningState {
-    let window = context_window_for_model(model);
+pub fn calculate_token_warning_state_for_window(
+    input_tokens: u64,
+    window: u64,
+) -> TokenWarningState {
     let pct = input_tokens as f64 / window as f64;
 
     if pct >= CRITICAL_PCT {
@@ -516,11 +926,22 @@ pub fn calculate_token_warning_state(input_tokens: u64, model: &str) -> TokenWar
 }
 
 /// Return `true` when auto-compaction should fire.
+///
+/// Convenience wrapper that derives the window from the model-name heuristic.
+/// Prefer [`should_auto_compact_for_window`] with a resolved window.
 pub fn should_auto_compact(input_tokens: u64, model: &str, state: &AutoCompactState) -> bool {
+    should_auto_compact_for_window(input_tokens, context_window_for_model(model), state)
+}
+
+/// Return `true` when auto-compaction should fire, against an explicit window.
+pub fn should_auto_compact_for_window(
+    input_tokens: u64,
+    window: u64,
+    state: &AutoCompactState,
+) -> bool {
     if state.disabled {
         return false;
     }
-    let window = context_window_for_model(model);
     let threshold = (window as f64 * AUTOCOMPACT_TRIGGER_FRACTION) as u64;
     input_tokens >= threshold
 }
@@ -545,6 +966,12 @@ async fn summarise_head(
 
     let head = &messages[..split_at];
 
+    // Iterative UPDATE mode: if a prior <compact-summary> already lives in the
+    // head, fold it forward instead of re-summarising from scratch. Keep the
+    // full previous summary (used later for the files-touched manifest) and a
+    // manifest-stripped copy for the prompt so the model doesn't echo it.
+    let previous_summary = extract_previous_summary(head);
+
     // Build a transcript string for the summarisation prompt.
     let mut transcript = String::new();
     let original_count = head.len();
@@ -556,14 +983,16 @@ async fn summarise_head(
             Role::Assistant => "Assistant",
         };
         let text = msg.get_all_text();
-        if !text.is_empty() {
+        // Skip the prior compact summary itself — it is fed separately in a
+        // <previous-summary> block, so rendering it here would duplicate it.
+        if !text.is_empty() && !text.contains("<compact-summary>") {
             transcript.push_str(&format!("{}: {}\n\n", role_label, text));
         }
         // Also render tool use/result blocks
         if let MessageContent::Blocks(blocks) = &msg.content {
             for block in blocks {
                 match block {
-                    ContentBlock::ToolUse { name, input, id } => {
+                    ContentBlock::ToolUse { name, input, id, .. } => {
                         transcript.push_str(&format!(
                             "[Tool Call: {} (id={})]\nInput: {}\n\n",
                             name, id, input
@@ -586,15 +1015,34 @@ async fn summarise_head(
         }
     }
 
-    let compact_prompt = get_compact_prompt(None);
+    // Feed the prior summary WITHOUT its files-touched manifest: the manifest is
+    // re-appended deterministically below (parsed + unioned), so echoing it in
+    // the prompt would only risk the model drifting the file list.
+    let previous_summary_for_prompt = previous_summary
+        .as_deref()
+        .map(strip_files_touched_section);
 
-    let user_content = format!(
-        "{}\n\n<conversation_to_summarize original_messages=\"{}\" estimated_tokens=\"{}\">\n{}\n</conversation_to_summarize>",
-        compact_prompt,
-        original_count,
-        original_token_estimate,
-        transcript
-    );
+    // Select the UPDATE prompt variant when a prior summary is present.
+    let compact_prompt = get_compact_prompt(None, previous_summary_for_prompt.as_deref());
+
+    let user_content = if let Some(prev) = previous_summary_for_prompt.as_deref() {
+        format!(
+            "{}\n\n<previous-summary>\n{}\n</previous-summary>\n\n<conversation_to_summarize original_messages=\"{}\" estimated_tokens=\"{}\">\n{}\n</conversation_to_summarize>",
+            compact_prompt,
+            prev,
+            original_count,
+            original_token_estimate,
+            transcript
+        )
+    } else {
+        format!(
+            "{}\n\n<conversation_to_summarize original_messages=\"{}\" estimated_tokens=\"{}\">\n{}\n</conversation_to_summarize>",
+            compact_prompt,
+            original_count,
+            original_token_estimate,
+            transcript
+        )
+    };
 
     let api_msgs = vec![ApiMessage {
         role: "user".to_string(),
@@ -632,12 +1080,29 @@ async fn summarise_head(
 
     let formatted_summary = format_compact_summary(&raw_summary);
 
+    // Files-touched manifest: files this batch read/wrote/edited, unioned with
+    // any manifest carried in the prior summary so the agent doesn't forget what
+    // it worked on across successive compactions. Appended deterministically
+    // (bounded via MAX_MANIFEST_FILES) rather than trusting the model.
+    let mut file_ops = extract_file_operations(head);
+    if let Some(prev) = &previous_summary {
+        file_ops.union(&parse_files_touched(prev));
+    }
+    let formatted_summary = if file_ops.is_empty() {
+        formatted_summary
+    } else {
+        format!("{}{}", formatted_summary, format_files_touched(&file_ops))
+    };
+
     // Build the new conversation:
     //   [user: compact summary preamble] [recent tail messages]
+    //
+    // The summary is wrapped in <compact-summary> tags so the NEXT compaction can
+    // detect it (via extract_previous_summary) and fold it forward in UPDATE mode.
     let compact_notice = Message::user(format!(
         "This session is being continued from a previous conversation that ran out of context. \
          The summary below covers the earlier portion of the conversation (originally {} messages, \
-         ~{} tokens).\n\n{}",
+         ~{} tokens).\n\n<compact-summary>\n{}\n</compact-summary>",
         original_count, original_token_estimate, formatted_summary
     ));
 
@@ -645,6 +1110,55 @@ async fn summarise_head(
     new_messages.extend_from_slice(&messages[split_at..]);
 
     Ok(new_messages)
+}
+
+/// Does this message carry any `tool_result` blocks?
+///
+/// A `tool_result` always answers the `tool_use` in the message *immediately
+/// before* it, so a compaction cut must never land on such a message: doing so
+/// would orphan the result from its call in the kept tail (and, symmetrically,
+/// leave a dangling `tool_use` at the end of the summarised head).
+fn message_has_tool_result(msg: &Message) -> bool {
+    match &msg.content {
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolResult { .. })),
+        _ => false,
+    }
+}
+
+/// Snap a raw keep-index back to a pairing-safe round boundary.
+///
+/// A cut at index `k` keeps `messages[k..]` verbatim. It is pairing-safe iff
+/// `messages[k]` carries no `tool_result` blocks (see [`message_has_tool_result`]).
+/// We walk *backwards* (keeping MORE — never less — than the raw budget asked
+/// for) until we land on a safe boundary. This preserves the round-aligned,
+/// tool_use↔tool_result-paired history compaction must emit, independent of the
+/// separate `sanitize_history` repair pass.
+fn snap_to_pairing_boundary(messages: &[Message], idx: usize) -> usize {
+    let len = messages.len();
+    // Keep-nothing (idx == len): the tail is empty, so there is no boundary
+    // message that could be orphaned — leave it as-is.
+    let mut idx = idx.min(len);
+    while idx > 0 && idx < len && message_has_tool_result(&messages[idx]) {
+        idx -= 1;
+    }
+    idx
+}
+
+/// Decide how much of the recent tail to preserve verbatim, driven by a TOKEN
+/// budget rather than a fixed message count.
+///
+/// Returns the split index: everything before it is summarised, everything at or
+/// after it is kept verbatim. Larger `keep_recent_tokens` keeps more messages;
+/// smaller keeps fewer. The index is snapped to a tool_use↔tool_result-safe
+/// boundary so pairing is never broken.
+fn compute_keep_split_index(messages: &[Message], keep_recent_tokens: u64) -> usize {
+    if messages.is_empty() {
+        return 0;
+    }
+    let raw = calculate_messages_to_keep_index(messages, keep_recent_tokens);
+    snap_to_pairing_boundary(messages, raw)
 }
 
 /// Compact `messages` in-place, replacing the head with a summary.
@@ -656,22 +1170,24 @@ pub async fn compact_conversation(
 ) -> Result<Vec<Message>, ClaudeError> {
     let total = messages.len();
 
-    if total <= KEEP_RECENT_MESSAGES + 1 {
+    // Token-budget keep: summarise everything older than the most recent
+    // ~KEEP_RECENT_TOKENS worth of messages, cut on a pairing-safe boundary.
+    let split_at = compute_keep_split_index(messages, KEEP_RECENT_TOKENS);
+
+    if split_at == 0 {
         debug!(
             total,
-            "Too few messages to compact – keeping everything"
+            keep_recent_tokens = KEEP_RECENT_TOKENS,
+            "Whole conversation fits the keep-recent budget – keeping everything"
         );
         return Ok(messages.to_vec());
     }
 
-    // Split: summarise everything except the most recent KEEP_RECENT_MESSAGES.
-    let split_at = total.saturating_sub(KEEP_RECENT_MESSAGES);
-
     info!(
         total,
         split_at,
-        keep = KEEP_RECENT_MESSAGES,
-        "Compacting conversation"
+        keep_recent_tokens = KEEP_RECENT_TOKENS,
+        "Compacting conversation (token-budget keep)"
     );
 
     // Use a generous token budget for the summary (20k mirrors TypeScript MAX_OUTPUT_TOKENS_FOR_SUMMARY)
@@ -680,14 +1196,19 @@ pub async fn compact_conversation(
 
 /// Auto-compact `messages` if needed.  Updates `state` in place.
 /// Returns `Some(new_messages)` if compaction ran, `None` otherwise.
+///
+/// `context_window` is the effective window for the active provider+model
+/// (resolve it via [`resolve_context_window`]); `model` is still used for the
+/// summarisation API call.
 pub async fn auto_compact_if_needed(
     client: &claurst_api::AnthropicClient,
     messages: &[Message],
     input_tokens: u64,
     model: &str,
+    context_window: u64,
     state: &mut AutoCompactState,
 ) -> Option<Vec<Message>> {
-    if !should_auto_compact(input_tokens, model, state) {
+    if !should_auto_compact_for_window(input_tokens, context_window, state) {
         return None;
     }
 
@@ -896,9 +1417,10 @@ pub async fn reactive_compact(
     // Phase 2: strip images before the compact API call.
     let stripped = strip_images(messages.clone());
 
-    // Phase 1 + 3: summarise the head (all but the most recent KEEP_RECENT_MESSAGES),
-    // then replace the old head with the summary message.
-    let split_at = total.saturating_sub(KEEP_RECENT_MESSAGES);
+    // Phase 1 + 3: summarise the head (everything older than the ~KEEP_RECENT_TOKENS
+    // recent tail, cut on a pairing-safe boundary), then replace the old head with
+    // the summary message.
+    let split_at = compute_keep_split_index(&stripped, KEEP_RECENT_TOKENS);
     if split_at == 0 {
         // Too few messages; nothing to summarise.
         return Ok(CompactResult {
@@ -1190,7 +1712,7 @@ pub fn collapse_search_results(messages: Vec<claurst_core::types::Message>) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claurst_core::types::{Message, Role};
+    use claurst_core::types::{Message, ToolResultContent};
 
     fn make_user(text: &str) -> Message {
         Message::user(text)
@@ -1199,6 +1721,30 @@ mod tests {
     fn make_assistant(text: &str) -> Message {
         // No UUID set — relies on the no-UUID grouping path in group_messages_for_compact.
         Message::assistant(text)
+    }
+
+    /// `n` bytes of filler text (≈ `n/4 * 4/3` tokens under the chars/4 estimate).
+    fn filler(n: usize) -> String {
+        "x".repeat(n)
+    }
+
+    /// An assistant message carrying a single `tool_use` block.
+    fn assistant_tool_use(id: &str, name: &str, input: serde_json::Value) -> Message {
+        Message::assistant_blocks(vec![ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: name.to_string(),
+            input,
+            thought_signature: None,
+        }])
+    }
+
+    /// A user message carrying a single `tool_result` block answering `id`.
+    fn user_tool_result(id: &str, text: &str) -> Message {
+        Message::user_blocks(vec![ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: ToolResultContent::Text(text.to_string()),
+            is_error: None,
+        }])
     }
 
     // ---- TokenWarningState --------------------------------------------------
@@ -1242,8 +1788,7 @@ mod tests {
 
     #[test]
     fn test_should_not_compact_when_disabled() {
-        let mut state = AutoCompactState::default();
-        state.disabled = true;
+        let state = AutoCompactState { disabled: true, ..Default::default() };
         assert!(!should_auto_compact(195_000, "claude-sonnet-4-6", &state));
     }
 
@@ -1350,14 +1895,14 @@ mod tests {
 
     #[test]
     fn test_compact_prompt_contains_no_tools_preamble() {
-        let prompt = get_compact_prompt(None);
+        let prompt = get_compact_prompt(None, None);
         assert!(prompt.contains("CRITICAL: Respond with TEXT ONLY"));
         assert!(prompt.contains("Do NOT call any tools"));
     }
 
     #[test]
     fn test_compact_prompt_contains_sections() {
-        let prompt = get_compact_prompt(None);
+        let prompt = get_compact_prompt(None, None);
         assert!(prompt.contains("Primary Request and Intent"));
         assert!(prompt.contains("Key Technical Concepts"));
         assert!(prompt.contains("Files and Code Sections"));
@@ -1368,15 +1913,15 @@ mod tests {
 
     #[test]
     fn test_compact_prompt_with_custom_instructions() {
-        let prompt = get_compact_prompt(Some("Focus on Rust type system changes."));
+        let prompt = get_compact_prompt(Some("Focus on Rust type system changes."), None);
         assert!(prompt.contains("Additional Instructions:"));
         assert!(prompt.contains("Focus on Rust type system changes."));
     }
 
     #[test]
     fn test_compact_prompt_empty_custom_instructions_ignored() {
-        let prompt_none = get_compact_prompt(None);
-        let prompt_empty = get_compact_prompt(Some("   "));
+        let prompt_none = get_compact_prompt(None, None);
+        let prompt_empty = get_compact_prompt(Some("   "), None);
         assert_eq!(prompt_none, prompt_empty);
     }
 
@@ -1397,6 +1942,91 @@ mod tests {
         assert_eq!(context_window_for_model("claude-2"), 100_000);
     }
 
+    // ---- resolve_context_window (#216) -------------------------------------
+
+    /// Build an in-memory `ModelRegistry` from a models.dev-style JSON snapshot
+    /// by round-tripping it through the real `load_cache` parse path.
+    fn registry_from_json(json: &str) -> claurst_api::ModelRegistry {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("models_dev.json");
+        std::fs::write(&path, json).expect("write snapshot");
+        let mut reg = claurst_api::ModelRegistry::new();
+        reg.load_cache(&path);
+        reg
+    }
+
+    // A fake provider with a genuine 1M window and a placeholder (no-limit)
+    // model. Fake ids keep the fixture isolated from the bundled snapshot.
+    const TEST_SNAPSHOT: &str = r#"{"testprov":{"id":"testprov","name":"Test Provider","env":[],"models":{"big-context-model":{"id":"big-context-model","name":"Big Context Model","limit":{"context":1000000,"output":65536}},"tiny-model":{"id":"tiny-model","name":"Tiny Model"}}}}"#;
+
+    #[test]
+    fn resolve_prefers_registry_for_large_context_model() {
+        let reg = registry_from_json(TEST_SNAPSHOT);
+        // Sanity: the registry really carries the 1M window.
+        assert_eq!(
+            reg.get("testprov", "big-context-model").unwrap().info.context_window,
+            1_000_000
+        );
+        assert_eq!(
+            resolve_context_window(Some(&reg), "testprov", "big-context-model"),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn resolve_handles_canonical_provider_slash_model_string() {
+        let reg = registry_from_json(TEST_SNAPSHOT);
+        // Model string carries the provider prefix; still resolves to 1M.
+        assert_eq!(
+            resolve_context_window(Some(&reg), "testprov", "testprov/big-context-model"),
+            1_000_000
+        );
+        // Provider arg is wrong but the "provider/model" string still resolves.
+        assert_eq!(
+            resolve_context_window(Some(&reg), "anthropic", "testprov/big-context-model"),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn resolve_falls_back_to_heuristic_when_registry_none() {
+        // No registry → heuristic. Claude-ish and legacy both come through.
+        assert_eq!(
+            resolve_context_window(None, "anthropic", "claude-opus-4-8"),
+            context_window_for_model("claude-opus-4-8")
+        );
+        assert_eq!(resolve_context_window(None, "anthropic", "claude-opus-4-8"), 200_000);
+        assert_eq!(resolve_context_window(None, "some-provider", "some-model"), 100_000);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_heuristic_when_no_registry_entry() {
+        let reg = registry_from_json(TEST_SNAPSHOT);
+        // Provider/model that isn't in the registry → heuristic default.
+        assert_eq!(
+            resolve_context_window(Some(&reg), "nope", "ghost-model"),
+            context_window_for_model("ghost-model")
+        );
+        assert_eq!(resolve_context_window(Some(&reg), "nope", "ghost-model"), 100_000);
+    }
+
+    #[test]
+    fn resolve_ignores_placeholder_4096_window() {
+        let reg = registry_from_json(TEST_SNAPSHOT);
+        // The registry stores the models.dev-omission placeholder (4096)...
+        assert_eq!(
+            reg.get("testprov", "tiny-model").unwrap().info.context_window,
+            4096
+        );
+        // ...but resolve treats it as "unknown" and uses the heuristic instead
+        // of compacting a real session at ~3.7k tokens.
+        assert_eq!(
+            resolve_context_window(Some(&reg), "testprov", "tiny-model"),
+            context_window_for_model("tiny-model")
+        );
+        assert_eq!(resolve_context_window(Some(&reg), "testprov", "tiny-model"), 100_000);
+    }
+
     // ---- estimate_tokens_for_messages --------------------------------------
 
     #[test]
@@ -1405,5 +2035,232 @@ mod tests {
         let est = estimate_tokens_for_messages(&msgs);
         // "Hello, world!" = 13 chars → 13/4 = 3 rough tokens → 3*4/3 = 4 padded
         assert!(est > 0);
+    }
+
+    // ---- (1) token-budget keep (#231) --------------------------------------
+
+    fn plain_convo(n: usize, size: usize) -> Vec<Message> {
+        (0..n)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::user(filler(size))
+                } else {
+                    Message::assistant(filler(size))
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn keep_split_keeps_more_as_budget_grows() {
+        // Eight plain messages, each filler(4000) ≈ 1333 tokens.
+        let msgs = plain_convo(8, 4000);
+
+        // Small budget keeps ~1 message; larger budget keeps ~3.
+        let split_small = compute_keep_split_index(&msgs, 2000);
+        let split_large = compute_keep_split_index(&msgs, 5000);
+
+        // A larger budget keeps MORE messages ⇒ a smaller split index.
+        assert!(
+            split_large < split_small,
+            "bigger budget must keep more (split_large={split_large}, split_small={split_small})"
+        );
+        assert_eq!(msgs.len() - split_small, 1, "2k budget keeps 1 message");
+        assert_eq!(msgs.len() - split_large, 3, "5k budget keeps 3 messages");
+
+        // Neither cut lands on a tool_result (trivially true for plain text).
+        assert!(!message_has_tool_result(&msgs[split_small]));
+        assert!(!message_has_tool_result(&msgs[split_large]));
+    }
+
+    #[test]
+    fn keep_split_snaps_off_tool_result_boundary() {
+        // A round whose tool_use is huge, so the raw budget cut lands right on
+        // the tool_result — which would orphan it from its call.
+        let msgs = vec![
+            Message::user(filler(400)),                                       // 0
+            assistant_tool_use("t1", "Bash", serde_json::json!({ "command": filler(8000) })), // 1 (BIG)
+            user_tool_result("t1", &filler(400)),                            // 2 (tool_result)
+            Message::assistant(filler(400)),                                 // 3
+        ];
+
+        // Raw token-budget index lands ON the tool_result (index 2).
+        let raw = calculate_messages_to_keep_index(&msgs, 500);
+        assert_eq!(raw, 2, "raw cut should land on the tool_result message");
+        assert!(message_has_tool_result(&msgs[raw]));
+
+        // The pairing-safe keep snaps back to the assistant tool_use boundary,
+        // so the kept tail contains BOTH the tool_use and its result.
+        let split = compute_keep_split_index(&msgs, 500);
+        assert_eq!(split, 1);
+        assert!(!message_has_tool_result(&msgs[split]));
+        // tail = msgs[1..] carries tool_use(t1) AND its tool_result(t1).
+        let tail = &msgs[split..];
+        assert!(tail.iter().any(|m| !m.get_tool_use_blocks().is_empty()));
+        assert!(tail.iter().any(message_has_tool_result));
+    }
+
+    #[test]
+    fn snap_to_pairing_boundary_handles_keep_nothing() {
+        let msgs = plain_convo(3, 100);
+        // idx == len (keep nothing) is left as-is — the tail is empty, nothing to orphan.
+        assert_eq!(snap_to_pairing_boundary(&msgs, msgs.len()), msgs.len());
+    }
+
+    // ---- (2) real-usage trigger (#231) -------------------------------------
+
+    #[test]
+    fn context_tokens_prefer_real_usage_over_estimate() {
+        let msgs = vec![Message::user(filler(4000))]; // ≈ 1333 estimated tokens
+        let estimate = estimate_tokens_for_messages(&msgs) as u64;
+
+        // Real usage present ⇒ used verbatim, ignoring the (much smaller) estimate.
+        assert_eq!(estimate_context_tokens(&msgs, Some(150_000)), 150_000);
+        assert_ne!(estimate_context_tokens(&msgs, Some(150_000)), estimate);
+
+        // No usage / zero usage ⇒ fall back to the chars/4 estimate.
+        assert_eq!(estimate_context_tokens(&msgs, None), estimate);
+        assert_eq!(estimate_context_tokens(&msgs, Some(0)), estimate);
+    }
+
+    // ---- (3) iterative UPDATE prompt (#231) --------------------------------
+
+    #[test]
+    fn extract_previous_summary_finds_compact_summary_block() {
+        let notice = Message::user(
+            "This session is being continued from a previous conversation.\n\n\
+             <compact-summary>\nSummary:\n1. Primary Request: build X\n</compact-summary>",
+        );
+        let msgs = vec![notice, make_assistant("ok"), make_user("next")];
+        let prev = extract_previous_summary(&msgs).expect("should detect prior summary");
+        assert!(prev.contains("Primary Request: build X"));
+        assert!(!prev.contains("<compact-summary>"));
+
+        // No summary block ⇒ None.
+        assert!(extract_previous_summary(&[make_user("hello"), make_assistant("hi")]).is_none());
+    }
+
+    #[test]
+    fn update_prompt_selected_only_with_previous_summary() {
+        let base = get_compact_prompt(None, None);
+        let update = get_compact_prompt(None, Some("Summary:\n1. Primary Request: build X"));
+
+        // UPDATE variant is distinct and references the previous summary.
+        assert!(update.contains("UPDATE an existing conversation summary"));
+        assert!(update.contains("<previous-summary>"));
+        assert!(!base.contains("UPDATE an existing conversation summary"));
+
+        // A blank previous summary is treated as "no previous summary".
+        let blank = get_compact_prompt(None, Some("   "));
+        assert_eq!(blank, base);
+
+        // Both variants preserve the structured sections.
+        for p in [&base, &update] {
+            assert!(p.contains("Primary Request and Intent"));
+            assert!(p.contains("Files and Code Sections"));
+            assert!(p.contains("Pending Tasks"));
+            assert!(p.contains("Optional Next Step"));
+        }
+    }
+
+    // ---- (4) files-touched manifest (#231) ---------------------------------
+
+    fn read_use(id: &str, path: &str) -> Message {
+        assistant_tool_use(id, "Read", serde_json::json!({ "file_path": path }))
+    }
+    fn edit_use(id: &str, path: &str) -> Message {
+        assistant_tool_use(id, "Edit", serde_json::json!({ "file_path": path }))
+    }
+    fn write_use(id: &str, path: &str) -> Message {
+        assistant_tool_use(id, "Write", serde_json::json!({ "file_path": path }))
+    }
+
+    #[test]
+    fn manifest_lists_read_write_edit_files() {
+        let msgs = vec![
+            read_use("1", "/repo/a.rs"),
+            edit_use("2", "/repo/b.rs"),
+            write_use("3", "/repo/c.rs"),
+            read_use("4", "/repo/a.rs"), // duplicate read — deduped
+        ];
+        let ops = extract_file_operations(&msgs);
+        let manifest = format_files_touched(&ops);
+
+        assert!(manifest.contains(FILES_TOUCHED_HEADER));
+        // b.rs (edit) and c.rs (write) are "Modified"; a.rs is "Read".
+        assert!(manifest.contains("Modified:"));
+        assert!(manifest.contains("/repo/b.rs"));
+        assert!(manifest.contains("/repo/c.rs"));
+        assert!(manifest.contains("Read:"));
+        assert!(manifest.contains("/repo/a.rs"));
+    }
+
+    #[test]
+    fn manifest_edit_wins_over_read_for_same_file() {
+        // A file that was both read and edited is reported only as Modified.
+        let msgs = vec![read_use("1", "/repo/x.rs"), edit_use("2", "/repo/x.rs")];
+        let (read_only, modified) = extract_file_operations(&msgs).computed_lists();
+        assert_eq!(modified, vec!["/repo/x.rs".to_string()]);
+        assert!(read_only.is_empty());
+    }
+
+    #[test]
+    fn manifest_unions_with_prior_and_roundtrips() {
+        // New batch touches new.rs (edit) and read_new.rs (read).
+        let msgs = vec![
+            edit_use("1", "/repo/new.rs"),
+            read_use("2", "/repo/read_new.rs"),
+        ];
+        let mut ops = extract_file_operations(&msgs);
+
+        // Prior manifest, as it would appear inside a previous <compact-summary>.
+        let prior = "Summary:\n1. Primary Request: ...\n\nFiles touched:\n\
+                     Modified: /repo/old.rs\nRead: /repo/read_old.rs";
+        let parsed = parse_files_touched(prior);
+        assert!(parsed.edited.contains("/repo/old.rs"));
+        assert!(parsed.read.contains("/repo/read_old.rs"));
+
+        ops.union(&parsed);
+        let manifest = format_files_touched(&ops);
+
+        // Both prior and new files survive the carry-forward.
+        for f in [
+            "/repo/new.rs",
+            "/repo/old.rs",
+            "/repo/read_new.rs",
+            "/repo/read_old.rs",
+        ] {
+            assert!(manifest.contains(f), "manifest missing {f}:\n{manifest}");
+        }
+
+        // strip_files_touched_section removes the manifest for the UPDATE prompt.
+        let stripped = strip_files_touched_section(prior);
+        assert!(!stripped.contains(FILES_TOUCHED_HEADER));
+        assert!(stripped.contains("Primary Request"));
+    }
+
+    #[test]
+    fn manifest_is_bounded_with_overflow_marker() {
+        // 25 edited files ⇒ list is capped at MAX_MANIFEST_FILES (20) with "+5 more".
+        let msgs: Vec<Message> = (0..(MAX_MANIFEST_FILES + 5))
+            .map(|i| edit_use(&format!("id{i}"), &format!("/repo/file_{i:02}.rs")))
+            .collect();
+        let manifest = format_files_touched(&extract_file_operations(&msgs));
+
+        assert!(manifest.contains("(+5 more)"), "expected overflow marker:\n{manifest}");
+        // Exactly MAX_MANIFEST_FILES paths are shown before the marker.
+        let modified_line = manifest
+            .lines()
+            .find(|l| l.starts_with("Modified:"))
+            .expect("Modified line");
+        let listed = modified_line
+            .trim_start_matches("Modified:")
+            .split(" (+")
+            .next()
+            .unwrap()
+            .matches(MANIFEST_SEP)
+            .count()
+            + 1;
+        assert_eq!(listed, MAX_MANIFEST_FILES);
     }
 }

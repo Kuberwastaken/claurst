@@ -102,6 +102,9 @@ pub fn expand_server_config(config: &McpServerConfig) -> McpServerConfig {
             .collect(),
         url: config.url.as_deref().map(expand_env_vars),
         server_type: config.server_type.clone(),
+        // Preserve origin: expansion must not launder a project server into
+        // a trusted one.
+        origin: config.origin,
     }
 }
 
@@ -1309,7 +1312,7 @@ impl McpManager {
 
         // Spawn a task for each client to handle notifications via the stream
         for client in clients.values() {
-            let client_clone = Arc::clone(&client);
+            let client_clone = Arc::clone(client);
             let manager_weak = Arc::downgrade(&self);
 
             tokio::spawn(async move {
@@ -1458,6 +1461,7 @@ mod tests {
             },
             url: None,
             server_type: "stdio".to_string(),
+            origin: Default::default(),
         };
         let expanded = expand_server_config(&cfg);
         assert_eq!(expanded.command.as_deref(), Some("/home/user/bin/server"));
@@ -1605,6 +1609,13 @@ mod tests {
 
     #[test]
     fn test_auth_state_uses_token_expiry_datetime() {
+        // Redirect the on-disk token store into a tempdir so this test never
+        // touches (or requires a writable) ~/.claurst. Sandboxed builds run
+        // with no HOME and disallow writes outside the build tree.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var_os("CLAURST_MCP_TOKENS_DIR");
+        std::env::set_var("CLAURST_MCP_TOKENS_DIR", tmp.path());
+
         let mut mgr = McpManager::new();
         mgr.server_configs.insert(
             "remote".to_string(),
@@ -1615,6 +1626,7 @@ mod tests {
                 env: HashMap::new(),
                 url: Some("https://example.com/mcp".to_string()),
                 server_type: "http".to_string(),
+                origin: Default::default(),
             },
         );
 
@@ -1640,6 +1652,11 @@ mod tests {
         }
 
         oauth::remove_mcp_token("remote").ok();
+
+        match prev {
+            Some(v) => std::env::set_var("CLAURST_MCP_TOKENS_DIR", v),
+            None => std::env::remove_var("CLAURST_MCP_TOKENS_DIR"),
+        }
     }
 }
 

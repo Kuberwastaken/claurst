@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.3"
+version = "0.1.7"
 edition = "2021"
 authors = ["Claurst"]
 license = "GPL-3.0"
@@ -30,7 +30,16 @@ async-trait = "0.1"
 async-stream = "0.3"
 
 # HTTP
-reqwest = { version = "0.13", features = ["json", "stream", "native-tls", "multipart", "form", "query"], default-features = false }
+# rustls (pas native-tls/openssl) pour cohabiter avec wreq/BoringSSL sans conflit
+# de symboles (openssl-sys ↔ boring-sys). aws-lc-rs préfixe ses symboles.
+reqwest = { version = "0.13", features = ["json", "stream", "rustls", "multipart", "form", "query"], default-features = false }
+# wreq = client BoringSSL avec impersonation TLS (profil Bun) — chemin Anthropic uniquement.
+# TODO(#227): pinned to the 6.x / 3.x release-candidate line. No stable (non-rc)
+# release exists yet — the latest stable is wreq 5.3.0 / wreq-util 2.2.6, a major
+# version behind that drops the TLS-impersonation API this crate relies on.
+# Revisit unpinning once wreq 6.0.0 / wreq-util 3.0.0 ship a stable release.
+wreq = { version = "=6.0.0-rc.29", features = ["json", "stream"] }
+wreq-util = "=3.0.0-rc.12"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -94,7 +103,7 @@ nix = { version = "0.29", features = ["process", "signal", "user"] }
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
 
 # WebSocket
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 
 # JSON Schema
 schemars = { version = "0.8", features = ["derive"] }
@@ -111,3 +120,12 @@ claurst-mcp = { path = "crates/mcp" }
 claurst-bridge = { path = "crates/bridge" }
 claurst-buddy = { path = "crates/buddy" }
 claurst-plugins = { path = "crates/plugins" }
+
+# Shipped binaries statically link two TLS stacks (rustls + BoringSSL),
+# bundled SQLite, syntect, and image codecs — LTO and symbol stripping cut
+# size substantially. Keep the default panic = "unwind": the TUI panic hook
+# relies on unwinding to restore the terminal (raw mode, cursor) on panic.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
