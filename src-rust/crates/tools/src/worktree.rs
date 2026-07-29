@@ -137,13 +137,13 @@ impl Tool for EnterWorktreeTool {
 
         // Determine worktree path
         let worktree_path = if let Some(p) = params.path {
-            ctx.working_dir.join(p)
+            ctx.main_root().join(p)
         } else {
-            ctx.working_dir.join(".worktrees").join(&branch)
+            ctx.main_root().join(".worktrees").join(&branch)
         };
 
         // Verify we are inside a git repository before attempting worktree creation
-        let head_result = run_git(&ctx.working_dir, &["rev-parse", "HEAD"]).await;
+        let head_result = run_git(&ctx.main_root(), &["rev-parse", "HEAD"]).await;
         let original_head = match &head_result {
             Ok(h) => Some(h.trim().to_string()),
             Err(e) => {
@@ -151,7 +151,7 @@ impl Tool for EnterWorktreeTool {
                 if msg.contains("not a git repository") || msg.contains("fatal") {
                     return ToolResult::error(format!(
                         "Cannot create worktree: the current directory '{}' is not inside a git repository.",
-                        ctx.working_dir.display()
+                        ctx.main_root().display()
                     ));
                 }
                 None
@@ -169,7 +169,7 @@ impl Tool for EnterWorktreeTool {
         // Create the worktree
         let worktree_str = worktree_path.to_string_lossy().to_string();
         let result = run_git(
-            &ctx.working_dir,
+            &ctx.main_root(),
             &["worktree", "add", "-b", &branch, &worktree_str],
         )
         .await;
@@ -185,7 +185,7 @@ impl Tool for EnterWorktreeTool {
                 } else if msg.to_lowercase().contains("not a git repository") {
                     format!(
                         "Failed to create worktree: '{}' is not inside a git repository.",
-                        ctx.working_dir.display()
+                        ctx.main_root().display()
                     )
                 } else {
                     format!("Failed to create worktree: {}", msg)
@@ -201,7 +201,7 @@ impl Tool for EnterWorktreeTool {
 
                 // Save session state
                 *WORKTREE_SESSION.write().await = Some(WorktreeSession {
-                    original_cwd: ctx.working_dir.clone(),
+                    original_cwd: ctx.main_root().clone(),
                     worktree_path: worktree_path.clone(),
                     branch: Some(branch.clone()),
                     original_head,
@@ -270,13 +270,13 @@ impl Tool for EnterWorktreeTool {
                     worktree_path.display(),
                     branch,
                     worktree_path.display(),
-                    ctx.working_dir.display(),
+                    ctx.main_root().display(),
                     post_create_output,
                 ))
                 .with_metadata(json!({
                     "worktree_path": worktree_path.to_string_lossy(),
                     "branch": branch,
-                    "original_cwd": ctx.working_dir.to_string_lossy(),
+                    "original_cwd": ctx.main_root().to_string_lossy(),
                 }))
             }
         }

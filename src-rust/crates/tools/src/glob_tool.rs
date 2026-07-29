@@ -46,7 +46,7 @@ impl Tool for GlobTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "The directory to search in. Defaults to working directory."
+                    "description": "The directory to search in. Accepts absolute paths, main-relative paths, or &root-name/relative paths. If omitted, searches only main. To search all workspace roots, call Glob once per root with path=&root-name; these calls can run in parallel."
                 }
             },
             "required": ["pattern"]
@@ -63,7 +63,7 @@ impl Tool for GlobTool {
             .path
             .as_ref()
             .map(|p| ctx.resolve_path(p))
-            .unwrap_or_else(|| ctx.working_dir.clone());
+            .unwrap_or_else(|| ctx.main_root().clone());
 
         if let Err(e) = ctx.check_permission_for_path(
             self.name(),

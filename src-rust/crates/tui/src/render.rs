@@ -369,18 +369,57 @@ fn startup_notice_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         ]));
     }
 
-    // Additional directories (from --add-dir)
-    for dir in &app.config.additional_dirs {
-        lines.push(Line::from(vec![
-            Span::styled(" +dir ", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                truncate_end(&dir.display().to_string(), max_width),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-    }
+    lines.extend(workspace_root_notice_lines(app, max_width));
 
     lines
+}
+
+fn workspace_root_notice_lines(app: &App, max_width: usize) -> Vec<Line<'static>> {
+    if app.config.additional_dirs.is_empty() && app.config.workspace_paths.is_empty() {
+        return Vec::new();
+    }
+
+    let primary = app
+        .config
+        .project_dir
+        .clone()
+        .or_else(|| app.current_dir.as_deref().map(std::path::PathBuf::from));
+    let Some(primary) = primary.filter(|path| path.is_absolute()) else {
+        return Vec::new();
+    };
+
+    let roots = claurst_core::generate_root_names(
+        &primary,
+        &app.config.additional_dirs,
+        &app.config.workspace_paths,
+    );
+
+    let mut ordered_roots = Vec::new();
+    if let Some(main) = roots.get("main") {
+        ordered_roots.push(("main", main));
+    }
+    ordered_roots.extend(
+        roots
+            .iter()
+            .filter(|(name, _)| name.as_str() != "main")
+            .map(|(name, path)| (name.as_str(), path)),
+    );
+
+    ordered_roots
+        .into_iter()
+        .map(|(name, path)| {
+            let root_ref = format!("&{} ", name);
+            let path_width = max_width.saturating_sub(UnicodeWidthStr::width(root_ref.as_str()));
+            Line::from(vec![
+                Span::styled(" root ", Style::default().fg(Color::Cyan)),
+                Span::styled(root_ref, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    truncate_end(&path.display().to_string(), path_width),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        })
+        .collect()
 }
 
 fn render_startup_notices(frame: &mut Frame, app: &App, area: Rect) {
@@ -3438,6 +3477,28 @@ mod tool_block_tests {
         }
         // A non-home path is left untouched.
         assert_eq!(shorten_home_path("/etc/hosts"), "/etc/hosts");
+    }
+
+    #[test]
+    fn startup_notices_show_named_workspace_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        let ai_engine = temp.path().join("_ai-engine");
+        let mut config = claurst_core::config::Config::default();
+        config.project_dir = Some(main.clone());
+        config.additional_dirs = vec![ai_engine.clone()];
+        let app = App::new(config, claurst_core::cost::CostTracker::new());
+
+        let lines: Vec<String> = startup_notice_lines(&app, 120)
+            .iter()
+            .map(flatten_line_text)
+            .collect();
+        let joined = lines.join("\n");
+        assert!(joined.contains("root &main"), "{joined}");
+        assert!(joined.contains("root &_ai-engine"), "{joined}");
+        assert!(joined.contains(main.to_string_lossy().as_ref()), "{joined}");
+        assert!(joined.contains(ai_engine.to_string_lossy().as_ref()), "{joined}");
+        assert!(!joined.contains("+dir"), "{joined}");
     }
 
     #[test]

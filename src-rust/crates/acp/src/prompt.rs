@@ -51,8 +51,13 @@ pub async fn handle(
     // Build per-session ToolContext.
     let permission_handler: Arc<dyn claurst_core::PermissionHandler> =
         Arc::new(AcpPermissionHandler);
+    let workspace_roots = claurst_core::generate_root_names(
+        &session.cwd,
+        &runtime.config.additional_dirs,
+        &runtime.config.workspace_paths,
+    );
     let tool_ctx = ToolContext {
-        working_dir: session.cwd.clone(),
+        workspace_roots,
         permission_mode: runtime.config.permission_mode.clone(),
         permission_handler,
         cost_tracker: runtime.cost_tracker.clone(),
@@ -91,12 +96,20 @@ pub async fn handle(
     ));
 
     // Run the query loop.
+    let mut query_config = runtime.query_config.clone();
+    query_config.working_directory = Some(tool_ctx.main_root().display().to_string());
+    query_config.workspace_roots = tool_ctx
+        .workspace_roots()
+        .iter()
+        .map(|(name, path)| (name.clone(), path.display().to_string()))
+        .collect();
+
     let outcome = claurst_query::run_query_loop(
         runtime.api_client.as_ref(),
         &mut messages,
         runtime.tools.as_slice(),
         &tool_ctx,
-        &runtime.query_config,
+        &query_config,
         runtime.cost_tracker.clone(),
         Some(ev_tx),
         cancel,

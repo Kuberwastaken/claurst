@@ -48,6 +48,7 @@ use claurst_core::types::ToolDefinition;
 use claurst_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
 use clap::{ArgAction, Parser, ValueEnum};
 use parking_lot::Mutex as ParkingMutex;
+use std::collections::BTreeMap;
 use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -109,6 +110,14 @@ impl Tool for McpToolWrapper {
             Err(e) => ToolResult::error(format!("MCP tool '{}' failed: {}", bare_name, e)),
         }
     }
+}
+
+fn workspace_roots_for_prompt(tool_ctx: &ToolContext) -> BTreeMap<String, String> {
+    tool_ctx
+        .workspace_roots()
+        .iter()
+        .map(|(name, path)| (name.clone(), path.display().to_string()))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -731,8 +740,15 @@ async fn main() -> anyhow::Result<()> {
         tokio::sync::mpsc::unbounded_channel::<claurst_tools::UserQuestionEvent>();
     let user_question_rx = if is_non_interactive { None } else { Some(user_question_rx) };
 
+    // Build workspace roots map: main = cwd, additional from config.
+    let workspace_roots = claurst_core::generate_root_names(
+        &cwd,
+        &config.additional_dirs,
+        &config.workspace_paths,
+    );
+
     let tool_ctx = ToolContext {
-        working_dir: cwd.clone(),
+        workspace_roots,
         permission_mode: config.permission_mode.clone(),
         permission_handler: permission_handler.clone(),
         cost_tracker: cost_tracker.clone(),
@@ -830,6 +846,7 @@ async fn main() -> anyhow::Result<()> {
     query_config.system_prompt = Some(system_prompt);
     query_config.append_system_prompt = None;
     query_config.working_directory = Some(cwd.display().to_string());
+    query_config.workspace_roots = workspace_roots_for_prompt(&tool_ctx);
     if let Some(tokens) = cli.thinking {
         query_config.thinking_budget = Some(tokens);
     }
@@ -1825,7 +1842,7 @@ async fn run_interactive(
                 if let Some(saved_dir) = session.working_dir.as_ref() {
                     let saved_path = std::path::PathBuf::from(saved_dir);
                     if saved_path.exists() {
-                        tool_ctx.working_dir = saved_path;
+                        tool_ctx.workspace_roots.insert("main".to_string(), saved_path);
                     }
                 }
                 tool_ctx.session_id = session.id.clone();
@@ -1838,7 +1855,7 @@ async fn run_interactive(
                         claurst_api::effective_model_for_config(&config, &model_registry),
                     );
                 session.id = tool_ctx.session_id.clone();
-                session.working_dir = Some(tool_ctx.working_dir.display().to_string());
+                session.working_dir = Some(tool_ctx.main_root().display().to_string());
                 session
             }
         }
@@ -1848,11 +1865,12 @@ async fn run_interactive(
                 claurst_api::effective_model_for_config(&config, &model_registry),
             );
         session.id = tool_ctx.session_id.clone();
-        session.working_dir = Some(tool_ctx.working_dir.display().to_string());
+        session.working_dir = Some(tool_ctx.main_root().display().to_string());
         session
     };
     let initial_messages = session.messages.clone();
     let mut base_query_config = query_config;
+    base_query_config.workspace_roots = workspace_roots_for_prompt(&tool_ctx);
     // Goal autonomy is now an in-loop continuation policy (issue #230 / MI-3):
     // run_query_loop itself decides whether to continue toward an active goal
     // after each turn, instead of the REPL re-dispatching a fresh turn. Select
@@ -1915,7 +1933,7 @@ async fn run_interactive(
         app.user_question_rx = Some(rx);
     }
 
-    app.config.project_dir = Some(tool_ctx.working_dir.clone());
+    app.config.project_dir = Some(tool_ctx.main_root().clone());
     app.attach_turn_diff_state(tool_ctx.file_history.clone(), tool_ctx.current_turn.clone());
     if let Some(manager) = tool_ctx.mcp_manager.clone() {
         app.attach_mcp_manager(manager);
@@ -1924,7 +1942,7 @@ async fn run_interactive(
 
     // Home directory warning: mirror TS feedConfigs.tsx warningText
     let home_dir = dirs::home_dir();
-    if home_dir.as_deref() == Some(tool_ctx.working_dir.as_path()) {
+    if home_dir.as_deref() == Some(tool_ctx.main_root().as_path()) {
         app.home_dir_warning = true;
     }
 
@@ -2089,7 +2107,7 @@ async fn run_interactive(
         config: live_config,
         cost_tracker: cost_tracker.clone(),
         messages: messages.clone(),
-        working_dir: tool_ctx.working_dir.clone(),
+        working_dir: tool_ctx.main_root().clone(),
         session_id: session.id.clone(),
         session_title: session.title.clone(),
         remote_session_url: session.remote_session_url.clone(),
@@ -2420,7 +2438,7 @@ async fn run_interactive(
                                     );
                                     session = claurst_commands::build_home_session(
                                         model,
-                                        Some(tool_ctx.working_dir.display().to_string()),
+                                        Some(tool_ctx.main_root().display().to_string()),
                                     );
                                     messages.clear();
                                     app.replace_messages(Vec::new());
@@ -2453,13 +2471,15 @@ async fn run_interactive(
                                     // command; here we repoint every cwd-aware
                                     // surface so tools, the system prompt and the
                                     // saved session all track the new location.
-                                    tool_ctx.working_dir = destination.clone();
+                                    tool_ctx.workspace_roots.insert("main".to_string(), destination.clone());
                                     cmd_ctx.working_dir = destination.clone();
                                     cmd_ctx.config.project_dir = Some(destination.clone());
                                     tool_ctx.config.project_dir = Some(destination.clone());
                                     app.config.project_dir = Some(destination.clone());
                                     base_query_config.working_directory =
                                         Some(destination.display().to_string());
+                                    base_query_config.workspace_roots =
+                                        workspace_roots_for_prompt(&tool_ctx);
                                     session.working_dir =
                                         Some(destination.display().to_string());
                                     session.updated_at = chrono::Utc::now();
@@ -2469,7 +2489,7 @@ async fn run_interactive(
                                     // <system-reminder> prompt after a move. claurst
                                     // re-derives working_directory into every turn's
                                     // system prompt (qcfg.working_directory below),
-                                    // so repointing tool_ctx.working_dir already
+                                    // so repointing tool_ctx.main_root() already
                                     // tells the model on its next turn — we skip the
                                     // dangling user message that would otherwise
                                     // break user/assistant role alternation.
@@ -2539,12 +2559,14 @@ async fn run_interactive(
                                         let saved_path =
                                             std::path::PathBuf::from(saved_dir);
                                         if saved_path.exists() {
-                                            tool_ctx.working_dir = saved_path.clone();
+                                            tool_ctx.workspace_roots.insert("main".to_string(), saved_path.clone());
                                             cmd_ctx.working_dir = saved_path;
                                         }
                                     }
+                                    base_query_config.workspace_roots =
+                                        workspace_roots_for_prompt(&tool_ctx);
                                     app.config.project_dir =
-                                        Some(tool_ctx.working_dir.clone());
+                                        Some(tool_ctx.main_root().clone());
                                     app.attach_turn_diff_state(
                                         tool_ctx.file_history.clone(),
                                         tool_ctx.current_turn.clone(),
@@ -2844,7 +2866,7 @@ async fn run_interactive(
                                 &cmd_ctx.config.hooks,
                                 claurst_core::config::HookEvent::UserPromptSubmit,
                                 &hook_ctx,
-                                &tool_ctx.working_dir,
+                                tool_ctx.main_root(),
                             )
                             .await;
                         }
@@ -2867,7 +2889,7 @@ async fn run_interactive(
                             } else {
                                 app.config.file_injection_max_size
                             };
-                            let (within_limit, mut oversized) = parse_at_refs(&input, &tool_ctx.working_dir, effective_limit);
+                            let (within_limit, mut oversized) = parse_at_refs(&input, &tool_ctx.main_root(), effective_limit);
                             if was_force {
                                 oversized.retain(|f| !matches!(f.issue, Some(claurst_tui::AtFileIssue::IsDirectory)));
                             }
@@ -2890,7 +2912,7 @@ async fn run_interactive(
                                     pending_imgs,
                                     oversized_summaries,
                                     app.config.file_injection_max_size,
-                                    Some(tool_ctx.working_dir.clone()),
+                                    Some(tool_ctx.main_root().clone()),
                                 );
                                 app.set_prompt_text(input);
                                 continue;
@@ -2992,7 +3014,8 @@ async fn run_interactive(
                         qcfg.system_prompt = base_query_config.system_prompt.clone();
                         qcfg.output_style = cmd_ctx.config.effective_output_style();
                         qcfg.output_style_prompt = cmd_ctx.config.resolve_output_style_prompt();
-                        qcfg.working_directory = Some(tool_ctx.working_dir.display().to_string());
+                        qcfg.working_directory = Some(tool_ctx.main_root().display().to_string());
+                        qcfg.workspace_roots = workspace_roots_for_prompt(&tool_ctx);
                         // The active-goal system-prompt addendum is now injected
                         // inside run_query_loop per turn (issue #230 / MI-3), so
                         // it also covers in-loop continuation turns.
@@ -3347,6 +3370,8 @@ async fn run_interactive(
                 let mut qcfg = base_query_config.clone();
                 qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                 qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                qcfg.working_directory = Some(tool_ctx.main_root().display().to_string());
+                qcfg.workspace_roots = workspace_roots_for_prompt(&tool_ctx);
                 // Auto-compact is a maintenance turn, not a goal turn: never let
                 // it trigger in-loop goal continuation.
                 qcfg.continuation = claurst_query::ContinuationMode::Default;
@@ -3503,6 +3528,8 @@ async fn run_interactive(
                         let mut qcfg = base_query_config.clone();
                         qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                         qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                        qcfg.working_directory = Some(tool_ctx.main_root().display().to_string());
+                        qcfg.workspace_roots = workspace_roots_for_prompt(&tool_ctx);
                         let tracker = cost_tracker.clone();
                         let tx = event_tx.clone();
                         let client_clone = client.clone();
@@ -3611,6 +3638,8 @@ async fn run_interactive(
                 let mut qcfg = base_query_config.clone();
                 qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                 qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                qcfg.working_directory = Some(tool_ctx.main_root().display().to_string());
+                qcfg.workspace_roots = workspace_roots_for_prompt(&tool_ctx);
                 let tracker = cost_tracker.clone();
                 let tx = event_tx.clone();
                 let client_clone = client.clone();
@@ -4027,7 +4056,7 @@ async fn run_interactive(
                 session.messages = messages.clone();
                 session.updated_at = chrono::Utc::now();
                 session.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
-                session.working_dir = Some(tool_ctx.working_dir.display().to_string());
+                session.working_dir = Some(tool_ctx.main_root().display().to_string());
                 app.is_streaming = false;
                 app.status_message = None;
                 // Drain one queued message into the prompt and request an

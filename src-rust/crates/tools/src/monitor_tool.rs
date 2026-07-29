@@ -258,8 +258,9 @@ mod tests {
         let handler = Arc::new(AutoPermissionHandler {
             mode: claurst_core::config::PermissionMode::Default,
         });
+        use std::collections::BTreeMap;
         ToolContext {
-            working_dir: PathBuf::from("."),
+            workspace_roots: BTreeMap::from([("main".to_string(), std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))]),
             permission_mode: claurst_core::config::PermissionMode::Default,
             permission_handler: handler,
             cost_tracker: claurst_core::cost::CostTracker::new(),

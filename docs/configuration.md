@@ -120,7 +120,7 @@ prefixed with their server name (`myserver_toolname`).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `additional_dirs` | array of strings | [] | Additional filesystem paths Claurst is allowed to read and write. Equivalent to passing `--add-dir` on the command line. |
+| `additional_dirs` | array of strings | [] | Additional filesystem paths Claurst is allowed to read and write. Equivalent to passing `--add-dir` on the command line. These directories are also exposed as named workspace roots alongside `&main`, so path-based tools can target them with `&root-name/relative` paths. |
 
 ### MCP servers
 

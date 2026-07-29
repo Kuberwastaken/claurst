@@ -637,6 +637,10 @@ Grants Claurst read access to an additional directory outside the working direct
 
 Multiple `--add-dir` flags can be combined.
 
+The working directory and additional directories are exposed to the model as named workspace roots. The primary working directory is always `&main`; each additional directory gets a stable root name derived from its directory name, lowercased and sanitized for use in prompts. For example, `_ai-engine` becomes `&_ai-engine`, and `My Project (API)` becomes `&my-project-api`.
+
+Path-based tools accept absolute paths, paths relative to `&main`, and workspace-root paths such as `&main/src/lib.rs` or `&_ai-engine/prd/spec.md`. For `Glob` and `Grep`, omitting `path` searches only `&main`; to search all workspace roots, the model calls the tool once per root, which can run in parallel.
+
 ### Environment variables in config
 
 Environment variables can be set in `.claude/settings.json` under an `env` key. These are injected into tool executions:
@@ -680,7 +684,7 @@ The `LspTool` provides code intelligence by communicating with a Language Server
 ```
 
 - `action` — required, one of the operations above
-- `file` — required, absolute or working-directory-relative path
+- `file` — required, absolute, working-directory-relative, or `&root-name/relative` path
 - `line` — 1-based line number (required for `hover`, `definition`, `references`)
 - `column` — 1-based column number (required for `hover`, `definition`, `references`)
 
@@ -707,4 +711,4 @@ LSP servers must be configured in `settings.json`:
 }
 ```
 
-If no LSP server is configured for the file's language, the tool returns an informative error. Path resolution is relative to the current working directory.
+If no LSP server is configured for the file's language, the tool returns an informative error. Relative paths resolve against `&main`; `&root-name/relative` paths resolve against the named workspace root.

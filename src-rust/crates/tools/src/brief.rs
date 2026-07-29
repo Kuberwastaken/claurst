@@ -59,7 +59,7 @@ impl Tool for BriefTool {
                 "attachments": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Optional file paths to attach (images, diffs, logs)"
+                    "description": "Optional file paths to attach (images, diffs, logs). Accepts absolute paths, main-relative paths, or &root-name/relative paths."
                 },
                 "status": {
                     "type": "string",

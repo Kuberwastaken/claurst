@@ -89,6 +89,14 @@ impl AgentRuntime {
 
         let mut query_config = QueryConfig::from_config(&config);
         query_config.working_directory = Some(working_dir.display().to_string());
+        query_config.workspace_roots = claurst_core::generate_root_names(
+            &working_dir,
+            &config.additional_dirs,
+            &config.workspace_paths,
+        )
+        .into_iter()
+        .map(|(name, path)| (name, path.display().to_string()))
+        .collect();
         query_config.provider_registry = Some(provider_registry.clone());
 
         Ok(Self {
