@@ -2,65 +2,47 @@
 
 ## Objective
 Clone claurst repo, create separate feature branches for 5 features, research
-codebase + jcode reference, write design docs per branch.
+codebase + jcode reference, write design docs per branch, review design docs,
+apply review fixes.
 
 ## Current status
-Complete. Repo cloned, 5 branches created, design docs committed per branch.
+Complete. Repo cloned, 5 branches created, design docs committed + reviewed +
+review fixes applied. All blocking and important review items resolved.
 
 ## Last completed step
-All 5 feature branches created with committed design docs. Research of claurst
-codebase + jcode reference complete.
+Applied review fixes to all 5 design docs. Each branch now has 2 commits:
+1. Initial design doc
+2. Review fixes applied
 
 ## Blockers
-None. Design phase complete. Implementation not started (user only requested
-branches + design).
+None. Design + review phase complete. Implementation not started.
 
-## Branches created
+## Branches
 
-| Branch | Design doc | Status |
-|--------|-----------|--------|
-| `feature/multiple-openai-compatible-providers` | `FEATURE_DESIGN_multiple_openai_compatible_providers.md` | Design committed |
-| `feature/model-favorite-selector` | `FEATURE_DESIGN_model_favorite_selector.md` | Design committed |
-| `feature/todo-management-status-indicator` | `FEATURE_DESIGN_todo_management_status_indicator.md` | Design committed |
-| `feature/batch-commands-no-model` | `FEATURE_DESIGN_batch_commands_no_model.md` | Design committed |
-| `feature/cursor-cli-acp-support` | `FEATURE_DESIGN_cursor_cli_acp_support.md` | Design committed |
+| Branch | Commits | Review fixes applied |
+|--------|---------|---------------------|
+| `feature/multiple-openai-compatible-providers` | 2 | headers on CustomProviderDef (not ProviderConfig), atomic writes for /add, is_openaiish_provider runtime check, HashMap not array, testing + error handling |
+| `feature/model-favorite-selector` | 2 | dedicated model_picker.rs widget (not dialog_select), valid_favorites() validation, Settings not Config placement, testing |
+| `feature/todo-management-status-indicator` | 2 | corrected schema (has id/content/status/priority, NOT activeForm), auto-poke ON by default, force_reopen for completed→pending, no-progress 3-turn threshold, confidence_history cap at 20, SystemMessageStyle::TodoCard, testing |
+| `feature/batch-commands-no-model` | 2 | std::process::Command (not PtyBashTool), !! multi-line via Shift+Enter, plan mode blocks !, separate shell history, default off, testing |
+| `feature/cursor-cli-acp-support` | 2 | tokio::sync::Mutex, Drop with start_kill, Connection client-mode lifecycle, lazy reconnection, ModelRegistry singleton (no OnceLock), testing + error handling |
 
-## Key research findings
+## Review verdicts (post-fix)
 
-### 1. Multiple OpenAI-compatible providers
-- Root cause: `provider_for_id()` is hardcoded `match` in
-  `openai_compat_providers.rs`; only `"custom-openai"` is generic
-- Fix: `customProviders` array in settings + dynamic dispatch before fixed match
-- No upstream PR implements this (confirmed via GitHub search)
+All 5 design docs pass review. Blocking items resolved:
+- multiple-providers: headers field clarified, atomic writes specified
+- model-favorite: separate widget, stale validation specified
+- todo-management: factual schema corrected, auto-poke default ON
+- batch-commands: std::process::Command, !! multi-line model specified
+- cursor-acp: tokio::sync::Mutex, Drop lifecycle, reconnection strategy
 
-### 2. Model favorite selector
-- No existing favorites concept in claurst
-- `ModelRegistry` keyed by `"provider/model"` — favorites = simple array of keys
-- Reference: jcode's model picker has `inline_interactive_state` with
-  `selected` + `preview` mode
-
-### 3. Todo management + poke verification
-- Claurst has `TodoWrite` tool (basic: content/status/activeForm) + `GoalCompleteTool`
-- Missing: live status indicator, auto-poke, inline todo card
-- Jcode pattern: `build_auto_poke_message()` in `jcode-base/src/todo.rs`,
-  `OvernightAutoPokeState` in `commands_overnight.rs`, todo card in
-  `todos_view.rs`, progress pips in `info_widget_todos.rs`
-- Jcode `TodoItem` has: confidence, completion_confidence, confidence_history,
-  blocked_by, group, assigned_to
-
-### 4. Bang (`!`) batch commands
-- Claurst has NO `!` feature currently — this is new, not a fix
-- Design: intercept `!` prefix before model query, execute via Bash directly,
-  zero token consumption, output in display_messages only (not conversation)
-- Existing `render_bash_input_line()` in messages/mod.rs can be reused
-
-### 5. Cursor CLI ACP support
-- Claurst has ACP **server** only (`crates/acp/`) — no client
-- Jcode has full implementation: `jcode-provider-cursor-acp-runtime` (1940 lines)
-- Key: spawn `agent --force --trust acp` subprocess, JSON-RPC 2.0 over stdio,
-  reuse claurst's `Connection` struct as client
-- Cursor models are opaque IDs, catalog discovered from `initialize` response
+## Recommended merge order
+1. `feature/multiple-openai-compatible-providers` — other features depend on custom provider ids
+2. `feature/model-favorite-selector` — benefits from custom provider models
+3. `feature/cursor-cli-acp-support` — independent but benefits from custom provider infrastructure
+4. `feature/todo-management-status-indicator` — independent, most complex
+5. `feature/batch-commands-no-model` — fully independent, simplest
 
 ## Next action
-Switch to `main` branch. Implementation of any feature can begin by checking out
-the corresponding branch and following the design doc.
+Switch to a feature branch and begin implementation following the design doc.
+Recommended start: `feature/multiple-openai-compatible-providers` (foundational).
