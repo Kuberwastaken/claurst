@@ -1,6 +1,11 @@
 # Rust
 src-rust/target/
 
+# VS Code extension
+editors/vscode/node_modules/
+editors/vscode/out/
+editors/vscode/*.vsix
+
 # OS
 .DS_Store
 
