@@ -1021,6 +1021,10 @@ pub mod config {
         pub theme: Theme,
         #[serde(default)]
         pub output_style: Option<String>,
+        /// Reasoning effort level for new turns (see [`crate::effort::EffortLevel`]).
+        /// `None` means the query loop's own default (`Medium`) applies.
+        #[serde(default)]
+        pub effort: Option<String>,
         pub auto_compact: bool,
         pub compact_threshold: f32,
         pub verbose: bool,
@@ -1455,6 +1459,13 @@ pub mod config {
             }
         }
 
+
+        /// Resolve the configured reasoning effort level, if any and valid.
+        /// An unset or unparseable value falls back to the query loop's own
+        /// default (`EffortLevel::Medium`) rather than erroring here.
+        pub fn effective_effort_level(&self) -> Option<crate::effort::EffortLevel> {
+            self.effort.as_deref().and_then(crate::effort::EffortLevel::from_str)
+        }
 
         /// Resolve the effective max-tokens.
         pub fn effective_max_tokens(&self) -> u32 {
@@ -1939,6 +1950,7 @@ pub mod config {
                 permission_mode: over.config.permission_mode,
                 theme: over.config.theme,
                 output_style: over.config.output_style.or(base.config.output_style),
+                effort: over.config.effort.or(base.config.effort),
                 auto_compact: over.config.auto_compact || base.config.auto_compact,
                 compact_threshold: if over.config.compact_threshold != 0.0 {
                     over.config.compact_threshold
@@ -4759,6 +4771,24 @@ mod tests {
     fn test_config_effective_model_override() {
         let cfg = crate::config::Config { model: Some("claude-haiku-4-5-20251001".to_string()), ..Default::default() };
         assert_eq!(cfg.effective_model(), "claude-haiku-4-5-20251001");
+    }
+
+    #[test]
+    fn test_config_effective_effort_level_unset_is_none() {
+        let cfg = crate::config::Config::default();
+        assert_eq!(cfg.effective_effort_level(), None);
+    }
+
+    #[test]
+    fn test_config_effective_effort_level_valid() {
+        let cfg = crate::config::Config { effort: Some("xhigh".to_string()), ..Default::default() };
+        assert_eq!(cfg.effective_effort_level(), Some(crate::effort::EffortLevel::XHigh));
+    }
+
+    #[test]
+    fn test_config_effective_effort_level_invalid_falls_back_to_none() {
+        let cfg = crate::config::Config { effort: Some("not-a-level".to_string()), ..Default::default() };
+        assert_eq!(cfg.effective_effort_level(), None);
     }
 
     #[test]
