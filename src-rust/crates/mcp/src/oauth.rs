@@ -195,7 +195,7 @@ pub async fn begin_mcp_auth(
     let redirect_port = oauth_port_alloc()
         .map_err(|e| anyhow::anyhow!("Failed to allocate OAuth redirect port: {}", e))?;
     let redirect_uri = format!("http://127.0.0.1:{}/callback", redirect_port);
-    let verifier = pkce_verifier();
+    let verifier = pkce_verifier().map_err(|e| anyhow::anyhow!("Failed to generate PKCE verifier: {}", e))?;
     let auth_url = build_mcp_auth_url(
         &metadata.authorization_endpoint,
         &redirect_uri,
@@ -373,12 +373,12 @@ pub async fn get_valid_mcp_access_token(
 // ---------------------------------------------------------------------------
 
 /// Generate a PKCE code verifier (43 URL-safe random chars per RFC 7636).
-pub fn pkce_verifier() -> String {
+pub fn pkce_verifier() -> std::io::Result<String> {
     use base64::Engine as _;
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).expect("getrandom failed");
+    getrandom::getrandom(&mut bytes).map_err(std::io::Error::other)?;
     // base64url-encode → 43 chars (256 bits of entropy, no padding)
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
 /// Derive a PKCE code challenge from a verifier (S256 method).
@@ -424,7 +424,7 @@ pub fn initiate_xaa_login(
     idp_url: &str,
 ) -> std::io::Result<XaaLoginState> {
     let port = oauth_port_alloc()?;
-    let verifier = pkce_verifier();
+    let verifier = pkce_verifier()?;
     let challenge = pkce_challenge(&verifier);
     let redirect_uri = format!("http://127.0.0.1:{}/callback", port);
 
@@ -584,6 +584,12 @@ mod tests {
 
         let normal = token_path("my-server");
         assert_eq!(normal.file_name().unwrap(), "my-server.json");
+    }
+
+    #[test]
+    fn pkce_verifier_is_43_chars() {
+        let v = pkce_verifier().expect("getrandom should succeed in tests");
+        assert_eq!(v.len(), 43);
     }
 
     #[test]
