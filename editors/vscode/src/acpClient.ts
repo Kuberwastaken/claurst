@@ -22,6 +22,8 @@ export type ToolCallUpdate = {
   title?: string;
   status?: string;
   kind?: string;
+  /** First text content block from the tool's result, if any. */
+  resultText?: string;
 };
 
 export interface AcpClientEvents {
@@ -158,6 +160,7 @@ export class AcpClient {
             title: update.title,
             status: update.status,
             kind: update.kind,
+            resultText: extractToolResultText(update.content),
           });
           break;
         case 'tool_call_update':
@@ -166,6 +169,7 @@ export class AcpClient {
             title: update.title,
             status: update.status,
             kind: update.kind,
+            resultText: extractToolResultText(update.content),
           });
           break;
         default:
@@ -237,4 +241,17 @@ function extractText(content: any): string {
     return content.text ?? '';
   }
   return '';
+}
+
+/** Pull the first text block out of a ToolCall(Update)'s `content` array. */
+function extractToolResultText(content: any): string | undefined {
+  if (!Array.isArray(content)) {
+    return undefined;
+  }
+  for (const item of content) {
+    if (item?.type === 'content' && item.content?.type === 'text') {
+      return item.content.text ?? undefined;
+    }
+  }
+  return undefined;
 }
