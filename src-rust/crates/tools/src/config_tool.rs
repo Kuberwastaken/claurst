@@ -1,7 +1,7 @@
 // ConfigTool: get or set Claurst configuration settings at runtime.
 //
 // Reads from and persists to ~/.claurst/settings.json.
-// Supported settings: model, max_tokens, verbose, permission_mode.
+// Supported settings: model, provider, effort, max_tokens, verbose, permission_mode.
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
@@ -18,6 +18,8 @@ struct ConfigInput {
 
 static SUPPORTED_SETTINGS: &[(&str, &str)] = &[
     ("model", "LLM model to use (e.g. 'claude-opus-4-6')"),
+    ("provider", "Active provider id (e.g. 'anthropic', 'openai', 'google')"),
+    ("effort", "Reasoning effort: none | minimal | low | medium | high | xhigh | max | ultracode"),
     ("max_tokens", "Maximum output tokens per response"),
     ("verbose", "Enable verbose logging (true/false)"),
     ("permission_mode", "Permission mode: default | accept_edits | bypass_permissions | plan"),
@@ -30,8 +32,8 @@ impl Tool for ConfigTool {
 
     fn description(&self) -> &str {
         "Get or set Claurst configuration settings. Omit 'value' to read the current value. \
-         Supported settings: model, max_tokens, verbose, permission_mode, auto_compact. \
-         Changes persist to ~/.claurst/settings.json."
+         Supported settings: model, provider, effort, max_tokens, verbose, permission_mode, \
+         auto_compact. Changes persist to ~/.claurst/settings.json."
     }
 
     fn permission_level(&self) -> PermissionLevel { PermissionLevel::Write }
@@ -91,6 +93,34 @@ impl Tool for ConfigTool {
                         return ToolResult::error(format!("Failed to save settings: {}", e));
                     }
                     ToolResult::success(format!("model = \"{}\"", s))
+                }
+                "provider" => {
+                    let s = match new_value.as_str() {
+                        Some(s) => s.to_string(),
+                        None => return ToolResult::error("'provider' must be a string".to_string()),
+                    };
+                    settings.config.provider = Some(s.clone());
+                    if let Err(e) = settings.save().await {
+                        return ToolResult::error(format!("Failed to save settings: {}", e));
+                    }
+                    ToolResult::success(format!("provider = \"{}\"", s))
+                }
+                "effort" => {
+                    let s = match new_value.as_str() {
+                        Some(s) => s,
+                        None => return ToolResult::error("'effort' must be a string".to_string()),
+                    };
+                    if claurst_core::effort::EffortLevel::from_str(s).is_none() {
+                        return ToolResult::error(format!(
+                            "Unknown effort level '{}'. Use: none | minimal | low | medium | high | xhigh | max | ultracode",
+                            s
+                        ));
+                    }
+                    settings.config.effort = Some(s.to_string());
+                    if let Err(e) = settings.save().await {
+                        return ToolResult::error(format!("Failed to save settings: {}", e));
+                    }
+                    ToolResult::success(format!("effort = \"{}\"", s))
                 }
                 "max_tokens" => {
                     let n = match new_value.as_u64() {
@@ -162,6 +192,18 @@ impl Tool for ConfigTool {
                 "model" => ToolResult::success(format!(
                     "model = \"{}\"",
                     settings.config.effective_model()
+                )),
+                "provider" => ToolResult::success(format!(
+                    "provider = \"{}\"",
+                    settings.config.selected_provider_id()
+                )),
+                "effort" => ToolResult::success(format!(
+                    "effort = \"{}\"",
+                    settings
+                        .config
+                        .effective_effort_level()
+                        .unwrap_or_default()
+                        .as_str()
                 )),
                 "max_tokens" => ToolResult::success(format!(
                     "max_tokens = {}",
