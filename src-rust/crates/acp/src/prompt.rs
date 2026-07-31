@@ -325,3 +325,84 @@ fn tool_title(tool_name: &str, raw_input: Option<&serde_json::Value>) -> String 
     }
     tool_name.to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_prompt_blocks_joins_text_blocks_with_blank_line() {
+        let blocks = vec![
+            acp::ContentBlock::Text(acp::TextContent::new("first")),
+            acp::ContentBlock::Text(acp::TextContent::new("second")),
+        ];
+        assert_eq!(render_prompt_blocks(&blocks), "first\n\nsecond");
+    }
+
+    #[test]
+    fn render_prompt_blocks_renders_resource_links() {
+        let blocks = vec![acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
+            "notes.md",
+            "file:///tmp/notes.md",
+        ))];
+        assert_eq!(
+            render_prompt_blocks(&blocks),
+            "[resource link: file:///tmp/notes.md]"
+        );
+    }
+
+    #[test]
+    fn render_prompt_blocks_drops_images_without_panicking() {
+        let blocks = vec![
+            acp::ContentBlock::Text(acp::TextContent::new("caption")),
+            acp::ContentBlock::Image(acp::ImageContent::new("base64data", "image/png")),
+        ];
+        assert_eq!(render_prompt_blocks(&blocks), "caption");
+    }
+
+    #[test]
+    fn render_prompt_blocks_empty_input_is_empty_string() {
+        assert_eq!(render_prompt_blocks(&[]), "");
+    }
+
+    #[test]
+    fn classify_tool_kind_maps_known_names() {
+        assert_eq!(classify_tool_kind("Read"), acp::ToolKind::Read);
+        assert_eq!(classify_tool_kind("Edit"), acp::ToolKind::Edit);
+        assert_eq!(classify_tool_kind("Bash"), acp::ToolKind::Execute);
+        assert_eq!(classify_tool_kind("WebFetch"), acp::ToolKind::Fetch);
+        assert_eq!(classify_tool_kind("Grep"), acp::ToolKind::Search);
+        assert_eq!(classify_tool_kind("Rm"), acp::ToolKind::Delete);
+        assert_eq!(classify_tool_kind("Rename"), acp::ToolKind::Move);
+        assert_eq!(classify_tool_kind("Sequential"), acp::ToolKind::Think);
+    }
+
+    #[test]
+    fn classify_tool_kind_unknown_name_is_other() {
+        assert_eq!(classify_tool_kind("SomeMcpTool"), acp::ToolKind::Other);
+    }
+
+    #[test]
+    fn tool_title_falls_back_to_bare_name_without_input() {
+        assert_eq!(tool_title("Bash", None), "Bash");
+    }
+
+    #[test]
+    fn tool_title_prefers_path_like_fields_in_priority_order() {
+        let input = serde_json::json!({ "path": "/a", "file_path": "/b" });
+        // file_path is checked before path in the priority list.
+        assert_eq!(tool_title("Edit", Some(&input)), "Edit: /b");
+    }
+
+    #[test]
+    fn tool_title_uses_command_field_for_bash() {
+        let input = serde_json::json!({ "command": "ls -la" });
+        assert_eq!(tool_title("Bash", Some(&input)), "Bash: ls -la");
+    }
+
+    #[test]
+    fn tool_title_falls_back_when_input_has_no_known_field() {
+        let input = serde_json::json!({ "unrelated": 42 });
+        assert_eq!(tool_title("CustomTool", Some(&input)), "CustomTool");
+    }
+}
