@@ -345,7 +345,7 @@ impl Drop for LegacySseRmcpTransport {
         // Some upper-layer paths drop the backend instead of calling close()
         // explicitly. Abort the listener tasks again here so legacy SSE does
         // not outlive the connection teardown.
-        let mut tasks = self.background_tasks.lock().expect("task mutex poisoned");
+        let mut tasks = lock_recover(&self.background_tasks);
         for handle in tasks.drain(..) {
             handle.abort();
         }
@@ -359,11 +359,7 @@ impl rmcp::transport::Transport<RoleClient> for LegacySseRmcpTransport {
         &mut self,
         item: rmcp::service::TxJsonRpcMessage<RoleClient>,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
-        let endpoint = self
-            .post_endpoint
-            .lock()
-            .expect("endpoint mutex poisoned")
-            .clone();
+        let endpoint = lock_recover(&self.post_endpoint).clone();
         let client = self.client.clone();
         let auth_token = self.auth_token.clone();
         let server_name = self.server_name.clone();
@@ -415,7 +411,7 @@ impl rmcp::transport::Transport<RoleClient> for LegacySseRmcpTransport {
     fn close(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         let background_tasks = Arc::clone(&self.background_tasks);
         async move {
-            let mut tasks = background_tasks.lock().expect("task mutex poisoned");
+            let mut tasks = lock_recover(&background_tasks);
             for handle in tasks.drain(..) {
                 handle.abort();
             }
@@ -474,7 +470,7 @@ async fn handle_legacy_sse_http_response(
                 tracing::warn!(server = %server_name_for_task, error = %e, "legacy SSE POST stream closed with error");
             }
         });
-        background_tasks.lock().expect("task mutex poisoned").push(task);
+        lock_recover(&background_tasks).push(task);
         return Ok(());
     }
 
