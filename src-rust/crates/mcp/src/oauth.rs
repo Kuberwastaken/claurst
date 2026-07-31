@@ -52,8 +52,16 @@ fn token_store_dir() -> PathBuf {
 }
 
 /// Path to the token store for a given MCP server.
+///
+/// `server_name` is untrusted (it comes from MCP server config), so it is
+/// reduced to its file-name component before joining — this rejects path
+/// separators and `..` traversal instead of trusting the raw string.
 fn token_path(server_name: &str) -> PathBuf {
-    token_store_dir().join(format!("{}.json", server_name))
+    let safe_name = std::path::Path::new(server_name)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    token_store_dir().join(format!("{}.json", safe_name))
 }
 
 /// Persist an MCP OAuth token to disk.
@@ -567,6 +575,16 @@ pub async fn refresh_mcp_token(server_name: &str, token_endpoint: &str) -> anyho
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_path_strips_path_traversal() {
+        let traversal = token_path("../../etc/passwd");
+        assert_eq!(traversal.file_name().unwrap(), "passwd.json");
+        assert_eq!(traversal.parent().unwrap(), token_store_dir());
+
+        let normal = token_path("my-server");
+        assert_eq!(normal.file_name().unwrap(), "my-server.json");
+    }
 
     #[test]
     fn pkce_challenge_length() {
