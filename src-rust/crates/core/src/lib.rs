@@ -1317,6 +1317,10 @@ pub mod config {
         /// Note: @include in CLAUDE.md/AGENTS.md always injects regardless of this limit.
         #[serde(default = "default_file_injection_max_size", rename = "fileInjectionMaxSize")]
         pub file_injection_max_size: usize,
+        /// Whether auto-poke is enabled. When true, the model is automatically
+        /// continued when it stops with incomplete todos. Default: true.
+        #[serde(default = "default_true", rename = "autoPokeEnabled")]
+        pub auto_poke_enabled: bool,
     }
 
     /// A user-defined slash command template.
@@ -2031,6 +2035,7 @@ pub mod config {
                 file_autocomplete_show_hidden_files: over.file_autocomplete_show_hidden_files || base.file_autocomplete_show_hidden_files,
                 file_injection_enabled: over.file_injection_enabled || base.file_injection_enabled,
                 file_injection_max_size: if over.file_injection_max_size != 0 { over.file_injection_max_size } else { base.file_injection_max_size },
+                auto_poke_enabled: over.auto_poke_enabled || base.auto_poke_enabled,
             }
         }
     }
@@ -5314,5 +5319,12 @@ mod tests {
             registry.get(&id).unwrap().status,
             tasks::TaskStatus::Cancelled
         );
+    }
+
+    #[test]
+    fn auto_poke_enabled_default_true() {
+        let json = r#"{}"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert!(settings.auto_poke_enabled);
     }
 }

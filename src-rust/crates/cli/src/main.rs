@@ -1884,6 +1884,8 @@ async fn run_interactive(
     // arrive as their final character, so re-shifting them would corrupt input
     // (issue #183: typing `/` produced `?`).
     app.kitty_keyboard_active = claurst_tui::keyboard_enhancement_active();
+    // Wire session ID so auto-poke + todo persistence can find the right list.
+    app.session_id = session.id.clone();
     // Seed the project-MCP approval queue: untrusted project servers that the
     // user must approve before they are allowed to launch (issue #123).
     app.mcp_project_root = mcp_project_root;
@@ -2427,6 +2429,7 @@ async fn run_interactive(
                                     tool_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_title = None;
+                                    app.session_id = session.id.clone();
                                     // Reset per-turn diff/turn bookkeeping, as
                                     // ResumeSession does when swapping sessions.
                                     tool_ctx.file_history = Arc::new(ParkingMutex::new(
@@ -2527,6 +2530,7 @@ async fn run_interactive(
                                     tool_ctx.config.model = Some(session.model.clone());
                                     app.model_name = session.model.clone();
                                     tool_ctx.session_id = session.id.clone();
+                                    app.session_id = session.id.clone();
                                     tool_ctx.file_history = Arc::new(ParkingMutex::new(
                                         claurst_core::file_history::FileHistory::new(),
                                     ));
