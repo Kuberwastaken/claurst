@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use crate::agents_view::render_agents_menu;
 use crate::context_viz::render_context_viz;
 use crate::export_dialog::render_export_dialog;
-use crate::app::{App, ContextMenuKind, SystemAnnotation, SystemMessageStyle, ToolStatus};
+use crate::app::{App, ContextMenuKind, DisplayMessage, SystemAnnotation, SystemMessageStyle, ToolStatus};
 use crate::rustle::rustle_lines;
 use crate::diff_viewer::render_diff_dialog;
 use crate::model_picker::render_model_picker;
@@ -1528,7 +1528,62 @@ fn build_all_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         }
     }
 
+    // Append display-only bang command output (never sent to the model).
+    let bang_lines = render_bang_display_lines(app);
+    if !bang_lines.is_empty() {
+        push_rendered_items(&mut items, bang_lines, None, false);
+    }
+
     items
+}
+
+/// Render display-only `!` bang command entries (command, output, error).
+/// These are appended at the end of the transcript and never sent to the model.
+fn render_bang_display_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut found = false;
+    for msg in &app.display_messages {
+        match msg {
+            DisplayMessage::BangCommand { command } => {
+                found = true;
+                if !lines.is_empty() {
+                    lines.push(Line::from(""));
+                }
+                lines.push(Line::styled(
+                    format!("$ {}", command),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            DisplayMessage::BangOutput { text, exit_code } => {
+                found = true;
+                let color = if exit_code.unwrap_or(0) != 0 {
+                    Color::Red
+                } else {
+                    Color::Gray
+                };
+                for line in text.lines() {
+                    lines.push(Line::styled(
+                        line.to_string(),
+                        Style::default().fg(color),
+                    ));
+                }
+            }
+            DisplayMessage::BangError { text } => {
+                found = true;
+                lines.push(Line::styled(
+                    text.clone(),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            _ => {}
+        }
+    }
+    if found {
+        lines.push(Line::from(""));
+    }
+    lines
 }
 
 fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {

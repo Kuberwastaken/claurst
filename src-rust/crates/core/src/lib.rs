@@ -89,7 +89,7 @@ pub use types::{
     ContentBlock, ImageSource, DocumentSource, CitationsConfig, Message, MessageContent,
     MessageCost, Role, ToolDefinition, ToolResultContent, UsageInfo,
 };
-pub use config::{AgentDefinition, BudgetSplitPolicy, Config, CommandTemplate, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
+pub use config::{AgentDefinition, BudgetSplitPolicy, BangCommandsConfig, Config, CommandTemplate, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
 pub use import_config::{ClaudeMdPreview, ImportExecutionResult, ImportPaths, ImportPreview, ImportSelection, PreviewAction, PreviewField, SettingsPreview, build_import_preview, execute_import, summarize_import_result};
 
 // Skill discovery: filesystem and git URL skill loading.
@@ -1202,6 +1202,32 @@ pub mod config {
         pub urls: Vec<String>,
     }
 
+    // ---- BangCommandsConfig ---------------------------------------------
+
+    /// Configuration for the `!` batch command feature.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct BangCommandsConfig {
+        /// Whether the feature is enabled. Default: false (opt-in).
+        #[serde(default)]
+        pub enabled: bool,
+        /// Whether to add `!` commands to a separate shell-command history.
+        #[serde(default, rename = "addToHistory")]
+        pub add_to_history: bool,
+        /// Whether to display command + output in the chat transcript.
+        #[serde(default = "default_true", rename = "showInTranscript")]
+        pub show_in_transcript: bool,
+    }
+
+    impl Default for BangCommandsConfig {
+        fn default() -> Self {
+            Self {
+                enabled: false,
+                add_to_history: false,
+                show_in_transcript: default_true(),
+            }
+        }
+    }
+
     // ---- Settings --------------------------------------------------------
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1317,6 +1343,9 @@ pub mod config {
         /// Note: @include in CLAUDE.md/AGENTS.md always injects regardless of this limit.
         #[serde(default = "default_file_injection_max_size", rename = "fileInjectionMaxSize")]
         pub file_injection_max_size: usize,
+        /// Configuration for the `!` batch command feature.
+        #[serde(default, rename = "bangCommands")]
+        pub bang_commands: BangCommandsConfig,
     }
 
     /// A user-defined slash command template.
@@ -2031,6 +2060,11 @@ pub mod config {
                 file_autocomplete_show_hidden_files: over.file_autocomplete_show_hidden_files || base.file_autocomplete_show_hidden_files,
                 file_injection_enabled: over.file_injection_enabled || base.file_injection_enabled,
                 file_injection_max_size: if over.file_injection_max_size != 0 { over.file_injection_max_size } else { base.file_injection_max_size },
+                bang_commands: BangCommandsConfig {
+                    enabled: over.bang_commands.enabled || base.bang_commands.enabled,
+                    add_to_history: over.bang_commands.add_to_history || base.bang_commands.add_to_history,
+                    show_in_transcript: over.bang_commands.show_in_transcript && base.bang_commands.show_in_transcript,
+                },
             }
         }
     }
@@ -2291,6 +2325,24 @@ pub mod config {
                 config.resolve_request_timeout_secs("openai"),
                 DEFAULT_REQUEST_TIMEOUT_SECS
             );
+        }
+
+        #[test]
+        fn bang_commands_default_disabled() {
+            let json = r#"{}"#;
+            let settings: Settings = serde_json::from_str(json).unwrap();
+            assert!(!settings.bang_commands.enabled);
+            assert!(!settings.bang_commands.add_to_history);
+            assert!(settings.bang_commands.show_in_transcript);
+        }
+
+        #[test]
+        fn bang_commands_deserialize() {
+            let json = r#"{"bangCommands": {"enabled": true, "addToHistory": true, "showInTranscript": false}}"#;
+            let settings: Settings = serde_json::from_str(json).unwrap();
+            assert!(settings.bang_commands.enabled);
+            assert!(settings.bang_commands.add_to_history);
+            assert!(!settings.bang_commands.show_in_transcript);
         }
     }
 }
