@@ -1114,6 +1114,12 @@ pub mod config {
         /// Keyboard scrolling (PageUp/PageDown, etc.) is unaffected either way.
         #[serde(default, rename = "mouseCapture", skip_serializing_if = "Option::is_none")]
         pub mouse_capture: Option<bool>,
+        /// Whether the max-steps graceful degradation summary turn is enabled.
+        /// When `true` (default), exceeding `max_turns` runs one final
+        /// tool-less turn asking the model to summarize progress. When `false`,
+        /// the loop returns cold (last assistant message) immediately.
+        #[serde(default = "default_true", rename = "degradationSummaryEnabled")]
+        pub degradation_summary_enabled: bool,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -1982,6 +1988,7 @@ pub mod config {
                 file_injection_enabled: over.config.file_injection_enabled || base.config.file_injection_enabled,
                 file_injection_max_size: if over.config.file_injection_max_size != 0 { over.config.file_injection_max_size } else { base.config.file_injection_max_size },
                 request_timeout_secs: over.config.request_timeout_secs.or(base.config.request_timeout_secs),
+                degradation_summary_enabled: over.config.degradation_summary_enabled && base.config.degradation_summary_enabled,
             };
             Self {
                 config: merged_config,

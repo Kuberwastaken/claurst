@@ -95,6 +95,10 @@ pub struct QueryConfig {
     pub model: String,
     pub max_tokens: u32,
     pub max_turns: u32,
+    /// Whether the max-steps graceful degradation summary turn is enabled.
+    /// When `false`, exceeding `max_turns` returns cold (last assistant
+    /// message) instead of running a final tool-less summary turn.
+    pub degradation_enabled: bool,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
     pub output_style: claurst_core::system_prompt::OutputStyle,
@@ -174,6 +178,7 @@ impl Default for QueryConfig {
             model: claurst_core::constants::DEFAULT_MODEL.to_string(),
             max_tokens: claurst_core::constants::DEFAULT_MAX_TOKENS,
             max_turns: claurst_core::constants::MAX_TURNS_DEFAULT,
+            degradation_enabled: true,
             system_prompt: None,
             append_system_prompt: None,
             output_style: claurst_core::system_prompt::OutputStyle::Default,
@@ -210,6 +215,7 @@ impl QueryConfig {
                 .as_ref()
                 .map(|p| p.display().to_string()),
             managed_agents: cfg.managed_agents.clone(),
+            degradation_enabled: cfg.degradation_summary_enabled,
             ..Default::default()
         }
     }
@@ -231,6 +237,7 @@ impl QueryConfig {
                 .as_ref()
                 .map(|p| p.display().to_string()),
             managed_agents: cfg.managed_agents.clone(),
+            degradation_enabled: cfg.degradation_summary_enabled,
             ..Default::default()
         }
     }
@@ -471,6 +478,21 @@ pub async fn run_query_loop(
         // dispatched exactly once, and re-exceeding the cap afterwards returns
         // cold. Applies to both goal and non-goal runs.
         let degradation_turn = if turn > effective_max_turns {
+            if !config.degradation_enabled {
+                info!(
+                    turns = turn,
+                    max = effective_max_turns,
+                    "Max turns reached — degradation disabled, returning cold"
+                );
+                let last_msg = messages
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| Message::assistant("Max turns reached."));
+                return QueryOutcome::EndTurn {
+                    message: last_msg,
+                    usage: UsageInfo::default(),
+                };
+            }
             if degradation_done {
                 info!(
                     turns = turn,
@@ -2127,6 +2149,7 @@ mod tests {
             model: "claude-sonnet-4-6".to_string(),
             max_tokens: 4096,
             max_turns: 10,
+            degradation_enabled: true,
             system_prompt: sys.map(String::from),
             append_system_prompt: append.map(String::from),
             output_style: claurst_core::system_prompt::OutputStyle::Default,
