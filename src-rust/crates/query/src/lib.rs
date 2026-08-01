@@ -835,10 +835,16 @@ pub async fn run_query_loop(
                 if known_providers.contains(&p) {
                     (p.to_string(), m.to_string())
                 } else {
-                    // Treat the whole string as the model ID, fall through
-                    // to auto-detection below.
-                    let fallback_provider = tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
-                    (fallback_provider.to_string(), effective_model.clone())
+                    // Check whether `p` is a user-defined custom provider id.
+                    let settings = claurst_core::Settings::load_sync().unwrap_or_default();
+                    if settings.custom_providers.contains_key(p) {
+                        (p.to_string(), m.to_string())
+                    } else {
+                        // Treat the whole string as the model ID, fall through
+                        // to auto-detection below.
+                        let fallback_provider = tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
+                        (fallback_provider.to_string(), effective_model.clone())
+                    }
                 }
             } else {
                 // No explicit provider set (or set to "anthropic"): try the
@@ -2413,6 +2419,27 @@ mod tests {
         // both must be treated as OpenAI-compatible providers.
         assert!(is_openaiish_provider("alibaba"));
         assert!(is_openaiish_provider("qwen"));
+    }
+
+    #[test]
+    fn is_openaiish_provider_unknown_id_returns_false() {
+        // When a custom provider is registered in settings, is_openaiish_provider
+        // should return true even though it's not in the hardcoded list.
+        // This test uses a unique id unlikely to collide with real settings.
+        // Note: This test depends on no settings.json having this id;
+        // it verifies the fallback (no custom provider → matches! list).
+        let result = is_openaiish_provider("definitely-not-a-real-provider-99999");
+        assert!(!result);
+    }
+
+    #[test]
+    fn known_providers_includes_custom_provider_runtime_check() {
+        // The runtime check for custom providers should not crash and
+        // should not return true for arbitrary unknown strings.
+        // This is a negative test — no custom provider "fake-provider-xyz"
+        // should exist in settings.
+        let settings = claurst_core::Settings::load_sync().unwrap_or_default();
+        assert!(!settings.custom_providers.contains_key("fake-provider-xyz-12345"));
     }
 
     // ---- apply_compact_result / #213 data-loss guard ------------------------

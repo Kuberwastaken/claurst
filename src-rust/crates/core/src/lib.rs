@@ -89,7 +89,7 @@ pub use types::{
     ContentBlock, ImageSource, DocumentSource, CitationsConfig, Message, MessageContent,
     MessageCost, Role, ToolDefinition, ToolResultContent, UsageInfo,
 };
-pub use config::{AgentDefinition, BudgetSplitPolicy, Config, CommandTemplate, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
+pub use config::{AgentDefinition, BudgetSplitPolicy, Config, CommandTemplate, CustomModelDef, CustomProviderDef, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, ModelVariant, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
 pub use import_config::{ClaudeMdPreview, ImportExecutionResult, ImportPaths, ImportPreview, ImportSelection, PreviewAction, PreviewField, SettingsPreview, build_import_preview, execute_import, summarize_import_result};
 
 // Skill discovery: filesystem and git URL skill loading.
@@ -1009,6 +1009,126 @@ pub mod config {
         }
     }
 
+    // ---- ModelVariant ----------------------------------------------------
+
+    /// A model variant that overrides specific fields from its parent model
+    /// definition (e.g. a "max" variant that changes only `reasoning_effort`).
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    pub struct ModelVariant {
+        /// Override for reasoning effort level.
+        #[serde(
+            default,
+            rename = "reasoningEffort",
+            alias = "reasoning_effort",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub reasoning_effort: Option<String>,
+    }
+
+    // ---- CustomModelDef -------------------------------------------------
+
+    /// A model definition within a custom OpenAI-compatible provider.
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    pub struct CustomModelDef {
+        /// Total context window size in tokens.
+        #[serde(
+            default,
+            rename = "contextWindow",
+            alias = "context_window",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub context_window: Option<u32>,
+        /// Maximum tokens the model can emit in a single response.
+        #[serde(
+            default,
+            rename = "maxOutputTokens",
+            alias = "max_output_tokens",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub max_output_tokens: Option<u32>,
+        /// Human-readable display name shown in the model picker.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        /// Reasoning effort level (e.g. "high", "max", "none").
+        #[serde(
+            default,
+            rename = "reasoningEffort",
+            alias = "reasoning_effort",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub reasoning_effort: Option<String>,
+        /// Named variants that override specific fields from this model definition.
+        #[serde(default)]
+        pub variants: HashMap<String, ModelVariant>,
+    }
+
+    // ---- CustomProviderDef ----------------------------------------------
+
+    /// A user-defined OpenAI-compatible provider, stored in
+    /// [`Settings::custom_providers`] keyed by its unique id.
+    ///
+    /// Unlike [`ProviderConfig`] (which tweaks built-in providers), this is a
+    /// fully self-contained provider definition with its own base URL, API key,
+    /// custom headers, and model catalog. The id (map key) becomes the provider
+    /// id used in `provider/model` routing.
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    pub struct CustomProviderDef {
+        /// Human-readable display name shown in the provider picker.
+        #[serde(default)]
+        pub name: String,
+        /// OpenAI-compatible base URL (claurst appends `/chat/completions`).
+        #[serde(rename = "apiBase", alias = "api_base")]
+        pub api_base: String,
+        /// API key. Supports `{env:VAR_NAME}` substitution at load time.
+        /// `None` means no key — provider is registered but health_check
+        /// returns `Unavailable`.
+        #[serde(rename = "apiKey", alias = "api_key", default, skip_serializing_if = "Option::is_none")]
+        pub api_key: Option<String>,
+        /// Custom HTTP headers sent on every request to this provider.
+        #[serde(default)]
+        pub headers: HashMap<String, String>,
+        /// Model catalog local to this provider, keyed by model id.
+        #[serde(default)]
+        pub models: HashMap<String, CustomModelDef>,
+        /// Per-provider request timeout override in seconds.
+        #[serde(
+            default,
+            rename = "requestTimeoutSecs",
+            alias = "request_timeout_secs",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub request_timeout_secs: Option<u64>,
+        /// Whether streaming is enabled for this provider. Default: true
+        /// (streaming). Set to false for providers that don't support SSE.
+        #[serde(default, rename = "streaming", skip_serializing_if = "Option::is_none")]
+        pub streaming: Option<bool>,
+        /// Whether to send stream_options.include_usage when streaming.
+        /// Default: true. Set to false for providers that don't support it.
+        #[serde(default, rename = "includeUsageInStream", alias = "include_usage_in_stream", skip_serializing_if = "Option::is_none")]
+        pub include_usage_in_stream: Option<bool>,
+        /// JSON field name for reasoning/thinking content (e.g.
+        /// "reasoning_content" for DeepSeek). None means no reasoning field.
+        #[serde(default, rename = "reasoningField", alias = "reasoning_field", skip_serializing_if = "Option::is_none")]
+        pub reasoning_field: Option<String>,
+    }
+
+    impl CustomProviderDef {
+        /// Resolve the API key, substituting `{env:VAR_NAME}` patterns with
+        /// the corresponding environment variable value. Returns `None` if
+        /// the key is absent or the env var is unset.
+        pub fn resolve_api_key(&self) -> Option<String> {
+            self.api_key.as_ref().and_then(|raw| {
+                if let Some(var) = raw.strip_prefix("{env:").and_then(|s| s.strip_suffix('}')) {
+                    std::env::var(var).ok().filter(|v| !v.is_empty())
+                } else if raw.is_empty() {
+                    None
+                } else {
+                    Some(raw.clone())
+                }
+            })
+        }
+    }
+
     // ---- Config ----------------------------------------------------------
 
     /// Top-level configuration values, merged from CLI args + settings file + env.
@@ -1252,6 +1372,12 @@ pub mod config {
         /// Per-provider configurations stored in settings.json.
         #[serde(default)]
         pub providers: HashMap<String, ProviderConfig>,
+        /// User-defined OpenAI-compatible providers, keyed by unique id.
+        /// Each entry is a self-contained provider with its own base URL,
+        /// API key, headers, and model catalog. The id becomes the provider
+        /// id used in `provider/model` routing.
+        #[serde(default, rename = "customProviders", alias = "custom_providers")]
+        pub custom_providers: HashMap<String, CustomProviderDef>,
         /// User-supplied model metadata overrides stored in settings.json,
         /// keyed by `"provider/model"`. Merged into
         /// [`Config::model_overrides`] by [`Settings::effective_config`] and
@@ -1772,7 +1898,11 @@ pub mod config {
                 std::fs::create_dir_all(parent)?;
             }
             let content = serde_json::to_string_pretty(self)?;
-            std::fs::write(path, content)?;
+            // Atomic write: serialize to a temp file, then rename into place.
+            // On Unix, rename() is atomic — readers never see a partial file.
+            let tmp_path = path.with_extension("json.tmp");
+            std::fs::write(&tmp_path, &content)?;
+            std::fs::rename(&tmp_path, path)?;
             Ok(())
         }
 
@@ -1819,6 +1949,18 @@ pub mod config {
             // Merge top-level `providers` map into config.provider_configs.
             for (id, pc) in &self.providers {
                 config.provider_configs.entry(id.clone()).or_insert_with(|| pc.clone());
+            }
+            // Merge custom providers' API keys and base URLs into
+            // provider_configs so resolve_provider_api_key() can find them.
+            for (id, cp) in &self.custom_providers {
+                config.provider_configs.entry(id.clone()).or_insert_with(|| {
+                    ProviderConfig {
+                        api_key: cp.api_key.clone(),
+                        api_base: Some(cp.api_base.clone()),
+                        enabled: true,
+                        ..Default::default()
+                    }
+                });
             }
             // Merge top-level `modelOverrides` into config.model_overrides
             // (nested `config` block wins for keys present in both).
@@ -2007,6 +2149,7 @@ pub mod config {
                 last_seen_version: over.last_seen_version.or(base.last_seen_version),
                 provider: over.provider.or(base.provider),
                 providers: merge_map(base.providers, over.providers),
+                custom_providers: merge_map(base.custom_providers, over.custom_providers),
                 model_overrides: merge_map(base.model_overrides, over.model_overrides),
                 commands: merge_map(base.commands, over.commands),
                 formatter: merge_map(base.formatter, over.formatter),
@@ -5314,5 +5457,141 @@ mod tests {
             registry.get(&id).unwrap().status,
             tasks::TaskStatus::Cancelled
         );
+    }
+
+    #[test]
+    fn custom_provider_def_deserialize_camel_case() {
+        let json = r#"{
+            "name": "Test Gateway",
+            "apiBase": "https://gateway.example.com/v1",
+            "apiKey": "secret-key",
+            "headers": { "X-Custom-Header": "value" },
+            "models": {
+                "model-1": {
+                    "name": "Model One",
+                    "contextWindow": 128000,
+                    "maxOutputTokens": 8192,
+                    "reasoningEffort": "high"
+                }
+            },
+            "requestTimeoutSecs": 300
+        }"#;
+        let def: CustomProviderDef = serde_json::from_str(json).unwrap();
+        assert_eq!(def.name, "Test Gateway");
+        assert_eq!(def.api_base, "https://gateway.example.com/v1");
+        assert_eq!(def.api_key.as_deref(), Some("secret-key"));
+        assert_eq!(def.headers.get("X-Custom-Header").unwrap(), "value");
+        assert_eq!(def.models.len(), 1);
+        let model = def.models.get("model-1").unwrap();
+        assert_eq!(model.context_window, Some(128000));
+        assert_eq!(model.max_output_tokens, Some(8192));
+        assert_eq!(model.name.as_deref(), Some("Model One"));
+        assert_eq!(model.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(def.request_timeout_secs, Some(300));
+    }
+
+    #[test]
+    fn custom_provider_def_deserialize_snake_case() {
+        let json = r#"{
+            "name": "Test",
+            "api_base": "https://example.com",
+            "api_key": "key",
+            "models": {}
+        }"#;
+        let def: CustomProviderDef = serde_json::from_str(json).unwrap();
+        assert_eq!(def.api_base, "https://example.com");
+        assert_eq!(def.api_key.as_deref(), Some("key"));
+    }
+
+    #[test]
+    fn custom_provider_def_resolve_api_key_env_substitution() {
+        std::env::set_var("TEST_CUSTOM_PROVIDER_KEY", "env-key-value");
+        let def = CustomProviderDef {
+            api_key: Some("{env:TEST_CUSTOM_PROVIDER_KEY}".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(def.resolve_api_key().as_deref(), Some("env-key-value"));
+        std::env::remove_var("TEST_CUSTOM_PROVIDER_KEY");
+    }
+
+    #[test]
+    fn custom_provider_def_resolve_api_key_empty_env() {
+        let def = CustomProviderDef {
+            api_key: Some("{env:NONEXISTENT_VAR_12345}".to_string()),
+            ..Default::default()
+        };
+        assert!(def.resolve_api_key().is_none());
+    }
+
+    #[test]
+    fn custom_provider_def_resolve_api_key_none() {
+        let def = CustomProviderDef {
+            api_key: None,
+            ..Default::default()
+        };
+        assert!(def.resolve_api_key().is_none());
+    }
+
+    #[test]
+    fn custom_provider_def_resolve_api_key_plain() {
+        let def = CustomProviderDef {
+            api_key: Some("plain-key".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(def.resolve_api_key().as_deref(), Some("plain-key"));
+    }
+
+    #[test]
+    fn custom_provider_def_with_streaming_settings() {
+        let json = r#"{
+            "name": "Test",
+            "apiBase": "https://example.com/v1",
+            "streaming": false,
+            "includeUsageInStream": false,
+            "reasoningField": "reasoning_content"
+        }"#;
+        let def: CustomProviderDef = serde_json::from_str(json).unwrap();
+        assert_eq!(def.streaming, Some(false));
+        assert_eq!(def.include_usage_in_stream, Some(false));
+        assert_eq!(def.reasoning_field.as_deref(), Some("reasoning_content"));
+    }
+
+    #[test]
+    fn custom_model_def_with_variants() {
+        let json = r#"{
+            "contextWindow": 230000,
+            "maxOutputTokens": 32072,
+            "variants": {
+                "max": { "reasoningEffort": "max" },
+                "none": { "reasoningEffort": "none" }
+            }
+        }"#;
+        let model: CustomModelDef = serde_json::from_str(json).unwrap();
+        assert_eq!(model.context_window, Some(230000));
+        assert_eq!(model.variants.len(), 2);
+        assert_eq!(
+            model.variants.get("max").unwrap().reasoning_effort.as_deref(),
+            Some("max")
+        );
+    }
+
+    #[test]
+    fn settings_deserialize_with_custom_providers() {
+        let json = r#"{
+            "customProviders": {
+                "my-gateway": {
+                    "name": "My Gateway",
+                    "apiBase": "https://gw.example.com/v1",
+                    "models": {
+                        "model-a": { "name": "Model A" }
+                    }
+                }
+            }
+        }"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.custom_providers.len(), 1);
+        let provider = settings.custom_providers.get("my-gateway").unwrap();
+        assert_eq!(provider.name, "My Gateway");
+        assert_eq!(provider.models.len(), 1);
     }
 }

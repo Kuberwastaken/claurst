@@ -67,6 +67,13 @@ pub struct ProviderRegistry {
 fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvider>> {
     use crate::providers::openai_compat_providers as p;
 
+    // Custom providers from Settings take priority — their API key is
+    // already resolved via resolve_api_key() inside provider_for_custom_id,
+    // so we must NOT re-apply the auth-store key here.
+    if let Some(provider) = p::provider_for_custom_id(provider_id) {
+        return Some(Arc::new(provider));
+    }
+
     if let Some(provider) = p::provider_for_id(provider_id) {
         return Some(Arc::new(provider.with_api_key(key)));
     }
@@ -272,6 +279,12 @@ pub fn provider_from_config(
 
 pub fn runtime_provider_for(provider_id: &str) -> Option<Arc<dyn LlmProvider>> {
     use crate::providers::openai_compat_providers as p;
+
+    // Custom providers from Settings take priority — their API key is
+    // already resolved via resolve_api_key() inside provider_for_custom_id.
+    if let Some(provider) = p::provider_for_custom_id(provider_id) {
+        return Some(Arc::new(provider));
+    }
 
     // Local providers never require an API key — build them directly so that
     // the auth-store bypass below doesn't silently drop them.

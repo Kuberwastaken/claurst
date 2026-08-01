@@ -1049,6 +1049,8 @@ async fn run_models_command(args: &[String]) -> anyhow::Result<()> {
         .map(|s| s.effective_config().model_overrides)
         .unwrap_or_default();
     registry.apply_model_overrides(&overrides);
+    let settings = claurst_core::Settings::load_sync().unwrap_or_default();
+    registry.apply_custom_providers(&settings.custom_providers);
 
     let mut entries: Vec<&claurst_api::ModelEntry> = match &provider_filter {
         Some(pid) => registry.list_by_provider(pid),
@@ -1191,6 +1193,8 @@ fn load_cached_model_registry(config: &Config) -> Arc<claurst_api::ModelRegistry
     // Layer user metadata overrides on top of the catalog (issue #309). Stored
     // in the registry, so any later cache reload re-asserts them automatically.
     reg.apply_model_overrides(&config.model_overrides);
+    let settings = claurst_core::Settings::load_sync().unwrap_or_default();
+    reg.apply_custom_providers(&settings.custom_providers);
     Arc::new(reg)
 }
 
