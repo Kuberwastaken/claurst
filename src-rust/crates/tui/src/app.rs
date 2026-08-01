@@ -1142,6 +1142,12 @@ pub struct App {
     /// None when no goal is active. Updated by the REPL after each turn.
     pub active_goal_badge: Option<String>,
 
+    /// Number of discovered skills (from `.claurst/skills/` etc.) for the
+    /// status-bar indicator.
+    pub skill_count: usize,
+    /// Number of configured MCP servers for the status-bar indicator.
+    pub mcp_server_count: usize,
+
     // ---- Thinking block expansion state ----------------------------------
     /// Set of thinking block content hashes that are expanded.
     pub thinking_expanded: std::collections::HashSet<u64>,
@@ -1270,6 +1276,11 @@ impl App {
             reg.apply_model_overrides(&config.model_overrides);
             reg
         };
+        let skill_count = {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            claurst_core::discover_skills(&cwd, &config.skills).len()
+        };
+        let mcp_server_count = config.mcp_servers.len();
         Self {
             config,
             cost_tracker,
@@ -1471,6 +1482,8 @@ impl App {
             worktree_branch: None,
             agent_type_badge: None,
             active_goal_badge: None,
+            skill_count,
+            mcp_server_count,
             thinking_expanded: std::collections::HashSet::new(),
             last_msg_area: Cell::new(ratatui::layout::Rect::default()),
             last_selectable_area: Cell::new(ratatui::layout::Rect::default()),

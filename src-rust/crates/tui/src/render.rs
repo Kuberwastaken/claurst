@@ -2746,6 +2746,17 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
+// Skills + MCP count indicator.
+        if app.skill_count > 0 || app.mcp_server_count > 0 {
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+            parts.push(Span::styled(
+                format!("{} skills \u{00b7} {} mcp", app.skill_count, app.mcp_server_count),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
         // 4. Rate limits
         if let Some(pct) = app.rate_limit_5h_pct {
             if pct > 0.0 {
