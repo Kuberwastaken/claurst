@@ -154,3 +154,111 @@ impl SlashCommand for AgentCommand {
         }
     }
 }
+
+// ---- /add -------------------------------------------------------------
+
+/// Add a custom OpenAI-compatible provider to settings.
+///
+/// Usage: `/add <id> <apiBase> [apiKey]`
+///
+/// The `id` becomes the provider id used in `provider/model` routing.
+/// The `apiBase` is the OpenAI-compatible base URL.
+/// The optional `apiKey` supports `{env:VAR}` substitution.
+pub struct AddCustomProviderCommand;
+
+#[async_trait]
+impl SlashCommand for AddCustomProviderCommand {
+    fn name(&self) -> &str { "add" }
+    fn description(&self) -> &str { "Add a custom OpenAI-compatible provider" }
+    fn help(&self) -> &str {
+        "Usage: /add <id> <apiBase> [apiKey]\n\n\
+         Add a custom OpenAI-compatible provider to settings.json.\n\n\
+         Arguments:\n  \
+         id       \u{2014} unique provider id (e.g. \"my-gateway\")\n  \
+         apiBase  \u{2014} OpenAI-compatible base URL\n  \
+         apiKey   \u{2014} optional API key or {env:VAR} pattern\n\n\
+         Example:\n  \
+         /add my-gw https://gw.example.com/v1 {env:GW_API_KEY}\n\n\
+         The provider appears in /providers after restart. Models can be\
+         added via the customProviders.models map in settings.json."
+    }
+
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let parts: Vec<&str> = args.split_whitespace().collect();
+        if parts.len() < 2 {
+            return CommandResult::Message(
+                "Usage: /add <id> <apiBase> [apiKey]\n\
+                 Example: /add my-gw https://gw.example.com/v1"
+                    .to_string(),
+            );
+        }
+
+        let id = parts[0].trim();
+        let api_base = parts[1].trim();
+        let api_key = parts.get(2).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+
+        if id.is_empty() {
+            return CommandResult::Message("Error: provider id must not be empty.".to_string());
+        }
+        if api_base.is_empty() {
+            return CommandResult::Message("Error: apiBase must not be empty.".to_string());
+        }
+
+        // Basic URL validation.
+        if !api_base.starts_with("http://") && !api_base.starts_with("https://") {
+            return CommandResult::Message(format!(
+                "Error: apiBase must start with http:// or https:// (got: {})",
+                api_base
+            ));
+        }
+
+        // Load current settings from disk (fresh read, not in-memory cache).
+        let mut settings = match claurst_core::Settings::load_sync() {
+            Ok(s) => s,
+            Err(e) => {
+                return CommandResult::Message(format!(
+                    "Error loading settings: {}",
+                    e
+                ));
+            }
+        };
+
+        // Check for duplicate id.
+        if settings.custom_providers.contains_key(id) {
+            return CommandResult::Message(format!(
+                "Error: custom provider '{}' already exists. Use a different id or remove it from settings.json first.",
+                id
+            ));
+        }
+
+        // Use the id as the display name if no explicit name is provided.
+        let display_name = id.to_string();
+
+        // Insert the new provider.
+        let provider_def = claurst_core::config::CustomProviderDef {
+            name: display_name,
+            api_base: api_base.to_string(),
+            api_key,
+            headers: std::collections::HashMap::new(),
+            models: std::collections::HashMap::new(),
+            request_timeout_secs: None,
+            streaming: None,
+            include_usage_in_stream: None,
+            reasoning_field: None,
+        };
+        settings.custom_providers.insert(id.to_string(), provider_def);
+
+        // Save atomically.
+        if let Err(e) = settings.save_sync() {
+            return CommandResult::Message(format!("Error saving settings: {}", e));
+        }
+
+        CommandResult::Message(format!(
+            "Added custom provider '{}'.\n\
+             Base URL: {}\n\
+             Restart or reload settings to use it. Add models via the\n\
+             customProviders.{}.models map in settings.json.",
+            id, api_base, id
+        ))
+    }
+}

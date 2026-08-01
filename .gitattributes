@@ -1,0 +1,4 @@
+# Preserve CRLF line endings in files that use them on main,
+# so diffs don't churn from line-ending normalization.
+src-rust/crates/api/src/registry.rs -text
+src-rust/crates/commands/src/providers.rs -text
