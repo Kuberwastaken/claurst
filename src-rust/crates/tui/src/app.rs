@@ -311,6 +311,8 @@ pub enum SystemMessageStyle {
     Warning,
     /// Compact / auto-compact boundary marker.
     Compact,
+    /// Inline todo card showing task progress.
+    TodoCard,
 }
 
 /// A synthetic system annotation inserted between conversation messages.
@@ -878,6 +880,9 @@ pub struct App {
     pub rustle_temp_pose: Option<crate::rustle::RustlePose>,
     /// Frame counter at which the next random eye-shift should fire.
     pub rustle_next_blink: u64,
+    /// Token output rates from recent turns (tokens/sec), for computing
+    /// a rolling average. Last 5 turns kept.
+    pub recent_token_rates: Vec<f64>,
     /// Instant the current turn's streaming began (reset each time streaming starts).
     pub turn_start: Option<std::time::Instant>,
     /// Elapsed time string for the last completed turn, e.g. "2m 5s".
@@ -1062,6 +1067,19 @@ pub struct App {
     /// When `true`, the main loop will inject a synthetic Enter event on the
     /// next iteration to dequeue and submit the next queued message.
     pub pending_auto_submit: bool,
+    /// Auto-poke counter — how many pokes have been sent this session.
+    pub auto_poke_count: u32,
+    /// Hash of the last todo state for no-progress detection.
+    pub last_todo_hash: String,
+    /// Count of consecutive no-progress turns.
+    pub no_progress_turns: u32,
+    /// Whether the todo card is visible in the transcript.
+    pub todo_card_visible: bool,
+    /// When `true`, the main loop should start a new query turn because
+    /// auto-poke injected a continuation message into `queued_messages`.
+    pub pending_auto_poke: bool,
+    /// Current session ID (used for todo persistence + auto-poke).
+    pub session_id: String,
     /// Connect-a-provider dialog (/connect command).
     pub connect_dialog: DialogSelectState,
     /// Import-config source picker (/import-config command).
@@ -1318,6 +1336,7 @@ impl App {
                 .unwrap_or_default()
                 .subsec_nanos() as u64 % 300),
             turn_start: None,
+            recent_token_rates: Vec::new(),
             last_turn_elapsed: None,
             last_turn_verb: None,
             turn_metadata: Vec::new(),
@@ -1398,6 +1417,12 @@ impl App {
             auth_store: claurst_core::AuthStore::load(),
             queued_messages: std::collections::VecDeque::new(),
             pending_auto_submit: false,
+            auto_poke_count: 0,
+            last_todo_hash: String::new(),
+            no_progress_turns: 0,
+            todo_card_visible: false,
+            pending_auto_poke: false,
+            session_id: String::new(),
             connect_dialog: DialogSelectState::new("Connect a provider", provider_picker_items()),
             import_config_picker: DialogSelectState::new("Import config", import_config_picker_items()),
             import_config_dialog: ImportConfigDialogState::new(),
@@ -6413,6 +6438,28 @@ impl App {
                 }
                 // Record elapsed time and pick a completion verb
                 let seed = self.frame_count as usize ^ (self.messages.len() * 7);
+                // Track tokens per second for the status indicator (before take()).
+                // Prefer real usage; fall back to a rough char-based estimate
+                // (~4 chars/token) for providers that never report usage (e.g.
+                // cursor-acp, whose ACP protocol omits token counts).
+                let reported_output = usage.as_ref().map(|u| u.output_tokens).unwrap_or(0);
+                let output_tokens = if reported_output > 0 {
+                    reported_output
+                } else {
+                    (self.streaming_text.len() / 4).max(if self.streaming_text.is_empty() { 0 } else { 1 }) as u64
+                };
+                if output_tokens > 0 {
+                    if let Some(start) = self.turn_start {
+                        let elapsed_secs = start.elapsed().as_secs_f64();
+                        if elapsed_secs > 0.0 {
+                            let rate = output_tokens as f64 / elapsed_secs;
+                            self.recent_token_rates.push(rate);
+                            if self.recent_token_rates.len() > 5 {
+                                self.recent_token_rates.remove(0);
+                            }
+                        }
+                    }
+                }
                 let elapsed = self.turn_start.take()
                     .map(|start| format_elapsed_ms(start.elapsed().as_millis()));
                 self.last_turn_elapsed = Some(
@@ -6424,6 +6471,9 @@ impl App {
                 self.complete_current_turn_snapshot(stop_reason.contains("abort") || stop_reason.contains("cancel"));
                 self.invalidate_transcript();
                 self.refresh_turn_diff_from_history();
+
+                // Auto-poke: check for incomplete todos and queue continuation.
+                self.check_auto_poke();
             }
 
             QueryEvent::Status(msg) => {
@@ -6473,6 +6523,65 @@ impl App {
 
         // Update token count from tracker.
         self.token_count = self.cost_tracker.total_tokens() as u32;
+    }
+
+    // -------------------------------------------------------------------
+    // Auto-poke
+    // -------------------------------------------------------------------
+
+    /// Check whether auto-poke should fire after a model turn.
+    /// If the model stopped with incomplete todos, queue a synthetic
+    /// continuation message via the existing `queued_messages` mechanism.
+    fn check_auto_poke(&mut self) {
+        // Don't poke if the turn was aborted/cancelled.
+        if !self.last_turn_elapsed.is_some() && self.tool_use_blocks.is_empty() {
+            // Likely a fresh state — still allow poke.
+        }
+
+        // Don't poke if auto-poke is disabled (check settings).
+        let settings = claurst_core::Settings::load_sync().unwrap_or_default();
+        if !settings.auto_poke_enabled {
+            return;
+        }
+
+        // Check poke budget.
+        if self.auto_poke_count >= claurst_tools::todo_write::MAX_AUTO_POKES {
+            self.status_message = Some(format!(
+                "Auto-poke stopped: budget of {} reached.",
+                claurst_tools::todo_write::MAX_AUTO_POKES
+            ));
+            return;
+        }
+
+        // Count incomplete todos.
+        let incomplete = claurst_tools::todo_write::count_incomplete_todos(&self.session_id);
+        if incomplete == 0 {
+            return; // All done — no poke needed.
+        }
+
+        // No-progress detection: hash the todo state.
+        let current_hash = claurst_tools::todo_write::todo_state_hash(&self.session_id);
+        if current_hash == self.last_todo_hash {
+            self.no_progress_turns += 1;
+        } else {
+            self.no_progress_turns = 0;
+            self.last_todo_hash = current_hash;
+        }
+
+        if self.no_progress_turns >= claurst_tools::todo_write::NO_PROGRESS_THRESHOLD {
+            self.status_message = Some(
+                "Auto-poke stopped: no progress for 3 turns.".to_string()
+            );
+            return;
+        }
+
+        // Queue the auto-poke message via the existing queued_messages
+        // infrastructure so the main loop submits it on the next iteration.
+        let poke_msg = claurst_tools::todo_write::build_auto_poke_message(incomplete);
+        self.auto_poke_count += 1;
+        self.status_message = Some(format!("Auto-poking... ({} incomplete todos)", incomplete));
+        self.queued_messages.push_back(poke_msg);
+        self.pending_auto_submit = true;
     }
 
     // -------------------------------------------------------------------

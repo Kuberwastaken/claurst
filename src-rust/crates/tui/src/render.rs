@@ -1917,6 +1917,7 @@ fn render_system_annotation_lines(
         SystemMessageStyle::Info => (Color::DarkGray, Color::DarkGray),
         SystemMessageStyle::Warning => (Color::Yellow, Color::Yellow),
         SystemMessageStyle::Compact => unreachable!(),
+        SystemMessageStyle::TodoCard => (Color::Cyan, Color::Cyan),
     };
 
     // Centred, padded rule: "â”€â”€â”€ text â”€â”€â”€"
@@ -2674,6 +2675,39 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             parts.push(Span::styled(
                 format!("Tokens: {}/{} ({}%)", used, max, pct),
                 Style::default().fg(color),
+            ));
+        }
+
+        // Tokens per second average (from last 5 turns).
+        if !app.recent_token_rates.is_empty() {
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+            let avg_tps = app.recent_token_rates.iter().sum::<f64>()
+                / app.recent_token_rates.len() as f64;
+            parts.push(Span::styled(
+                format!("{:.0} tok/s", avg_tps),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
+        // Todo progress (done/total).
+        let todos = claurst_tools::todo_write::load_todos(&app.session_id);
+        if !todos.is_empty() {
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+            let total = todos.len();
+            let completed = todos.iter()
+                .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("completed"))
+                .count();
+            parts.push(Span::styled(
+                format!("\u{2713}{}/{}", completed, total),
+                Style::default().fg(if completed == total {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                }),
             ));
         }
 
