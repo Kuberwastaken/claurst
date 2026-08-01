@@ -2344,6 +2344,16 @@ async fn run_interactive(
                             continue;
                         }
 
+                        // Check for bang command (! prefix) — execute directly in
+                        // the shell, no model dispatch, zero token consumption.
+                        if claurst_tui::input::is_bang_command(&input) {
+                            let command = input[1..].trim().to_string();
+                            if !command.is_empty() {
+                                app.execute_bang_command(command);
+                            }
+                            continue;
+                        }
+
                         // Check for slash command
                         if input.starts_with('/') {
                             let (cmd_name, cmd_args) =

@@ -333,6 +333,12 @@ pub enum DisplayMessage {
     Conversation(Message),
     /// An injected system notice (e.g. compact boundary).
     System { text: String, style: SystemMessageStyle },
+    /// A `!` bang command execution — display only, never sent to model.
+    BangCommand { command: String },
+    /// Output from a `!` bang command.
+    BangOutput { text: String, exit_code: Option<i32> },
+    /// Error from a `!` bang command.
+    BangError { text: String },
 }
 
 /// Context menu state: position and currently selected item index.
@@ -800,6 +806,8 @@ pub struct App {
     pub input: String,
     pub prompt_input: PromptInputState,
     pub input_history: Vec<String>,
+    /// Separate history for `!` bang commands (distinct from prompt input history).
+    pub bang_command_history: Vec<String>,
     pub history_index: Option<usize>,
     pub scroll_offset: usize,
     pub is_streaming: bool,
@@ -1279,6 +1287,7 @@ impl App {
             input: String::new(),
             prompt_input: PromptInputState::new(),
             input_history: Vec::new(),
+            bang_command_history: Vec::new(),
             history_index: None,
             scroll_offset: 0,
             is_streaming: false,
@@ -2979,6 +2988,103 @@ impl App {
     fn clear_prompt(&mut self) {
         self.prompt_input.clear();
         self.refresh_prompt_input();
+    }
+
+    /// Execute a `!` bang command directly, without sending to the model.
+    /// Output is displayed in the transcript (display_messages only) — the
+    /// model never sees it. Zero token consumption.
+    pub fn execute_bang_command(&mut self, command: String) {
+        // Check if bang commands are enabled.
+        let settings = claurst_core::Settings::load_sync().unwrap_or_default();
+        if !settings.bang_commands.enabled {
+            self.push_notification(
+                crate::notifications::NotificationKind::Warning,
+                "Bang commands are disabled. Enable with \"bangCommands\": {\"enabled\": true} in settings.json.".to_string(),
+                None,
+            );
+            return;
+        }
+
+        // Block in plan mode.
+        if self.config.permission_mode == claurst_core::PermissionMode::Plan {
+            self.push_notification(
+                crate::notifications::NotificationKind::Warning,
+                "Bang commands disabled in plan mode.".to_string(),
+                None,
+            );
+            return;
+        }
+
+        // Display the command.
+        if settings.bang_commands.show_in_transcript {
+            self.display_messages.push(DisplayMessage::BangCommand {
+                command: command.clone(),
+            });
+        }
+
+        // Resolve working directory: prefer project dir, fall back to current dir.
+        let working_dir = self
+            .config
+            .project_dir
+            .clone()
+            .or_else(|| {
+                self.current_dir
+                    .as_ref()
+                    .map(|s| std::path::PathBuf::from(s))
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        // Execute via std::process::Command — NO model round-trip, NO PTY.
+        let result = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&command)
+            .current_dir(&working_dir)
+            .output();
+
+        match result {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let exit_code = output.status.code();
+
+                let display = if stderr.is_empty() {
+                    stdout.to_string()
+                } else if stdout.is_empty() {
+                    stderr.to_string()
+                } else {
+                    format!("{}\n--- stderr ---\n{}", stdout, stderr)
+                };
+
+                if settings.bang_commands.show_in_transcript {
+                    if exit_code.is_some_and(|c| c != 0) {
+                        let full = format!("{}\n[exit: {}]", display, exit_code.unwrap());
+                        self.display_messages.push(DisplayMessage::BangOutput {
+                            text: full,
+                            exit_code,
+                        });
+                    } else {
+                        self.display_messages.push(DisplayMessage::BangOutput {
+                            text: display,
+                            exit_code,
+                        });
+                    }
+                }
+
+                // Add to separate history if enabled.
+                if settings.bang_commands.add_to_history {
+                    self.bang_command_history.push(command);
+                }
+            }
+            Err(e) => {
+                if settings.bang_commands.show_in_transcript {
+                    self.display_messages.push(DisplayMessage::BangError {
+                        text: format!("Error: {}", e),
+                    });
+                }
+            }
+        }
+
+        self.invalidate_transcript();
     }
 
     fn refresh_turn_diff_from_history(&mut self) {
@@ -6717,6 +6823,15 @@ impl App {
                         if should_submit {
                             // Dismiss any active error modal when the user sends a message
                             self.dismiss_error_notifications();
+                            // Check for bang command (! prefix) — execute directly, no model.
+                            if crate::input::is_bang_command(&self.prompt_input.text) {
+                                let command = self.prompt_input.text[1..].trim().to_string();
+                                self.clear_prompt();
+                                if !command.is_empty() {
+                                    self.execute_bang_command(command);
+                                }
+                                continue;
+                            }
                             // Check if this is a slash command that should open a UI screen
                             if crate::input::is_slash_command(&self.prompt_input.text) {
                                 let slash_input = self.prompt_input.text.clone();
