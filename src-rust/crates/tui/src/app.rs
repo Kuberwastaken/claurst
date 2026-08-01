@@ -1174,6 +1174,10 @@ pub struct App {
     pub selection_anchor: Option<(u16, u16)>,
     /// Selection drag focus (col, row) — updated on mouse-drag / mouse-up.
     pub selection_focus: Option<(u16, u16)>,
+    /// Keyboard selection mode active.
+    pub kb_select_mode: bool,
+    /// Cursor row for keyboard selection (screen coordinate).
+    pub kb_cursor_row: u16,
     /// Text extracted from the current selection (updated each render frame).
     pub selection_text: RefCell<String>,
     /// Cache of row -> rendered text within the selectable area, refreshed
@@ -1484,6 +1488,8 @@ impl App {
             last_max_scroll: Cell::new(0),
             selection_anchor: None,
             selection_focus: None,
+            kb_select_mode: false,
+            kb_cursor_row: 0,
             selection_text: RefCell::new(String::new()),
             last_row_text: RefCell::new(std::collections::HashMap::new()),
             last_click_time: None,
@@ -4090,6 +4096,114 @@ impl App {
             self.keybindings.cancel_chord();
         }
 
+        // ---- Keyboard selection mode -------------------------------
+        if self.kb_select_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    self.kb_select_mode = false;
+                    self.clear_selection();
+                    self.status_message = Some("Selection cancelled.".to_string());
+                    return false;
+                }
+                // Copy selection and exit
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let text = self.selection_text.borrow().clone();
+                    if !text.is_empty() {
+                        let copied = crate::image_paste::write_clipboard_text(&text);
+                        if copied {
+                            self.push_notification(NotificationKind::Info, "Copied to clipboard".to_string(), Some(2));
+                        }
+                    }
+                    self.kb_select_mode = false;
+                    self.clear_selection();
+                    return false;
+                }
+                // Ctrl+C also copies in selection mode
+                KeyCode::Char(c) if (c == 'c' || c == 'C') && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let text = self.selection_text.borrow().clone();
+                    if !text.is_empty() {
+                        let copied = crate::image_paste::write_clipboard_text(&text);
+                        if copied {
+                            self.push_notification(NotificationKind::Info, "Copied to clipboard".to_string(), Some(2));
+                        }
+                    }
+                    self.kb_select_mode = false;
+                    self.clear_selection();
+                    return false;
+                }
+                // Movement: extend selection
+                KeyCode::Up => {
+                    if self.kb_cursor_row > self.last_selectable_area.get().y {
+                        self.kb_cursor_row -= 1;
+                        // Scroll up if cursor goes above visible area
+                        let area = self.last_selectable_area.get();
+                        if self.kb_cursor_row < area.y {
+                            let step = self.scroll_step();
+                            self.scroll_offset = self.scroll_offset.saturating_add(step);
+                        }
+                    }
+                    self.update_kb_selection();
+                    return false;
+                }
+                KeyCode::Down => {
+                    let area = self.last_selectable_area.get();
+                    let max_row = area.y + area.height.saturating_sub(1);
+                    if self.kb_cursor_row < max_row {
+                        self.kb_cursor_row += 1;
+                        // Scroll down if cursor goes below visible area
+                        if self.kb_cursor_row >= area.y + area.height {
+                            let step = self.scroll_step();
+                            let new_off = self.scroll_offset.saturating_sub(step);
+                            self.scroll_offset = new_off;
+                            if new_off == 0 {
+                                self.auto_scroll = true;
+                            }
+                        }
+                    }
+                    self.update_kb_selection();
+                    return false;
+                }
+                KeyCode::Home => {
+                    let area = self.last_selectable_area.get();
+                    self.kb_cursor_row = area.y;
+                    // Scroll to top
+                    self.scroll_offset = self.total_message_lines.get().saturating_sub(area.height as usize);
+                    self.auto_scroll = false;
+                    self.update_kb_selection();
+                    return false;
+                }
+                KeyCode::End => {
+                    let area = self.last_selectable_area.get();
+                    self.kb_cursor_row = area.y + area.height.saturating_sub(1);
+                    // Scroll to bottom
+                    self.scroll_offset = 0;
+                    self.auto_scroll = true;
+                    self.update_kb_selection();
+                    return false;
+                }
+                KeyCode::PageUp => {
+                    let area = self.last_selectable_area.get();
+                    let step = area.height;
+                    self.kb_cursor_row = self.kb_cursor_row.saturating_sub(step).max(area.y);
+                    self.scroll_offset = self.scroll_offset.saturating_add(step as usize);
+                    self.update_kb_selection();
+                    return false;
+                }
+                KeyCode::PageDown => {
+                    let area = self.last_selectable_area.get();
+                    let max_row = area.y + area.height.saturating_sub(1);
+                    let step = area.height;
+                    self.kb_cursor_row = (self.kb_cursor_row + step).min(max_row);
+                    let new_off = self.scroll_offset.saturating_sub(step as usize);
+                    self.scroll_offset = new_off;
+                    if new_off == 0 { self.auto_scroll = true; }
+                    self.update_kb_selection();
+                    return false;
+                }
+                _ => return false, // Swallow all other keys in selection mode
+            }
+        }
+
         // Clear any active text selection on key press (except Ctrl+C which copies it).
         let is_copy = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
         if !is_copy && self.selection_anchor.is_some() {
@@ -4386,6 +4500,23 @@ impl App {
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.prompt_input.delete_word_at_cursor();
                 self.refresh_prompt_input();
+            }
+
+            // ---- Enter keyboard selection mode ------------------------
+            KeyCode::Char('v') if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+                && self.prompt_input.is_empty() =>
+            {
+                self.kb_select_mode = true;
+                let area = self.last_selectable_area.get();
+                // Start cursor at the bottom of the visible area
+                self.kb_cursor_row = area.y + area.height.saturating_sub(1);
+                // Set anchor at current cursor, focus at same point (empty selection)
+                let col = area.x;
+                self.selection_anchor = Some((col, self.kb_cursor_row));
+                self.selection_focus = Some((col, self.kb_cursor_row));
+                self.status_message = Some("Selection mode: Arrows select, y/Ctrl+C copy, Esc cancel".to_string());
+                return false;
             }
 
             // ---- Text entry (allowed while streaming so users can queue
@@ -5550,7 +5681,28 @@ impl App {
     fn clear_selection(&mut self) {
         self.selection_anchor = None;
         self.selection_focus = None;
+        self.kb_select_mode = false;
         *self.selection_text.borrow_mut() = String::new();
+    }
+
+    /// Update the selection from keyboard cursor position.
+    fn update_kb_selection(&mut self) {
+        if !self.kb_select_mode {
+            return;
+        }
+        let area = self.last_selectable_area.get();
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        // Anchor stays at original position, focus follows cursor.
+        // The render code in render.rs already handles extracting text between
+        // anchor and focus in row-major order.
+        let col = area.x;
+        self.selection_focus = Some((col, self.kb_cursor_row));
+        // If anchor is None (shouldn't happen), set it.
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = Some((col, self.kb_cursor_row));
+        }
     }
 
     /// Show context menu at the given position.
@@ -6146,17 +6298,22 @@ impl App {
                 let input_area = self.last_input_area.get();
                 let selectable_area = self.last_selectable_area.get();
 
+                // When an error modal is showing, the selectable area covers
+                // the entire terminal — the modal text is selectable for copy.
+                let error_modal_active = self.notifications.current_is_error();
+
                 let in_input = input_area.width > 0 && input_area.height > 0
                     && mouse_event.row >= input_area.y
                     && mouse_event.row < input_area.y.saturating_add(input_area.height)
                     && mouse_event.column >= input_area.x
                     && mouse_event.column < input_area.x.saturating_add(input_area.width);
 
-                let in_selectable = selectable_area.width > 0 && selectable_area.height > 0
-                    && mouse_event.row >= selectable_area.y
-                    && mouse_event.row < selectable_area.y.saturating_add(selectable_area.height)
-                    && mouse_event.column >= selectable_area.x
-                    && mouse_event.column < selectable_area.x.saturating_add(selectable_area.width);
+                let in_selectable = error_modal_active
+                    || (selectable_area.width > 0 && selectable_area.height > 0
+                        && mouse_event.row >= selectable_area.y
+                        && mouse_event.row < selectable_area.y.saturating_add(selectable_area.height)
+                        && mouse_event.column >= selectable_area.x
+                        && mouse_event.column < selectable_area.x.saturating_add(selectable_area.width));
 
                 // Check for click on a thinking block header (takes priority over text selection).
                 if let Some(&hash) = self.thinking_row_map.borrow().get(&mouse_event.row) {
@@ -6169,11 +6326,11 @@ impl App {
                     return;
                 }
 
-                if in_input {
+                if in_input && !error_modal_active {
                     self.focus = FocusTarget::Input;
                     self.clear_selection();
                     self.handle_prompt_click(mouse_event.column, mouse_event.row);
-                } else if selectable_area.width == 0 || selectable_area.height == 0 {
+                } else if !error_modal_active && (selectable_area.width == 0 || selectable_area.height == 0) {
                     self.click_count = 0;
                 } else if in_selectable {
                     self.focus = FocusTarget::Transcript;
@@ -7803,5 +7960,19 @@ mod tests {
         assert!(!app.should_exit);
         app.handle_key_event(press_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.should_exit);
+    }
+
+    #[test]
+    fn kb_select_mode_starts_and_cancels() {
+        let mut app = make_app();
+        app.kb_select_mode = true;
+        app.selection_anchor = Some((0, 5));
+        app.selection_focus = Some((0, 5));
+        app.kb_cursor_row = 5;
+        // Simulate Esc by testing state directly via clear_selection.
+        app.clear_selection();
+        assert!(!app.kb_select_mode);
+        assert!(app.selection_anchor.is_none());
+        assert!(app.selection_focus.is_none());
     }
 }

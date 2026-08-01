@@ -862,6 +862,15 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_mcp_approval_dialog(&app.mcp_approval, size, frame.buffer_mut());
     }
 
+    // When error modal is showing, selectable area = full terminal
+    if app.notifications.current_is_error() {
+        app.last_selectable_area.set(size);
+    }
+
+    // ---- Text selection highlight (applied before modal overlay) ----------
+    apply_selection_highlight(frame, app);
+    cache_selectable_row_text(frame, app);
+
     // Always show error modals on top of everything (highest priority)
     if let Some(notif) = app.notifications.current() {
         if notif.kind == NotificationKind::Error {
@@ -870,6 +879,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
                 && app.streaming_thinking.is_empty()
                 && app.tool_use_blocks.is_empty();
             render_error_modal(frame, size, notif, app.error_modal_scroll_offset, app.footer_right_column_area.get(), is_welcome_screen);
+            render_context_menu(frame, app);
             return; // Don't render other overlays/notifications when error modal is showing
         }
     }
@@ -881,9 +891,6 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_notification_banner(frame, &app.notifications, size);
     }
 
-    // ---- Text selection highlight (topmost post-pass) ---------------------
-    apply_selection_highlight(frame, app);
-    cache_selectable_row_text(frame, app);
     render_context_menu(frame, app);
 }
 
