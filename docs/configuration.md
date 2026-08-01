@@ -42,6 +42,7 @@ values. Keys absent from the project file fall back to the global value.
   "config": { ... },
   "providers": { ... },
   "modelOverrides": { ... },
+  "favoriteModels": [ ... ],
   "projects": { ... },
   "commands": { ... },
   "formatter": { ... },
@@ -639,6 +640,13 @@ matches. They are defined in the `formatter` map:
     }
   },
 
+  // Pin frequently-used models to the top of the /model picker.
+  "favoriteModels": [
+    "anthropic/claude-sonnet-4-6",
+    "openai/gpt-4o",
+    "nvidia/z-ai/glm-5.2"
+  ],
+
   // Custom slash commands
   "commands": {
     "test": {
@@ -657,3 +665,29 @@ matches. They are defined in the `formatter` map:
   }
 }
 ```
+
+---
+
+## Favorite Models
+
+Pin frequently-used models to the top of the `/model` picker by adding them to
+the `favoriteModels` array in `settings.json`:
+
+```json
+"favoriteModels": [
+  "anthropic/claude-sonnet-4-6",
+  "openai/gpt-4o",
+  "nvidia/z-ai/glm-5.2"
+]
+```
+
+Entries use the canonical `"provider/model"` format (the same key used by
+`modelOverrides`). For the `anthropic` and `free` composite providers, the
+provider prefix is optional — the bare model id (`"claude-sonnet-4-6"`) is
+accepted too.
+
+In the model picker, press `f` (or `*`) to toggle favorite status on the
+highlighted model. Favorited models appear with a ★ prefix at the top of the
+list and persist across sessions in `~/.claurst/settings.json`. Stale
+favorites (models no longer in the catalog) are hidden from the picker but
+kept in settings until you un-favorite them.

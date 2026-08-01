@@ -1710,6 +1710,7 @@ impl App {
             &self.model_registry,
         );
         self.model_picker.set_models(models);
+        self.model_picker.load_favorites();
         self.model_picker_provider_id = Some(provider_id.to_string());
         // Catalog-backed providers (Anthropic/OpenAI/Google) are a read-only
         // projection of the models.dev catalog — there is no live endpoint to
@@ -3642,6 +3643,19 @@ impl App {
                 KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => self.model_picker.select_next(),
                 KeyCode::Enter => {
                     if let Some((model_id, effort)) = self.model_picker.confirm() {
+                        // Default sentinel — clear explicit model override.
+                        if model_id == crate::model_picker::DEFAULT_MODEL_SENTINEL {
+                            self.config.model = None;
+                            let provider = self.config.provider.as_deref().unwrap_or("anthropic");
+                            let best = self.display_default_model_for_provider(provider);
+                            self.model_name = best.clone();
+                            self.cost_tracker.set_model(&best);
+                            self.refresh_context_window_size();
+                            self.context_used_tokens = 0;
+                            self.persist_provider_and_model();
+                            self.status_message = Some(format!("Model: {} (default)", best));
+                            return false;
+                        }
                         // If user picked a model other than the fast-mode model
                         // while fast mode was active, turn fast mode off.
                         if self.fast_mode && !self.model_picker.is_selected_fast_mode_model(&model_id) {
@@ -3669,6 +3683,19 @@ impl App {
                     }
                 }
                 KeyCode::Backspace => self.model_picker.pop_filter_char(),
+                KeyCode::Char('f') | KeyCode::Char('*') => {
+                    // Toggle favorite on the currently selected model.
+                    let grouped = self.model_picker.filtered_models_grouped();
+                    if let Some((m, _)) = grouped.get(self.model_picker.selected_idx) {
+                        let provider = self.config.provider.as_deref().unwrap_or("anthropic");
+                        let model_key = if provider == "anthropic" || provider == "free" {
+                            m.id.clone()
+                        } else {
+                            format!("{}/{}", provider, m.id)
+                        };
+                        self.model_picker.toggle_favorite(&model_key);
+                    }
+                }
                 KeyCode::Char(c) => self.model_picker.push_filter_char(c),
                 _ => {}
             }

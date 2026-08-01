@@ -24,6 +24,10 @@ use crate::overlays::{centered_rect, modal_search_line, CLAURST_PANEL_BG};
 /// support reasoning honour it.
 pub use claurst_core::effort::EffortLevel;
 
+/// Sentinel model id for the "Default" picker entry. When the user selects
+/// this, the app clears the explicit model override so the provider's best
+/// model is used.
+pub const DEFAULT_MODEL_SENTINEL: &str = "__default__";
 
 // ---------------------------------------------------------------------------
 // Model capability helpers — driven by the opencode variants() ladder
@@ -523,6 +527,10 @@ pub struct ModelPickerState {
     pub models_loaded: bool,
     /// `true` while the background fetch is in flight.
     pub loading_models: bool,
+    /// Favorited model keys ("provider/model" format), loaded from Settings.
+    pub favorites: Vec<String>,
+    /// Synthetic "Default" entry prepended to the model list.
+    default_entry: ModelEntry,
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +559,13 @@ impl ModelPickerState {
             fast_mode_model: None,
             models_loaded: false,
             loading_models: false,
+            favorites: Vec::new(),
+            default_entry: ModelEntry {
+                id: DEFAULT_MODEL_SENTINEL.to_string(),
+                display_name: "Default".to_string(),
+                description: "Provider's recommended model (auto-selects best)".to_string(),
+                is_current: false,
+            },
         }
     }
 
@@ -578,6 +593,9 @@ impl ModelPickerState {
         for m in &mut self.models {
             m.is_current = m.id == current_model;
         }
+        // Mark default entry as current when no explicit model is set.
+        self.default_entry.is_current = current_model.is_empty()
+            || current_model == DEFAULT_MODEL_SENTINEL;
         self.selected_idx = self
             .models
             .iter()
@@ -632,9 +650,9 @@ impl ModelPickerState {
     /// no ultracode). Empty when nothing is highlighted or the model is
     /// non-reasoning.
     fn selected_ladder(&self) -> Vec<EffortLevel> {
-        let filtered = self.filtered_models();
+        let filtered = self.filtered_models_grouped();
         match filtered.get(self.selected_idx) {
-            Some(m) => picker_variant_ladder(&m.id),
+            Some((m, _)) => picker_variant_ladder(&m.id),
             None => Vec::new(),
         }
     }
@@ -671,7 +689,7 @@ impl ModelPickerState {
     /// Returns the selected model; the caller is responsible for persisting it
     /// in the correct provider-aware format.
     pub fn confirm(&mut self) -> Option<(String, Option<EffortLevel>)> {
-        let filtered = self.filtered_models();
+        let filtered = self.filtered_models_grouped();
         let custom = self.filter.trim();
         if filtered.is_empty() {
             if custom.is_empty() {
@@ -681,8 +699,12 @@ impl ModelPickerState {
             self.close();
             return Some((id, None));
         }
-        let entry = filtered.get(self.selected_idx)?;
+        let (entry, _is_fav) = filtered.get(self.selected_idx)?;
         let id = entry.id.clone();
+        if id == DEFAULT_MODEL_SENTINEL {
+            self.close();
+            return Some((id, None));
+        }
         let ladder = picker_variant_ladder(&id);
         let effort = if ladder.len() > 1 {
             Some(clamp_to_ladder(&ladder, self.effort_level))
@@ -721,6 +743,117 @@ impl ModelPickerState {
                     || m.description.to_lowercase().contains(needle.as_str())
             })
             .collect()
+    }
+
+    /// Load favorites from Settings into the picker state.
+    pub fn load_favorites(&mut self) {
+        if let Ok(settings) = claurst_core::Settings::load_sync() {
+            self.favorites = settings.favorite_models;
+        }
+    }
+
+    /// Toggle favorite status on a model key. Saves to Settings immediately.
+    pub fn toggle_favorite(&mut self, model_key: &str) {
+        if self.favorites.contains(&model_key.to_string()) {
+            self.favorites.retain(|f| f != model_key);
+        } else {
+            self.favorites.push(model_key.to_string());
+        }
+        // Persist to settings.
+        if let Ok(mut settings) = claurst_core::Settings::load_sync() {
+            settings.favorite_models = self.favorites.clone();
+            let _ = settings.save_sync();
+        }
+    }
+
+    /// Check if a model key is favorited.
+    pub fn is_favorite(&self, model_key: &str) -> bool {
+        self.favorites.contains(&model_key.to_string())
+    }
+
+    /// Get the list of valid favorites — those present in the picker's
+    /// current model list. Stale favorites (model removed from catalog)
+    /// are silently excluded from display but NOT removed from settings.
+    pub fn valid_favorites(&self) -> Vec<String> {
+        let model_ids: std::collections::HashSet<&str> =
+            self.models.iter().map(|m| m.id.as_str()).collect();
+        self.favorites
+            .iter()
+            .filter(|f| {
+                // Favorites are in "provider/model" format. The picker's
+                // models list has bare model ids (no provider prefix) since
+                // the picker is scoped to one provider. So we match on the
+                // model portion after the slash.
+                if let Some((_, model)) = f.split_once('/') {
+                    model_ids.contains(model)
+                } else {
+                    model_ids.contains(f.as_str())
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Returns model entries for display: favorites first (marked with ★),
+    /// then all other models. Applies the current filter to both sections.
+    pub fn filtered_models_grouped(&self) -> Vec<(&ModelEntry, bool)> {
+        let valid_favs = self.valid_favorites();
+        let fav_model_ids: std::collections::HashSet<String> = valid_favs
+            .iter()
+            .map(|f| f.split_once('/').map(|(_, m)| m.to_string()).unwrap_or(f.clone()))
+            .collect();
+
+        if self.filter.is_empty() {
+            // No filter: favorites section, then all models
+            let mut result = Vec::new();
+            // Default entry always at top.
+            result.push((&self.default_entry, false));
+            // Favorites first
+            for m in &self.models {
+                if fav_model_ids.contains(&m.id) {
+                    result.push((m, true));
+                }
+            }
+            // Then non-favorites
+            for m in &self.models {
+                if !fav_model_ids.contains(&m.id) {
+                    result.push((m, false));
+                }
+            }
+            result
+        } else {
+            let needle = self.filter.to_lowercase();
+            let mut result = Vec::new();
+            // Default entry — always show if filter matches or is empty.
+            if self.filter.is_empty()
+                || "default".contains(&needle)
+                || self.default_entry.display_name.to_lowercase().contains(&needle)
+                || self.default_entry.description.to_lowercase().contains(&needle)
+            {
+                result.push((&self.default_entry, false));
+            }
+            // Favorites matching filter
+            for m in &self.models {
+                if fav_model_ids.contains(&m.id)
+                    && (m.id.to_lowercase().contains(&needle)
+                        || m.display_name.to_lowercase().contains(&needle)
+                        || m.description.to_lowercase().contains(&needle))
+                {
+                    result.push((m, true));
+                }
+            }
+            // Non-favorites matching filter
+            for m in &self.models {
+                if !fav_model_ids.contains(&m.id)
+                    && (m.id.to_lowercase().contains(&needle)
+                        || m.display_name.to_lowercase().contains(&needle)
+                        || m.description.to_lowercase().contains(&needle))
+                {
+                    result.push((m, false));
+                }
+            }
+            result
+        }
     }
 
     /// Replace the model list with dynamically loaded entries.
@@ -820,8 +953,8 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
     // ── Dialog size ──
     let width = 65u16.min(area.width.saturating_sub(6));
     let max_height = (area.height as f32 * 0.75) as u16;
-    let filtered = state.filtered_models();
-    let content_h = (filtered.len() as u16 + 6).min(max_height).max(8);
+    let grouped = state.filtered_models_grouped();
+    let content_h = (grouped.len() as u16 + 6).min(max_height).max(8);
     let dialog_area = centered_rect(width, content_h, area);
 
     // ── Fill dialog bg (no border) ──
@@ -909,7 +1042,7 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
         lines.push(Line::from(""));
     }
 
-    if filtered.is_empty() {
+    if grouped.is_empty() {
         lines.push(Line::from(vec![Span::styled(" No results found", Style::default().fg(dim))]));
         if !state.filter.trim().is_empty() {
             lines.push(Line::from(vec![Span::styled(
@@ -918,7 +1051,7 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
             )]));
         }
     } else {
-        for (i, model) in filtered.iter().enumerate() {
+        for (i, (model, is_fav)) in grouped.iter().enumerate() {
             let is_selected = i == state.selected_idx;
             let supports_effort = model_supports_effort(&model.id);
 
@@ -940,6 +1073,10 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
             } else {
                 spans.push(Span::styled("   ", Style::default().bg(bg)));
             }
+
+            // Favorite star indicator
+            let star = if *is_fav { "\u{2605} " } else { "  " };
+            spans.push(Span::styled(star.to_string(), Style::default().fg(Color::Yellow).bg(bg)));
 
             spans.push(Span::styled(model.display_name.clone(), Style::default().fg(fg).bg(bg)));
 
@@ -994,7 +1131,7 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
         Span::styled(" enter", Style::default().fg(dim)),
         Span::styled(" select", Style::default().fg(dim)),
     ];
-    if let Some(model) = filtered.get(state.selected_idx) {
+    if let Some((model, _)) = grouped.get(state.selected_idx) {
         if model_supports_effort(&model.id) {
             footer_spans.push(Span::raw("  "));
             footer_spans.push(Span::styled("\u{2190}/\u{2192}", Style::default().fg(dim)));
@@ -1182,10 +1319,10 @@ mod tests {
     #[test]
     fn confirm_returns_id_and_closes() {
         let mut p = make_picker_with_current("claude-opus-4-6");
-        p.selected_idx = 0;
-        let first_id = p.filtered_models()[0].id.clone();
+        p.selected_idx = 1; // skip Default sentinel at index 0
+        let first_model_id = p.filtered_models()[0].id.clone();
         let result = p.confirm();
-        assert_eq!(result.map(|(id, _)| id), Some(first_id));
+        assert_eq!(result.map(|(id, _)| id), Some(first_model_id));
         assert!(!p.visible, "picker should be closed after confirm");
     }
 
@@ -1581,5 +1718,131 @@ mod tests {
         }
         assert!(!provider_has_authoritative_live_models("github-copilot"));
         assert!(!provider_has_authoritative_live_models("openrouter"));
+    }
+
+    #[test]
+    fn valid_favorites_filters_stale_entries() {
+        let mut state = ModelPickerState::new();
+        state.models = vec![
+            ModelEntry { id: "model-a".to_string(), display_name: "A".to_string(), description: "".to_string(), is_current: false },
+            ModelEntry { id: "model-b".to_string(), display_name: "B".to_string(), description: "".to_string(), is_current: false },
+        ];
+        state.favorites = vec![
+            "provider/model-a".to_string(),  // valid
+            "provider/model-c".to_string(),  // stale (not in models list)
+            "model-b".to_string(),           // valid (no provider prefix)
+        ];
+        let valid = state.valid_favorites();
+        assert_eq!(valid.len(), 2);
+        assert!(valid.contains(&"provider/model-a".to_string()));
+        assert!(valid.contains(&"model-b".to_string()));
+    }
+
+    #[test]
+    fn filtered_models_grouped_puts_favorites_first() {
+        let mut state = ModelPickerState::new();
+        state.models = vec![
+            ModelEntry { id: "regular".to_string(), display_name: "Regular".to_string(), description: "".to_string(), is_current: false },
+            ModelEntry { id: "pinned".to_string(), display_name: "Pinned".to_string(), description: "".to_string(), is_current: false },
+            ModelEntry { id: "other".to_string(), display_name: "Other".to_string(), description: "".to_string(), is_current: false },
+        ];
+        state.favorites = vec!["provider/pinned".to_string()];
+        let grouped = state.filtered_models_grouped();
+        assert_eq!(grouped.len(), 4);
+        // Default sentinel at top.
+        assert_eq!(grouped[0].0.id, DEFAULT_MODEL_SENTINEL);
+        // Favorite must come next.
+        assert_eq!(grouped[1].0.id, "pinned");
+        assert!(grouped[1].1);
+        // Rest are non-favorites, preserve source order.
+        assert_eq!(grouped[2].0.id, "regular");
+        assert!(!grouped[2].1);
+        assert_eq!(grouped[3].0.id, "other");
+        assert!(!grouped[3].1);
+    }
+
+    #[test]
+    fn filtered_models_grouped_respects_filter() {
+        let mut state = ModelPickerState::new();
+        state.models = vec![
+            ModelEntry { id: "pinned-a".to_string(), display_name: "Pinned A".to_string(), description: "".to_string(), is_current: false },
+            ModelEntry { id: "pinned-b".to_string(), display_name: "Other B".to_string(), description: "".to_string(), is_current: false },
+        ];
+        state.favorites = vec![
+            "provider/pinned-a".to_string(),
+            "provider/pinned-b".to_string(),
+        ];
+        for c in "pinned a".chars() {
+            state.push_filter_char(c);
+        }
+        let grouped = state.filtered_models_grouped();
+        // Only the favorite matching the filter appears, on top.
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].0.id, "pinned-a");
+        assert!(grouped[0].1);
+    }
+
+    #[test]
+    fn is_favorite_roundtrips_without_persist() {
+        let mut state = ModelPickerState::new();
+        state.favorites = vec!["anthropic/claude-sonnet-4-6".to_string()];
+        assert!(state.is_favorite("anthropic/claude-sonnet-4-6"));
+        assert!(!state.is_favorite("openai/gpt-4o"));
+    }
+
+    #[test]
+    fn default_entry_appears_at_top() {
+        let mut picker = ModelPickerState::new();
+        picker.set_models(vec![
+            ModelEntry {
+                id: "model-a".to_string(),
+                display_name: "Model A".to_string(),
+                description: "desc".to_string(),
+                is_current: false,
+            },
+            ModelEntry {
+                id: "model-b".to_string(),
+                display_name: "Model B".to_string(),
+                description: "desc".to_string(),
+                is_current: false,
+            },
+        ]);
+        picker.open("model-a");
+        let grouped = picker.filtered_models_grouped();
+        assert_eq!(grouped.len(), 3);
+        assert_eq!(grouped[0].0.id, DEFAULT_MODEL_SENTINEL);
+        assert_eq!(grouped[1].0.id, "model-a");
+    }
+
+    #[test]
+    fn default_entry_is_current_when_no_model() {
+        let mut picker = ModelPickerState::new();
+        picker.set_models(vec![
+            ModelEntry {
+                id: "model-a".to_string(),
+                display_name: "Model A".to_string(),
+                description: "desc".to_string(),
+                is_current: false,
+            },
+        ]);
+        picker.open_with_title("Test", "", EffortLevel::Medium, false);
+        assert!(picker.default_entry.is_current);
+    }
+
+    #[test]
+    fn confirm_returns_default_sentinel() {
+        let mut picker = ModelPickerState::new();
+        picker.set_models(vec![
+            ModelEntry {
+                id: "model-a".to_string(),
+                display_name: "Model A".to_string(),
+                description: "desc".to_string(),
+                is_current: false,
+            },
+        ]);
+        picker.open("model-a");
+        picker.selected_idx = 0; // Default entry
+        let result = picker.confirm();
+        assert_eq!(result.unwrap().0, DEFAULT_MODEL_SENTINEL);
     }
 }

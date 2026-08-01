@@ -1252,6 +1252,10 @@ pub mod config {
         /// Per-provider configurations stored in settings.json.
         #[serde(default)]
         pub providers: HashMap<String, ProviderConfig>,
+        /// User-favorited model keys ("provider/model" format). Shown in a
+        /// dedicated section at the top of the /model picker.
+        #[serde(default, rename = "favoriteModels", alias = "favorite_models")]
+        pub favorite_models: Vec<String>,
         /// User-supplied model metadata overrides stored in settings.json,
         /// keyed by `"provider/model"`. Merged into
         /// [`Config::model_overrides`] by [`Settings::effective_config`] and
@@ -2007,6 +2011,7 @@ pub mod config {
                 last_seen_version: over.last_seen_version.or(base.last_seen_version),
                 provider: over.provider.or(base.provider),
                 providers: merge_map(base.providers, over.providers),
+                favorite_models: { let mut v = base.favorite_models; for f in over.favorite_models { if !v.contains(&f) { v.push(f); } } v },
                 model_overrides: merge_map(base.model_overrides, over.model_overrides),
                 commands: merge_map(base.commands, over.commands),
                 formatter: merge_map(base.formatter, over.formatter),
@@ -2282,6 +2287,30 @@ pub mod config {
             let ov = &s.model_overrides["ollama/y"];
             assert_eq!(ov.context_window, Some(262144));
             assert_eq!(ov.status.as_deref(), Some("beta"));
+        }
+
+        #[test]
+        fn favorite_models_deserialize() {
+            let json = r#"{"favoriteModels": ["anthropic/claude-sonnet-4-6", "openai/gpt-4o"]}"#;
+            let settings: Settings = serde_json::from_str(json).unwrap();
+            assert_eq!(settings.favorite_models.len(), 2);
+            assert_eq!(settings.favorite_models[0], "anthropic/claude-sonnet-4-6");
+            assert_eq!(settings.favorite_models[1], "openai/gpt-4o");
+        }
+
+        #[test]
+        fn favorite_models_snake_alias() {
+            let json = r#"{"favorite_models": ["anthropic/claude-opus-4-6"]}"#;
+            let settings: Settings = serde_json::from_str(json).unwrap();
+            assert_eq!(settings.favorite_models.len(), 1);
+            assert_eq!(settings.favorite_models[0], "anthropic/claude-opus-4-6");
+        }
+
+        #[test]
+        fn favorite_models_default_empty() {
+            let json = r#"{}"#;
+            let settings: Settings = serde_json::from_str(json).unwrap();
+            assert!(settings.favorite_models.is_empty());
         }
 
         #[test]
