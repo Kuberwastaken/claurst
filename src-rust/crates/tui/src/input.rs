@@ -5,6 +5,13 @@ pub fn is_slash_command(input: &str) -> bool {
     input.starts_with('/') && !input.starts_with("//")
 }
 
+/// Check if the input is a bang command (! prefix).
+/// A single `!` is a bang command only when followed by at least one
+/// non-whitespace character; `!!` (double bang) is NOT a bang command.
+pub fn is_bang_command(input: &str) -> bool {
+    input.starts_with('!') && !input.starts_with("!!") && input.len() > 1
+}
+
 /// Parse a slash command into `(command_name, args)`.
 /// Returns `("", "")` if the input is not a slash command.
 pub fn parse_slash_command(input: &str) -> (&str, &str) {

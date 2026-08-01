@@ -1917,6 +1917,7 @@ fn render_system_annotation_lines(
         SystemMessageStyle::Info => (Color::DarkGray, Color::DarkGray),
         SystemMessageStyle::Warning => (Color::Yellow, Color::Yellow),
         SystemMessageStyle::Compact => unreachable!(),
+        SystemMessageStyle::TodoCard => (Color::Cyan, Color::Cyan),
     };
 
     // Centred, padded rule: "â”€â”€â”€ text â”€â”€â”€"

@@ -12,6 +12,10 @@ use claurst_core::provider_id::ProviderId;
 use super::openai_compat::{OpenAiCompatProvider, ProviderQuirks};
 
 pub fn provider_for_id(provider_id: &str) -> Option<OpenAiCompatProvider> {
+    // Custom providers take priority — check before the fixed-id match.
+    if let Some(custom) = provider_for_custom_id(provider_id) {
+        return Some(custom);
+    }
     match provider_id {
         "ollama" => Some(ollama()),
         "lmstudio" | "lm-studio" => Some(lm_studio()),
@@ -162,6 +166,36 @@ pub fn custom_openai() -> OpenAiCompatProvider {
         .unwrap_or("http://localhost:11434/v1");
 
     custom_openai_with_url(base_url)
+}
+
+/// Build an [`OpenAiCompatProvider`] from a user-defined custom provider in
+/// `Settings::custom_providers`, looked up by id.
+///
+/// Returns `None` when the id is not in the custom providers map, or when
+/// `apiBase` is empty. Custom headers from the definition are applied via
+/// the builder API. API key is resolved via `resolve_api_key()` (supports
+/// `{env:VAR}` substitution).
+pub fn provider_for_custom_id(id: &str) -> Option<OpenAiCompatProvider> {
+    let settings = Settings::load_sync().unwrap_or_default();
+    let def = settings.custom_providers.get(id)?;
+    if def.api_base.trim().is_empty() {
+        return None;
+    }
+    let mut provider = OpenAiCompatProvider::new(id, &def.name, &def.api_base);
+    if let Some(key) = def.resolve_api_key() {
+        provider = provider.with_api_key(key);
+    }
+    for (name, value) in &def.headers {
+        provider = provider.with_header(name, value);
+    }
+    // Apply streaming / reasoning settings from the custom provider definition.
+    provider = provider.with_quirks(ProviderQuirks {
+        streaming: def.streaming.unwrap_or(true),
+        include_usage_in_stream: def.include_usage_in_stream.unwrap_or(true),
+        reasoning_field: def.reasoning_field.clone(),
+        ..Default::default()
+    });
+    Some(provider)
 }
 
 /// DeepSeek V4 — supports reasoning output via `reasoning_content` field.
@@ -629,5 +663,20 @@ mod tests {
         let qwen = provider_for_id("qwen").expect("qwen should resolve");
         assert_eq!(alibaba.id(), qwen.id());
         assert_eq!(alibaba.name(), qwen.name());
+    }
+
+    #[test]
+    fn provider_for_custom_id_returns_none_for_unknown() {
+        // "nonexistent-custom-provider-12345" is not a real custom provider.
+        assert!(provider_for_custom_id("nonexistent-custom-provider-12345").is_none());
+    }
+
+    #[test]
+    fn provider_for_custom_id_returns_none_for_known_fixed_provider() {
+        // Fixed providers like "ollama" should not match as custom providers.
+        // This test verifies that provider_for_custom_id doesn't accidentally
+        // return Some for a fixed provider id when no custom provider is
+        // registered with that id.
+        assert!(provider_for_custom_id("ollama").is_none());
     }
 }

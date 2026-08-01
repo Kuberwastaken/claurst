@@ -767,3 +767,63 @@ When the keyed model exists in the catalog, the override patches it in place.
 When it does not (a self-hosted alias), Claurst materialises a synthetic entry
 so the corrected values flow everywhere the metadata is read: the `/model`
 picker, the token-usage warnings, and the auto-compact thresholds.
+
+## Cursor ACP (`cursor-acp`)
+
+Connect to Cursor's CLI agent via the Agent Client Protocol (ACP).
+
+### Setup
+
+1. Install Cursor CLI (`agent` must be on PATH)
+2. Set `cursor-acp` as your provider:
+```json
+{
+  "provider": "cursor-acp"
+}
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLAURST_CURSOR_ACP_PATH` | `agent` | Path to the Cursor CLI executable |
+| `CLAURST_CURSOR_ACP_ARGS` | `acp` | ACP subcommand argument |
+| `CLAURST_CURSOR_ACP_EXTRA_ARGS` | `--force --trust` | Permission arguments before `acp` |
+| `CLAURST_CURSOR_ACP_MODEL` | (empty) | Default model ID |
+
+The provider spawns `agent --force --trust acp` as a subprocess and
+communicates via newline-delimited JSON-RPC 2.0 over stdin/stdout.
+
+---
+
+## Custom OpenAI-Compatible Providers (from OpenCode config)
+
+The following custom providers are configured in `~/.claurst/settings.json` under
+`customProviders`, mirroring the OpenCode configuration:
+
+| Provider ID | Display Name | Base URL | Models |
+|-------------|-------------|----------|--------|
+| `llmg-coding` | LLMG Coding | `https://llm-gateway-coding.revolut.com/proxy/openai/opencode/` | `together_ai/revolut-ca/glm-5-2` (with max/high/none variants) |
+| `llmg-non-coding` | LLMG Non-Coding | `https://llm-gateway-coding.revolut.com/proxy/openai/opencode/` | `fireworks_revolut-non-coding/...hxjsp23w` (with max/high/none variants) |
+| `together-ai-coding` | Together AI Coding | `https://api.together.xyz/v1` | `revolut-ca/glm-5-2` (with high/max/none variants) |
+| `openai-custom` | OpenAI (Custom) | `https://api.openai.com/v1` | `gpt-5.5` |
+| `nvidia-custom` | Nvidia (Custom) | `https://integrate.api.nvidia.com/v1` | `z-ai/glm-5.2`, `nvidia/nemotron-3-ultra-550b-a55b` |
+| `cursor-acp-rest` | Cursor ACP (REST) | `http://127.0.0.1:32124/v1` | 14 models (Auto, Composer 2.5, Opus variants, GPT variants, GLM 5.2) |
+
+API keys use `{env:VAR_NAME}` substitution:
+- `TOGETHER_AI_CODING_API_KEY` for `together-ai-coding`
+- `OPENAI_API_KEY` for `openai-custom`
+- `NVIDIA_API_KEY` for `nvidia-custom`
+
+Select a custom provider:
+```json
+{
+  "provider": "llmg-coding",
+  "config": {
+    "model": "llmg-coding/together_ai/revolut-ca/glm-5-2"
+  }
+}
+```
+
+All custom providers appear in the `/model` picker and the `/providers` command.
+Use `Ctrl+F` or `*` in the picker to toggle ★ favorite status.
