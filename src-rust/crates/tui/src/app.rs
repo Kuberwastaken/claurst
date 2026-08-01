@@ -297,6 +297,7 @@ fn provider_picker_items() -> Vec<SelectItem> {
         SelectItem { id: "upstage".into(), title: "Upstage".into(), description: "Hosted Upstage models".into(), category: "Other".into(), badge: None },
         SelectItem { id: "stepfun".into(), title: "StepFun".into(), description: "Hosted reasoning models".into(), category: "Other".into(), badge: None },
         SelectItem { id: "fireworks".into(), title: "Fireworks AI".into(), description: "Fast inference".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "cursor-acp".into(), title: "Cursor ACP".into(), description: "Cursor CLI via Agent Client Protocol".into(), category: "Other".into(), badge: None },
     ]
 }
 
@@ -1807,6 +1808,7 @@ impl App {
                 "llamacpp",
                 "azure",
                 "amazon-bedrock",
+                "cursor-acp",
                 "free",
                 "opencode-zen",
             ];
@@ -3537,6 +3539,10 @@ impl App {
                             "amazon-bedrock" => {
                                 self.key_input_dialog
                                     .open(selected.id.clone(), selected.title.clone());
+                            }
+                            // Cursor ACP — spawns a subprocess, no API key needed
+                            "cursor-acp" => {
+                                // Provider is ready to use via subprocess
                             }
                             // All other providers — open API key input dialog
                             _ => {

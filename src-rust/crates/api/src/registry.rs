@@ -13,7 +13,7 @@ use crate::provider::LlmProvider;
 use crate::provider_types::ProviderStatus;
 use crate::providers::{
     AnthropicProvider, AzureProvider, BedrockProvider, CodexProvider, CohereProvider,
-    CopilotProvider, FreeEntry, FreeProvider, FREE_CATALOG, GoogleProvider, MinimaxProvider,
+    CopilotProvider, CursorAcpProvider, FreeEntry, FreeProvider, FREE_CATALOG, GoogleProvider, MinimaxProvider,
     OpenAiProvider,
 };
 
@@ -89,6 +89,7 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
         // "free" needs two keys (Zen + OpenRouter) — single-key path doesn't
         // apply.  The auth-store-aware path `runtime_provider_for` handles it.
         "free" => build_free_provider(),
+        "cursor-acp" => Some(Arc::new(CursorAcpProvider::from_env())),
         _ => None,
     }
 }
@@ -266,6 +267,7 @@ pub fn provider_from_config(
         "codex" | "openai-codex" => {
             CodexProvider::from_stored().map(|provider| Arc::new(provider) as Arc<dyn LlmProvider>)
         }
+        "cursor-acp" => Some(Arc::new(CursorAcpProvider::from_env())),
         _ => api_key.and_then(|key| provider_from_key(provider_id, key)),
     }
 }
@@ -290,6 +292,7 @@ pub fn runtime_provider_for(provider_id: &str) -> Option<Arc<dyn LlmProvider>> {
         // wraps them in a fallback composite — handled here so the generic
         // single-key path below doesn't short-circuit on a missing key.
         "free" => return build_free_provider(),
+        "cursor-acp" => return Some(Arc::new(CursorAcpProvider::from_env())),
         _ => {}
     }
 

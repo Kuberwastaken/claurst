@@ -767,3 +767,29 @@ When the keyed model exists in the catalog, the override patches it in place.
 When it does not (a self-hosted alias), Claurst materialises a synthetic entry
 so the corrected values flow everywhere the metadata is read: the `/model`
 picker, the token-usage warnings, and the auto-compact thresholds.
+
+## Cursor ACP (`cursor-acp`)
+
+Connect to Cursor's CLI agent via the Agent Client Protocol (ACP).
+
+### Setup
+
+1. Install Cursor CLI (`agent` must be on PATH)
+2. Set `cursor-acp` as your provider:
+```json
+{
+  "provider": "cursor-acp"
+}
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLAURST_CURSOR_ACP_PATH` | `agent` | Path to the Cursor CLI executable |
+| `CLAURST_CURSOR_ACP_ARGS` | `acp` | ACP subcommand argument |
+| `CLAURST_CURSOR_ACP_EXTRA_ARGS` | `--force --trust` | Permission arguments before `acp` |
+| `CLAURST_CURSOR_ACP_MODEL` | (empty) | Default model ID |
+
+The provider spawns `agent --force --trust acp` as a subprocess and
+communicates via newline-delimited JSON-RPC 2.0 over stdin/stdout.
