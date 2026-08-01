@@ -24,6 +24,10 @@ use crate::overlays::{centered_rect, modal_search_line, CLAURST_PANEL_BG};
 /// support reasoning honour it.
 pub use claurst_core::effort::EffortLevel;
 
+/// Sentinel model id for the "Default" picker entry. When the user selects
+/// this, the app clears the explicit model override so the provider's best
+/// model is used.
+pub const DEFAULT_MODEL_SENTINEL: &str = "__default__";
 
 // ---------------------------------------------------------------------------
 // Model capability helpers — driven by the opencode variants() ladder
@@ -221,6 +225,8 @@ pub struct ModelEntry {
     pub description: String,
     /// Whether this is the currently active model.
     pub is_current: bool,
+    /// Provider ID this model belongs to (for all-providers mode).
+    pub provider_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -228,12 +234,13 @@ pub struct ModelEntry {
 // ---------------------------------------------------------------------------
 
 /// Helper to build a `ModelEntry` with `is_current = false`.
-fn model_entry(id: &str, name: &str, desc: &str) -> ModelEntry {
+fn model_entry(id: &str, name: &str, desc: &str, provider_id: &str) -> ModelEntry {
     ModelEntry {
         id: id.to_string(),
         display_name: name.to_string(),
         description: desc.to_string(),
         is_current: false,
+        provider_id: provider_id.to_string(),
     }
 }
 
@@ -254,7 +261,7 @@ pub fn models_for_provider_from_registry(
     // directly.  `free/auto` is the default routing entry; the rest pin a
     // specific upstream model for users who care.
     if provider_id == "free" {
-        return free_provider_models();
+        return free_provider_models(provider_id);
     }
     // Codex (ChatGPT-authenticated OpenAI) is not in the models.dev catalog —
     // serve the curated CODEX_MODELS list so the picker isn't empty.  Accept
@@ -262,7 +269,7 @@ pub fn models_for_provider_from_registry(
     // ("openai-codex"); without the alias a fresh Codex login lands on the
     // empty-registry fallback and the picker shows no models.
     if is_codex_provider(provider_id) {
-        return codex_provider_models(registry);
+        return codex_provider_models(registry, provider_id);
     }
 
     let mut entries = registry.list_visible_by_provider(provider_id);
@@ -280,6 +287,7 @@ pub fn models_for_provider_from_registry(
             "default",
             "Default model",
             "no catalog entry for this provider",
+            provider_id,
         )];
     }
 
@@ -307,6 +315,7 @@ pub fn models_for_provider_from_registry(
                 display_name: e.info.name.clone(),
                 description: cost_str,
                 is_current: false,
+                provider_id: provider_id.to_string(),
             }
         })
         .collect()
@@ -377,10 +386,20 @@ pub fn default_model_for_provider(
 /// event loop either replaces or merges the projection according to
 /// [`provider_has_authoritative_live_models`].
 pub fn provider_uses_catalog_projection(provider_id: &str) -> bool {
-    matches!(
+    if matches!(
         provider_id,
         "openai" | "google" | "azure" | "amazon-bedrock" | "cohere" | "minimax"
-    )
+    ) {
+        return true;
+    }
+    // Custom providers have a curated model list in settings — no live
+    // endpoint to fetch from, so skip the background fetch.
+    if let Ok(settings) = claurst_core::Settings::load_sync() {
+        if settings.custom_providers.contains_key(provider_id) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether live discovery is the complete set of models usable through a local
@@ -417,7 +436,7 @@ fn is_codex_provider(provider_id: &str) -> bool {
 /// catalog yields nothing (e.g. an empty/old snapshot).
 ///
 /// [`codex_model_allowed`]: claurst_core::codex_oauth::codex_model_allowed
-fn codex_provider_models(registry: &claurst_api::ModelRegistry) -> Vec<ModelEntry> {
+fn codex_provider_models(registry: &claurst_api::ModelRegistry, provider_id: &str) -> Vec<ModelEntry> {
     use claurst_core::codex_oauth::{codex_limit_override, codex_model_allowed};
 
     let mut entries: Vec<&claurst_api::ModelEntry> = registry
@@ -427,7 +446,7 @@ fn codex_provider_models(registry: &claurst_api::ModelRegistry) -> Vec<ModelEntr
         .collect();
 
     if entries.is_empty() {
-        return codex_fallback_models();
+        return codex_fallback_models(provider_id);
     }
 
     // Newest release first, then by id for stability — matches the picker's
@@ -455,13 +474,14 @@ fn codex_provider_models(registry: &claurst_api::ModelRegistry) -> Vec<ModelEntr
                     format_context_window(ctx)
                 ),
                 is_current: false,
+                provider_id: provider_id.to_string(),
             }
         })
         .collect()
 }
 
 /// Static fallback used when the models.dev `openai` catalog is unavailable.
-fn codex_fallback_models() -> Vec<ModelEntry> {
+fn codex_fallback_models(provider_id: &str) -> Vec<ModelEntry> {
     use claurst_core::codex_oauth::codex_limit_override;
     claurst_core::codex_oauth::CODEX_MODELS
         .iter()
@@ -477,6 +497,7 @@ fn codex_fallback_models() -> Vec<ModelEntry> {
                     format_context_window(ctx)
                 ),
                 is_current: false,
+                provider_id: provider_id.to_string(),
             }
         })
         .collect()
@@ -485,12 +506,13 @@ fn codex_fallback_models() -> Vec<ModelEntry> {
 /// Curated free-mode model list used by `models_for_provider_from_registry`.
 /// Always shows `free/auto` first; one pin entry per catalog upstream so the
 /// user can target a specific provider when they need to.
-fn free_provider_models() -> Vec<ModelEntry> {
+fn free_provider_models(provider_id: &str) -> Vec<ModelEntry> {
     let mut entries = vec![ModelEntry {
         id: "free/auto".to_string(),
         display_name: "Auto (round-robin across configured providers)".to_string(),
         description: "stacks every free-tier key you've added · $0.00 per M".to_string(),
         is_current: false,
+        provider_id: provider_id.to_string(),
     }];
 
     for upstream in claurst_api::FREE_CATALOG {
@@ -499,6 +521,7 @@ fn free_provider_models() -> Vec<ModelEntry> {
             display_name: format!("{} \u{2014} {}", upstream.title, upstream.default_model),
             description: format!("{} · $0.00 per M", upstream.note),
             is_current: false,
+            provider_id: provider_id.to_string(),
         });
     }
 
@@ -523,6 +546,25 @@ pub struct ModelPickerState {
     pub models_loaded: bool,
     /// `true` while the background fetch is in flight.
     pub loading_models: bool,
+    /// Favorited model keys ("provider/model" format), loaded from Settings.
+    pub favorites: Vec<String>,
+    /// Synthetic "Default" entry prepended to the model list.
+    default_entry: ModelEntry,
+    /// When true, the picker shows models from all connected providers
+    /// grouped by provider name.
+    pub all_providers_mode: bool,
+    /// Provider ID → display name map, populated from the model registry
+    /// when the all-providers picker opens. Used for group headers so
+    /// built-in providers (nvidia, deepinfra, etc.) show their real name
+    /// instead of "Other".
+    pub provider_names: std::collections::HashMap<String, String>,
+    /// When true, show ALL providers (including unconfigured) in the picker.
+    /// Default false — only connected providers shown.
+    pub show_all_providers: bool,
+    /// Set of connected provider IDs. When `show_all_providers` is false,
+    /// only models whose provider_id is in this set are shown (plus the
+    /// default entry). Populated by `open_model_picker_all_providers`.
+    pub connected_provider_ids: std::collections::HashSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +593,18 @@ impl ModelPickerState {
             fast_mode_model: None,
             models_loaded: false,
             loading_models: false,
+            favorites: Vec::new(),
+            default_entry: ModelEntry {
+                id: DEFAULT_MODEL_SENTINEL.to_string(),
+                display_name: "Default".to_string(),
+                description: "Provider's recommended model (auto-selects best)".to_string(),
+                is_current: false,
+                provider_id: String::new(),
+            },
+            all_providers_mode: false,
+            provider_names: std::collections::HashMap::new(),
+            show_all_providers: false,
+            connected_provider_ids: std::collections::HashSet::new(),
         }
     }
 
@@ -568,6 +622,48 @@ impl ModelPickerState {
         self.open_with_title("Select model", current_model, effort, fast_mode);
     }
 
+    /// Open in all-providers mode — shows models from all connected
+    /// providers grouped by provider name.
+    pub fn open_all_providers(&mut self, current_model: &str, effort: EffortLevel, fast_mode: bool) {
+        self.all_providers_mode = true;
+        self.open_with_title("Select model (all providers)", current_model, effort, fast_mode);
+    }
+
+    /// Get the display name for a provider ID (for all-providers mode).
+    pub fn provider_group_name(provider_id: &str) -> String {
+        // Custom providers: use the user-configured display name from settings.
+        if let Ok(settings) = claurst_core::Settings::load_sync() {
+            if let Some(def) = settings.custom_providers.get(provider_id) {
+                return def.name.clone();
+            }
+        }
+        match provider_id {
+            "anthropic" => "Anthropic".to_string(),
+            "openai" => "OpenAI".to_string(),
+            "google" => "Google".to_string(),
+            "groq" => "Groq".to_string(),
+            "openrouter" => "OpenRouter".to_string(),
+            "deepseek" => "DeepSeek".to_string(),
+            "ollama" => "Ollama".to_string(),
+            "lmstudio" => "LM Studio".to_string(),
+            "llamacpp" | "llama-cpp" | "llama-server" => "llama.cpp".to_string(),
+            "github-copilot" => "GitHub Copilot".to_string(),
+            "codex" | "openai-codex" => "OpenAI Codex".to_string(),
+            "cohere" => "Cohere".to_string(),
+            "xai" => "xAI".to_string(),
+            "free" => "Free Mode".to_string(),
+            "cerebras" => "Cerebras".to_string(),
+            "sambanova" => "SambaNova".to_string(),
+            "together-ai" | "togetherai" => "Together AI".to_string(),
+            "mistral" => "Mistral".to_string(),
+            "perplexity" => "Perplexity".to_string(),
+            "azure" => "Azure OpenAI".to_string(),
+            "amazon-bedrock" => "AWS Bedrock".to_string(),
+            "custom-openai" => "Custom OpenAI".to_string(),
+            _ => "Other".to_string(),
+        }
+    }
+
     pub fn open_with_title(
         &mut self,
         title: impl Into<String>,
@@ -576,15 +672,24 @@ impl ModelPickerState {
         fast_mode: bool,
     ) {
         for m in &mut self.models {
-            m.is_current = m.id == current_model;
+            m.is_current = m.id == current_model
+                || current_model == format!("{}/{}", m.provider_id, m.id);
         }
-        self.selected_idx = self
-            .models
-            .iter()
-            .position(|m| m.is_current)
-            .unwrap_or(0);
+        // Mark default entry as current when no explicit model is set.
+        self.default_entry.is_current = current_model.is_empty()
+            || current_model == DEFAULT_MODEL_SENTINEL;
         self.title = title.into();
+        // Clear the filter BEFORE computing selected_idx so a stale filter
+        // can't hide the current model and leave the cursor on row 0.
         self.filter.clear();
+        // Compute selected_idx from the grouped list (default entry at 0,
+        // favorites first, then non-favorites) — not the raw models vec —
+        // so the cursor highlights the correct row.
+        self.selected_idx = self
+            .filtered_models_grouped()
+            .iter()
+            .position(|(m, _)| m.is_current)
+            .unwrap_or(0);
         self.effort_level = effort;
         self.fast_mode = fast_mode;
         self.fast_mode_model = fast_mode.then_some(current_model.to_string());
@@ -595,6 +700,10 @@ impl ModelPickerState {
     pub fn close(&mut self) {
         self.visible = false;
         self.filter.clear();
+        self.all_providers_mode = false;
+        self.provider_names.clear();
+        self.show_all_providers = false;
+        self.connected_provider_ids.clear();
     }
 
     pub fn is_selected_fast_mode_model(&self, model_id: &str) -> bool {
@@ -603,7 +712,7 @@ impl ModelPickerState {
 
     /// Move selection up one row (wraps to last if at top).
     pub fn select_prev(&mut self) {
-        let count = self.filtered_models().len();
+        let count = self.filtered_models_grouped().len();
         if count == 0 { return; }
         if self.selected_idx == 0 {
             self.selected_idx = count - 1;
@@ -614,9 +723,90 @@ impl ModelPickerState {
 
     /// Move selection down one row (wraps to first if at bottom).
     pub fn select_next(&mut self) {
-        let count = self.filtered_models().len();
+        let count = self.filtered_models_grouped().len();
         if count == 0 { return; }
         self.selected_idx = (self.selected_idx + 1) % count;
+    }
+
+    /// Jump to the first model of the next provider group (all-providers mode).
+    /// Wraps around to the default entry (index 0) after the last provider.
+    pub fn select_next_provider(&mut self) {
+        let grouped = self.filtered_models_grouped();
+        if grouped.is_empty() {
+            return;
+        }
+        let current_provider = grouped
+            .get(self.selected_idx)
+            .map(|(m, _)| m.provider_id.as_str())
+            .unwrap_or("");
+        // Find the first entry after the current position with a different
+        // non-empty provider_id. Skip the default entry (empty provider_id).
+        for i in (self.selected_idx + 1)..grouped.len() {
+            let pid = grouped[i].0.provider_id.as_str();
+            if !pid.is_empty() && pid != current_provider {
+                self.selected_idx = i;
+                return;
+            }
+        }
+        // Wrap around: find the first entry with a non-empty provider_id
+        // from the beginning (skips default entry at index 0).
+        for i in 0..self.selected_idx {
+            let pid = grouped[i].0.provider_id.as_str();
+            if !pid.is_empty() && pid != current_provider {
+                self.selected_idx = i;
+                return;
+            }
+        }
+        // No other provider found — stay put.
+    }
+
+    /// Jump to the first model of the previous provider group (all-providers mode).
+    /// Wraps around to the last provider's first model after index 0.
+    pub fn select_prev_provider(&mut self) {
+        let grouped = self.filtered_models_grouped();
+        if grouped.is_empty() {
+            return;
+        }
+        let current_provider = grouped
+            .get(self.selected_idx)
+            .map(|(m, _)| m.provider_id.as_str())
+            .unwrap_or("");
+        // Walk backwards to find the first entry of the previous provider.
+        // We need to find the boundary: the first entry whose provider_id
+        // differs from current AND is non-empty, then from that point find
+        // the FIRST entry of that provider group.
+        let mut prev_provider = None;
+        if self.selected_idx > 0 {
+            for i in (0..self.selected_idx).rev() {
+                let pid = grouped[i].0.provider_id.as_str();
+                if !pid.is_empty() && pid != current_provider {
+                    prev_provider = Some(pid);
+                    // Now find the first entry of this provider group.
+                    for j in 0..=i {
+                        if grouped[j].0.provider_id == pid {
+                            self.selected_idx = j;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        // Wrap around: find the last provider group's first entry.
+        if prev_provider.is_none() {
+            // Find the last distinct provider group.
+            let mut last_provider = "";
+            let mut last_provider_first_idx = 0;
+            for (i, (m, _)) in grouped.iter().enumerate() {
+                let pid = m.provider_id.as_str();
+                if !pid.is_empty() && pid != last_provider {
+                    last_provider = pid;
+                    last_provider_first_idx = i;
+                }
+            }
+            if !last_provider.is_empty() && last_provider != current_provider {
+                self.selected_idx = last_provider_first_idx;
+            }
+        }
     }
 
     pub fn select_first(&mut self) {
@@ -624,17 +814,27 @@ impl ModelPickerState {
     }
 
     pub fn select_last(&mut self) {
-        let count = self.filtered_models().len();
+        let count = self.filtered_models_grouped().len();
         self.selected_idx = count.saturating_sub(1);
+    }
+
+    /// Toggle showing all providers vs only connected ones.
+    pub fn toggle_show_all_providers(&mut self) {
+        self.show_all_providers = !self.show_all_providers;
+        // Reset selection to stay in bounds.
+        let count = self.filtered_models_grouped().len();
+        if count > 0 && self.selected_idx >= count {
+            self.selected_idx = count - 1;
+        }
     }
 
     /// The reasoning-effort ladder of the currently highlighted model (ascending,
     /// no ultracode). Empty when nothing is highlighted or the model is
     /// non-reasoning.
     fn selected_ladder(&self) -> Vec<EffortLevel> {
-        let filtered = self.filtered_models();
+        let filtered = self.filtered_models_grouped();
         match filtered.get(self.selected_idx) {
-            Some(m) => picker_variant_ladder(&m.id),
+            Some((m, _)) => picker_variant_ladder(&m.id),
             None => Vec::new(),
         }
     }
@@ -671,7 +871,7 @@ impl ModelPickerState {
     /// Returns the selected model; the caller is responsible for persisting it
     /// in the correct provider-aware format.
     pub fn confirm(&mut self) -> Option<(String, Option<EffortLevel>)> {
-        let filtered = self.filtered_models();
+        let filtered = self.filtered_models_grouped();
         let custom = self.filter.trim();
         if filtered.is_empty() {
             if custom.is_empty() {
@@ -681,8 +881,12 @@ impl ModelPickerState {
             self.close();
             return Some((id, None));
         }
-        let entry = filtered.get(self.selected_idx)?;
+        let (entry, _is_fav) = filtered.get(self.selected_idx)?;
         let id = entry.id.clone();
+        if id == DEFAULT_MODEL_SENTINEL {
+            self.close();
+            return Some((id, None));
+        }
         let ladder = picker_variant_ladder(&id);
         let effort = if ladder.len() > 1 {
             Some(clamp_to_ladder(&ladder, self.effort_level))
@@ -723,6 +927,133 @@ impl ModelPickerState {
             .collect()
     }
 
+    /// Load favorites from Settings into the picker state.
+    pub fn load_favorites(&mut self) {
+        if let Ok(settings) = claurst_core::Settings::load_sync() {
+            self.favorites = settings.favorite_models;
+        }
+    }
+
+    /// Toggle favorite status on a model key. Saves to Settings immediately.
+    pub fn toggle_favorite(&mut self, model_key: &str) {
+        if self.favorites.contains(&model_key.to_string()) {
+            self.favorites.retain(|f| f != model_key);
+        } else {
+            self.favorites.push(model_key.to_string());
+        }
+        // Persist to settings.
+        if let Ok(mut settings) = claurst_core::Settings::load_sync() {
+            settings.favorite_models = self.favorites.clone();
+            let _ = settings.save_sync();
+        }
+    }
+
+    /// Check if a model key is favorited.
+    pub fn is_favorite(&self, model_key: &str) -> bool {
+        self.favorites.contains(&model_key.to_string())
+    }
+
+    /// Get the list of valid favorites — those present in the picker's
+    /// current model list. Stale favorites (model removed from catalog)
+    /// are silently excluded from display but NOT removed from settings.
+    pub fn valid_favorites(&self) -> Vec<String> {
+        let model_ids: std::collections::HashSet<&str> =
+            self.models.iter().map(|m| m.id.as_str()).collect();
+        self.favorites
+            .iter()
+            .filter(|f| {
+                // Favorites are in "provider/model" format. The picker's
+                // models list has bare model ids (no provider prefix) since
+                // the picker is scoped to one provider. So we match on the
+                // model portion after the slash.
+                if let Some((_, model)) = f.split_once('/') {
+                    model_ids.contains(model)
+                } else {
+                    model_ids.contains(f.as_str())
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Returns model entries for display: favorites first (marked with ★),
+    /// then all other models. Applies the current filter to both sections.
+    pub fn filtered_models_grouped(&self) -> Vec<(&ModelEntry, bool)> {
+        let valid_favs = self.valid_favorites();
+        let fav_model_ids: std::collections::HashSet<String> = valid_favs
+            .iter()
+            .map(|f| f.split_once('/').map(|(_, m)| m.to_string()).unwrap_or(f.clone()))
+            .collect();
+
+        // Connected-providers filter: when show_all_providers is false AND
+        // we're in all-providers mode, only show models whose provider_id is
+        // in the connected set. The default entry (empty provider_id) always
+        // passes.
+        let connected_filter = |m: &&ModelEntry| -> bool {
+            if m.provider_id.is_empty() {
+                return true;
+            }
+            if self.show_all_providers || !self.all_providers_mode {
+                return true;
+            }
+            self.connected_provider_ids.contains(&m.provider_id)
+        };
+
+        if self.filter.is_empty() {
+            // No filter: favorites section, then all models
+            let mut result = Vec::new();
+            // Default entry always at top.
+            result.push((&self.default_entry, false));
+            // Favorites first
+            for m in &self.models {
+                if fav_model_ids.contains(&m.id) && connected_filter(&m) {
+                    result.push((m, true));
+                }
+            }
+            // Then non-favorites
+            for m in &self.models {
+                if !fav_model_ids.contains(&m.id) && connected_filter(&m) {
+                    result.push((m, false));
+                }
+            }
+            result
+        } else {
+            let needle = self.filter.to_lowercase();
+            let mut result = Vec::new();
+            // Default entry — always show if filter matches or is empty.
+            if self.filter.is_empty()
+                || "default".contains(&needle)
+                || self.default_entry.display_name.to_lowercase().contains(&needle)
+                || self.default_entry.description.to_lowercase().contains(&needle)
+            {
+                result.push((&self.default_entry, false));
+            }
+            // Favorites matching filter
+            for m in &self.models {
+                if fav_model_ids.contains(&m.id)
+                    && (m.id.to_lowercase().contains(&needle)
+                        || m.display_name.to_lowercase().contains(&needle)
+                        || m.description.to_lowercase().contains(&needle))
+                    && connected_filter(&m)
+                {
+                    result.push((m, true));
+                }
+            }
+            // Non-favorites matching filter
+            for m in &self.models {
+                if !fav_model_ids.contains(&m.id)
+                    && (m.id.to_lowercase().contains(&needle)
+                        || m.display_name.to_lowercase().contains(&needle)
+                        || m.description.to_lowercase().contains(&needle))
+                    && connected_filter(&m)
+                {
+                    result.push((m, false));
+                }
+            }
+            result
+        }
+    }
+
     /// Replace the model list with dynamically loaded entries.
     ///
     /// Called by the app event loop when the background fetch completes.
@@ -731,8 +1062,8 @@ impl ModelPickerState {
         self.models = entries;
         self.loading_models = false;
         self.models_loaded = true;
-        // Keep selected_idx in bounds.
-        let count = self.filtered_models().len();
+        // Keep selected_idx in bounds (grouped view includes default entry).
+        let count = self.filtered_models_grouped().len();
         if count > 0 && self.selected_idx >= count {
             self.selected_idx = count - 1;
         }
@@ -769,8 +1100,8 @@ impl ModelPickerState {
         }
         self.loading_models = false;
         self.models_loaded = true;
-        // Keep selected_idx in bounds.
-        let count = self.filtered_models().len();
+        // Keep selected_idx in bounds (grouped view includes default entry).
+        let count = self.filtered_models_grouped().len();
         if count > 0 && self.selected_idx >= count {
             self.selected_idx = count - 1;
         }
@@ -820,8 +1151,8 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
     // ── Dialog size ──
     let width = 65u16.min(area.width.saturating_sub(6));
     let max_height = (area.height as f32 * 0.75) as u16;
-    let filtered = state.filtered_models();
-    let content_h = (filtered.len() as u16 + 6).min(max_height).max(8);
+    let grouped = state.filtered_models_grouped();
+    let content_h = (grouped.len() as u16 + 6).min(max_height).max(8);
     let dialog_area = centered_rect(width, content_h, area);
 
     // ── Fill dialog bg (no border) ──
@@ -909,7 +1240,7 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
         lines.push(Line::from(""));
     }
 
-    if filtered.is_empty() {
+    if grouped.is_empty() {
         lines.push(Line::from(vec![Span::styled(" No results found", Style::default().fg(dim))]));
         if !state.filter.trim().is_empty() {
             lines.push(Line::from(vec![Span::styled(
@@ -918,7 +1249,24 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
             )]));
         }
     } else {
-        for (i, model) in filtered.iter().enumerate() {
+        let mut last_provider: Option<&str> = None;
+        for (i, (model, is_fav)) in grouped.iter().enumerate() {
+            // Provider group header in all-providers mode — skip for the
+            // synthetic default entry (empty provider_id).
+            if state.all_providers_mode
+                && model.id != DEFAULT_MODEL_SENTINEL
+                && last_provider != Some(&model.provider_id) {
+                last_provider = Some(&model.provider_id);
+                let group_name = state
+                    .provider_names
+                    .get(&model.provider_id)
+                    .cloned()
+                    .unwrap_or_else(|| ModelPickerState::provider_group_name(&model.provider_id));
+                lines.push(Line::from(vec![Span::styled(
+                    format!(" {} ", group_name),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )]));
+            }
             let is_selected = i == state.selected_idx;
             let supports_effort = model_supports_effort(&model.id);
 
@@ -934,12 +1282,18 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
 
             let mut spans: Vec<Span<'static>> = Vec::new();
 
-            // Current model indicator
-            if model.is_current {
+            // Default entry gets a star (★); active model gets a green dot (●).
+            if model.id == DEFAULT_MODEL_SENTINEL {
+                spans.push(Span::styled(" \u{2605} ", Style::default().fg(Color::Cyan).bg(bg)));
+            } else if model.is_current {
                 spans.push(Span::styled(" \u{25cf} ", Style::default().fg(Color::Green).bg(bg)));
             } else {
                 spans.push(Span::styled("   ", Style::default().bg(bg)));
             }
+
+            // Favorite indicator — heart (♥) when favorited.
+            let heart = if *is_fav { "\u{2665} " } else { "  " };
+            spans.push(Span::styled(heart.to_string(), Style::default().fg(Color::Yellow).bg(bg)));
 
             spans.push(Span::styled(model.display_name.clone(), Style::default().fg(fg).bg(bg)));
 
@@ -990,11 +1344,37 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
 
     para.render(body_area, buf);
 
-    let mut footer_spans = vec![
-        Span::styled(" enter", Style::default().fg(dim)),
-        Span::styled(" select", Style::default().fg(dim)),
-    ];
-    if let Some(model) = filtered.get(state.selected_idx) {
+    let mut footer_spans = vec![];
+    // Show "enter set default" when the default sentinel is selected,
+    // otherwise "enter select".
+    let is_on_default = grouped
+        .get(state.selected_idx)
+        .map(|(m, _)| m.id == DEFAULT_MODEL_SENTINEL)
+        .unwrap_or(false);
+    if is_on_default {
+        footer_spans.push(Span::styled(" enter", Style::default().fg(dim)));
+        footer_spans.push(Span::styled(" set default", Style::default().fg(dim)));
+    } else {
+        footer_spans.push(Span::styled(" enter", Style::default().fg(dim)));
+        footer_spans.push(Span::styled(" select", Style::default().fg(dim)));
+    }
+    // Favorite toggle shortcut.
+    footer_spans.push(Span::raw("  "));
+    footer_spans.push(Span::styled("f", Style::default().fg(dim)));
+    footer_spans.push(Span::styled(" favorite", Style::default().fg(dim)));
+    // Tab to jump between provider groups.
+    footer_spans.push(Span::raw("  "));
+    footer_spans.push(Span::styled("Tab", Style::default().fg(dim)));
+    footer_spans.push(Span::styled(" providers", Style::default().fg(dim)));
+    // Show-all toggle shortcut.
+    footer_spans.push(Span::raw("  "));
+    footer_spans.push(Span::styled("a", Style::default().fg(dim)));
+    if state.show_all_providers {
+        footer_spans.push(Span::styled(" connected", Style::default().fg(dim)));
+    } else {
+        footer_spans.push(Span::styled(" all", Style::default().fg(dim)));
+    }
+    if let Some((model, _)) = grouped.get(state.selected_idx) {
         if model_supports_effort(&model.id) {
             footer_spans.push(Span::raw("  "));
             footer_spans.push(Span::styled("\u{2190}/\u{2192}", Style::default().fg(dim)));
@@ -1026,18 +1406,21 @@ mod tests {
                 display_name: "Claude Opus 4.6".to_string(),
                 description: "200K context".to_string(),
                 is_current: false,
+                provider_id: "anthropic".to_string(),
             },
             ModelEntry {
                 id: "claude-sonnet-4-6".to_string(),
                 display_name: "Claude Sonnet 4.6".to_string(),
                 description: "200K context".to_string(),
                 is_current: false,
+                provider_id: "anthropic".to_string(),
             },
             ModelEntry {
                 id: "claude-haiku-4-5".to_string(),
                 display_name: "Claude Haiku 4.5".to_string(),
                 description: "200K context".to_string(),
                 is_current: false,
+                provider_id: "anthropic".to_string(),
             },
         ]
     }
@@ -1137,7 +1520,7 @@ mod tests {
     #[test]
     fn select_next_wraps() {
         let mut p = make_picker_with_current("claude-opus-4-6");
-        let total = p.filtered_models().len();
+        let total = p.filtered_models_grouped().len();
         p.selected_idx = total - 1;
         p.select_next();
         assert_eq!(p.selected_idx, 0);
@@ -1149,7 +1532,7 @@ mod tests {
         let mut p = make_picker_with_current("claude-opus-4-6");
         p.selected_idx = 0;
         p.select_prev();
-        let total = p.filtered_models().len();
+        let total = p.filtered_models_grouped().len();
         assert_eq!(p.selected_idx, total - 1);
     }
 
@@ -1182,10 +1565,10 @@ mod tests {
     #[test]
     fn confirm_returns_id_and_closes() {
         let mut p = make_picker_with_current("claude-opus-4-6");
-        p.selected_idx = 0;
-        let first_id = p.filtered_models()[0].id.clone();
+        p.selected_idx = 1; // skip Default sentinel at index 0
+        let first_model_id = p.filtered_models()[0].id.clone();
         let result = p.confirm();
-        assert_eq!(result.map(|(id, _)| id), Some(first_id));
+        assert_eq!(result.map(|(id, _)| id), Some(first_model_id));
         assert!(!p.visible, "picker should be closed after confirm");
     }
 
@@ -1478,6 +1861,7 @@ mod tests {
                 display_name: "LIVE OVERWRITE".to_string(),
                 description: "live desc".to_string(),
                 is_current: false,
+                provider_id: "anthropic".to_string(),
             },
             // A brand-new live id absent from the catalog — must be appended.
             ModelEntry {
@@ -1485,6 +1869,7 @@ mod tests {
                 display_name: "GPT-5.5 (live)".to_string(),
                 description: "live only".to_string(),
                 is_current: false,
+                provider_id: "anthropic".to_string(),
             },
         ];
         p.merge_models(live);
@@ -1530,12 +1915,14 @@ mod tests {
             "default",
             "Default model",
             "no catalog entry for this provider",
+            "anthropic",
         )]);
         p.merge_models(vec![ModelEntry {
             id: "llama3.3".to_string(),
             display_name: "Llama 3.3".to_string(),
             description: "local".to_string(),
             is_current: false,
+            provider_id: "anthropic".to_string(),
         }]);
         assert!(
             !p.models.iter().any(|m| m.id == "default"),
@@ -1581,5 +1968,530 @@ mod tests {
         }
         assert!(!provider_has_authoritative_live_models("github-copilot"));
         assert!(!provider_has_authoritative_live_models("openrouter"));
+    }
+
+    #[test]
+    fn valid_favorites_filters_stale_entries() {
+        let mut state = ModelPickerState::new();
+        state.models = vec![
+            ModelEntry { id: "model-a".to_string(), display_name: "A".to_string(), description: "".to_string(), is_current: false, provider_id: String::new() },
+            ModelEntry { id: "model-b".to_string(), display_name: "B".to_string(), description: "".to_string(), is_current: false, provider_id: String::new() },
+        ];
+        state.favorites = vec![
+            "provider/model-a".to_string(),  // valid
+            "provider/model-c".to_string(),  // stale (not in models list)
+            "model-b".to_string(),           // valid (no provider prefix)
+        ];
+        let valid = state.valid_favorites();
+        assert_eq!(valid.len(), 2);
+        assert!(valid.contains(&"provider/model-a".to_string()));
+        assert!(valid.contains(&"model-b".to_string()));
+    }
+
+    #[test]
+    fn filtered_models_grouped_puts_favorites_first() {
+        let mut state = ModelPickerState::new();
+        state.models = vec![
+            ModelEntry { id: "regular".to_string(), display_name: "Regular".to_string(), description: "".to_string(), is_current: false, provider_id: String::new() },
+            ModelEntry { id: "pinned".to_string(), display_name: "Pinned".to_string(), description: "".to_string(), is_current: false, provider_id: String::new() },
+            ModelEntry { id: "other".to_string(), display_name: "Other".to_string(), description: "".to_string(), is_current: false, provider_id: String::new() },
+        ];
+        state.favorites = vec!["provider/pinned".to_string()];
+        let grouped = state.filtered_models_grouped();
+        assert_eq!(grouped.len(), 4);
+        // Default sentinel at top.
+        assert_eq!(grouped[0].0.id, DEFAULT_MODEL_SENTINEL);
+        // Favorite must come next.
+        assert_eq!(grouped[1].0.id, "pinned");
+        assert!(grouped[1].1);
+        // Rest are non-favorites, preserve source order.
+        assert_eq!(grouped[2].0.id, "regular");
+        assert!(!grouped[2].1);
+        assert_eq!(grouped[3].0.id, "other");
+        assert!(!grouped[3].1);
+    }
+
+    #[test]
+    fn filtered_models_grouped_respects_filter() {
+        let mut state = ModelPickerState::new();
+        state.models = vec![
+            ModelEntry { id: "pinned-a".to_string(), display_name: "Pinned A".to_string(), description: "".to_string(), is_current: false, provider_id: String::new() },
+            ModelEntry { id: "pinned-b".to_string(), display_name: "Other B".to_string(), description: "".to_string(), is_current: false, provider_id: String::new() },
+        ];
+        state.favorites = vec![
+            "provider/pinned-a".to_string(),
+            "provider/pinned-b".to_string(),
+        ];
+        for c in "pinned a".chars() {
+            state.push_filter_char(c);
+        }
+        let grouped = state.filtered_models_grouped();
+        // Only the favorite matching the filter appears, on top.
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].0.id, "pinned-a");
+        assert!(grouped[0].1);
+    }
+
+    #[test]
+    fn is_favorite_roundtrips_without_persist() {
+        let mut state = ModelPickerState::new();
+        state.favorites = vec!["anthropic/claude-sonnet-4-6".to_string()];
+        assert!(state.is_favorite("anthropic/claude-sonnet-4-6"));
+        assert!(!state.is_favorite("openai/gpt-4o"));
+    }
+
+    #[test]
+    fn default_entry_appears_at_top() {
+        let mut picker = ModelPickerState::new();
+        picker.set_models(vec![
+            ModelEntry {
+                id: "model-a".to_string(),
+                display_name: "Model A".to_string(),
+                description: "desc".to_string(),
+                is_current: false,
+                provider_id: String::new(),
+            },
+            ModelEntry {
+                id: "model-b".to_string(),
+                display_name: "Model B".to_string(),
+                description: "desc".to_string(),
+                is_current: false,
+                provider_id: String::new(),
+            },
+        ]);
+        picker.open("model-a");
+        let grouped = picker.filtered_models_grouped();
+        assert_eq!(grouped.len(), 3);
+        assert_eq!(grouped[0].0.id, DEFAULT_MODEL_SENTINEL);
+        assert_eq!(grouped[1].0.id, "model-a");
+    }
+
+    #[test]
+    fn default_entry_is_current_when_no_model() {
+        let mut picker = ModelPickerState::new();
+        picker.set_models(vec![
+            ModelEntry {
+                id: "model-a".to_string(),
+                display_name: "Model A".to_string(),
+                description: "desc".to_string(),
+                is_current: false,
+                provider_id: String::new(),
+            },
+        ]);
+        picker.open_with_title("Test", "", EffortLevel::Medium, false);
+        assert!(picker.default_entry.is_current);
+    }
+
+    #[test]
+    fn confirm_returns_default_sentinel() {
+        let mut picker = ModelPickerState::new();
+        picker.set_models(vec![
+            ModelEntry {
+                id: "model-a".to_string(),
+                display_name: "Model A".to_string(),
+                description: "desc".to_string(),
+                is_current: false,
+                provider_id: String::new(),
+            },
+        ]);
+        picker.open("model-a");
+        picker.selected_idx = 0; // Default entry
+        let result = picker.confirm();
+        assert_eq!(result.unwrap().0, DEFAULT_MODEL_SENTINEL);
+    }
+
+    // --- selected_idx preselection from grouped order (Bug 1 + Bug 2) ---
+
+    #[test]
+    fn open_with_title_preselects_current_in_grouped_order() {
+        let mut p = make_picker();
+        // Set the model at raw index 1 (claude-sonnet-4-6) as current.
+        // Grouped order: [default, opus, sonnet, haiku] (no favorites).
+        // The grouped index of sonnet should be 2 (default=0, opus=1, sonnet=2).
+        p.open_with_title("Test", "claude-sonnet-4-6", EffortLevel::Medium, false);
+        let grouped = p.filtered_models_grouped();
+        let expected_idx = grouped
+            .iter()
+            .position(|(m, _)| m.id == "claude-sonnet-4-6")
+            .unwrap();
+        assert_eq!(
+            p.selected_idx, expected_idx,
+            "selected_idx must match grouped position, not raw models position"
+        );
+        // Sanity: grouped includes default entry at 0.
+        assert_eq!(grouped[0].0.id, DEFAULT_MODEL_SENTINEL);
+        assert!(p.models.iter().find(|m| m.id == "claude-sonnet-4-6").unwrap().is_current);
+    }
+
+    #[test]
+    fn open_with_title_preselects_default_entry_when_no_model() {
+        let mut p = make_picker();
+        p.open_with_title("Test", "", EffortLevel::Medium, false);
+        assert!(p.default_entry.is_current);
+        assert_eq!(p.selected_idx, 0);
+    }
+
+    #[test]
+    fn open_with_title_preselects_with_provider_prefixed_current() {
+        let models = vec![
+            ModelEntry {
+                id: "revolut-ca/glm-5-2".to_string(),
+                display_name: "GLM 5.2".to_string(),
+                description: "".to_string(),
+                is_current: false,
+                provider_id: "together-ai-coding".to_string(),
+            },
+            ModelEntry {
+                id: "some-other-model".to_string(),
+                display_name: "Other".to_string(),
+                description: "".to_string(),
+                is_current: false,
+                provider_id: "together-ai-coding".to_string(),
+            },
+        ];
+        let mut p = ModelPickerState::new();
+        p.set_models(models);
+        p.open_with_title(
+            "Test",
+            "together-ai-coding/revolut-ca/glm-5-2",
+            EffortLevel::Medium,
+            false,
+        );
+        let glm = p
+            .models
+            .iter()
+            .find(|m| m.id == "revolut-ca/glm-5-2")
+            .unwrap();
+        assert!(glm.is_current, "provider-prefixed current must set is_current");
+        // Other model must NOT be current.
+        assert!(!p
+            .models
+            .iter()
+            .find(|m| m.id == "some-other-model")
+            .unwrap()
+            .is_current);
+        let grouped = p.filtered_models_grouped();
+        let expected_idx = grouped
+            .iter()
+            .position(|(m, _)| m.id == "revolut-ca/glm-5-2")
+            .unwrap();
+        assert_eq!(p.selected_idx, expected_idx);
+    }
+
+    #[test]
+    fn open_with_title_preselects_correct_row_with_favorites() {
+        // Build a picker where a NON-current model is a favorite.
+        // sample_models: [opus, sonnet, haiku] (all anthropic).
+        // Favorite: anthropic/claude-sonnet-4-6
+        // Current:  claude-opus-4-6
+        // Grouped order: [default, sonnet(fav), opus, haiku]
+        // So opus is at grouped index 2, not raw index 0.
+        let mut p = make_picker();
+        p.favorites = vec!["anthropic/claude-sonnet-4-6".to_string()];
+        p.open_with_title("Test", "claude-opus-4-6", EffortLevel::Medium, false);
+        let grouped = p.filtered_models_grouped();
+        // Verify grouped order: default, sonnet (favorite), opus, haiku.
+        assert_eq!(grouped.len(), 4);
+        assert_eq!(grouped[0].0.id, DEFAULT_MODEL_SENTINEL);
+        assert_eq!(grouped[1].0.id, "claude-sonnet-4-6");
+        assert!(grouped[1].1, "sonnet should be favorite");
+        assert_eq!(grouped[2].0.id, "claude-opus-4-6");
+        assert!(!grouped[2].1, "opus should not be favorite");
+        assert_eq!(grouped[3].0.id, "claude-haiku-4-5");
+        // selected_idx must point to opus in grouped order (index 2).
+        assert_eq!(
+            p.selected_idx, 2,
+            "selected_idx must be the grouped position of the current model, not the raw index"
+        );
+    }
+
+    #[test]
+    fn open_all_providers_preselects_provider_prefixed_model() {
+        let models = vec![
+            ModelEntry {
+                id: "revolut-ca/glm-5-2".to_string(),
+                display_name: "GLM 5.2".to_string(),
+                description: "".to_string(),
+                is_current: false,
+                provider_id: "together-ai-coding".to_string(),
+            },
+            ModelEntry {
+                id: "another-model".to_string(),
+                display_name: "Another".to_string(),
+                description: "".to_string(),
+                is_current: false,
+                provider_id: "together-ai-coding".to_string(),
+            },
+        ];
+        let mut p = ModelPickerState::new();
+        p.set_models(models);
+        p.connected_provider_ids =
+            ["together-ai-coding".to_string()].into_iter().collect();
+        p.open_all_providers(
+            "together-ai-coding/revolut-ca/glm-5-2",
+            EffortLevel::Medium,
+            false,
+        );
+        assert!(p.all_providers_mode);
+        let glm = p
+            .models
+            .iter()
+            .find(|m| m.id == "revolut-ca/glm-5-2")
+            .unwrap();
+        assert!(glm.is_current, "all-providers mode must match provider-prefixed current");
+        let grouped = p.filtered_models_grouped();
+        let expected_idx = grouped
+            .iter()
+            .position(|(m, _)| m.id == "revolut-ca/glm-5-2")
+            .unwrap();
+        assert_eq!(p.selected_idx, expected_idx);
+    }
+
+    #[test]
+    fn default_entry_does_not_get_group_header() {
+        let entry = ModelEntry {
+            id: DEFAULT_MODEL_SENTINEL.to_string(),
+            display_name: "Default".to_string(),
+            description: "".to_string(),
+            is_current: false,
+            provider_id: String::new(),
+        };
+        // The render condition checks model.id != DEFAULT_MODEL_SENTINEL
+        // before pushing a group header. The default entry must NOT pass.
+        assert!(entry.id == DEFAULT_MODEL_SENTINEL);
+    }
+
+    #[test]
+    fn selected_provider_id_captured_before_close() {
+        // When a filter is active and the user navigates + confirms,
+        // the provider_id must be captured BEFORE close() clears the filter.
+        let mut picker = ModelPickerState::new();
+        picker.all_providers_mode = true;
+        picker.connected_provider_ids =
+            ["together-ai-coding".to_string(), "cohere".to_string()]
+                .into_iter()
+                .collect();
+        picker.set_models(vec![
+            ModelEntry {
+                id: "glm-5-2".to_string(),
+                display_name: "GLM 5.2".to_string(),
+                description: "".to_string(),
+                is_current: false,
+                provider_id: "together-ai-coding".to_string(),
+            },
+            ModelEntry {
+                id: "opus-4-8".to_string(),
+                display_name: "Opus 4.8".to_string(),
+                description: "".to_string(),
+                is_current: false,
+                provider_id: "cohere".to_string(),
+            },
+        ]);
+        // Type filter "glm" so only the glm model shows (default entry is
+        // filtered out because "glm" does not match "default").
+        for c in "glm".chars() {
+            picker.push_filter_char(c);
+        }
+        // glm is the only filtered result → grouped index 0.
+        picker.selected_idx = 0;
+        // Capture provider BEFORE confirm (as the fixed Enter handler does).
+        let captured_provider = picker
+            .filtered_models_grouped()
+            .get(picker.selected_idx)
+            .map(|(m, _)| m.provider_id.clone());
+        // Now confirm — this closes and clears the filter.
+        let confirmed_id = picker.confirm();
+        // After close, the filter is cleared — unfiltered list is different.
+        // But we captured the provider BEFORE close.
+        assert_eq!(confirmed_id, Some(("glm-5-2".to_string(), None)));
+        assert_eq!(captured_provider, Some("together-ai-coding".to_string()));
+        // If we had re-read AFTER close, selected_idx=0 would point to the
+        // default entry (provider_id="") in the unfiltered list — the bug.
+        assert_ne!(
+            picker
+                .filtered_models_grouped()
+                .get(0)
+                .map(|(m, _)| m.provider_id.clone()),
+            Some("together-ai-coding".to_string())
+        );
+    }
+
+    // --- Tab / BackTab provider-group navigation (all-providers mode) ---
+
+    /// Two providers with two models each — the basic multi-provider fixture.
+    fn two_provider_models() -> Vec<ModelEntry> {
+        vec![
+            ModelEntry {
+                id: "model-a1".to_string(),
+                display_name: "Model A1".to_string(),
+                description: "".to_string(),
+                is_current: false,
+                provider_id: "provider-a".to_string(),
+            },
+            ModelEntry {
+                id: "model-a2".to_string(),
+                display_name: "Model A2".to_string(),
+                description: "".to_string(),
+                is_current: false,
+                provider_id: "provider-a".to_string(),
+            },
+            ModelEntry {
+                id: "model-b1".to_string(),
+                display_name: "Model B1".to_string(),
+                description: "".to_string(),
+                is_current: false,
+                provider_id: "provider-b".to_string(),
+            },
+            ModelEntry {
+                id: "model-b2".to_string(),
+                display_name: "Model B2".to_string(),
+                description: "".to_string(),
+                is_current: false,
+                provider_id: "provider-b".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn select_next_provider_jumps_to_next_group() {
+        let mut p = ModelPickerState::new();
+        p.set_models(two_provider_models());
+        p.connected_provider_ids =
+            ["provider-a".to_string(), "provider-b".to_string()]
+                .into_iter()
+                .collect();
+        p.open_all_providers("model-a1", EffortLevel::Medium, false);
+        // Default entry at index 0, then provider-a models, then provider-b.
+        let grouped = p.filtered_models_grouped();
+        let a1_idx = grouped.iter().position(|(m, _)| m.id == "model-a1").unwrap();
+        let b1_idx = grouped.iter().position(|(m, _)| m.id == "model-b1").unwrap();
+        p.selected_idx = a1_idx;
+        p.select_next_provider();
+        assert_eq!(
+            p.selected_idx, b1_idx,
+            "Tab from provider A should jump to provider B's first model"
+        );
+    }
+
+    #[test]
+    fn select_prev_provider_jumps_to_previous_group() {
+        let mut p = ModelPickerState::new();
+        p.set_models(two_provider_models());
+        p.connected_provider_ids =
+            ["provider-a".to_string(), "provider-b".to_string()]
+                .into_iter()
+                .collect();
+        p.open_all_providers("model-b1", EffortLevel::Medium, false);
+        let grouped = p.filtered_models_grouped();
+        let a1_idx = grouped.iter().position(|(m, _)| m.id == "model-a1").unwrap();
+        let b1_idx = grouped.iter().position(|(m, _)| m.id == "model-b1").unwrap();
+        p.selected_idx = b1_idx;
+        p.select_prev_provider();
+        assert_eq!(
+            p.selected_idx, a1_idx,
+            "BackTab from provider B should jump to provider A's first model"
+        );
+    }
+
+    #[test]
+    fn select_next_provider_wraps_around() {
+        let mut p = ModelPickerState::new();
+        p.set_models(two_provider_models());
+        p.connected_provider_ids =
+            ["provider-a".to_string(), "provider-b".to_string()]
+                .into_iter()
+                .collect();
+        p.open_all_providers("model-b2", EffortLevel::Medium, false);
+        let grouped = p.filtered_models_grouped();
+        let b2_idx = grouped.iter().position(|(m, _)| m.id == "model-b2").unwrap();
+        let a1_idx = grouped.iter().position(|(m, _)| m.id == "model-a1").unwrap();
+        p.selected_idx = b2_idx;
+        p.select_next_provider();
+        assert_eq!(
+            p.selected_idx, a1_idx,
+            "Tab from last provider should wrap to first provider's first model"
+        );
+    }
+
+    #[test]
+    fn select_next_provider_skips_default_entry() {
+        let mut p = ModelPickerState::new();
+        p.set_models(two_provider_models());
+        p.connected_provider_ids =
+            ["provider-a".to_string(), "provider-b".to_string()]
+                .into_iter()
+                .collect();
+        p.open_all_providers("", EffortLevel::Medium, false);
+        // No current model → default entry (index 0) is selected.
+        {
+            let grouped = p.filtered_models_grouped();
+            assert_eq!(p.selected_idx, 0, "default entry should be at index 0");
+            assert_eq!(grouped[0].0.id, DEFAULT_MODEL_SENTINEL);
+            assert_eq!(grouped[0].0.provider_id, "");
+        }
+        p.select_next_provider();
+        // Tab must skip the default entry and land on the first real
+        // provider's first model — never back on the default entry.
+        assert_ne!(
+            p.selected_idx, 0,
+            "Tab must never select the default entry"
+        );
+        let selected_pid = p.filtered_models_grouped()[p.selected_idx].0.provider_id.clone();
+        assert!(
+            !selected_pid.is_empty(),
+            "Tab must land on a real provider, not the default entry"
+        );
+    }
+
+    #[test]
+    fn connected_filter_hides_unconnected_providers() {
+        let mut state = ModelPickerState::new();
+        state.all_providers_mode = true;
+        state.connected_provider_ids =
+            ["provider-a".to_string()].into_iter().collect();
+        state.set_models(vec![
+            ModelEntry { id: "model-a1".to_string(), display_name: "A1".to_string(), description: "".to_string(), is_current: false, provider_id: "provider-a".to_string() },
+            ModelEntry { id: "model-a2".to_string(), display_name: "A2".to_string(), description: "".to_string(), is_current: false, provider_id: "provider-a".to_string() },
+            ModelEntry { id: "model-b1".to_string(), display_name: "B1".to_string(), description: "".to_string(), is_current: false, provider_id: "provider-b".to_string() },
+            ModelEntry { id: "model-b2".to_string(), display_name: "B2".to_string(), description: "".to_string(), is_current: false, provider_id: "provider-b".to_string() },
+        ]);
+        let grouped = state.filtered_models_grouped();
+        // Default entry + 2 provider-a models. Provider-b filtered out.
+        assert_eq!(grouped.len(), 3);
+        assert_eq!(grouped[0].0.id, DEFAULT_MODEL_SENTINEL);
+        let provider_ids: std::collections::HashSet<&str> =
+            grouped.iter().map(|(m, _)| m.provider_id.as_str()).collect();
+        assert!(!provider_ids.contains("provider-b"));
+        assert!(provider_ids.contains("provider-a"));
+    }
+
+    #[test]
+    fn show_all_providers_shows_everyone() {
+        let mut state = ModelPickerState::new();
+        state.all_providers_mode = true;
+        state.show_all_providers = true;
+        state.connected_provider_ids =
+            ["provider-a".to_string()].into_iter().collect();
+        state.set_models(vec![
+            ModelEntry { id: "model-a1".to_string(), display_name: "A1".to_string(), description: "".to_string(), is_current: false, provider_id: "provider-a".to_string() },
+            ModelEntry { id: "model-b1".to_string(), display_name: "B1".to_string(), description: "".to_string(), is_current: false, provider_id: "provider-b".to_string() },
+        ]);
+        let grouped = state.filtered_models_grouped();
+        // Default entry + 1 from provider-a + 1 from provider-b.
+        assert_eq!(grouped.len(), 3);
+        let provider_ids: std::collections::HashSet<&str> =
+            grouped.iter().map(|(m, _)| m.provider_id.as_str()).collect();
+        assert!(provider_ids.contains("provider-a"));
+        assert!(provider_ids.contains("provider-b"));
+    }
+
+    #[test]
+    fn toggle_show_all_providers_flips_state() {
+        let mut state = ModelPickerState::new();
+        assert!(!state.show_all_providers);
+        state.toggle_show_all_providers();
+        assert!(state.show_all_providers);
+        state.toggle_show_all_providers();
+        assert!(!state.show_all_providers);
     }
 }

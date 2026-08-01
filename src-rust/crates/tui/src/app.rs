@@ -241,7 +241,7 @@ fn import_config_picker_items() -> Vec<SelectItem> {
 }
 
 fn provider_picker_items() -> Vec<SelectItem> {
-    vec![
+    let mut items = vec![
         SelectItem { id: "free".into(), title: "Free Mode".into(), description: "OpenCode Zen → OpenRouter free fallback (no spend)".into(), category: "Popular".into(), badge: Some("FREE".into()) },
         SelectItem { id: "openai".into(), title: "OpenAI".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "openai-codex".into(), title: "OpenAI Codex".into(), description: "(ChatGPT Plus/Pro — browser login)".into(), category: "Popular".into(), badge: None },
@@ -297,7 +297,21 @@ fn provider_picker_items() -> Vec<SelectItem> {
         SelectItem { id: "upstage".into(), title: "Upstage".into(), description: "Hosted Upstage models".into(), category: "Other".into(), badge: None },
         SelectItem { id: "stepfun".into(), title: "StepFun".into(), description: "Hosted reasoning models".into(), category: "Other".into(), badge: None },
         SelectItem { id: "fireworks".into(), title: "Fireworks AI".into(), description: "Fast inference".into(), category: "Other".into(), badge: None },
-    ]
+    ];
+
+        // Dynamically append custom providers from Settings.
+        if let Ok(settings) = Settings::load_sync() {
+            for (id, def) in &settings.custom_providers {
+                items.push(SelectItem {
+                    id: id.clone(),
+                    title: def.name.clone(),
+                    description: format!("Custom OpenAI-compatible — {}", def.api_base),
+                    category: "Custom".into(),
+                    badge: Some("CUSTOM".into()),
+                });
+            }
+        }
+        items
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +325,8 @@ pub enum SystemMessageStyle {
     Warning,
     /// Compact / auto-compact boundary marker.
     Compact,
+    /// Inline todo card showing task progress.
+    TodoCard,
 }
 
 /// A synthetic system annotation inserted between conversation messages.
@@ -333,6 +349,12 @@ pub enum DisplayMessage {
     Conversation(Message),
     /// An injected system notice (e.g. compact boundary).
     System { text: String, style: SystemMessageStyle },
+    /// A `!` bang command execution — display only, never sent to model.
+    BangCommand { command: String },
+    /// Output from a `!` bang command.
+    BangOutput { text: String, exit_code: Option<i32> },
+    /// Error from a `!` bang command.
+    BangError { text: String },
 }
 
 /// Context menu state: position and currently selected item index.
@@ -800,6 +822,8 @@ pub struct App {
     pub input: String,
     pub prompt_input: PromptInputState,
     pub input_history: Vec<String>,
+    /// Separate history for `!` bang commands (distinct from prompt input history).
+    pub bang_command_history: Vec<String>,
     pub history_index: Option<usize>,
     pub scroll_offset: usize,
     pub is_streaming: bool,
@@ -878,8 +902,15 @@ pub struct App {
     pub rustle_temp_pose: Option<crate::rustle::RustlePose>,
     /// Frame counter at which the next random eye-shift should fire.
     pub rustle_next_blink: u64,
+    /// Token output rates from recent turns (tokens/sec), for computing
+    /// a rolling average. Last 5 turns kept.
+    pub recent_token_rates: Vec<f64>,
     /// Instant the current turn's streaming began (reset each time streaming starts).
     pub turn_start: Option<std::time::Instant>,
+    /// Instant the first streaming token arrived this turn (for active-throughput TPS).
+    pub stream_first_token: Option<std::time::Instant>,
+    /// Instant of the most recent streaming token this turn.
+    pub stream_last_token: Option<std::time::Instant>,
     /// Elapsed time string for the last completed turn, e.g. "2m 5s".
     pub last_turn_elapsed: Option<String>,
     /// Past-tense verb shown after turn completes, e.g. "Worked" / "Baked".
@@ -1062,6 +1093,19 @@ pub struct App {
     /// When `true`, the main loop will inject a synthetic Enter event on the
     /// next iteration to dequeue and submit the next queued message.
     pub pending_auto_submit: bool,
+    /// Auto-poke counter — how many pokes have been sent this session.
+    pub auto_poke_count: u32,
+    /// Hash of the last todo state for no-progress detection.
+    pub last_todo_hash: String,
+    /// Count of consecutive no-progress turns.
+    pub no_progress_turns: u32,
+    /// Whether the todo card is visible in the transcript.
+    pub todo_card_visible: bool,
+    /// When `true`, the main loop should start a new query turn because
+    /// auto-poke injected a continuation message into `queued_messages`.
+    pub pending_auto_poke: bool,
+    /// Current session ID (used for todo persistence + auto-poke).
+    pub session_id: String,
     /// Connect-a-provider dialog (/connect command).
     pub connect_dialog: DialogSelectState,
     /// Import-config source picker (/import-config command).
@@ -1174,6 +1218,10 @@ pub struct App {
     pub selection_anchor: Option<(u16, u16)>,
     /// Selection drag focus (col, row) — updated on mouse-drag / mouse-up.
     pub selection_focus: Option<(u16, u16)>,
+    /// Keyboard selection mode active.
+    pub kb_select_mode: bool,
+    /// Cursor row for keyboard selection (screen coordinate).
+    pub kb_cursor_row: u16,
     /// Text extracted from the current selection (updated each render frame).
     pub selection_text: RefCell<String>,
     /// Cache of row -> rendered text within the selectable area, refreshed
@@ -1268,6 +1316,8 @@ impl App {
                 .join("models.json");
             reg.load_cache(&cache_path);
             reg.apply_model_overrides(&config.model_overrides);
+            let settings = claurst_core::Settings::load_sync().unwrap_or_default();
+            reg.apply_custom_providers(&settings.custom_providers);
             reg
         };
         Self {
@@ -1279,6 +1329,7 @@ impl App {
             input: String::new(),
             prompt_input: PromptInputState::new(),
             input_history: Vec::new(),
+            bang_command_history: Vec::new(),
             history_index: None,
             scroll_offset: 0,
             is_streaming: false,
@@ -1318,6 +1369,9 @@ impl App {
                 .unwrap_or_default()
                 .subsec_nanos() as u64 % 300),
             turn_start: None,
+            stream_first_token: None,
+            stream_last_token: None,
+            recent_token_rates: Vec::new(),
             last_turn_elapsed: None,
             last_turn_verb: None,
             turn_metadata: Vec::new(),
@@ -1398,6 +1452,12 @@ impl App {
             auth_store: claurst_core::AuthStore::load(),
             queued_messages: std::collections::VecDeque::new(),
             pending_auto_submit: false,
+            auto_poke_count: 0,
+            last_todo_hash: String::new(),
+            no_progress_turns: 0,
+            todo_card_visible: false,
+            pending_auto_poke: false,
+            session_id: String::new(),
             connect_dialog: DialogSelectState::new("Connect a provider", provider_picker_items()),
             import_config_picker: DialogSelectState::new("Import config", import_config_picker_items()),
             import_config_dialog: ImportConfigDialogState::new(),
@@ -1484,6 +1544,8 @@ impl App {
             last_max_scroll: Cell::new(0),
             selection_anchor: None,
             selection_focus: None,
+            kb_select_mode: false,
+            kb_cursor_row: 0,
             selection_text: RefCell::new(String::new()),
             last_row_text: RefCell::new(std::collections::HashMap::new()),
             last_click_time: None,
@@ -1613,6 +1675,8 @@ impl App {
         // measures actual round-trip time even when the provider buffers its
         // full response before yielding any stream events (e.g. Gemini flash).
         self.turn_start = Some(std::time::Instant::now());
+        self.stream_first_token = None;
+        self.stream_last_token = None;
         self.last_turn_elapsed = None;
         self.last_turn_verb = None;
     }
@@ -1703,6 +1767,10 @@ impl App {
             .join("models.json");
         if cache_path.exists() {
             self.model_registry.load_cache(&cache_path);
+            // Re-apply custom providers after cache merge so custom model
+            // entries survive any catalog overlay.
+            let settings = claurst_core::Settings::load_sync().unwrap_or_default();
+            self.model_registry.apply_custom_providers(&settings.custom_providers);
         }
 
         let models = crate::model_picker::models_for_provider_from_registry(
@@ -1710,6 +1778,7 @@ impl App {
             &self.model_registry,
         );
         self.model_picker.set_models(models);
+        self.model_picker.load_favorites();
         self.model_picker_provider_id = Some(provider_id.to_string());
         // Catalog-backed providers (Anthropic/OpenAI/Google) are a read-only
         // projection of the models.dev catalog — there is no live endpoint to
@@ -1754,6 +1823,98 @@ impl App {
         self.has_credentials = true;
         self.status_message = Some(format!("{} {}.", status_prefix, provider_name));
         self.open_model_picker_for_provider(&provider_id, Some(picker_title));
+    }
+
+    /// Check if a provider is connected (has credentials, is a keyless
+    /// local/subprocess provider, or is a configured custom provider with
+    /// a non-empty apiBase — even without an API key for internal gateways).
+    fn is_provider_connected(&self, provider_id: &str) -> bool {
+        match provider_id {
+            "ollama" | "lmstudio" | "lm-studio"
+            | "llamacpp" | "llama-cpp" | "llama-server" | "free" => true,
+            _ => {
+                // Has an API key configured → connected.
+                if self.config.resolve_provider_api_key(provider_id).is_some() {
+                    return true;
+                }
+                // Custom provider with a non-empty apiBase → connected
+                // (internal gateways / local proxies may not need auth).
+                if let Ok(settings) = claurst_core::Settings::load_sync() {
+                    if let Some(def) = settings.custom_providers.get(provider_id) {
+                        return !def.api_base.trim().is_empty();
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// Open the model picker showing models from all connected providers,
+    /// grouped by provider name.
+    fn open_model_picker_all_providers(&mut self) {
+        self.dismiss_error_notifications();
+
+        // Collect models from all connected providers.
+        let mut all_models: Vec<crate::model_picker::ModelEntry> = Vec::new();
+
+        // Get ALL provider IDs from the registry (for the full model list).
+        let all_provider_ids: Vec<String> = if let Some(ref registry) = self.provider_registry {
+            registry.provider_ids().iter().map(|id| id.to_string()).collect()
+        } else {
+            Vec::new()
+        };
+
+        // Also include current provider if not in registry.
+        let mut provider_ids = all_provider_ids;
+        if let Some(ref current) = self.config.provider {
+            if !provider_ids.contains(current) {
+                provider_ids.push(current.clone());
+            }
+        }
+
+        // Determine which providers are connected.
+        let connected_ids: std::collections::HashSet<String> = provider_ids
+            .iter()
+            .filter(|pid| self.is_provider_connected(pid))
+            .cloned()
+            .collect();
+
+        // Pass the connected set to the picker for runtime filtering.
+        self.model_picker.connected_provider_ids = connected_ids;
+
+        // Collect models from ALL providers (filtering happens at display time).
+        let mut provider_names = std::collections::HashMap::new();
+        for pid in &provider_ids {
+            // Look up the provider display name from the registry.
+            if let Some(entry) = self.model_registry.list_providers()
+                .iter()
+                .find(|p| &*p.id == pid)
+            {
+                provider_names.insert(pid.clone(), entry.name.clone());
+            }
+            let models = crate::model_picker::models_for_provider_from_registry(
+                pid,
+                &self.model_registry,
+            );
+            for mut m in models {
+                m.provider_id = pid.clone();
+                all_models.push(m);
+            }
+        }
+
+        self.model_picker.provider_names = provider_names;
+        self.model_picker.set_models(all_models);
+        self.model_picker_provider_id = None; // All providers mode
+        self.model_picker.all_providers_mode = true;
+        // Trigger background model discovery.
+        self.model_picker.loading_models = true;
+        self.model_picker_fetch_pending = true;
+
+        self.model_picker.open_all_providers(
+            &self.model_name,
+            self.effort_level,
+            self.fast_mode,
+        );
     }
 
     fn persist_custom_provider_base_url(&self, base_url: &str) {
@@ -1812,6 +1973,12 @@ impl App {
             ];
             if known.contains(&provider) {
                 return Some(provider.to_string());
+            }
+            // Check custom providers at runtime.
+            if let Ok(settings) = Settings::load_sync() {
+                if settings.custom_providers.contains_key(provider) {
+                    return Some(provider.to_string());
+                }
             }
         }
 
@@ -1980,6 +2147,8 @@ impl App {
         self.model_registry = claurst_api::ModelRegistry::new();
         // Re-layer user metadata overrides (issue #309) onto the fresh registry.
         self.model_registry.apply_model_overrides(&self.config.model_overrides);
+        let settings = claurst_core::Settings::load_sync().unwrap_or_default();
+        self.model_registry.apply_custom_providers(&settings.custom_providers);
         self.auth_store = auth_store;
         self.connect_dialog = DialogSelectState::new("Connect a provider", provider_picker_items());
         self.import_config_picker = DialogSelectState::new("Import config", import_config_picker_items());
@@ -2084,12 +2253,7 @@ impl App {
                     self.status_message = Some("Connect a provider to choose a model.".to_string());
                     return true;
                 }
-                let provider = self
-                    .config
-                    .provider
-                    .clone()
-                    .unwrap_or_else(|| "anthropic".to_string());
-                self.open_model_picker_for_provider(&provider, None);
+                self.open_model_picker_all_providers();
                 true
             }
             "session" | "resume" => {
@@ -2981,6 +3145,103 @@ impl App {
         self.refresh_prompt_input();
     }
 
+    /// Execute a `!` bang command directly, without sending to the model.
+    /// Output is displayed in the transcript (display_messages only) — the
+    /// model never sees it. Zero token consumption.
+    pub fn execute_bang_command(&mut self, command: String) {
+        // Check if bang commands are enabled.
+        let settings = claurst_core::Settings::load_sync().unwrap_or_default();
+        if !settings.bang_commands.enabled {
+            self.push_notification(
+                crate::notifications::NotificationKind::Warning,
+                "Bang commands are disabled. Enable with \"bangCommands\": {\"enabled\": true} in settings.json.".to_string(),
+                None,
+            );
+            return;
+        }
+
+        // Block in plan mode.
+        if self.config.permission_mode == claurst_core::PermissionMode::Plan {
+            self.push_notification(
+                crate::notifications::NotificationKind::Warning,
+                "Bang commands disabled in plan mode.".to_string(),
+                None,
+            );
+            return;
+        }
+
+        // Display the command.
+        if settings.bang_commands.show_in_transcript {
+            self.display_messages.push(DisplayMessage::BangCommand {
+                command: command.clone(),
+            });
+        }
+
+        // Resolve working directory: prefer project dir, fall back to current dir.
+        let working_dir = self
+            .config
+            .project_dir
+            .clone()
+            .or_else(|| {
+                self.current_dir
+                    .as_ref()
+                    .map(|s| std::path::PathBuf::from(s))
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+        // Execute via std::process::Command — NO model round-trip, NO PTY.
+        let result = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&command)
+            .current_dir(&working_dir)
+            .output();
+
+        match result {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let exit_code = output.status.code();
+
+                let display = if stderr.is_empty() {
+                    stdout.to_string()
+                } else if stdout.is_empty() {
+                    stderr.to_string()
+                } else {
+                    format!("{}\n--- stderr ---\n{}", stdout, stderr)
+                };
+
+                if settings.bang_commands.show_in_transcript {
+                    if exit_code.is_some_and(|c| c != 0) {
+                        let full = format!("{}\n[exit: {}]", display, exit_code.unwrap());
+                        self.display_messages.push(DisplayMessage::BangOutput {
+                            text: full,
+                            exit_code,
+                        });
+                    } else {
+                        self.display_messages.push(DisplayMessage::BangOutput {
+                            text: display,
+                            exit_code,
+                        });
+                    }
+                }
+
+                // Add to separate history if enabled.
+                if settings.bang_commands.add_to_history {
+                    self.bang_command_history.push(command);
+                }
+            }
+            Err(e) => {
+                if settings.bang_commands.show_in_transcript {
+                    self.display_messages.push(DisplayMessage::BangError {
+                        text: format!("Error: {}", e),
+                    });
+                }
+            }
+        }
+
+        self.invalidate_transcript();
+    }
+
     fn refresh_turn_diff_from_history(&mut self) {
         let Some(file_history) = self.file_history.as_ref() else {
             self.diff_viewer.set_turn_diff(Vec::new());
@@ -3478,6 +3739,7 @@ impl App {
 
                         match selected.id.as_str() {
                             // Local providers — activate immediately, no key needed
+                            // Local providers — activate immediately, no key needed
                             "ollama" | "lmstudio" | "llamacpp" => {
                                 self.activate_provider(selected.id.clone(), selected.title.clone(), "Switched to");
                             }
@@ -3537,6 +3799,23 @@ impl App {
                             "amazon-bedrock" => {
                                 self.key_input_dialog
                                     .open(selected.id.clone(), selected.title.clone());
+                            }
+                            // Custom providers from Settings — may need API key
+                            id if {
+                                let settings = Settings::load_sync().unwrap_or_default();
+                                settings.custom_providers.contains_key(id)
+                            } => {
+                                // Check if the custom provider has an API key resolved.
+                                let settings = Settings::load_sync().unwrap_or_default();
+                                let def = settings.custom_providers.get(&selected.id).unwrap();
+                                if def.resolve_api_key().is_some() {
+                                    // Key available — activate directly.
+                                    self.activate_provider(selected.id.clone(), selected.title.clone(), "Switched to");
+                                } else {
+                                    // No key — open key input dialog.
+                                    self.key_input_dialog
+                                        .open(selected.id.clone(), selected.title.clone());
+                                }
                             }
                             // All other providers — open API key input dialog
                             _ => {
@@ -3640,8 +3919,37 @@ impl App {
                 KeyCode::Right => self.model_picker.effort_next(),
                 KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => self.model_picker.select_prev(),
                 KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => self.model_picker.select_next(),
+                KeyCode::Tab => self.model_picker.select_next_provider(),
+                KeyCode::BackTab => self.model_picker.select_prev_provider(),
                 KeyCode::Enter => {
+                    // Capture all-providers mode AND the selected entry's
+                    // provider_id BEFORE confirm() — confirm() calls close()
+                    // which resets all_providers_mode to false AND clears the
+                    // filter, changing the grouped list and invalidating
+                    // selected_idx.
+                    let was_all_providers = self.model_picker.all_providers_mode;
+                    let selected_provider_id = if was_all_providers {
+                        self.model_picker
+                            .filtered_models_grouped()
+                            .get(self.model_picker.selected_idx)
+                            .map(|(m, _)| m.provider_id.clone())
+                    } else {
+                        None
+                    };
                     if let Some((model_id, effort)) = self.model_picker.confirm() {
+                        // Default sentinel — clear explicit model override.
+                        if model_id == crate::model_picker::DEFAULT_MODEL_SENTINEL {
+                            self.config.model = None;
+                            let provider = self.config.provider.as_deref().unwrap_or("anthropic");
+                            let best = self.display_default_model_for_provider(provider);
+                            self.model_name = best.clone();
+                            self.cost_tracker.set_model(&best);
+                            self.refresh_context_window_size();
+                            self.context_used_tokens = 0;
+                            self.persist_provider_and_model();
+                            self.status_message = Some(format!("Model: {} (default)", best));
+                            return false;
+                        }
                         // If user picked a model other than the fast-mode model
                         // while fast mode was active, turn fast mode off.
                         if self.fast_mode && !self.model_picker.is_selected_fast_mode_model(&model_id) {
@@ -3656,11 +3964,27 @@ impl App {
                         // a routing prefix (`free/…`, `zen/…`, `openrouter/…`)
                         // so re-prefixing would produce nonsense like
                         // `free/free/auto`.
-                        let provider = self.config.provider.as_deref().unwrap_or("anthropic");
-                        let full_model = if provider == "anthropic" || provider == "free" {
-                            model_id.clone()
+                        //
+                        // In all-providers mode the provider is inferred from
+                        // the selected entry's `provider_id` field rather than
+                        // the current config provider.
+                        let full_model = if was_all_providers {
+                            if let Some(ref provider) = selected_provider_id {
+                                if provider == "anthropic" || provider == "free" {
+                                    model_id.clone()
+                                } else {
+                                    format!("{}/{}", provider, model_id)
+                                }
+                            } else {
+                                model_id.clone()
+                            }
                         } else {
-                            format!("{}/{}", provider, model_id)
+                            let provider = self.config.provider.as_deref().unwrap_or("anthropic");
+                            if provider == "anthropic" || provider == "free" {
+                                model_id.clone()
+                            } else {
+                                format!("{}/{}", provider, model_id)
+                            }
                         };
                         self.set_model(full_model.clone());
                         self.persist_provider_and_model();
@@ -3669,6 +3993,20 @@ impl App {
                     }
                 }
                 KeyCode::Backspace => self.model_picker.pop_filter_char(),
+                KeyCode::Char('f') | KeyCode::Char('*') => {
+                    // Toggle favorite on the currently selected model.
+                    let grouped = self.model_picker.filtered_models_grouped();
+                    if let Some((m, _)) = grouped.get(self.model_picker.selected_idx) {
+                        let provider = self.config.provider.as_deref().unwrap_or("anthropic");
+                        let model_key = if provider == "anthropic" || provider == "free" {
+                            m.id.clone()
+                        } else {
+                            format!("{}/{}", provider, m.id)
+                        };
+                        self.model_picker.toggle_favorite(&model_key);
+                    }
+                }
+                KeyCode::Char('a') => self.model_picker.toggle_show_all_providers(),
                 KeyCode::Char(c) => self.model_picker.push_filter_char(c),
                 _ => {}
             }
@@ -4090,6 +4428,114 @@ impl App {
             self.keybindings.cancel_chord();
         }
 
+        // ---- Keyboard selection mode -------------------------------
+        if self.kb_select_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    self.kb_select_mode = false;
+                    self.clear_selection();
+                    self.status_message = Some("Selection cancelled.".to_string());
+                    return false;
+                }
+                // Copy selection and exit
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let text = self.selection_text.borrow().clone();
+                    if !text.is_empty() {
+                        let copied = crate::image_paste::write_clipboard_text(&text);
+                        if copied {
+                            self.push_notification(NotificationKind::Info, "Copied to clipboard".to_string(), Some(2));
+                        }
+                    }
+                    self.kb_select_mode = false;
+                    self.clear_selection();
+                    return false;
+                }
+                // Ctrl+C also copies in selection mode
+                KeyCode::Char(c) if (c == 'c' || c == 'C') && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let text = self.selection_text.borrow().clone();
+                    if !text.is_empty() {
+                        let copied = crate::image_paste::write_clipboard_text(&text);
+                        if copied {
+                            self.push_notification(NotificationKind::Info, "Copied to clipboard".to_string(), Some(2));
+                        }
+                    }
+                    self.kb_select_mode = false;
+                    self.clear_selection();
+                    return false;
+                }
+                // Movement: extend selection
+                KeyCode::Up => {
+                    if self.kb_cursor_row > self.last_selectable_area.get().y {
+                        self.kb_cursor_row -= 1;
+                        // Scroll up if cursor goes above visible area
+                        let area = self.last_selectable_area.get();
+                        if self.kb_cursor_row < area.y {
+                            let step = self.scroll_step();
+                            self.scroll_offset = self.scroll_offset.saturating_add(step);
+                        }
+                    }
+                    self.update_kb_selection();
+                    return false;
+                }
+                KeyCode::Down => {
+                    let area = self.last_selectable_area.get();
+                    let max_row = area.y + area.height.saturating_sub(1);
+                    if self.kb_cursor_row < max_row {
+                        self.kb_cursor_row += 1;
+                        // Scroll down if cursor goes below visible area
+                        if self.kb_cursor_row >= area.y + area.height {
+                            let step = self.scroll_step();
+                            let new_off = self.scroll_offset.saturating_sub(step);
+                            self.scroll_offset = new_off;
+                            if new_off == 0 {
+                                self.auto_scroll = true;
+                            }
+                        }
+                    }
+                    self.update_kb_selection();
+                    return false;
+                }
+                KeyCode::Home => {
+                    let area = self.last_selectable_area.get();
+                    self.kb_cursor_row = area.y;
+                    // Scroll to top
+                    self.scroll_offset = self.total_message_lines.get().saturating_sub(area.height as usize);
+                    self.auto_scroll = false;
+                    self.update_kb_selection();
+                    return false;
+                }
+                KeyCode::End => {
+                    let area = self.last_selectable_area.get();
+                    self.kb_cursor_row = area.y + area.height.saturating_sub(1);
+                    // Scroll to bottom
+                    self.scroll_offset = 0;
+                    self.auto_scroll = true;
+                    self.update_kb_selection();
+                    return false;
+                }
+                KeyCode::PageUp => {
+                    let area = self.last_selectable_area.get();
+                    let step = area.height;
+                    self.kb_cursor_row = self.kb_cursor_row.saturating_sub(step).max(area.y);
+                    self.scroll_offset = self.scroll_offset.saturating_add(step as usize);
+                    self.update_kb_selection();
+                    return false;
+                }
+                KeyCode::PageDown => {
+                    let area = self.last_selectable_area.get();
+                    let max_row = area.y + area.height.saturating_sub(1);
+                    let step = area.height;
+                    self.kb_cursor_row = (self.kb_cursor_row + step).min(max_row);
+                    let new_off = self.scroll_offset.saturating_sub(step as usize);
+                    self.scroll_offset = new_off;
+                    if new_off == 0 { self.auto_scroll = true; }
+                    self.update_kb_selection();
+                    return false;
+                }
+                _ => return false, // Swallow all other keys in selection mode
+            }
+        }
+
         // Clear any active text selection on key press (except Ctrl+C which copies it).
         let is_copy = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
         if !is_copy && self.selection_anchor.is_some() {
@@ -4386,6 +4832,23 @@ impl App {
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.prompt_input.delete_word_at_cursor();
                 self.refresh_prompt_input();
+            }
+
+            // ---- Enter keyboard selection mode ------------------------
+            KeyCode::Char('v') if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+                && self.prompt_input.is_empty() =>
+            {
+                self.kb_select_mode = true;
+                let area = self.last_selectable_area.get();
+                // Start cursor at the bottom of the visible area
+                self.kb_cursor_row = area.y + area.height.saturating_sub(1);
+                // Set anchor at current cursor, focus at same point (empty selection)
+                let col = area.x;
+                self.selection_anchor = Some((col, self.kb_cursor_row));
+                self.selection_focus = Some((col, self.kb_cursor_row));
+                self.status_message = Some("Selection mode: Arrows select, y/Ctrl+C copy, Esc cancel".to_string());
+                return false;
             }
 
             // ---- Text entry (allowed while streaming so users can queue
@@ -5550,7 +6013,28 @@ impl App {
     fn clear_selection(&mut self) {
         self.selection_anchor = None;
         self.selection_focus = None;
+        self.kb_select_mode = false;
         *self.selection_text.borrow_mut() = String::new();
+    }
+
+    /// Update the selection from keyboard cursor position.
+    fn update_kb_selection(&mut self) {
+        if !self.kb_select_mode {
+            return;
+        }
+        let area = self.last_selectable_area.get();
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        // Anchor stays at original position, focus follows cursor.
+        // The render code in render.rs already handles extracting text between
+        // anchor and focus in row-major order.
+        let col = area.x;
+        self.selection_focus = Some((col, self.kb_cursor_row));
+        // If anchor is None (shouldn't happen), set it.
+        if self.selection_anchor.is_none() {
+            self.selection_anchor = Some((col, self.kb_cursor_row));
+        }
     }
 
     /// Show context menu at the given position.
@@ -6146,17 +6630,22 @@ impl App {
                 let input_area = self.last_input_area.get();
                 let selectable_area = self.last_selectable_area.get();
 
+                // When an error modal is showing, the selectable area covers
+                // the entire terminal — the modal text is selectable for copy.
+                let error_modal_active = self.notifications.current_is_error();
+
                 let in_input = input_area.width > 0 && input_area.height > 0
                     && mouse_event.row >= input_area.y
                     && mouse_event.row < input_area.y.saturating_add(input_area.height)
                     && mouse_event.column >= input_area.x
                     && mouse_event.column < input_area.x.saturating_add(input_area.width);
 
-                let in_selectable = selectable_area.width > 0 && selectable_area.height > 0
-                    && mouse_event.row >= selectable_area.y
-                    && mouse_event.row < selectable_area.y.saturating_add(selectable_area.height)
-                    && mouse_event.column >= selectable_area.x
-                    && mouse_event.column < selectable_area.x.saturating_add(selectable_area.width);
+                let in_selectable = error_modal_active
+                    || (selectable_area.width > 0 && selectable_area.height > 0
+                        && mouse_event.row >= selectable_area.y
+                        && mouse_event.row < selectable_area.y.saturating_add(selectable_area.height)
+                        && mouse_event.column >= selectable_area.x
+                        && mouse_event.column < selectable_area.x.saturating_add(selectable_area.width));
 
                 // Check for click on a thinking block header (takes priority over text selection).
                 if let Some(&hash) = self.thinking_row_map.borrow().get(&mouse_event.row) {
@@ -6169,11 +6658,11 @@ impl App {
                     return;
                 }
 
-                if in_input {
+                if in_input && !error_modal_active {
                     self.focus = FocusTarget::Input;
                     self.clear_selection();
                     self.handle_prompt_click(mouse_event.column, mouse_event.row);
-                } else if selectable_area.width == 0 || selectable_area.height == 0 {
+                } else if !error_modal_active && (selectable_area.width == 0 || selectable_area.height == 0) {
                     self.click_count = 0;
                 } else if in_selectable {
                     self.focus = FocusTarget::Transcript;
@@ -6312,6 +6801,11 @@ impl App {
                         self.stall_start = None;
                         match delta {
                             claurst_api::streaming::ContentDelta::TextDelta { text } => {
+                                let now = std::time::Instant::now();
+                                if self.stream_first_token.is_none() {
+                                    self.stream_first_token = Some(now);
+                                }
+                                self.stream_last_token = Some(now);
                                 self.streaming_text.push_str(&text);
                                 self.invalidate_transcript();
                             }
@@ -6413,17 +6907,58 @@ impl App {
                 }
                 // Record elapsed time and pick a completion verb
                 let seed = self.frame_count as usize ^ (self.messages.len() * 7);
+                // Track tokens per second for the status indicator (before take()).
+                // Prefer real usage; fall back to a rough char-based estimate
+                // (~4 chars/token) for providers that never report usage.
+                let reported_output = usage.as_ref().map(|u| u.output_tokens).unwrap_or(0);
+                let output_tokens = if reported_output > 0 {
+                    reported_output
+                } else {
+                    (self.streaming_text.len() / 4).max(if self.streaming_text.is_empty() { 0 } else { 1 }) as u64
+                };
+                // Active streaming throughput: time between first and last
+                // token arrival, excluding TTFT and post-stream idle.
+                if output_tokens > 0 {
+                    if let (Some(first), Some(last)) =
+                        (self.stream_first_token, self.stream_last_token)
+                    {
+                        let active_secs = last.duration_since(first).as_secs_f64();
+                        if active_secs > 0.0 {
+                            let rate = output_tokens as f64 / active_secs;
+                            self.recent_token_rates.push(rate);
+                            if self.recent_token_rates.len() > 5 {
+                                self.recent_token_rates.remove(0);
+                            }
+                        }
+                    } else if let Some(start) = self.turn_start {
+                        // Fallback for turns with no streamed text deltas
+                        // (e.g. non-streaming / cached): use submit-to-complete.
+                        let elapsed_secs = start.elapsed().as_secs_f64();
+                        if elapsed_secs > 0.0 {
+                            let rate = output_tokens as f64 / elapsed_secs;
+                            self.recent_token_rates.push(rate);
+                            if self.recent_token_rates.len() > 5 {
+                                self.recent_token_rates.remove(0);
+                            }
+                        }
+                    }
+                }
                 let elapsed = self.turn_start.take()
                     .map(|start| format_elapsed_ms(start.elapsed().as_millis()));
                 self.last_turn_elapsed = Some(
                     elapsed.unwrap_or_else(|| "0s".to_string())
                 );
                 self.last_turn_verb = Some(sample_completion_verb(seed));
+                self.stream_first_token = None;
+                self.stream_last_token = None;
                 self.flush_streamed_assistant_message();
                 self.tool_use_blocks.retain(|b| b.status != ToolStatus::Running);
                 self.complete_current_turn_snapshot(stop_reason.contains("abort") || stop_reason.contains("cancel"));
                 self.invalidate_transcript();
                 self.refresh_turn_diff_from_history();
+
+                // Auto-poke: check for incomplete todos and queue continuation.
+                self.check_auto_poke();
             }
 
             QueryEvent::Status(msg) => {
@@ -6435,6 +6970,8 @@ impl App {
                 self.spinner_verb = None;
                 self.streaming_text.clear();
                 self.streaming_thinking.clear();
+                self.stream_first_token = None;
+                self.stream_last_token = None;
                 self.invalidate_transcript();
                 let err_msg = format!("Error: {}", msg);
                 self.push_assistant_message(err_msg.clone());
@@ -6473,6 +7010,65 @@ impl App {
 
         // Update token count from tracker.
         self.token_count = self.cost_tracker.total_tokens() as u32;
+    }
+
+    // -------------------------------------------------------------------
+    // Auto-poke
+    // -------------------------------------------------------------------
+
+    /// Check whether auto-poke should fire after a model turn.
+    /// If the model stopped with incomplete todos, queue a synthetic
+    /// continuation message via the existing `queued_messages` mechanism.
+    fn check_auto_poke(&mut self) {
+        // Don't poke if the turn was aborted/cancelled.
+        if !self.last_turn_elapsed.is_some() && self.tool_use_blocks.is_empty() {
+            // Likely a fresh state — still allow poke.
+        }
+
+        // Don't poke if auto-poke is disabled (check settings).
+        let settings = claurst_core::Settings::load_sync().unwrap_or_default();
+        if !settings.auto_poke_enabled {
+            return;
+        }
+
+        // Check poke budget.
+        if self.auto_poke_count >= claurst_tools::todo_write::MAX_AUTO_POKES {
+            self.status_message = Some(format!(
+                "Auto-poke stopped: budget of {} reached.",
+                claurst_tools::todo_write::MAX_AUTO_POKES
+            ));
+            return;
+        }
+
+        // Count incomplete todos.
+        let incomplete = claurst_tools::todo_write::count_incomplete_todos(&self.session_id);
+        if incomplete == 0 {
+            return; // All done — no poke needed.
+        }
+
+        // No-progress detection: hash the todo state.
+        let current_hash = claurst_tools::todo_write::todo_state_hash(&self.session_id);
+        if current_hash == self.last_todo_hash {
+            self.no_progress_turns += 1;
+        } else {
+            self.no_progress_turns = 0;
+            self.last_todo_hash = current_hash;
+        }
+
+        if self.no_progress_turns >= claurst_tools::todo_write::NO_PROGRESS_THRESHOLD {
+            self.status_message = Some(
+                "Auto-poke stopped: no progress for 3 turns.".to_string()
+            );
+            return;
+        }
+
+        // Queue the auto-poke message via the existing queued_messages
+        // infrastructure so the main loop submits it on the next iteration.
+        let poke_msg = claurst_tools::todo_write::build_auto_poke_message(incomplete);
+        self.auto_poke_count += 1;
+        self.status_message = Some(format!("Auto-poking... ({} incomplete todos)", incomplete));
+        self.queued_messages.push_back(poke_msg);
+        self.pending_auto_submit = true;
     }
 
     // -------------------------------------------------------------------
@@ -6717,6 +7313,15 @@ impl App {
                         if should_submit {
                             // Dismiss any active error modal when the user sends a message
                             self.dismiss_error_notifications();
+                            // Check for bang command (! prefix) — execute directly, no model.
+                            if crate::input::is_bang_command(&self.prompt_input.text) {
+                                let command = self.prompt_input.text[1..].trim().to_string();
+                                self.clear_prompt();
+                                if !command.is_empty() {
+                                    self.execute_bang_command(command);
+                                }
+                                continue;
+                            }
                             // Check if this is a slash command that should open a UI screen
                             if crate::input::is_slash_command(&self.prompt_input.text) {
                                 let slash_input = self.prompt_input.text.clone();
@@ -7803,5 +8408,19 @@ mod tests {
         assert!(!app.should_exit);
         app.handle_key_event(press_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.should_exit);
+    }
+
+    #[test]
+    fn kb_select_mode_starts_and_cancels() {
+        let mut app = make_app();
+        app.kb_select_mode = true;
+        app.selection_anchor = Some((0, 5));
+        app.selection_focus = Some((0, 5));
+        app.kb_cursor_row = 5;
+        // Simulate Esc by testing state directly via clear_selection.
+        app.clear_selection();
+        assert!(!app.kb_select_mode);
+        assert!(app.selection_anchor.is_none());
+        assert!(app.selection_focus.is_none());
     }
 }
