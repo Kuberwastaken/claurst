@@ -380,6 +380,69 @@ and `api_base` override the corresponding environment variables.
 | `models_blacklist` | array | These model IDs are never offered. |
 | `options` | object | Provider-specific passthrough options. |
 
+### Custom OpenAI-Compatible Providers
+
+For OpenAI-compatible endpoints not in the built-in provider list (e.g.
+self-hosted gateways, internal LLM proxies), define them under the
+`customProviders` map. Each entry is a self-contained provider with its
+own base URL, API key, custom headers, and model catalog.
+
+```json
+"customProviders": {
+  "my-gateway": {
+    "name": "My Gateway",
+    "apiBase": "https://gateway.example.com/v1",
+    "apiKey": "{env:GATEWAY_API_KEY}",
+    "headers": {
+      "X-Custom-Header": "value"
+    },
+    "models": {
+      "model-1": {
+        "name": "Model One",
+        "contextWindow": 128000,
+        "maxOutputTokens": 8192,
+        "reasoningEffort": "high",
+        "variants": {
+          "max": { "reasoningEffort": "max" },
+          "none": { "reasoningEffort": "none" }
+        }
+      }
+    },
+    "requestTimeoutSecs": 300
+  }
+}
+```
+
+`CustomProviderDef` fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Display name shown in the provider picker. |
+| `apiBase` | string | OpenAI-compatible base URL. Claurst appends `/chat/completions`. |
+| `apiKey` | string \| null | API key. Supports `{env:VAR}` substitution. `null` = no key. |
+| `headers` | object | Custom HTTP headers sent on every request. |
+| `models` | object | Model catalog local to this provider, keyed by model id. |
+| `requestTimeoutSecs` | number \| null | Per-provider request timeout override in seconds. |
+
+`CustomModelDef` fields (inside `models`):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string \| null | Display name shown in the model picker. |
+| `contextWindow` | number \| null | Total context window size in tokens. |
+| `maxOutputTokens` | number \| null | Maximum tokens the model can emit in one response. |
+| `reasoningEffort` | string \| null | Reasoning effort level (`"high"`, `"max"`, `"none"`). |
+| `variants` | object | Named variants that override specific fields. |
+
+Adding a provider via the `/add` command:
+
+```
+/add my-gateway https://gateway.example.com/v1 {env:GATEWAY_API_KEY}
+```
+
+The map key (e.g. `"my-gateway"`) becomes the provider id used in
+`provider/model` routing (e.g. `my-gateway/model-1`).
+
 ---
 
 ## Environment Variables

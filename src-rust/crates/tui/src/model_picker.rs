@@ -377,10 +377,24 @@ pub fn default_model_for_provider(
 /// event loop either replaces or merges the projection according to
 /// [`provider_has_authoritative_live_models`].
 pub fn provider_uses_catalog_projection(provider_id: &str) -> bool {
-    matches!(
+    if matches!(
         provider_id,
         "openai" | "google" | "azure" | "amazon-bedrock" | "cohere" | "minimax"
-    )
+    ) {
+        return true;
+    }
+    // Custom providers have a curated model list in settings — no live
+    // endpoint to fetch from, so skip the background fetch.
+    if let Ok(settings) = claurst_core::Settings::load_sync() {
+        if settings.custom_providers.contains_key(provider_id) {
+            return true;
+        }
+    }
+    // cursor-acp is also a curated/provider-managed list.
+    if provider_id == "cursor-acp" || provider_id == "cursor-acp-rest" {
+        return true;
+    }
+    false
 }
 
 /// Whether live discovery is the complete set of models usable through a local

@@ -1268,6 +1268,8 @@ impl App {
                 .join("models.json");
             reg.load_cache(&cache_path);
             reg.apply_model_overrides(&config.model_overrides);
+            let settings = claurst_core::Settings::load_sync().unwrap_or_default();
+            reg.apply_custom_providers(&settings.custom_providers);
             reg
         };
         Self {
@@ -1703,6 +1705,10 @@ impl App {
             .join("models.json");
         if cache_path.exists() {
             self.model_registry.load_cache(&cache_path);
+            // Re-apply custom providers after cache merge so custom model
+            // entries survive any catalog overlay.
+            let settings = claurst_core::Settings::load_sync().unwrap_or_default();
+            self.model_registry.apply_custom_providers(&settings.custom_providers);
         }
 
         let models = crate::model_picker::models_for_provider_from_registry(
@@ -1980,6 +1986,8 @@ impl App {
         self.model_registry = claurst_api::ModelRegistry::new();
         // Re-layer user metadata overrides (issue #309) onto the fresh registry.
         self.model_registry.apply_model_overrides(&self.config.model_overrides);
+        let settings = claurst_core::Settings::load_sync().unwrap_or_default();
+        self.model_registry.apply_custom_providers(&settings.custom_providers);
         self.auth_store = auth_store;
         self.connect_dialog = DialogSelectState::new("Connect a provider", provider_picker_items());
         self.import_config_picker = DialogSelectState::new("Import config", import_config_picker_items());

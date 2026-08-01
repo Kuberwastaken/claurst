@@ -1318,6 +1318,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         // Multi-provider support
         Box::new(ProvidersCommand),
         Box::new(ConnectCommand),
+        Box::new(AddCustomProviderCommand),
         // Named agent system
         Box::new(AgentCommand),
         // Session search (SQLite)
