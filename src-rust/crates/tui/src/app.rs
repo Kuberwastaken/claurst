@@ -1710,6 +1710,7 @@ impl App {
             &self.model_registry,
         );
         self.model_picker.set_models(models);
+        self.model_picker.load_favorites();
         self.model_picker_provider_id = Some(provider_id.to_string());
         // Catalog-backed providers (Anthropic/OpenAI/Google) are a read-only
         // projection of the models.dev catalog — there is no live endpoint to
@@ -3669,6 +3670,19 @@ impl App {
                     }
                 }
                 KeyCode::Backspace => self.model_picker.pop_filter_char(),
+                KeyCode::Char('f') | KeyCode::Char('*') => {
+                    // Toggle favorite on the currently selected model.
+                    let grouped = self.model_picker.filtered_models_grouped();
+                    if let Some((m, _)) = grouped.get(self.model_picker.selected_idx) {
+                        let provider = self.config.provider.as_deref().unwrap_or("anthropic");
+                        let model_key = if provider == "anthropic" || provider == "free" {
+                            m.id.clone()
+                        } else {
+                            format!("{}/{}", provider, m.id)
+                        };
+                        self.model_picker.toggle_favorite(&model_key);
+                    }
+                }
                 KeyCode::Char(c) => self.model_picker.push_filter_char(c),
                 _ => {}
             }
