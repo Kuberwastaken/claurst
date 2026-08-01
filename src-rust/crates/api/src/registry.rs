@@ -13,7 +13,7 @@ use crate::provider::LlmProvider;
 use crate::provider_types::ProviderStatus;
 use crate::providers::{
     AnthropicProvider, AzureProvider, BedrockProvider, CodexProvider, CohereProvider,
-    CopilotProvider, FreeEntry, FreeProvider, FREE_CATALOG, GoogleProvider, MinimaxProvider,
+    CopilotProvider, CursorAcpProvider, FreeEntry, FreeProvider, FREE_CATALOG, GoogleProvider, MinimaxProvider,
     OpenAiProvider,
 };
 
@@ -67,6 +67,13 @@ pub struct ProviderRegistry {
 fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvider>> {
     use crate::providers::openai_compat_providers as p;
 
+    // Custom providers from Settings take priority — their API key is
+    // already resolved via resolve_api_key() inside provider_for_custom_id,
+    // so we must NOT re-apply the auth-store key here.
+    if let Some(provider) = p::provider_for_custom_id(provider_id) {
+        return Some(Arc::new(provider));
+    }
+
     if let Some(provider) = p::provider_for_id(provider_id) {
         return Some(Arc::new(provider.with_api_key(key)));
     }
@@ -89,6 +96,7 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
         // "free" needs two keys (Zen + OpenRouter) — single-key path doesn't
         // apply.  The auth-store-aware path `runtime_provider_for` handles it.
         "free" => build_free_provider(),
+        "cursor-acp" => Some(Arc::new(CursorAcpProvider::from_env())),
         _ => None,
     }
 }
@@ -266,12 +274,19 @@ pub fn provider_from_config(
         "codex" | "openai-codex" => {
             CodexProvider::from_stored().map(|provider| Arc::new(provider) as Arc<dyn LlmProvider>)
         }
+        "cursor-acp" => Some(Arc::new(CursorAcpProvider::from_env())),
         _ => api_key.and_then(|key| provider_from_key(provider_id, key)),
     }
 }
 
 pub fn runtime_provider_for(provider_id: &str) -> Option<Arc<dyn LlmProvider>> {
     use crate::providers::openai_compat_providers as p;
+
+    // Custom providers from Settings take priority — their API key is
+    // already resolved via resolve_api_key() inside provider_for_custom_id.
+    if let Some(provider) = p::provider_for_custom_id(provider_id) {
+        return Some(Arc::new(provider));
+    }
 
     // Local providers never require an API key — build them directly so that
     // the auth-store bypass below doesn't silently drop them.
@@ -290,6 +305,7 @@ pub fn runtime_provider_for(provider_id: &str) -> Option<Arc<dyn LlmProvider>> {
         // wraps them in a fallback composite — handled here so the generic
         // single-key path below doesn't short-circuit on a missing key.
         "free" => return build_free_provider(),
+        "cursor-acp" => return Some(Arc::new(CursorAcpProvider::from_env())),
         _ => {}
     }
 
