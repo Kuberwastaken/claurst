@@ -42,6 +42,7 @@ values. Keys absent from the project file fall back to the global value.
   "config": { ... },
   "providers": { ... },
   "modelOverrides": { ... },
+  "favoriteModels": [ ... ],
   "projects": { ... },
   "commands": { ... },
   "formatter": { ... },
@@ -380,6 +381,69 @@ and `api_base` override the corresponding environment variables.
 | `models_blacklist` | array | These model IDs are never offered. |
 | `options` | object | Provider-specific passthrough options. |
 
+### Custom OpenAI-Compatible Providers
+
+For OpenAI-compatible endpoints not in the built-in provider list (e.g.
+self-hosted gateways, internal LLM proxies), define them under the
+`customProviders` map. Each entry is a self-contained provider with its
+own base URL, API key, custom headers, and model catalog.
+
+```json
+"customProviders": {
+  "my-gateway": {
+    "name": "My Gateway",
+    "apiBase": "https://gateway.example.com/v1",
+    "apiKey": "{env:GATEWAY_API_KEY}",
+    "headers": {
+      "X-Custom-Header": "value"
+    },
+    "models": {
+      "model-1": {
+        "name": "Model One",
+        "contextWindow": 128000,
+        "maxOutputTokens": 8192,
+        "reasoningEffort": "high",
+        "variants": {
+          "max": { "reasoningEffort": "max" },
+          "none": { "reasoningEffort": "none" }
+        }
+      }
+    },
+    "requestTimeoutSecs": 300
+  }
+}
+```
+
+`CustomProviderDef` fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Display name shown in the provider picker. |
+| `apiBase` | string | OpenAI-compatible base URL. Claurst appends `/chat/completions`. |
+| `apiKey` | string \| null | API key. Supports `{env:VAR}` substitution. `null` = no key. |
+| `headers` | object | Custom HTTP headers sent on every request. |
+| `models` | object | Model catalog local to this provider, keyed by model id. |
+| `requestTimeoutSecs` | number \| null | Per-provider request timeout override in seconds. |
+
+`CustomModelDef` fields (inside `models`):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string \| null | Display name shown in the model picker. |
+| `contextWindow` | number \| null | Total context window size in tokens. |
+| `maxOutputTokens` | number \| null | Maximum tokens the model can emit in one response. |
+| `reasoningEffort` | string \| null | Reasoning effort level (`"high"`, `"max"`, `"none"`). |
+| `variants` | object | Named variants that override specific fields. |
+
+Adding a provider via the `/add` command:
+
+```
+/add my-gateway https://gateway.example.com/v1 {env:GATEWAY_API_KEY}
+```
+
+The map key (e.g. `"my-gateway"`) becomes the provider id used in
+`provider/model` routing (e.g. `my-gateway/model-1`).
+
 ---
 
 ## Environment Variables
@@ -639,6 +703,13 @@ matches. They are defined in the `formatter` map:
     }
   },
 
+  // Pin frequently-used models to the top of the /model picker.
+  "favoriteModels": [
+    "anthropic/claude-sonnet-4-6",
+    "openai/gpt-4o",
+    "nvidia/z-ai/glm-5.2"
+  ],
+
   // Custom slash commands
   "commands": {
     "test": {
@@ -657,3 +728,29 @@ matches. They are defined in the `formatter` map:
   }
 }
 ```
+
+---
+
+## Favorite Models
+
+Pin frequently-used models to the top of the `/model` picker by adding them to
+the `favoriteModels` array in `settings.json`:
+
+```json
+"favoriteModels": [
+  "anthropic/claude-sonnet-4-6",
+  "openai/gpt-4o",
+  "nvidia/z-ai/glm-5.2"
+]
+```
+
+Entries use the canonical `"provider/model"` format (the same key used by
+`modelOverrides`). For the `anthropic` and `free` composite providers, the
+provider prefix is optional — the bare model id (`"claude-sonnet-4-6"`) is
+accepted too.
+
+In the model picker, press `f` (or `*`) to toggle favorite status on the
+highlighted model. Favorited models appear with a ★ prefix at the top of the
+list and persist across sessions in `~/.claurst/settings.json`. Stale
+favorites (models no longer in the catalog) are hidden from the picker but
+kept in settings until you un-favorite them.
