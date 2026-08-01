@@ -1243,6 +1243,66 @@ impl ModelRegistry {
         }
         apply_overrides_to_entries(&mut self.entries, &self.overrides);
     }
+
+    /// Register user-defined custom provider models into the registry.
+    /// Each model is keyed as `<provider_id>/<model_id>` and a synthetic
+    /// `ModelEntry` is created from the `CustomModelDef` metadata.
+    /// A `ProviderEntry` is also created for each custom provider so it
+    /// appears in `/providers` listing.
+    pub fn apply_custom_providers(
+        &mut self,
+        custom_providers: &HashMap<String, claurst_core::config::CustomProviderDef>,
+    ) {
+        for (provider_id, def) in custom_providers {
+            // Register the provider entry so it shows up in /providers.
+            self.providers.entry(provider_id.clone()).or_insert(ProviderEntry {
+                id: ProviderId::new(provider_id),
+                name: def.name.clone(),
+                env: Vec::new(),
+                api: Some(def.api_base.clone()),
+                npm: None,
+                doc: None,
+            });
+
+            for (model_id, model_def) in &def.models {
+                let key = format!("{}/{}", provider_id, model_id);
+                self.entries.insert(key, ModelEntry {
+                    info: ModelInfo {
+                        id: ModelId::new(model_id),
+                        provider_id: ProviderId::new(provider_id),
+                        name: model_def.name.clone().unwrap_or_else(|| model_id.to_string()),
+                        context_window: model_def.context_window.unwrap_or(0),
+                        max_output_tokens: model_def.max_output_tokens.unwrap_or(0),
+                        release_date: None,
+                        status: None,
+                    },
+                    family: None,
+                    status: Default::default(),
+                    release_date: None,
+                    last_updated: None,
+                    knowledge: None,
+                    open_weights: false,
+                    tool_calling: true,
+                    reasoning: model_def.reasoning_effort.is_some(),
+                    structured_output: false,
+                    temperature: true,
+                    attachment: false,
+                    interleaved: None,
+                    modalities_input: vec![Modality::Text],
+                    modalities_output: vec![Modality::Text],
+                    cost_input: None,
+                    cost_output: None,
+                    cost_cache_read: None,
+                    cost_cache_write: None,
+                    cost: Default::default(),
+                    provider_override: None,
+                    experimental_modes: Default::default(),
+                    options: Default::default(),
+                    headers: Default::default(),
+                });
+            }
+        }
+    }
 }
 
 /// Layer `overrides` onto `entries`: patch existing catalog rows in place and
