@@ -1255,3 +1255,44 @@ Some commands are available only under certain account or platform conditions:
 ### Feature-Flagged Commands
 
 Some commands check `isEnabled()` at runtime. For example, voice-related commands check for audio device availability; the desktop command checks for a display server.
+
+## Bang Commands (`!`)
+
+Execute shell commands directly from the input prompt without going through
+the model. Zero token consumption. Output is display-only — the model never
+sees it.
+
+### Usage
+
+```
+! ls -la
+! git status
+! echo "hello"
+```
+
+Type `!` followed by a shell command. The command runs via `bash -c` in the
+project working directory and the result is shown inline in the transcript.
+
+### Configuration (`settings.json`)
+
+```json
+"bangCommands": {
+  "enabled": true,
+  "addToHistory": true,
+  "showInTranscript": true
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `enabled` | `false` (opt-in) | Toggle the feature |
+| `addToHistory` | `false` | Store `!` commands in a separate shell-command history |
+| `showInTranscript` | `true` | Display command + output in the chat transcript |
+
+### Notes
+
+- Output is display-only — the model never sees it (zero token consumption).
+- Blocked in plan mode (read-only restriction).
+- Uses `bash -c` for execution (not the PTY-based Bash tool).
+- `!!` (double bang) is NOT treated as a bang command.
+- A single `!` with no command is ignored.
