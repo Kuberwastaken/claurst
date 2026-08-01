@@ -241,7 +241,7 @@ fn import_config_picker_items() -> Vec<SelectItem> {
 }
 
 fn provider_picker_items() -> Vec<SelectItem> {
-    vec![
+    let mut items = vec![
         SelectItem { id: "free".into(), title: "Free Mode".into(), description: "OpenCode Zen → OpenRouter free fallback (no spend)".into(), category: "Popular".into(), badge: Some("FREE".into()) },
         SelectItem { id: "openai".into(), title: "OpenAI".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "openai-codex".into(), title: "OpenAI Codex".into(), description: "(ChatGPT Plus/Pro — browser login)".into(), category: "Popular".into(), badge: None },
@@ -250,6 +250,7 @@ fn provider_picker_items() -> Vec<SelectItem> {
         SelectItem { id: "anthropic".into(), title: "Anthropic".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "anthropic-oauth".into(), title: "Anthropic (Claude Pro/Max)".into(), description: "(subscription — browser login; draws from extra-usage)".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "custom-openai".into(), title: "Custom OpenAI-Compatible".into(), description: "Custom URL + API key".into(), category: "Advanced".into(), badge: None },
+        SelectItem { id: "cursor-acp".into(), title: "Cursor ACP".into(), description: "Cursor CLI agent via ACP (subprocess)".into(), category: "Advanced".into(), badge: None },
         SelectItem { id: "openrouter".into(), title: "OpenRouter".into(), description: "100+ models with one key".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "vercel".into(), title: "Vercel AI Gateway".into(), description: "Gateway for AI SDK models".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "groq".into(), title: "Groq".into(), description: "Fast hosted inference".into(), category: "Popular".into(), badge: Some("FREE".into()) },
@@ -297,7 +298,21 @@ fn provider_picker_items() -> Vec<SelectItem> {
         SelectItem { id: "upstage".into(), title: "Upstage".into(), description: "Hosted Upstage models".into(), category: "Other".into(), badge: None },
         SelectItem { id: "stepfun".into(), title: "StepFun".into(), description: "Hosted reasoning models".into(), category: "Other".into(), badge: None },
         SelectItem { id: "fireworks".into(), title: "Fireworks AI".into(), description: "Fast inference".into(), category: "Other".into(), badge: None },
-    ]
+    ];
+
+        // Dynamically append custom providers from Settings.
+        if let Ok(settings) = Settings::load_sync() {
+            for (id, def) in &settings.custom_providers {
+                items.push(SelectItem {
+                    id: id.clone(),
+                    title: def.name.clone(),
+                    description: format!("Custom OpenAI-compatible — {}", def.api_base),
+                    category: "Custom".into(),
+                    badge: Some("CUSTOM".into()),
+                });
+            }
+        }
+        items
 }
 
 // ---------------------------------------------------------------------------
@@ -1809,9 +1824,16 @@ impl App {
                 "amazon-bedrock",
                 "free",
                 "opencode-zen",
+                "cursor-acp",
             ];
             if known.contains(&provider) {
                 return Some(provider.to_string());
+            }
+            // Check custom providers at runtime.
+            if let Ok(settings) = Settings::load_sync() {
+                if settings.custom_providers.contains_key(provider) {
+                    return Some(provider.to_string());
+                }
             }
         }
 
@@ -3481,6 +3503,10 @@ impl App {
                             "ollama" | "lmstudio" | "llamacpp" => {
                                 self.activate_provider(selected.id.clone(), selected.title.clone(), "Switched to");
                             }
+                            "cursor-acp" => {
+                                // Cursor ACP: spawns agent subprocess, no API key needed.
+                                self.activate_provider(selected.id.clone(), selected.title.clone(), "Switched to");
+                            }
                             // "Free" composite mode — collects any subset of the
                             // free-tier upstreams (min 1; more = better availability).
                             "free" => {
@@ -3537,6 +3563,23 @@ impl App {
                             "amazon-bedrock" => {
                                 self.key_input_dialog
                                     .open(selected.id.clone(), selected.title.clone());
+                            }
+                            // Custom providers from Settings — may need API key
+                            id if {
+                                let settings = Settings::load_sync().unwrap_or_default();
+                                settings.custom_providers.contains_key(id)
+                            } => {
+                                // Check if the custom provider has an API key resolved.
+                                let settings = Settings::load_sync().unwrap_or_default();
+                                let def = settings.custom_providers.get(&selected.id).unwrap();
+                                if def.resolve_api_key().is_some() {
+                                    // Key available — activate directly.
+                                    self.activate_provider(selected.id.clone(), selected.title.clone(), "Switched to");
+                                } else {
+                                    // No key — open key input dialog.
+                                    self.key_input_dialog
+                                        .open(selected.id.clone(), selected.title.clone());
+                                }
                             }
                             // All other providers — open API key input dialog
                             _ => {

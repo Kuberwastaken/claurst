@@ -815,6 +815,7 @@ pub async fn run_query_loop(
                     // Native (non-OpenAI-compat) providers
                     "anthropic", "openai", "google", "azure", "amazon-bedrock",
                     "github-copilot", "codex", "openai-codex", "cohere", "minimax",
+                    "cursor-acp",
                     // Local / self-hosted
                     "ollama",
                     "lmstudio", "lm-studio",

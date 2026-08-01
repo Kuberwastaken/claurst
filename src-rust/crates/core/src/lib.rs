@@ -89,7 +89,7 @@ pub use types::{
     ContentBlock, ImageSource, DocumentSource, CitationsConfig, Message, MessageContent,
     MessageCost, Role, ToolDefinition, ToolResultContent, UsageInfo,
 };
-pub use config::{AgentDefinition, BudgetSplitPolicy, Config, CommandTemplate, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
+pub use config::{AgentDefinition, BudgetSplitPolicy, Config, CommandTemplate, CustomProviderDef, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
 pub use import_config::{ClaudeMdPreview, ImportExecutionResult, ImportPaths, ImportPreview, ImportSelection, PreviewAction, PreviewField, SettingsPreview, build_import_preview, execute_import, summarize_import_result};
 
 // Skill discovery: filesystem and git URL skill loading.
@@ -948,6 +948,46 @@ pub mod config {
         }
     }
 
+    // ---- CustomProviderDef ----------------------------------------------
+
+    /// Definition of a user-defined OpenAI-compatible provider, stored in
+    /// `settings.json` under the `customProviders` map. Each entry is keyed by
+    /// a stable provider id and carries a display name, base URL, and optional
+    /// API key (or env-var reference). These appear in the connect dialog
+    /// alongside built-in providers.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct CustomProviderDef {
+        /// Human-readable name shown in the connect dialog.
+        #[serde(default)]
+        pub name: String,
+        /// Base URL for the OpenAI-compatible API endpoint.
+        #[serde(default, rename = "apiBase", alias = "api_base")]
+        pub api_base: String,
+        /// API key (overrides the env var when set). Supports `{env:VAR}` patterns.
+        #[serde(default, rename = "apiKey", alias = "api_key")]
+        pub api_key: Option<String>,
+        /// Environment variable name to read the API key from when
+        /// [`api_key`](Self::api_key) is absent.
+        #[serde(default, rename = "apiKeyEnvVar", alias = "api_key_env_var")]
+        pub api_key_env_var: Option<String>,
+    }
+
+    impl CustomProviderDef {
+        /// Resolve the API key for this custom provider: config key first,
+        /// then the named env var, then the auth store.
+        pub fn resolve_api_key(&self) -> Option<String> {
+            self.api_key
+                .clone()
+                .filter(|key| !key.is_empty())
+                .or_else(|| {
+                    self.api_key_env_var
+                        .as_ref()
+                        .and_then(|var| std::env::var(var).ok().filter(|v| !v.is_empty()))
+                })
+                .map(|key| substitute_env_vars(&key))
+        }
+    }
+
     // ---- ModelOverride ---------------------------------------------------
 
     /// User-supplied metadata override for a single model, keyed by the
@@ -1317,6 +1357,10 @@ pub mod config {
         /// Note: @include in CLAUDE.md/AGENTS.md always injects regardless of this limit.
         #[serde(default = "default_file_injection_max_size", rename = "fileInjectionMaxSize")]
         pub file_injection_max_size: usize,
+        /// User-defined OpenAI-compatible providers, keyed by provider id.
+        /// Each entry is shown in the connect dialog and model picker.
+        #[serde(default, rename = "customProviders", alias = "custom_providers")]
+        pub custom_providers: HashMap<String, CustomProviderDef>,
     }
 
     /// A user-defined slash command template.
@@ -2031,6 +2075,7 @@ pub mod config {
                 file_autocomplete_show_hidden_files: over.file_autocomplete_show_hidden_files || base.file_autocomplete_show_hidden_files,
                 file_injection_enabled: over.file_injection_enabled || base.file_injection_enabled,
                 file_injection_max_size: if over.file_injection_max_size != 0 { over.file_injection_max_size } else { base.file_injection_max_size },
+                custom_providers: merge_map(base.custom_providers, over.custom_providers),
             }
         }
     }
