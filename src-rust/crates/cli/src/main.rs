@@ -3144,6 +3144,10 @@ async fn run_interactive(
                             tools_arc = all_tools_arc.clone();
                         }
                     }
+                    // Apply /turns override if set (takes precedence over agent defaults).
+                    if let Some(turns) = app.max_turns_override {
+                        base_query_config.max_turns = turns;
+                    }
                     if !app.is_streaming && app.messages.len() < messages.len() {
                         messages = app.messages.clone();
                         session.messages = messages.clone();
