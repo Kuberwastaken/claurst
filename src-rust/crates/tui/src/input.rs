@@ -5,6 +5,13 @@ pub fn is_slash_command(input: &str) -> bool {
     input.starts_with('/') && !input.starts_with("//")
 }
 
+/// Check if the input is a bang command (! prefix).
+/// A single `!` is a bang command only when followed by at least one
+/// non-whitespace character; `!!` (double bang) is NOT a bang command.
+pub fn is_bang_command(input: &str) -> bool {
+    input.starts_with('!') && !input.starts_with("!!") && input.len() > 1
+}
+
 /// Parse a slash command into `(command_name, args)`.
 /// Returns `("", "")` if the input is not a slash command.
 pub fn parse_slash_command(input: &str) -> (&str, &str) {
@@ -54,5 +61,21 @@ mod tests {
         let (cmd, args) = parse_slash_command("hello world");
         assert_eq!(cmd, "");
         assert_eq!(args, "");
+    }
+
+    #[test]
+    fn is_bang_command_true() {
+        assert!(is_bang_command("!ls"));
+        assert!(is_bang_command("! git status"));
+        assert!(is_bang_command("!echo hello"));
+    }
+
+    #[test]
+    fn is_bang_command_false() {
+        assert!(!is_bang_command("ls"));
+        assert!(!is_bang_command("/help"));
+        assert!(!is_bang_command("!! multi-line"));
+        assert!(!is_bang_command("hello"));
+        assert!(!is_bang_command(""));
     }
 }
