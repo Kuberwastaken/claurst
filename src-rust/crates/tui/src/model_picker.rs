@@ -24,6 +24,10 @@ use crate::overlays::{centered_rect, modal_search_line, CLAURST_PANEL_BG};
 /// support reasoning honour it.
 pub use claurst_core::effort::EffortLevel;
 
+/// Sentinel model id for the "Default" picker entry. When the user selects
+/// this, the app clears the explicit model override so the provider's best
+/// model is used.
+pub const DEFAULT_MODEL_SENTINEL: &str = "__default__";
 
 // ---------------------------------------------------------------------------
 // Model capability helpers — driven by the opencode variants() ladder
@@ -221,6 +225,8 @@ pub struct ModelEntry {
     pub description: String,
     /// Whether this is the currently active model.
     pub is_current: bool,
+    /// Provider ID this model belongs to (for all-providers mode).
+    pub provider_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -228,12 +234,13 @@ pub struct ModelEntry {
 // ---------------------------------------------------------------------------
 
 /// Helper to build a `ModelEntry` with `is_current = false`.
-fn model_entry(id: &str, name: &str, desc: &str) -> ModelEntry {
+fn model_entry(id: &str, name: &str, desc: &str, provider_id: &str) -> ModelEntry {
     ModelEntry {
         id: id.to_string(),
         display_name: name.to_string(),
         description: desc.to_string(),
         is_current: false,
+        provider_id: provider_id.to_string(),
     }
 }
 
@@ -254,7 +261,7 @@ pub fn models_for_provider_from_registry(
     // directly.  `free/auto` is the default routing entry; the rest pin a
     // specific upstream model for users who care.
     if provider_id == "free" {
-        return free_provider_models();
+        return free_provider_models(provider_id);
     }
     // Codex (ChatGPT-authenticated OpenAI) is not in the models.dev catalog —
     // serve the curated CODEX_MODELS list so the picker isn't empty.  Accept
@@ -262,7 +269,7 @@ pub fn models_for_provider_from_registry(
     // ("openai-codex"); without the alias a fresh Codex login lands on the
     // empty-registry fallback and the picker shows no models.
     if is_codex_provider(provider_id) {
-        return codex_provider_models(registry);
+        return codex_provider_models(registry, provider_id);
     }
 
     let mut entries = registry.list_visible_by_provider(provider_id);
@@ -280,6 +287,7 @@ pub fn models_for_provider_from_registry(
             "default",
             "Default model",
             "no catalog entry for this provider",
+            provider_id,
         )];
     }
 
@@ -307,6 +315,7 @@ pub fn models_for_provider_from_registry(
                 display_name: e.info.name.clone(),
                 description: cost_str,
                 is_current: false,
+                provider_id: provider_id.to_string(),
             }
         })
         .collect()
@@ -377,10 +386,26 @@ pub fn default_model_for_provider(
 /// event loop either replaces or merges the projection according to
 /// [`provider_has_authoritative_live_models`].
 pub fn provider_uses_catalog_projection(provider_id: &str) -> bool {
-    matches!(
+    if matches!(
         provider_id,
         "openai" | "google" | "azure" | "amazon-bedrock" | "cohere" | "minimax"
-    )
+    ) {
+        return true;
+    }
+    // Custom providers have a curated model list in settings — no live
+    // endpoint to fetch from, so skip the background fetch.
+    if let Ok(settings) = claurst_core::Settings::load_sync() {
+        if settings.custom_providers.contains_key(provider_id) {
+            return true;
+        }
+    }
+// cursor-acp-rest is a custom provider with curated models — no
+    // discovery needed. cursor-acp (native subprocess) triggers
+    // discover_models() for live model discovery from the ACP.
+    if provider_id == "cursor-acp-rest" {
+        return true;
+    }
+    false
 }
 
 /// Whether live discovery is the complete set of models usable through a local
@@ -417,7 +442,7 @@ fn is_codex_provider(provider_id: &str) -> bool {
 /// catalog yields nothing (e.g. an empty/old snapshot).
 ///
 /// [`codex_model_allowed`]: claurst_core::codex_oauth::codex_model_allowed
-fn codex_provider_models(registry: &claurst_api::ModelRegistry) -> Vec<ModelEntry> {
+fn codex_provider_models(registry: &claurst_api::ModelRegistry, provider_id: &str) -> Vec<ModelEntry> {
     use claurst_core::codex_oauth::{codex_limit_override, codex_model_allowed};
 
     let mut entries: Vec<&claurst_api::ModelEntry> = registry
@@ -427,7 +452,7 @@ fn codex_provider_models(registry: &claurst_api::ModelRegistry) -> Vec<ModelEntr
         .collect();
 
     if entries.is_empty() {
-        return codex_fallback_models();
+        return codex_fallback_models(provider_id);
     }
 
     // Newest release first, then by id for stability — matches the picker's
@@ -455,13 +480,14 @@ fn codex_provider_models(registry: &claurst_api::ModelRegistry) -> Vec<ModelEntr
                     format_context_window(ctx)
                 ),
                 is_current: false,
+                provider_id: provider_id.to_string(),
             }
         })
         .collect()
 }
 
 /// Static fallback used when the models.dev `openai` catalog is unavailable.
-fn codex_fallback_models() -> Vec<ModelEntry> {
+fn codex_fallback_models(provider_id: &str) -> Vec<ModelEntry> {
     use claurst_core::codex_oauth::codex_limit_override;
     claurst_core::codex_oauth::CODEX_MODELS
         .iter()
@@ -477,6 +503,7 @@ fn codex_fallback_models() -> Vec<ModelEntry> {
                     format_context_window(ctx)
                 ),
                 is_current: false,
+                provider_id: provider_id.to_string(),
             }
         })
         .collect()
@@ -485,12 +512,13 @@ fn codex_fallback_models() -> Vec<ModelEntry> {
 /// Curated free-mode model list used by `models_for_provider_from_registry`.
 /// Always shows `free/auto` first; one pin entry per catalog upstream so the
 /// user can target a specific provider when they need to.
-fn free_provider_models() -> Vec<ModelEntry> {
+fn free_provider_models(provider_id: &str) -> Vec<ModelEntry> {
     let mut entries = vec![ModelEntry {
         id: "free/auto".to_string(),
         display_name: "Auto (round-robin across configured providers)".to_string(),
         description: "stacks every free-tier key you've added · $0.00 per M".to_string(),
         is_current: false,
+        provider_id: provider_id.to_string(),
     }];
 
     for upstream in claurst_api::FREE_CATALOG {
@@ -499,6 +527,7 @@ fn free_provider_models() -> Vec<ModelEntry> {
             display_name: format!("{} \u{2014} {}", upstream.title, upstream.default_model),
             description: format!("{} · $0.00 per M", upstream.note),
             is_current: false,
+            provider_id: provider_id.to_string(),
         });
     }
 
@@ -523,6 +552,13 @@ pub struct ModelPickerState {
     pub models_loaded: bool,
     /// `true` while the background fetch is in flight.
     pub loading_models: bool,
+    /// Favorited model keys ("provider/model" format), loaded from Settings.
+    pub favorites: Vec<String>,
+    /// Synthetic "Default" entry prepended to the model list.
+    default_entry: ModelEntry,
+    /// When true, the picker shows models from all connected providers
+    /// grouped by provider name.
+    pub all_providers_mode: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +587,15 @@ impl ModelPickerState {
             fast_mode_model: None,
             models_loaded: false,
             loading_models: false,
+            favorites: Vec::new(),
+            default_entry: ModelEntry {
+                id: DEFAULT_MODEL_SENTINEL.to_string(),
+                display_name: "Default".to_string(),
+                description: "Provider's recommended model (auto-selects best)".to_string(),
+                is_current: false,
+                provider_id: String::new(),
+            },
+            all_providers_mode: false,
         }
     }
 
@@ -568,6 +613,43 @@ impl ModelPickerState {
         self.open_with_title("Select model", current_model, effort, fast_mode);
     }
 
+    /// Open in all-providers mode — shows models from all connected
+    /// providers grouped by provider name.
+    pub fn open_all_providers(&mut self, current_model: &str, effort: EffortLevel, fast_mode: bool) {
+        self.all_providers_mode = true;
+        self.open_with_title("Select model (all providers)", current_model, effort, fast_mode);
+    }
+
+    /// Get the display name for a provider ID (for all-providers mode).
+    pub fn provider_group_name(provider_id: &str) -> &'static str {
+        match provider_id {
+            "anthropic" => "Anthropic",
+            "openai" => "OpenAI",
+            "google" => "Google",
+            "groq" => "Groq",
+            "openrouter" => "OpenRouter",
+            "deepseek" => "DeepSeek",
+            "ollama" => "Ollama",
+            "lmstudio" => "LM Studio",
+            "llamacpp" | "llama-cpp" | "llama-server" => "llama.cpp",
+            "github-copilot" => "GitHub Copilot",
+            "codex" | "openai-codex" => "OpenAI Codex",
+            "cohere" => "Cohere",
+            "xai" => "xAI",
+            "free" => "Free Mode",
+            "cursor-acp" => "Cursor ACP",
+            "cerebras" => "Cerebras",
+            "sambanova" => "SambaNova",
+            "together-ai" | "togetherai" => "Together AI",
+            "mistral" => "Mistral",
+            "perplexity" => "Perplexity",
+            "azure" => "Azure OpenAI",
+            "amazon-bedrock" => "AWS Bedrock",
+            "custom-openai" => "Custom OpenAI",
+            _ => "Other",
+        }
+    }
+
     pub fn open_with_title(
         &mut self,
         title: impl Into<String>,
@@ -578,6 +660,9 @@ impl ModelPickerState {
         for m in &mut self.models {
             m.is_current = m.id == current_model;
         }
+        // Mark default entry as current when no explicit model is set.
+        self.default_entry.is_current = current_model.is_empty()
+            || current_model == DEFAULT_MODEL_SENTINEL;
         self.selected_idx = self
             .models
             .iter()
@@ -595,6 +680,7 @@ impl ModelPickerState {
     pub fn close(&mut self) {
         self.visible = false;
         self.filter.clear();
+        self.all_providers_mode = false;
     }
 
     pub fn is_selected_fast_mode_model(&self, model_id: &str) -> bool {
@@ -603,7 +689,7 @@ impl ModelPickerState {
 
     /// Move selection up one row (wraps to last if at top).
     pub fn select_prev(&mut self) {
-        let count = self.filtered_models().len();
+        let count = self.filtered_models_grouped().len();
         if count == 0 { return; }
         if self.selected_idx == 0 {
             self.selected_idx = count - 1;
@@ -614,7 +700,7 @@ impl ModelPickerState {
 
     /// Move selection down one row (wraps to first if at bottom).
     pub fn select_next(&mut self) {
-        let count = self.filtered_models().len();
+        let count = self.filtered_models_grouped().len();
         if count == 0 { return; }
         self.selected_idx = (self.selected_idx + 1) % count;
     }
@@ -624,7 +710,7 @@ impl ModelPickerState {
     }
 
     pub fn select_last(&mut self) {
-        let count = self.filtered_models().len();
+        let count = self.filtered_models_grouped().len();
         self.selected_idx = count.saturating_sub(1);
     }
 
@@ -632,9 +718,9 @@ impl ModelPickerState {
     /// no ultracode). Empty when nothing is highlighted or the model is
     /// non-reasoning.
     fn selected_ladder(&self) -> Vec<EffortLevel> {
-        let filtered = self.filtered_models();
+        let filtered = self.filtered_models_grouped();
         match filtered.get(self.selected_idx) {
-            Some(m) => picker_variant_ladder(&m.id),
+            Some((m, _)) => picker_variant_ladder(&m.id),
             None => Vec::new(),
         }
     }
@@ -671,7 +757,7 @@ impl ModelPickerState {
     /// Returns the selected model; the caller is responsible for persisting it
     /// in the correct provider-aware format.
     pub fn confirm(&mut self) -> Option<(String, Option<EffortLevel>)> {
-        let filtered = self.filtered_models();
+        let filtered = self.filtered_models_grouped();
         let custom = self.filter.trim();
         if filtered.is_empty() {
             if custom.is_empty() {
@@ -681,8 +767,12 @@ impl ModelPickerState {
             self.close();
             return Some((id, None));
         }
-        let entry = filtered.get(self.selected_idx)?;
+        let (entry, _is_fav) = filtered.get(self.selected_idx)?;
         let id = entry.id.clone();
+        if id == DEFAULT_MODEL_SENTINEL {
+            self.close();
+            return Some((id, None));
+        }
         let ladder = picker_variant_ladder(&id);
         let effort = if ladder.len() > 1 {
             Some(clamp_to_ladder(&ladder, self.effort_level))
@@ -723,6 +813,117 @@ impl ModelPickerState {
             .collect()
     }
 
+    /// Load favorites from Settings into the picker state.
+    pub fn load_favorites(&mut self) {
+        if let Ok(settings) = claurst_core::Settings::load_sync() {
+            self.favorites = settings.favorite_models;
+        }
+    }
+
+    /// Toggle favorite status on a model key. Saves to Settings immediately.
+    pub fn toggle_favorite(&mut self, model_key: &str) {
+        if self.favorites.contains(&model_key.to_string()) {
+            self.favorites.retain(|f| f != model_key);
+        } else {
+            self.favorites.push(model_key.to_string());
+        }
+        // Persist to settings.
+        if let Ok(mut settings) = claurst_core::Settings::load_sync() {
+            settings.favorite_models = self.favorites.clone();
+            let _ = settings.save_sync();
+        }
+    }
+
+    /// Check if a model key is favorited.
+    pub fn is_favorite(&self, model_key: &str) -> bool {
+        self.favorites.contains(&model_key.to_string())
+    }
+
+    /// Get the list of valid favorites — those present in the picker's
+    /// current model list. Stale favorites (model removed from catalog)
+    /// are silently excluded from display but NOT removed from settings.
+    pub fn valid_favorites(&self) -> Vec<String> {
+        let model_ids: std::collections::HashSet<&str> =
+            self.models.iter().map(|m| m.id.as_str()).collect();
+        self.favorites
+            .iter()
+            .filter(|f| {
+                // Favorites are in "provider/model" format. The picker's
+                // models list has bare model ids (no provider prefix) since
+                // the picker is scoped to one provider. So we match on the
+                // model portion after the slash.
+                if let Some((_, model)) = f.split_once('/') {
+                    model_ids.contains(model)
+                } else {
+                    model_ids.contains(f.as_str())
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Returns model entries for display: favorites first (marked with ★),
+    /// then all other models. Applies the current filter to both sections.
+    pub fn filtered_models_grouped(&self) -> Vec<(&ModelEntry, bool)> {
+        let valid_favs = self.valid_favorites();
+        let fav_model_ids: std::collections::HashSet<String> = valid_favs
+            .iter()
+            .map(|f| f.split_once('/').map(|(_, m)| m.to_string()).unwrap_or(f.clone()))
+            .collect();
+
+        if self.filter.is_empty() {
+            // No filter: favorites section, then all models
+            let mut result = Vec::new();
+            // Default entry always at top.
+            result.push((&self.default_entry, false));
+            // Favorites first
+            for m in &self.models {
+                if fav_model_ids.contains(&m.id) {
+                    result.push((m, true));
+                }
+            }
+            // Then non-favorites
+            for m in &self.models {
+                if !fav_model_ids.contains(&m.id) {
+                    result.push((m, false));
+                }
+            }
+            result
+        } else {
+            let needle = self.filter.to_lowercase();
+            let mut result = Vec::new();
+            // Default entry — always show if filter matches or is empty.
+            if self.filter.is_empty()
+                || "default".contains(&needle)
+                || self.default_entry.display_name.to_lowercase().contains(&needle)
+                || self.default_entry.description.to_lowercase().contains(&needle)
+            {
+                result.push((&self.default_entry, false));
+            }
+            // Favorites matching filter
+            for m in &self.models {
+                if fav_model_ids.contains(&m.id)
+                    && (m.id.to_lowercase().contains(&needle)
+                        || m.display_name.to_lowercase().contains(&needle)
+                        || m.description.to_lowercase().contains(&needle))
+                {
+                    result.push((m, true));
+                }
+            }
+            // Non-favorites matching filter
+            for m in &self.models {
+                if !fav_model_ids.contains(&m.id)
+                    && (m.id.to_lowercase().contains(&needle)
+                        || m.display_name.to_lowercase().contains(&needle)
+                        || m.description.to_lowercase().contains(&needle))
+                {
+                    result.push((m, false));
+                }
+            }
+            result
+        }
+    }
+
     /// Replace the model list with dynamically loaded entries.
     ///
     /// Called by the app event loop when the background fetch completes.
@@ -731,8 +932,8 @@ impl ModelPickerState {
         self.models = entries;
         self.loading_models = false;
         self.models_loaded = true;
-        // Keep selected_idx in bounds.
-        let count = self.filtered_models().len();
+        // Keep selected_idx in bounds (grouped view includes default entry).
+        let count = self.filtered_models_grouped().len();
         if count > 0 && self.selected_idx >= count {
             self.selected_idx = count - 1;
         }
@@ -769,8 +970,8 @@ impl ModelPickerState {
         }
         self.loading_models = false;
         self.models_loaded = true;
-        // Keep selected_idx in bounds.
-        let count = self.filtered_models().len();
+        // Keep selected_idx in bounds (grouped view includes default entry).
+        let count = self.filtered_models_grouped().len();
         if count > 0 && self.selected_idx >= count {
             self.selected_idx = count - 1;
         }
@@ -820,8 +1021,8 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
     // ── Dialog size ──
     let width = 65u16.min(area.width.saturating_sub(6));
     let max_height = (area.height as f32 * 0.75) as u16;
-    let filtered = state.filtered_models();
-    let content_h = (filtered.len() as u16 + 6).min(max_height).max(8);
+    let grouped = state.filtered_models_grouped();
+    let content_h = (grouped.len() as u16 + 6).min(max_height).max(8);
     let dialog_area = centered_rect(width, content_h, area);
 
     // ── Fill dialog bg (no border) ──
@@ -909,7 +1110,7 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
         lines.push(Line::from(""));
     }
 
-    if filtered.is_empty() {
+    if grouped.is_empty() {
         lines.push(Line::from(vec![Span::styled(" No results found", Style::default().fg(dim))]));
         if !state.filter.trim().is_empty() {
             lines.push(Line::from(vec![Span::styled(
@@ -918,7 +1119,17 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
             )]));
         }
     } else {
-        for (i, model) in filtered.iter().enumerate() {
+        let mut last_provider: Option<&str> = None;
+        for (i, (model, is_fav)) in grouped.iter().enumerate() {
+            // Provider group header in all-providers mode
+            if state.all_providers_mode && last_provider != Some(&model.provider_id) {
+                last_provider = Some(&model.provider_id);
+                let group_name = ModelPickerState::provider_group_name(&model.provider_id);
+                lines.push(Line::from(vec![Span::styled(
+                    format!(" {} ", group_name),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )]));
+            }
             let is_selected = i == state.selected_idx;
             let supports_effort = model_supports_effort(&model.id);
 
@@ -940,6 +1151,10 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
             } else {
                 spans.push(Span::styled("   ", Style::default().bg(bg)));
             }
+
+            // Favorite star indicator
+            let star = if *is_fav { "\u{2605} " } else { "  " };
+            spans.push(Span::styled(star.to_string(), Style::default().fg(Color::Yellow).bg(bg)));
 
             spans.push(Span::styled(model.display_name.clone(), Style::default().fg(fg).bg(bg)));
 
@@ -994,7 +1209,7 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
         Span::styled(" enter", Style::default().fg(dim)),
         Span::styled(" select", Style::default().fg(dim)),
     ];
-    if let Some(model) = filtered.get(state.selected_idx) {
+    if let Some((model, _)) = grouped.get(state.selected_idx) {
         if model_supports_effort(&model.id) {
             footer_spans.push(Span::raw("  "));
             footer_spans.push(Span::styled("\u{2190}/\u{2192}", Style::default().fg(dim)));
@@ -1026,18 +1241,21 @@ mod tests {
                 display_name: "Claude Opus 4.6".to_string(),
                 description: "200K context".to_string(),
                 is_current: false,
+                provider_id: "anthropic".to_string(),
             },
             ModelEntry {
                 id: "claude-sonnet-4-6".to_string(),
                 display_name: "Claude Sonnet 4.6".to_string(),
                 description: "200K context".to_string(),
                 is_current: false,
+                provider_id: "anthropic".to_string(),
             },
             ModelEntry {
                 id: "claude-haiku-4-5".to_string(),
                 display_name: "Claude Haiku 4.5".to_string(),
                 description: "200K context".to_string(),
                 is_current: false,
+                provider_id: "anthropic".to_string(),
             },
         ]
     }
@@ -1137,7 +1355,7 @@ mod tests {
     #[test]
     fn select_next_wraps() {
         let mut p = make_picker_with_current("claude-opus-4-6");
-        let total = p.filtered_models().len();
+        let total = p.filtered_models_grouped().len();
         p.selected_idx = total - 1;
         p.select_next();
         assert_eq!(p.selected_idx, 0);
@@ -1149,7 +1367,7 @@ mod tests {
         let mut p = make_picker_with_current("claude-opus-4-6");
         p.selected_idx = 0;
         p.select_prev();
-        let total = p.filtered_models().len();
+        let total = p.filtered_models_grouped().len();
         assert_eq!(p.selected_idx, total - 1);
     }
 
@@ -1182,10 +1400,10 @@ mod tests {
     #[test]
     fn confirm_returns_id_and_closes() {
         let mut p = make_picker_with_current("claude-opus-4-6");
-        p.selected_idx = 0;
-        let first_id = p.filtered_models()[0].id.clone();
+        p.selected_idx = 1; // skip Default sentinel at index 0
+        let first_model_id = p.filtered_models()[0].id.clone();
         let result = p.confirm();
-        assert_eq!(result.map(|(id, _)| id), Some(first_id));
+        assert_eq!(result.map(|(id, _)| id), Some(first_model_id));
         assert!(!p.visible, "picker should be closed after confirm");
     }
 
@@ -1478,6 +1696,7 @@ mod tests {
                 display_name: "LIVE OVERWRITE".to_string(),
                 description: "live desc".to_string(),
                 is_current: false,
+                provider_id: "anthropic".to_string(),
             },
             // A brand-new live id absent from the catalog — must be appended.
             ModelEntry {
@@ -1485,6 +1704,7 @@ mod tests {
                 display_name: "GPT-5.5 (live)".to_string(),
                 description: "live only".to_string(),
                 is_current: false,
+                provider_id: "anthropic".to_string(),
             },
         ];
         p.merge_models(live);
@@ -1530,12 +1750,14 @@ mod tests {
             "default",
             "Default model",
             "no catalog entry for this provider",
+            "anthropic",
         )]);
         p.merge_models(vec![ModelEntry {
             id: "llama3.3".to_string(),
             display_name: "Llama 3.3".to_string(),
             description: "local".to_string(),
             is_current: false,
+            provider_id: "anthropic".to_string(),
         }]);
         assert!(
             !p.models.iter().any(|m| m.id == "default"),
@@ -1581,5 +1803,135 @@ mod tests {
         }
         assert!(!provider_has_authoritative_live_models("github-copilot"));
         assert!(!provider_has_authoritative_live_models("openrouter"));
+    }
+
+    #[test]
+    fn valid_favorites_filters_stale_entries() {
+        let mut state = ModelPickerState::new();
+        state.models = vec![
+            ModelEntry { id: "model-a".to_string(), display_name: "A".to_string(), description: "".to_string(), is_current: false, provider_id: String::new() },
+            ModelEntry { id: "model-b".to_string(), display_name: "B".to_string(), description: "".to_string(), is_current: false, provider_id: String::new() },
+        ];
+        state.favorites = vec![
+            "provider/model-a".to_string(),  // valid
+            "provider/model-c".to_string(),  // stale (not in models list)
+            "model-b".to_string(),           // valid (no provider prefix)
+        ];
+        let valid = state.valid_favorites();
+        assert_eq!(valid.len(), 2);
+        assert!(valid.contains(&"provider/model-a".to_string()));
+        assert!(valid.contains(&"model-b".to_string()));
+    }
+
+    #[test]
+    fn filtered_models_grouped_puts_favorites_first() {
+        let mut state = ModelPickerState::new();
+        state.models = vec![
+            ModelEntry { id: "regular".to_string(), display_name: "Regular".to_string(), description: "".to_string(), is_current: false, provider_id: String::new() },
+            ModelEntry { id: "pinned".to_string(), display_name: "Pinned".to_string(), description: "".to_string(), is_current: false, provider_id: String::new() },
+            ModelEntry { id: "other".to_string(), display_name: "Other".to_string(), description: "".to_string(), is_current: false, provider_id: String::new() },
+        ];
+        state.favorites = vec!["provider/pinned".to_string()];
+        let grouped = state.filtered_models_grouped();
+        assert_eq!(grouped.len(), 4);
+        // Default sentinel at top.
+        assert_eq!(grouped[0].0.id, DEFAULT_MODEL_SENTINEL);
+        // Favorite must come next.
+        assert_eq!(grouped[1].0.id, "pinned");
+        assert!(grouped[1].1);
+        // Rest are non-favorites, preserve source order.
+        assert_eq!(grouped[2].0.id, "regular");
+        assert!(!grouped[2].1);
+        assert_eq!(grouped[3].0.id, "other");
+        assert!(!grouped[3].1);
+    }
+
+    #[test]
+    fn filtered_models_grouped_respects_filter() {
+        let mut state = ModelPickerState::new();
+        state.models = vec![
+            ModelEntry { id: "pinned-a".to_string(), display_name: "Pinned A".to_string(), description: "".to_string(), is_current: false, provider_id: String::new() },
+            ModelEntry { id: "pinned-b".to_string(), display_name: "Other B".to_string(), description: "".to_string(), is_current: false, provider_id: String::new() },
+        ];
+        state.favorites = vec![
+            "provider/pinned-a".to_string(),
+            "provider/pinned-b".to_string(),
+        ];
+        for c in "pinned a".chars() {
+            state.push_filter_char(c);
+        }
+        let grouped = state.filtered_models_grouped();
+        // Only the favorite matching the filter appears, on top.
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].0.id, "pinned-a");
+        assert!(grouped[0].1);
+    }
+
+    #[test]
+    fn is_favorite_roundtrips_without_persist() {
+        let mut state = ModelPickerState::new();
+        state.favorites = vec!["anthropic/claude-sonnet-4-6".to_string()];
+        assert!(state.is_favorite("anthropic/claude-sonnet-4-6"));
+        assert!(!state.is_favorite("openai/gpt-4o"));
+    }
+
+    #[test]
+    fn default_entry_appears_at_top() {
+        let mut picker = ModelPickerState::new();
+        picker.set_models(vec![
+            ModelEntry {
+                id: "model-a".to_string(),
+                display_name: "Model A".to_string(),
+                description: "desc".to_string(),
+                is_current: false,
+                provider_id: String::new(),
+            },
+            ModelEntry {
+                id: "model-b".to_string(),
+                display_name: "Model B".to_string(),
+                description: "desc".to_string(),
+                is_current: false,
+                provider_id: String::new(),
+            },
+        ]);
+        picker.open("model-a");
+        let grouped = picker.filtered_models_grouped();
+        assert_eq!(grouped.len(), 3);
+        assert_eq!(grouped[0].0.id, DEFAULT_MODEL_SENTINEL);
+        assert_eq!(grouped[1].0.id, "model-a");
+    }
+
+    #[test]
+    fn default_entry_is_current_when_no_model() {
+        let mut picker = ModelPickerState::new();
+        picker.set_models(vec![
+            ModelEntry {
+                id: "model-a".to_string(),
+                display_name: "Model A".to_string(),
+                description: "desc".to_string(),
+                is_current: false,
+                provider_id: String::new(),
+            },
+        ]);
+        picker.open_with_title("Test", "", EffortLevel::Medium, false);
+        assert!(picker.default_entry.is_current);
+    }
+
+    #[test]
+    fn confirm_returns_default_sentinel() {
+        let mut picker = ModelPickerState::new();
+        picker.set_models(vec![
+            ModelEntry {
+                id: "model-a".to_string(),
+                display_name: "Model A".to_string(),
+                description: "desc".to_string(),
+                is_current: false,
+                provider_id: String::new(),
+            },
+        ]);
+        picker.open("model-a");
+        picker.selected_idx = 0; // Default entry
+        let result = picker.confirm();
+        assert_eq!(result.unwrap().0, DEFAULT_MODEL_SENTINEL);
     }
 }
