@@ -52,6 +52,12 @@ pub(crate) fn is_openai_reasoning_model(model_id: &str) -> bool {
 }
 
 pub(crate) fn is_openaiish_provider(provider_id: &str) -> bool {
+    // Custom providers from Settings are always OpenAI-compatible.
+    if let Ok(settings) = claurst_core::Settings::load_sync() {
+        if settings.custom_providers.contains_key(provider_id) {
+            return true;
+        }
+    }
     matches!(
         provider_id,
         "openai"
