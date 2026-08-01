@@ -221,6 +221,8 @@ pub struct ModelEntry {
     pub description: String,
     /// Whether this is the currently active model.
     pub is_current: bool,
+    /// Provider ID this model belongs to (for all-providers mode).
+    pub provider_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -228,12 +230,13 @@ pub struct ModelEntry {
 // ---------------------------------------------------------------------------
 
 /// Helper to build a `ModelEntry` with `is_current = false`.
-fn model_entry(id: &str, name: &str, desc: &str) -> ModelEntry {
+fn model_entry(id: &str, name: &str, desc: &str, provider_id: &str) -> ModelEntry {
     ModelEntry {
         id: id.to_string(),
         display_name: name.to_string(),
         description: desc.to_string(),
         is_current: false,
+        provider_id: provider_id.to_string(),
     }
 }
 
@@ -254,7 +257,7 @@ pub fn models_for_provider_from_registry(
     // directly.  `free/auto` is the default routing entry; the rest pin a
     // specific upstream model for users who care.
     if provider_id == "free" {
-        return free_provider_models();
+        return free_provider_models(provider_id);
     }
     // Codex (ChatGPT-authenticated OpenAI) is not in the models.dev catalog —
     // serve the curated CODEX_MODELS list so the picker isn't empty.  Accept
@@ -262,7 +265,7 @@ pub fn models_for_provider_from_registry(
     // ("openai-codex"); without the alias a fresh Codex login lands on the
     // empty-registry fallback and the picker shows no models.
     if is_codex_provider(provider_id) {
-        return codex_provider_models(registry);
+        return codex_provider_models(registry, provider_id);
     }
 
     let mut entries = registry.list_visible_by_provider(provider_id);
@@ -280,6 +283,7 @@ pub fn models_for_provider_from_registry(
             "default",
             "Default model",
             "no catalog entry for this provider",
+            provider_id,
         )];
     }
 
@@ -307,6 +311,7 @@ pub fn models_for_provider_from_registry(
                 display_name: e.info.name.clone(),
                 description: cost_str,
                 is_current: false,
+                provider_id: provider_id.to_string(),
             }
         })
         .collect()
@@ -417,7 +422,7 @@ fn is_codex_provider(provider_id: &str) -> bool {
 /// catalog yields nothing (e.g. an empty/old snapshot).
 ///
 /// [`codex_model_allowed`]: claurst_core::codex_oauth::codex_model_allowed
-fn codex_provider_models(registry: &claurst_api::ModelRegistry) -> Vec<ModelEntry> {
+fn codex_provider_models(registry: &claurst_api::ModelRegistry, provider_id: &str) -> Vec<ModelEntry> {
     use claurst_core::codex_oauth::{codex_limit_override, codex_model_allowed};
 
     let mut entries: Vec<&claurst_api::ModelEntry> = registry
@@ -427,7 +432,7 @@ fn codex_provider_models(registry: &claurst_api::ModelRegistry) -> Vec<ModelEntr
         .collect();
 
     if entries.is_empty() {
-        return codex_fallback_models();
+        return codex_fallback_models(provider_id);
     }
 
     // Newest release first, then by id for stability — matches the picker's
@@ -455,13 +460,14 @@ fn codex_provider_models(registry: &claurst_api::ModelRegistry) -> Vec<ModelEntr
                     format_context_window(ctx)
                 ),
                 is_current: false,
+                provider_id: provider_id.to_string(),
             }
         })
         .collect()
 }
 
 /// Static fallback used when the models.dev `openai` catalog is unavailable.
-fn codex_fallback_models() -> Vec<ModelEntry> {
+fn codex_fallback_models(provider_id: &str) -> Vec<ModelEntry> {
     use claurst_core::codex_oauth::codex_limit_override;
     claurst_core::codex_oauth::CODEX_MODELS
         .iter()
@@ -477,6 +483,7 @@ fn codex_fallback_models() -> Vec<ModelEntry> {
                     format_context_window(ctx)
                 ),
                 is_current: false,
+                provider_id: provider_id.to_string(),
             }
         })
         .collect()
@@ -485,12 +492,13 @@ fn codex_fallback_models() -> Vec<ModelEntry> {
 /// Curated free-mode model list used by `models_for_provider_from_registry`.
 /// Always shows `free/auto` first; one pin entry per catalog upstream so the
 /// user can target a specific provider when they need to.
-fn free_provider_models() -> Vec<ModelEntry> {
+fn free_provider_models(provider_id: &str) -> Vec<ModelEntry> {
     let mut entries = vec![ModelEntry {
         id: "free/auto".to_string(),
         display_name: "Auto (round-robin across configured providers)".to_string(),
         description: "stacks every free-tier key you've added · $0.00 per M".to_string(),
         is_current: false,
+        provider_id: provider_id.to_string(),
     }];
 
     for upstream in claurst_api::FREE_CATALOG {
@@ -499,6 +507,7 @@ fn free_provider_models() -> Vec<ModelEntry> {
             display_name: format!("{} \u{2014} {}", upstream.title, upstream.default_model),
             description: format!("{} · $0.00 per M", upstream.note),
             is_current: false,
+            provider_id: provider_id.to_string(),
         });
     }
 
@@ -523,6 +532,9 @@ pub struct ModelPickerState {
     pub models_loaded: bool,
     /// `true` while the background fetch is in flight.
     pub loading_models: bool,
+    /// When true, the picker shows models from all connected providers
+    /// grouped by provider name.
+    pub all_providers_mode: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +563,7 @@ impl ModelPickerState {
             fast_mode_model: None,
             models_loaded: false,
             loading_models: false,
+            all_providers_mode: false,
         }
     }
 
@@ -566,6 +579,43 @@ impl ModelPickerState {
     /// Open the overlay with full state context.
     pub fn open_with_state(&mut self, current_model: &str, effort: EffortLevel, fast_mode: bool) {
         self.open_with_title("Select model", current_model, effort, fast_mode);
+    }
+
+    /// Open in all-providers mode — shows models from all connected
+    /// providers grouped by provider name.
+    pub fn open_all_providers(&mut self, current_model: &str, effort: EffortLevel, fast_mode: bool) {
+        self.all_providers_mode = true;
+        self.open_with_title("Select model (all providers)", current_model, effort, fast_mode);
+    }
+
+    /// Get the display name for a provider ID (for all-providers mode).
+    pub fn provider_group_name(provider_id: &str) -> &'static str {
+        match provider_id {
+            "anthropic" => "Anthropic",
+            "openai" => "OpenAI",
+            "google" => "Google",
+            "groq" => "Groq",
+            "openrouter" => "OpenRouter",
+            "deepseek" => "DeepSeek",
+            "ollama" => "Ollama",
+            "lmstudio" => "LM Studio",
+            "llamacpp" | "llama-cpp" | "llama-server" => "llama.cpp",
+            "github-copilot" => "GitHub Copilot",
+            "codex" | "openai-codex" => "OpenAI Codex",
+            "cohere" => "Cohere",
+            "xai" => "xAI",
+            "free" => "Free Mode",
+            "cursor-acp" => "Cursor ACP",
+            "cerebras" => "Cerebras",
+            "sambanova" => "SambaNova",
+            "together-ai" | "togetherai" => "Together AI",
+            "mistral" => "Mistral",
+            "perplexity" => "Perplexity",
+            "azure" => "Azure OpenAI",
+            "amazon-bedrock" => "AWS Bedrock",
+            "custom-openai" => "Custom OpenAI",
+            _ => "Other",
+        }
     }
 
     pub fn open_with_title(
@@ -595,6 +645,7 @@ impl ModelPickerState {
     pub fn close(&mut self) {
         self.visible = false;
         self.filter.clear();
+        self.all_providers_mode = false;
     }
 
     pub fn is_selected_fast_mode_model(&self, model_id: &str) -> bool {
@@ -918,7 +969,18 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
             )]));
         }
     } else {
+        let mut last_provider: Option<&str> = None;
         for (i, model) in filtered.iter().enumerate() {
+            // Provider group header in all-providers mode
+            if state.all_providers_mode && last_provider != Some(&model.provider_id) {
+                last_provider = Some(&model.provider_id);
+                let group_name = ModelPickerState::provider_group_name(&model.provider_id);
+                lines.push(Line::from(vec![Span::styled(
+                    format!(" {} ", group_name),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )]));
+            }
+
             let is_selected = i == state.selected_idx;
             let supports_effort = model_supports_effort(&model.id);
 
@@ -1026,18 +1088,21 @@ mod tests {
                 display_name: "Claude Opus 4.6".to_string(),
                 description: "200K context".to_string(),
                 is_current: false,
+                provider_id: "anthropic".to_string(),
             },
             ModelEntry {
                 id: "claude-sonnet-4-6".to_string(),
                 display_name: "Claude Sonnet 4.6".to_string(),
                 description: "200K context".to_string(),
                 is_current: false,
+                provider_id: "anthropic".to_string(),
             },
             ModelEntry {
                 id: "claude-haiku-4-5".to_string(),
                 display_name: "Claude Haiku 4.5".to_string(),
                 description: "200K context".to_string(),
                 is_current: false,
+                provider_id: "anthropic".to_string(),
             },
         ]
     }
@@ -1478,6 +1543,7 @@ mod tests {
                 display_name: "LIVE OVERWRITE".to_string(),
                 description: "live desc".to_string(),
                 is_current: false,
+                provider_id: "anthropic".to_string(),
             },
             // A brand-new live id absent from the catalog — must be appended.
             ModelEntry {
@@ -1485,6 +1551,7 @@ mod tests {
                 display_name: "GPT-5.5 (live)".to_string(),
                 description: "live only".to_string(),
                 is_current: false,
+                provider_id: "anthropic".to_string(),
             },
         ];
         p.merge_models(live);
@@ -1530,12 +1597,14 @@ mod tests {
             "default",
             "Default model",
             "no catalog entry for this provider",
+            "anthropic",
         )]);
         p.merge_models(vec![ModelEntry {
             id: "llama3.3".to_string(),
             display_name: "Llama 3.3".to_string(),
             description: "local".to_string(),
             is_current: false,
+            provider_id: "anthropic".to_string(),
         }]);
         assert!(
             !p.models.iter().any(|m| m.id == "default"),

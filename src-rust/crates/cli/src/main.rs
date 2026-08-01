@@ -3797,6 +3797,7 @@ async fn run_interactive(
                                                                 ctx_for(&id, m.context_window),
                                                             ),
                                                         is_current: false,
+                                                        provider_id: provider_key.clone(),
                                                     }
                                                 })
                                             })
@@ -3814,6 +3815,7 @@ async fn run_interactive(
                                                         ),
                                                     id,
                                                     is_current: false,
+                                                    provider_id: provider_key.clone(),
                                                 }
                                             })
                                             .collect()

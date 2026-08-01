@@ -1756,6 +1756,54 @@ impl App {
         self.open_model_picker_for_provider(&provider_id, Some(picker_title));
     }
 
+    /// Open the model picker showing models from all connected providers,
+    /// grouped by provider name.
+    fn open_model_picker_all_providers(&mut self) {
+        self.dismiss_error_notifications();
+
+        // Collect models from all connected providers.
+        let mut all_models: Vec<crate::model_picker::ModelEntry> = Vec::new();
+
+        // Get connected provider IDs from provider_registry.
+        let connected_ids: Vec<String> = if let Some(ref registry) = self.provider_registry {
+            registry.provider_ids().iter().map(|id| id.to_string()).collect()
+        } else {
+            Vec::new()
+        };
+
+        // Also include current provider if not in registry.
+        let mut provider_ids = connected_ids;
+        if let Some(ref current) = self.config.provider {
+            if !provider_ids.contains(current) {
+                provider_ids.push(current.clone());
+            }
+        }
+
+        // Collect models from each provider.
+        for pid in &provider_ids {
+            let models = crate::model_picker::models_for_provider_from_registry(
+                pid,
+                &self.model_registry,
+            );
+            for mut m in models {
+                m.provider_id = pid.clone();
+                all_models.push(m);
+            }
+        }
+
+        self.model_picker.set_models(all_models);
+        self.model_picker_provider_id = None; // All providers mode
+        self.model_picker.all_providers_mode = true;
+        self.model_picker.loading_models = false;
+        self.model_picker_fetch_pending = false;
+
+        self.model_picker.open_all_providers(
+            &self.model_name,
+            self.effort_level,
+            self.fast_mode,
+        );
+    }
+
     fn persist_custom_provider_base_url(&self, base_url: &str) {
         let mut settings = Settings::load_sync().unwrap_or_default();
         let entry = settings.providers.entry("custom-openai".to_string()).or_default();
@@ -2084,12 +2132,7 @@ impl App {
                     self.status_message = Some("Connect a provider to choose a model.".to_string());
                     return true;
                 }
-                let provider = self
-                    .config
-                    .provider
-                    .clone()
-                    .unwrap_or_else(|| "anthropic".to_string());
-                self.open_model_picker_for_provider(&provider, None);
+                self.open_model_picker_all_providers();
                 true
             }
             "session" | "resume" => {
@@ -3656,11 +3699,29 @@ impl App {
                         // a routing prefix (`free/…`, `zen/…`, `openrouter/…`)
                         // so re-prefixing would produce nonsense like
                         // `free/free/auto`.
-                        let provider = self.config.provider.as_deref().unwrap_or("anthropic");
-                        let full_model = if provider == "anthropic" || provider == "free" {
-                            model_id.clone()
+                        //
+                        // In all-providers mode the provider is inferred from
+                        // the selected entry's `provider_id` field rather than
+                        // the current config provider.
+                        let full_model = if self.model_picker.all_providers_mode {
+                            let filtered = self.model_picker.filtered_models();
+                            if let Some(entry) = filtered.get(self.model_picker.selected_idx) {
+                                let provider = &entry.provider_id;
+                                if provider == "anthropic" || provider == "free" {
+                                    entry.id.clone()
+                                } else {
+                                    format!("{}/{}", provider, entry.id)
+                                }
+                            } else {
+                                model_id.clone()
+                            }
                         } else {
-                            format!("{}/{}", provider, model_id)
+                            let provider = self.config.provider.as_deref().unwrap_or("anthropic");
+                            if provider == "anthropic" || provider == "free" {
+                                model_id.clone()
+                            } else {
+                                format!("{}/{}", provider, model_id)
+                            }
                         };
                         self.set_model(full_model.clone());
                         self.persist_provider_and_model();
