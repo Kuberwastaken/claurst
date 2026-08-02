@@ -4,7 +4,7 @@
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tracing::debug;
 
 pub struct FileEditTool;
@@ -21,7 +21,9 @@ struct FileEditInput {
 #[async_trait]
 impl Tool for FileEditTool {
     // Gates itself: calls `ctx.check_permission_for_path` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
         claurst_core::constants::TOOL_NAME_FILE_EDIT

@@ -11,8 +11,12 @@ pub struct ManagedAgentsCommand;
 
 #[async_trait]
 impl SlashCommand for ManagedAgentsCommand {
-    fn name(&self) -> &str { "managed-agents" }
-    fn description(&self) -> &str { "Configure and manage the manager-executor agent architecture" }
+    fn name(&self) -> &str {
+        "managed-agents"
+    }
+    fn description(&self) -> &str {
+        "Configure and manage the manager-executor agent architecture"
+    }
     fn help(&self) -> &str {
         "Usage: /managed-agents [subcommand]\n\n\
          Subcommands:\n\
@@ -33,24 +37,36 @@ impl SlashCommand for ManagedAgentsCommand {
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
-        use claurst_core::{BudgetSplitPolicy, ManagedAgentConfig, builtin_managed_agent_presets};
+        use claurst_core::{builtin_managed_agent_presets, BudgetSplitPolicy, ManagedAgentConfig};
 
         let args = args.trim();
 
         // Helper to format current config as status string
         fn format_status(cfg: &Option<ManagedAgentConfig>) -> String {
             match cfg {
-                None => "Managed Agents: NOT CONFIGURED\n\nRun /managed-agents setup to get started.".to_string(),
+                None => {
+                    "Managed Agents: NOT CONFIGURED\n\nRun /managed-agents setup to get started."
+                        .to_string()
+                }
                 Some(c) => {
-                    let state = if c.enabled { "ACTIVE" } else { "CONFIGURED but inactive" };
+                    let state = if c.enabled {
+                        "ACTIVE"
+                    } else {
+                        "CONFIGURED but inactive"
+                    };
                     let budget_str = match c.total_budget_usd {
                         Some(b) => format!("${:.2} total", b),
                         None => "no cap".to_string(),
                     };
                     let split_str = match &c.budget_split {
                         BudgetSplitPolicy::SharedPool => "shared pool".to_string(),
-                        BudgetSplitPolicy::Percentage { manager_pct } => format!("{}% manager", manager_pct),
-                        BudgetSplitPolicy::FixedCaps { manager_usd, executor_usd } => {
+                        BudgetSplitPolicy::Percentage { manager_pct } => {
+                            format!("{}% manager", manager_pct)
+                        }
+                        BudgetSplitPolicy::FixedCaps {
+                            manager_usd,
+                            executor_usd,
+                        } => {
                             format!("${:.2} mgr / ${:.2} exe", manager_usd, executor_usd)
                         }
                     };
@@ -93,7 +109,10 @@ impl SlashCommand for ManagedAgentsCommand {
             let presets = builtin_managed_agent_presets();
             let mut out = "Managed Agents Setup\n\nQuickstart — apply a preset:\n\n".to_string();
             for p in &presets {
-                out.push_str(&format!("  /managed-agents preset {}\n    {}\n\n", p.name, p.description));
+                out.push_str(&format!(
+                    "  /managed-agents preset {}\n    {}\n\n",
+                    p.name, p.description
+                ));
             }
             out.push_str("\nOr configure manually:\n  /managed-agents configure manager-model <provider/model>\n  /managed-agents configure executor-model <provider/model>\n  /managed-agents enable\n\nModel format: provider/model (e.g. anthropic/claude-opus-4-6, openai/gpt-4o, google/gemini-2.5-flash)\nAny provider registered in the ProviderRegistry can be used.");
             return CommandResult::Message(out);
@@ -101,7 +120,9 @@ impl SlashCommand for ManagedAgentsCommand {
 
         if let Some(preset_name) = args.strip_prefix("preset ").map(str::trim) {
             let presets = builtin_managed_agent_presets();
-            let found = presets.iter().find(|p| p.name.eq_ignore_ascii_case(preset_name));
+            let found = presets
+                .iter()
+                .find(|p| p.name.eq_ignore_ascii_case(preset_name));
             match found {
                 None => {
                     let names: Vec<&str> = presets.iter().map(|p| p.name).collect();
@@ -141,17 +162,21 @@ impl SlashCommand for ManagedAgentsCommand {
         }
 
         if let Some(rest) = args.strip_prefix("configure ").map(str::trim) {
-            let mut cfg = ctx.config.managed_agents.clone().unwrap_or(ManagedAgentConfig {
-                enabled: false,
-                manager_model: String::new(),
-                executor_model: String::new(),
-                executor_max_turns: 10,
-                max_concurrent_executors: 4,
-                budget_split: BudgetSplitPolicy::SharedPool,
-                total_budget_usd: None,
-                preset_name: None,
-                executor_isolation: false,
-            });
+            let mut cfg = ctx
+                .config
+                .managed_agents
+                .clone()
+                .unwrap_or(ManagedAgentConfig {
+                    enabled: false,
+                    manager_model: String::new(),
+                    executor_model: String::new(),
+                    executor_max_turns: 10,
+                    max_concurrent_executors: 4,
+                    budget_split: BudgetSplitPolicy::SharedPool,
+                    total_budget_usd: None,
+                    preset_name: None,
+                    executor_isolation: false,
+                });
 
             if let Some(val) = rest.strip_prefix("manager-model ").map(str::trim) {
                 cfg.manager_model = val.to_string();
@@ -180,21 +205,42 @@ impl SlashCommand for ManagedAgentsCommand {
                     cfg.budget_split = BudgetSplitPolicy::SharedPool;
                 } else if let Some(pct_str) = val.strip_prefix("percentage:") {
                     match pct_str.parse::<u8>() {
-                        Ok(pct) => cfg.budget_split = BudgetSplitPolicy::Percentage { manager_pct: pct },
-                        Err(_) => return CommandResult::Error(format!("Invalid percentage: '{}'", pct_str)),
+                        Ok(pct) => {
+                            cfg.budget_split = BudgetSplitPolicy::Percentage { manager_pct: pct }
+                        }
+                        Err(_) => {
+                            return CommandResult::Error(format!(
+                                "Invalid percentage: '{}'",
+                                pct_str
+                            ))
+                        }
                     }
                 } else if let Some(caps_str) = val.strip_prefix("fixed:") {
                     let parts: Vec<&str> = caps_str.splitn(2, ':').collect();
                     if parts.len() == 2 {
                         match (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
-                            (Ok(m), Ok(e)) => cfg.budget_split = BudgetSplitPolicy::FixedCaps { manager_usd: m, executor_usd: e },
-                            _ => return CommandResult::Error("Invalid fixed caps format. Use fixed:<manager>:<executor>".to_string()),
+                            (Ok(m), Ok(e)) => {
+                                cfg.budget_split = BudgetSplitPolicy::FixedCaps {
+                                    manager_usd: m,
+                                    executor_usd: e,
+                                }
+                            }
+                            _ => {
+                                return CommandResult::Error(
+                                    "Invalid fixed caps format. Use fixed:<manager>:<executor>"
+                                        .to_string(),
+                                )
+                            }
                         }
                     } else {
-                        return CommandResult::Error("Invalid fixed caps format. Use fixed:<manager>:<executor>".to_string());
+                        return CommandResult::Error(
+                            "Invalid fixed caps format. Use fixed:<manager>:<executor>".to_string(),
+                        );
                     }
                 } else {
-                    return CommandResult::Error("Use: shared | percentage:<pct> | fixed:<manager>:<executor>".to_string());
+                    return CommandResult::Error(
+                        "Use: shared | percentage:<pct> | fixed:<manager>:<executor>".to_string(),
+                    );
                 }
             } else {
                 return CommandResult::Error(format!(
@@ -211,7 +257,10 @@ impl SlashCommand for ManagedAgentsCommand {
             }
             let mut new_config = ctx.config.clone();
             new_config.managed_agents = Some(cfg);
-            return CommandResult::ConfigChangeMessage(new_config, "Managed agents configuration updated.".to_string());
+            return CommandResult::ConfigChangeMessage(
+                new_config,
+                "Managed agents configuration updated.".to_string(),
+            );
         }
 
         if let Some(amount_str) = args.strip_prefix("budget ").map(str::trim) {
@@ -219,7 +268,12 @@ impl SlashCommand for ManagedAgentsCommand {
                 Err(_) => return CommandResult::Error(format!("Invalid amount: '{}'", amount_str)),
                 Ok(amount) => {
                     let mut cfg = match ctx.config.managed_agents.clone() {
-                        None => return CommandResult::Error("No managed agents config. Run /managed-agents setup first.".to_string()),
+                        None => {
+                            return CommandResult::Error(
+                                "No managed agents config. Run /managed-agents setup first."
+                                    .to_string(),
+                            )
+                        }
                         Some(c) => c,
                     };
                     cfg.total_budget_usd = if amount <= 0.0 { None } else { Some(amount) };
@@ -243,11 +297,17 @@ impl SlashCommand for ManagedAgentsCommand {
 
         if args == "enable" {
             let mut cfg = match ctx.config.managed_agents.clone() {
-                None => return CommandResult::Error("No managed agents config. Run /managed-agents setup first.".to_string()),
+                None => {
+                    return CommandResult::Error(
+                        "No managed agents config. Run /managed-agents setup first.".to_string(),
+                    )
+                }
                 Some(c) => c,
             };
             if cfg.manager_model.is_empty() || cfg.executor_model.is_empty() {
-                return CommandResult::Error("manager_model and executor_model must be set before enabling.".to_string());
+                return CommandResult::Error(
+                    "manager_model and executor_model must be set before enabling.".to_string(),
+                );
             }
             cfg.enabled = true;
             if let Err(e) = save_settings_mutation(|settings| {
@@ -258,7 +318,10 @@ impl SlashCommand for ManagedAgentsCommand {
             }
             let mut new_config = ctx.config.clone();
             new_config.managed_agents = Some(cfg);
-            return CommandResult::ConfigChangeMessage(new_config, "Managed agents ENABLED.".to_string());
+            return CommandResult::ConfigChangeMessage(
+                new_config,
+                "Managed agents ENABLED.".to_string(),
+            );
         }
 
         if args == "disable" {
@@ -275,7 +338,10 @@ impl SlashCommand for ManagedAgentsCommand {
             }
             let mut new_config = ctx.config.clone();
             new_config.managed_agents = Some(cfg);
-            return CommandResult::ConfigChangeMessage(new_config, "Managed agents disabled.".to_string());
+            return CommandResult::ConfigChangeMessage(
+                new_config,
+                "Managed agents disabled.".to_string(),
+            );
         }
 
         if args == "reset" {
@@ -287,7 +353,10 @@ impl SlashCommand for ManagedAgentsCommand {
             }
             let mut new_config = ctx.config.clone();
             new_config.managed_agents = None;
-            return CommandResult::ConfigChangeMessage(new_config, "Managed agents configuration removed.".to_string());
+            return CommandResult::ConfigChangeMessage(
+                new_config,
+                "Managed agents configuration removed.".to_string(),
+            );
         }
 
         CommandResult::Error(format!(

@@ -11,9 +11,15 @@ pub struct SandboxToggleCommand;
 
 #[async_trait]
 impl SlashCommand for SandboxToggleCommand {
-    fn name(&self) -> &str { "sandbox-toggle" }
-    fn aliases(&self) -> Vec<&str> { vec!["sandbox"] }
-    fn description(&self) -> &str { "Enable or disable sandboxed execution of shell commands" }
+    fn name(&self) -> &str {
+        "sandbox-toggle"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["sandbox"]
+    }
+    fn description(&self) -> &str {
+        "Enable or disable sandboxed execution of shell commands"
+    }
     fn help(&self) -> &str {
         "Usage: /sandbox-toggle [on|off|exclude <pattern>|status]\n\n\
          Toggles sandboxed execution of bash/shell commands.\n\
@@ -34,14 +40,18 @@ impl SlashCommand for SandboxToggleCommand {
 
         // Platform support check: sandbox requires macOS or Linux (not Windows native).
         let platform = std::env::consts::OS;
-        let is_wsl = std::env::var("WSL_DISTRO_NAME").is_ok()
-            || std::env::var("WSL_INTEROP").is_ok();
+        let is_wsl =
+            std::env::var("WSL_DISTRO_NAME").is_ok() || std::env::var("WSL_INTEROP").is_ok();
         let is_supported = matches!(platform, "linux" | "macos") || is_wsl;
 
         // Handle subcommand: status
         if args == "status" {
             let ui = load_ui_settings();
-            let mode = if ui.sandbox_mode.unwrap_or(false) { "enabled" } else { "disabled" };
+            let mode = if ui.sandbox_mode.unwrap_or(false) {
+                "enabled"
+            } else {
+                "disabled"
+            };
             let excl = if ui.sandbox_excluded_commands.is_empty() {
                 "(none)".to_string()
             } else {
@@ -54,7 +64,10 @@ impl SlashCommand for SandboxToggleCommand {
             let platform_note = if is_supported {
                 format!("\u{2713} Supported on this platform ({})", platform)
             } else {
-                format!("\u{2717} Not supported on this platform ({}). Requires macOS, Linux, or WSL2.", platform)
+                format!(
+                    "\u{2717} Not supported on this platform ({}). Requires macOS, Linux, or WSL2.",
+                    platform
+                )
             };
             return CommandResult::Message(format!(
                 "Sandbox mode: {}\n\
@@ -71,7 +84,8 @@ impl SlashCommand for SandboxToggleCommand {
             if rest.is_empty() {
                 return CommandResult::Error(
                     "Usage: /sandbox-toggle exclude <command-pattern>\n\
-                     Example: /sandbox-toggle exclude \"npm run test:*\"".to_string()
+                     Example: /sandbox-toggle exclude \"npm run test:*\""
+                        .to_string(),
                 );
             }
             // Strip surrounding quotes if present
@@ -98,8 +112,13 @@ impl SlashCommand for SandboxToggleCommand {
         }
 
         // Platform guard for toggling on/off
-        if !is_supported && (args == "on" || args == "enable" || args == "enabled"
-            || args == "true" || args == "1" || args.is_empty())
+        if !is_supported
+            && (args == "on"
+                || args == "enable"
+                || args == "enabled"
+                || args == "true"
+                || args == "1"
+                || args.is_empty())
         {
             let msg = if is_wsl {
                 "Error: Sandboxing requires WSL2. WSL1 is not supported.".to_string()
@@ -111,8 +130,11 @@ impl SlashCommand for SandboxToggleCommand {
                 )
             };
             // Only hard-block enabling; allow off/status even on unsupported platforms.
-            if args != "off" && args != "disable" && args != "disabled"
-                && args != "false" && args != "0"
+            if args != "off"
+                && args != "disable"
+                && args != "disabled"
+                && args != "false"
+                && args != "0"
             {
                 return CommandResult::Error(msg);
             }

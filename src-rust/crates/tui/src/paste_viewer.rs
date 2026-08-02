@@ -16,9 +16,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthChar;
 
-use crate::overlays::{
-    begin_modal_buf, render_modal_title_buf, CLAURST_MUTED, CLAURST_TEXT,
-};
+use crate::overlays::{begin_modal_buf, render_modal_title_buf, CLAURST_MUTED, CLAURST_TEXT};
 
 /// Rows scrolled per PageUp/PageDown press.
 const PAGE_ROWS: usize = 10;
@@ -45,10 +43,7 @@ impl PasteViewer {
         self.paste_id = paste_id;
         // Tabs render with unpredictable widths in a terminal cell grid;
         // expand them so wrapping arithmetic stays exact.
-        self.lines = body
-            .lines()
-            .map(|l| l.replace('\t', "    "))
-            .collect();
+        self.lines = body.lines().map(|l| l.replace('\t', "    ")).collect();
         if self.lines.is_empty() {
             self.lines.push(String::new());
         }
@@ -147,10 +142,7 @@ pub fn render_paste_viewer_buf(viewer: &PasteViewer, area: Rect, buf: &mut Buffe
         .take(body.height as usize)
         .enumerate()
     {
-        let line = Line::from(Span::styled(
-            row.clone(),
-            Style::default().fg(CLAURST_TEXT),
-        ));
+        let line = Line::from(Span::styled(row.clone(), Style::default().fg(CLAURST_TEXT)));
         Paragraph::new(line).render(
             Rect {
                 x: body.x + 1,

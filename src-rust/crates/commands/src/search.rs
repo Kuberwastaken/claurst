@@ -11,8 +11,12 @@ pub struct SearchCommand;
 
 #[async_trait]
 impl SlashCommand for SearchCommand {
-    fn name(&self) -> &str { "search" }
-    fn description(&self) -> &str { "Search across all sessions" }
+    fn name(&self) -> &str {
+        "search"
+    }
+    fn description(&self) -> &str {
+        "Search across all sessions"
+    }
     fn help(&self) -> &str {
         "Usage: /search <query>\n\n\
          Searches session titles and message content in the local SQLite\n\
@@ -46,19 +50,11 @@ impl SlashCommand for SearchCommand {
 
         let results = match store.search_sessions(query) {
             Ok(r) => r,
-            Err(e) => {
-                return CommandResult::Error(format!(
-                    "Search failed: {}",
-                    e
-                ))
-            }
+            Err(e) => return CommandResult::Error(format!("Search failed: {}", e)),
         };
 
         if results.is_empty() {
-            return CommandResult::Message(format!(
-                "No sessions found matching \"{}\".",
-                query
-            ));
+            return CommandResult::Message(format!("No sessions found matching \"{}\".", query));
         }
 
         let mut out = format!(

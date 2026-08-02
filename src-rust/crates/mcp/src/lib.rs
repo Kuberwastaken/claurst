@@ -26,13 +26,13 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 pub use client::McpClient;
-pub use types::*;
 pub use connection_manager::{McpConnectionManager, McpServerStatus};
+pub use types::*;
 
 pub mod backend;
 pub mod connection_manager;
-pub mod registry;
 pub mod oauth;
+pub mod registry;
 pub mod rmcp_backend;
 
 // ---------------------------------------------------------------------------
@@ -77,7 +77,8 @@ pub fn expand_env_vars(input: &str) -> String {
                             },
                         };
 
-                        result = format!("{}{}{}", &result[..start], replacement, &result[end + 1..]);
+                        result =
+                            format!("{}{}{}", &result[..start], replacement, &result[end + 1..]);
                         // Continue scanning from where the replacement ends
                         search_from = start + replacement.len();
                     }
@@ -145,7 +146,6 @@ pub mod types {
             }
         }
     }
-
 
     /// A JSON-RPC 2.0 response.
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,13 +258,17 @@ pub mod types {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(tag = "type", rename_all = "lowercase")]
     pub enum McpContent {
-        Text { text: String },
+        Text {
+            text: String,
+        },
         Image {
             data: String,
             #[serde(rename = "mimeType")]
             mime_type: String,
         },
-        Resource { resource: ResourceContents },
+        Resource {
+            resource: ResourceContents,
+        },
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -357,7 +361,7 @@ pub mod types {
 
 pub mod transport {
     use super::*;
-    use reqwest::header::{CONTENT_TYPE, HeaderValue};
+    use reqwest::header::{HeaderValue, CONTENT_TYPE};
     #[cfg(test)]
     use tokio::sync::mpsc;
 
@@ -411,7 +415,10 @@ pub mod transport {
             .unwrap_or(false)
     }
 
-    pub(crate) fn resolve_legacy_endpoint(base_url: &str, endpoint: &str) -> anyhow::Result<String> {
+    pub(crate) fn resolve_legacy_endpoint(
+        base_url: &str,
+        endpoint: &str,
+    ) -> anyhow::Result<String> {
         let endpoint = endpoint.trim();
         if endpoint.is_empty() {
             anyhow::bail!("legacy SSE endpoint event did not include a POST endpoint");
@@ -421,9 +428,13 @@ pub mod transport {
         }
         let base = url::Url::parse(base_url)
             .map_err(|e| anyhow::anyhow!("invalid legacy SSE base URL '{}': {}", base_url, e))?;
-        base.join(endpoint)
-            .map(|url| url.to_string())
-            .map_err(|e| anyhow::anyhow!("failed to resolve legacy SSE endpoint '{}': {}", endpoint, e))
+        base.join(endpoint).map(|url| url.to_string()).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to resolve legacy SSE endpoint '{}': {}",
+                endpoint,
+                e
+            )
+        })
     }
 
     #[cfg(test)]
@@ -539,7 +550,6 @@ pub mod transport {
         dispatch_sse_event(&mut event_name, &mut data_lines, &mut on_event)?;
         Ok(())
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -588,13 +598,15 @@ pub mod client {
                 .ok_or_else(|| anyhow::anyhow!("MCP client backend missing"))
         }
 
-        pub async fn connect(config: &McpServerConfig, auth_token: Option<String>) -> anyhow::Result<Self> {
+        pub async fn connect(
+            config: &McpServerConfig,
+            auth_token: Option<String>,
+        ) -> anyhow::Result<Self> {
             match config.server_type.as_str() {
                 "stdio" => Self::connect_stdio(config).await,
                 "sse" => {
                     let backend = crate::rmcp_backend::RmcpClientBackend::connect_legacy_sse(
-                        config,
-                        auth_token,
+                        config, auth_token,
                     )
                     .await?;
                     Ok(Self::from_backend(Arc::new(backend)))
@@ -682,14 +694,17 @@ pub mod client {
             name: &str,
             arguments: Option<Value>,
         ) -> anyhow::Result<CallToolResult> {
-            self.backend()?.call_tool(name, arguments).await.map_err(|e| {
-                anyhow::anyhow!(
-                    "MCP server '{}': tool '{}' call failed: {}",
-                    self.server_name,
-                    name,
-                    e
-                )
-            })
+            self.backend()?
+                .call_tool(name, arguments)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "MCP server '{}': tool '{}' call failed: {}",
+                        self.server_name,
+                        name,
+                        e
+                    )
+                })
         }
 
         pub async fn list_resources(&self) -> anyhow::Result<Vec<McpResource>> {
@@ -732,7 +747,9 @@ pub mod client {
         }
 
         /// Subscribe to raw JSON notifications from the active backend.
-        pub fn subscribe_to_notifications(&self) -> BoxStream<'static, anyhow::Result<serde_json::Value>> {
+        pub fn subscribe_to_notifications(
+            &self,
+        ) -> BoxStream<'static, anyhow::Result<serde_json::Value>> {
             self.backend()
                 .expect("MCP client backend missing")
                 .subscribe_to_notifications()
@@ -847,7 +864,9 @@ pub enum McpAuthState {
     /// OAuth required; `auth_url` is where the user should go.
     Required { auth_url: String },
     /// Successfully authenticated; token may have an expiry.
-    Authenticated { token_expiry: Option<chrono::DateTime<chrono::Utc>> },
+    Authenticated {
+        token_expiry: Option<chrono::DateTime<chrono::Utc>>,
+    },
     /// An error occurred reading / initiating auth.
     Error(String),
 }
@@ -864,7 +883,8 @@ pub struct McpManager {
     /// Original (unexpanded) server configs — needed for OAuth initiation.
     server_configs: HashMap<String, McpServerConfig>,
     /// Active resource subscriptions: (server_name, uri) → change event sender.
-    pub resource_subscriptions: DashMap<(String, String), tokio::sync::mpsc::Sender<ResourceChangedEvent>>,
+    pub resource_subscriptions:
+        DashMap<(String, String), tokio::sync::mpsc::Sender<ResourceChangedEvent>>,
 }
 
 #[derive(Debug, Clone)]
@@ -896,7 +916,9 @@ impl McpManager {
         let mut manager = Self::new();
         for config in configs {
             // Store original config for later OAuth use
-            manager.server_configs.insert(config.name.clone(), config.clone());
+            manager
+                .server_configs
+                .insert(config.name.clone(), config.clone());
             // Expand env vars before using the config
             let expanded = expand_server_config(config);
 
@@ -916,7 +938,9 @@ impl McpManager {
                                 resources = client.resources.len(),
                                 "MCP server connected"
                             );
-                            manager.clients.insert(expanded.name.clone(), Arc::new(client));
+                            manager
+                                .clients
+                                .insert(expanded.name.clone(), Arc::new(client));
                         }
                         Err(e) => {
                             error!(
@@ -1063,16 +1087,16 @@ impl McpManager {
         self.clients
             .iter()
             .filter_map(|(name, client)| {
-                client.instructions.as_ref().map(|instr| (name.clone(), instr.clone()))
+                client
+                    .instructions
+                    .as_ref()
+                    .map(|instr| (name.clone(), instr.clone()))
             })
             .collect()
     }
 
     /// List all resources from all (or a specific) connected server.
-    pub async fn list_all_resources(
-        &self,
-        server_filter: Option<&str>,
-    ) -> Vec<serde_json::Value> {
+    pub async fn list_all_resources(&self, server_filter: Option<&str>) -> Vec<serde_json::Value> {
         let mut all = vec![];
         for (name, client) in &self.clients {
             if let Some(filter) = server_filter {
@@ -1106,20 +1130,16 @@ impl McpManager {
         server_name: &str,
         uri: &str,
     ) -> anyhow::Result<serde_json::Value> {
-        let client = self
-            .clients
-            .get(server_name)
-            .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found or not connected", server_name))?;
+        let client = self.clients.get(server_name).ok_or_else(|| {
+            anyhow::anyhow!("MCP server '{}' not found or not connected", server_name)
+        })?;
 
         let contents = client.read_resource(uri).await?;
         Ok(serde_json::to_value(&contents)?)
     }
 
     /// List all prompts from all (or a specific) connected server.
-    pub async fn list_all_prompts(
-        &self,
-        server_filter: Option<&str>,
-    ) -> Vec<serde_json::Value> {
+    pub async fn list_all_prompts(&self, server_filter: Option<&str>) -> Vec<serde_json::Value> {
         let mut all = vec![];
         for (name, client) in &self.clients {
             if let Some(filter) = server_filter {
@@ -1156,10 +1176,9 @@ impl McpManager {
         prompt_name: &str,
         arguments: Option<std::collections::HashMap<String, String>>,
     ) -> anyhow::Result<GetPromptResult> {
-        let client = self
-            .clients
-            .get(server_name)
-            .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found or not connected", server_name))?;
+        let client = self.clients.get(server_name).ok_or_else(|| {
+            anyhow::anyhow!("MCP server '{}' not found or not connected", server_name)
+        })?;
         client.get_prompt(prompt_name, arguments).await
     }
 
@@ -1221,15 +1240,12 @@ impl McpManager {
             .get(server_name)
             .ok_or_else(|| anyhow::anyhow!("Unknown MCP server: {}", server_name))?;
 
-        let base_url = config
-            .url
-            .as_deref()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "MCP server '{}' has no URL configured (required for OAuth)",
-                    server_name
-                )
-            })?;
+        let base_url = config.url.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "MCP server '{}' has no URL configured (required for OAuth)",
+                server_name
+            )
+        })?;
 
         oauth::begin_mcp_auth(server_name, base_url).await
     }
@@ -1241,15 +1257,12 @@ impl McpManager {
             .get(server_name)
             .ok_or_else(|| anyhow::anyhow!("Unknown MCP server: {}", server_name))?;
 
-        let base_url = config
-            .url
-            .as_deref()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "MCP server '{}' has no URL configured (required for OAuth)",
-                    server_name
-                )
-            })?;
+        let base_url = config.url.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "MCP server '{}' has no URL configured (required for OAuth)",
+                server_name
+            )
+        })?;
 
         oauth::run_mcp_auth_flow(server_name, base_url).await
     }
@@ -1466,7 +1479,10 @@ mod tests {
         let expanded = expand_server_config(&cfg);
         assert_eq!(expanded.command.as_deref(), Some("/home/user/bin/server"));
         assert_eq!(expanded.args[1], "/home/user");
-        assert_eq!(expanded.env.get("PATH").map(|s| s.as_str()), Some("/home/user/bin"));
+        assert_eq!(
+            expanded.env.get("PATH").map(|s| s.as_str()),
+            Some("/home/user/bin")
+        );
         std::env::remove_var("_CC_TEST_HOME");
     }
 
@@ -1730,10 +1746,12 @@ pub async fn unsubscribe_resource(
     server_name: &str,
     uri: &str,
 ) -> Result<(), String> {
-    let client = manager
-        .clients
-        .get(server_name)
-        .ok_or_else(|| format!("unsubscribe_resource: server '{}' not connected", server_name))?;
+    let client = manager.clients.get(server_name).ok_or_else(|| {
+        format!(
+            "unsubscribe_resource: server '{}' not connected",
+            server_name
+        )
+    })?;
 
     client
         .unsubscribe_resource(uri)
@@ -1809,9 +1827,10 @@ mod transport_tests {
         assert!(crate::McpClient::is_unsupported_protocol_error(
             "Bad Request: Unsupported MCP-Protocol-Version: 2025-11-25"
         ));
-        assert!(!crate::McpClient::is_unsupported_protocol_error("connection reset by peer"));
+        assert!(!crate::McpClient::is_unsupported_protocol_error(
+            "connection reset by peer"
+        ));
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -1839,12 +1858,17 @@ mod notification_tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ResourceChangedEvent>(4);
         subscriptions.insert(("myserver".to_string(), "file:///foo.txt".to_string()), tx);
 
-        client.process_notification(notification, &subscriptions).await;
+        client
+            .process_notification(notification, &subscriptions)
+            .await;
 
         let event = rx.try_recv().expect("expected a ResourceChangedEvent");
         assert_eq!(event.server_name, "myserver");
         assert_eq!(event.uri, "file:///foo.txt");
-        assert!(rx.try_recv().is_err(), "channel should be empty after one event");
+        assert!(
+            rx.try_recv().is_err(),
+            "channel should be empty after one event"
+        );
     }
 
     #[tokio::test]
@@ -1860,7 +1884,9 @@ mod notification_tests {
             (String, String),
             tokio::sync::mpsc::Sender<ResourceChangedEvent>,
         > = DashMap::new();
-        client.process_notification(notification, &subscriptions).await;
+        client
+            .process_notification(notification, &subscriptions)
+            .await;
     }
 
     #[tokio::test]
@@ -1876,7 +1902,9 @@ mod notification_tests {
             (String, String),
             tokio::sync::mpsc::Sender<ResourceChangedEvent>,
         > = DashMap::new();
-        client.process_notification(notification, &subscriptions).await;
+        client
+            .process_notification(notification, &subscriptions)
+            .await;
     }
 
     #[tokio::test]

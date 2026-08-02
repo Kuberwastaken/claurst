@@ -235,7 +235,11 @@ impl std::error::Error for MoveError {}
 ///
 /// Returns `true` when any changes were carried across, `false` when there was
 /// nothing to move (or `move_changes` was `false`).
-pub fn move_session_changes(source: &Path, dest: &Path, move_changes: bool) -> Result<bool, MoveError> {
+pub fn move_session_changes(
+    source: &Path,
+    dest: &Path,
+    move_changes: bool,
+) -> Result<bool, MoveError> {
     if !move_changes {
         return Ok(false);
     }
@@ -284,7 +288,14 @@ fn capture_changes(source_root: &Path, scope: &str) -> Result<String, MoveError>
     // Untracked files, NUL-separated so paths with newlines survive.
     let untracked = run_git(
         source_root,
-        &["ls-files", "--others", "--exclude-standard", "-z", "--", scope],
+        &[
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            scope,
+        ],
     )
     .map_err(|e| MoveError::Capture(e.to_string()))?;
     if !untracked.status.success() {
@@ -298,8 +309,11 @@ fn capture_changes(source_root: &Path, scope: &str) -> Result<String, MoveError>
         .split('\0')
         .filter(|s| !s.is_empty())
     {
-        let created = run_git(source_root, &["diff", "--binary", "--no-index", "--", "/dev/null", file])
-            .map_err(|e| MoveError::Capture(e.to_string()))?;
+        let created = run_git(
+            source_root,
+            &["diff", "--binary", "--no-index", "--", "/dev/null", file],
+        )
+        .map_err(|e| MoveError::Capture(e.to_string()))?;
         // `git diff --no-index` exits 1 when it finds differences (the normal
         // case for a brand-new file); 0 or 1 are both success here.
         match created.status.code() {
@@ -537,7 +551,10 @@ mod tests {
 
         // Add a second worktree of the SAME project.
         let wt2 = tmp.path().join("wt2");
-        if !git_ok(&repo, &["worktree", "add", "-q", "--detach", wt2.to_str().unwrap()]) {
+        if !git_ok(
+            &repo,
+            &["worktree", "add", "-q", "--detach", wt2.to_str().unwrap()],
+        ) {
             eprintln!("git worktree unsupported; skipping test");
             return;
         }
@@ -555,11 +572,20 @@ mod tests {
         assert!(moved, "expected changes to be carried across");
 
         // Destination now has both changes.
-        assert_eq!(fs::read_to_string(wt2.join("tracked.txt")).unwrap(), "modified\n");
-        assert_eq!(fs::read_to_string(wt2.join("untracked.txt")).unwrap(), "brand new\n");
+        assert_eq!(
+            fs::read_to_string(wt2.join("tracked.txt")).unwrap(),
+            "modified\n"
+        );
+        assert_eq!(
+            fs::read_to_string(wt2.join("untracked.txt")).unwrap(),
+            "brand new\n"
+        );
 
         // Source is reset: tracked file restored, untracked removed.
-        assert_eq!(fs::read_to_string(repo.join("tracked.txt")).unwrap(), "original\n");
+        assert_eq!(
+            fs::read_to_string(repo.join("tracked.txt")).unwrap(),
+            "original\n"
+        );
         assert!(!repo.join("untracked.txt").exists());
     }
 
@@ -573,7 +599,10 @@ mod tests {
             return;
         };
         let wt2 = tmp.path().join("wt2");
-        if !git_ok(&repo, &["worktree", "add", "-q", "--detach", wt2.to_str().unwrap()]) {
+        if !git_ok(
+            &repo,
+            &["worktree", "add", "-q", "--detach", wt2.to_str().unwrap()],
+        ) {
             return;
         }
         let wt2 = wt2.canonicalize().unwrap();

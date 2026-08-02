@@ -17,7 +17,9 @@ struct FileWriteInput {
 #[async_trait]
 impl Tool for FileWriteTool {
     // Gates itself: calls `ctx.check_permission` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
         claurst_core::constants::TOOL_NAME_FILE_WRITE
@@ -60,11 +62,9 @@ impl Tool for FileWriteTool {
         debug!(path = %path.display(), "Writing file");
 
         // Permission check
-        if let Err(e) = ctx.check_permission(
-            self.name(),
-            &format!("Write {}", path.display()),
-            false,
-        ) {
+        if let Err(e) =
+            ctx.check_permission(self.name(), &format!("Write {}", path.display()), false)
+        {
             return ToolResult::error(e.to_string());
         }
 
@@ -100,11 +100,7 @@ impl Tool for FileWriteTool {
 
         // Write the file
         if let Err(e) = crate::write_atomic(&path, params.content.as_bytes()).await {
-            return ToolResult::error(format!(
-                "Failed to write file {}: {}",
-                path.display(),
-                e
-            ));
+            return ToolResult::error(format!("Failed to write file {}: {}", path.display(), e));
         }
 
         ctx.record_file_change(

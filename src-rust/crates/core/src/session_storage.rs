@@ -290,10 +290,7 @@ pub fn transcript_path(project_root: &Path, session_id: &str) -> crate::Result<P
 ///   [`MAX_TRANSCRIPT_BYTES`] to avoid unbounded growth.
 /// * Uses `OpenOptions::append(true)` which results in an atomic positional
 ///   write on POSIX (O_APPEND) and a best-effort append on Windows.
-pub async fn write_transcript_entry(
-    path: &Path,
-    entry: &TranscriptEntry,
-) -> crate::Result<()> {
+pub async fn write_transcript_entry(path: &Path, entry: &TranscriptEntry) -> crate::Result<()> {
     // Guard: do not grow files beyond the cap.
     if let Ok(meta) = tokio::fs::metadata(path).await {
         if meta.len() >= MAX_TRANSCRIPT_BYTES {
@@ -353,8 +350,7 @@ pub async fn load_transcript(path: &Path) -> crate::Result<Vec<TranscriptEntry>>
     let raw = tokio::fs::read_to_string(path).await?;
 
     // First pass: collect tombstoned UUIDs.
-    let mut tombstoned: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut tombstoned: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for line in raw.lines() {
         let trimmed = line.trim();
@@ -362,8 +358,11 @@ pub async fn load_transcript(path: &Path) -> crate::Result<Vec<TranscriptEntry>>
             continue;
         }
         // Cheap structural check before full parse.
-        if trimmed.contains("\"type\":\"tombstone\"") || trimmed.contains("\"type\": \"tombstone\"") {
-            if let Ok(TranscriptEntry::Tombstone(t)) = serde_json::from_str::<TranscriptEntry>(trimmed) {
+        if trimmed.contains("\"type\":\"tombstone\"") || trimmed.contains("\"type\": \"tombstone\"")
+        {
+            if let Ok(TranscriptEntry::Tombstone(t)) =
+                serde_json::from_str::<TranscriptEntry>(trimmed)
+            {
                 tombstoned.insert(t.deleted_uuid);
             }
         }
@@ -444,9 +443,7 @@ pub async fn list_sessions_in(
             Ok(m) => m,
             Err(_) => continue,
         };
-        let mtime = meta
-            .modified()
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
         // Read the tail of the file (up to 64 KB) to extract metadata.
         let (last_prompt, title) = read_session_tail_metadata(&path).await;
@@ -489,13 +486,16 @@ pub async fn truncate_after(path: &Path, from_uuid: &str) -> crate::Result<()> {
     let mut keep = Vec::new();
     let mut found = false;
     for entry in entries {
-        if found { continue; }
+        if found {
+            continue;
+        }
         match &entry {
             TranscriptEntry::User(m) | TranscriptEntry::Assistant(m)
-                if m.message.uuid.as_deref() == Some(from_uuid) => {
-                    found = true;
-                    continue; // drop this entry and everything after
-                }
+                if m.message.uuid.as_deref() == Some(from_uuid) =>
+            {
+                found = true;
+                continue; // drop this entry and everything after
+            }
             _ => {}
         }
         keep.push(entry);
@@ -613,10 +613,7 @@ async fn read_session_tail_metadata(path: &Path) -> (Option<String>, Option<Stri
 
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let mut file = file;
-    if file
-        .seek(std::io::SeekFrom::Start(offset))
-        .await.is_err()
-    {
+    if file.seek(std::io::SeekFrom::Start(offset)).await.is_err() {
         return (None, None);
     }
     if file.read_exact(&mut buf).await.is_err() {
@@ -638,7 +635,9 @@ async fn read_session_tail_metadata(path: &Path) -> (Option<String>, Option<Stri
             && (trimmed.contains("\"type\":\"last-prompt\"")
                 || trimmed.contains("\"type\": \"last-prompt\""))
         {
-            if let Ok(TranscriptEntry::LastPrompt(lp)) = serde_json::from_str::<TranscriptEntry>(trimmed) {
+            if let Ok(TranscriptEntry::LastPrompt(lp)) =
+                serde_json::from_str::<TranscriptEntry>(trimmed)
+            {
                 last_prompt = Some(lp.last_prompt);
             }
         }
@@ -647,7 +646,9 @@ async fn read_session_tail_metadata(path: &Path) -> (Option<String>, Option<Stri
             && (trimmed.contains("\"type\":\"custom-title\"")
                 || trimmed.contains("\"type\": \"custom-title\""))
         {
-            if let Ok(TranscriptEntry::CustomTitle(ct)) = serde_json::from_str::<TranscriptEntry>(trimmed) {
+            if let Ok(TranscriptEntry::CustomTitle(ct)) =
+                serde_json::from_str::<TranscriptEntry>(trimmed)
+            {
                 title = Some(ct.custom_title);
             }
         }
@@ -726,9 +727,7 @@ pub fn messages_from_transcript(entries: &[TranscriptEntry]) -> Vec<Message> {
     entries
         .iter()
         .filter_map(|e| match e {
-            TranscriptEntry::User(m) | TranscriptEntry::Assistant(m) => {
-                Some(m.message.clone())
-            }
+            TranscriptEntry::User(m) | TranscriptEntry::Assistant(m) => Some(m.message.clone()),
             _ => None,
         })
         .collect()
@@ -764,7 +763,12 @@ pub fn last_leaf(entries: &[TranscriptEntry]) -> Option<&LeafEntry> {
 pub fn active_branch_entries(entries: &[TranscriptEntry]) -> Vec<&TranscriptEntry> {
     let leaf = match last_leaf(entries) {
         // Back-compat: no leaf pointer → linear file order.
-        None => return entries.iter().filter(|e| e.is_chain_participant()).collect(),
+        None => {
+            return entries
+                .iter()
+                .filter(|e| e.is_chain_participant())
+                .collect()
+        }
         Some(l) => l,
     };
 
@@ -786,7 +790,10 @@ pub fn active_branch_entries(entries: &[TranscriptEntry]) -> Vec<&TranscriptEntr
 
     if !by_uuid.contains_key(leaf_uuid) {
         // Dangling leaf → safe fallback to file order.
-        return entries.iter().filter(|e| e.is_chain_participant()).collect();
+        return entries
+            .iter()
+            .filter(|e| e.is_chain_participant())
+            .collect();
     }
 
     // Walk parentUuid links from the leaf back toward the root.
@@ -836,15 +843,19 @@ pub fn active_branch_messages(entries: &[TranscriptEntry]) -> Vec<Message> {
 /// Filter transcript entries by agent role ("manager" or "executor").
 ///
 /// Returns only User and Assistant entries whose `agent_role` matches `role`.
-pub fn filter_by_agent_role<'a>(entries: &'a [TranscriptEntry], role: &str) -> Vec<&'a TranscriptEntry> {
-    entries.iter().filter(|e| {
-        match e {
+pub fn filter_by_agent_role<'a>(
+    entries: &'a [TranscriptEntry],
+    role: &str,
+) -> Vec<&'a TranscriptEntry> {
+    entries
+        .iter()
+        .filter(|e| match e {
             TranscriptEntry::User(msg) | TranscriptEntry::Assistant(msg) => {
                 msg.agent_role.as_deref() == Some(role)
             }
             _ => false,
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -854,8 +865,8 @@ pub fn filter_by_agent_role<'a>(entries: &'a [TranscriptEntry], role: &str) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use crate::types::{Message, MessageContent, Role};
+    use tempfile::tempdir;
 
     fn make_msg(role: Role) -> Message {
         Message {
@@ -1037,8 +1048,12 @@ mod tests {
             chain_entry(Role::User, "u1", None, "a"),
             chain_entry(Role::Assistant, "a1", Some("u1"), "b"),
             chain_entry(Role::User, "u2", Some("a1"), "c"),
-            TranscriptEntry::Leaf(LeafEntry { leaf_uuid: Some("u2".to_string()) }),
-            TranscriptEntry::Leaf(LeafEntry { leaf_uuid: Some("a1".to_string()) }),
+            TranscriptEntry::Leaf(LeafEntry {
+                leaf_uuid: Some("u2".to_string()),
+            }),
+            TranscriptEntry::Leaf(LeafEntry {
+                leaf_uuid: Some("a1".to_string()),
+            }),
         ];
         let active = active_branch_messages(&entries);
         assert_eq!(texts(&active), vec!["a", "b"]);
@@ -1061,7 +1076,9 @@ mod tests {
         let entries = vec![
             chain_entry(Role::User, "u1", None, "a"),
             chain_entry(Role::Assistant, "a1", Some("u1"), "b"),
-            TranscriptEntry::Leaf(LeafEntry { leaf_uuid: Some("nope".to_string()) }),
+            TranscriptEntry::Leaf(LeafEntry {
+                leaf_uuid: Some("nope".to_string()),
+            }),
         ];
         assert_eq!(texts(&active_branch_messages(&entries)), vec!["a", "b"]);
     }
@@ -1070,7 +1087,9 @@ mod tests {
     /// that ignore it (it is not a chain participant).
     #[test]
     fn leaf_entry_json_round_trip() {
-        let e = TranscriptEntry::Leaf(LeafEntry { leaf_uuid: Some("abc".to_string()) });
+        let e = TranscriptEntry::Leaf(LeafEntry {
+            leaf_uuid: Some("abc".to_string()),
+        });
         let s = serde_json::to_string(&e).unwrap();
         assert!(s.contains("\"type\":\"leaf\""), "got {s}");
         assert!(s.contains("\"leafUuid\":\"abc\""), "got {s}");
@@ -1146,7 +1165,10 @@ mod tests {
 
         // The reverted turn is still physically on disk (non-destructive).
         let raw = tokio::fs::read_to_string(&path).await.unwrap();
-        assert!(raw.contains("\"reply\""), "later entry must be retained on disk");
+        assert!(
+            raw.contains("\"reply\""),
+            "later entry must be retained on disk"
+        );
 
         // Reconstructed active branch ends just before the reverted turn.
         let entries = load_transcript(&path).await.unwrap();
@@ -1191,12 +1213,21 @@ mod tests {
 
         let raw = tokio::fs::read_to_string(&path).await.unwrap();
         // Destructive fallback dropped the reverted turn and wrote no leaf.
-        assert!(!raw.contains("\"reply\""), "unchained fallback truncates the turn");
-        assert!(!raw.contains("\"type\":\"leaf\""), "fallback writes no leaf pointer");
+        assert!(
+            !raw.contains("\"reply\""),
+            "unchained fallback truncates the turn"
+        );
+        assert!(
+            !raw.contains("\"type\":\"leaf\""),
+            "fallback writes no leaf pointer"
+        );
 
         let entries = load_transcript(&path).await.unwrap();
         assert!(last_leaf(&entries).is_none());
-        assert_eq!(texts(&active_branch_messages(&entries)), vec!["start", "ok", "next"]);
+        assert_eq!(
+            texts(&active_branch_messages(&entries)),
+            vec!["start", "ok", "next"]
+        );
     }
 
     #[test]

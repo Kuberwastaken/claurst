@@ -3,9 +3,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use crate::overlays::{
-    CLAURST_ACCENT, CLAURST_MUTED, CLAURST_PANEL_BORDER, CLAURST_TEXT,
-};
+use crate::overlays::{CLAURST_ACCENT, CLAURST_MUTED, CLAURST_PANEL_BORDER, CLAURST_TEXT};
 use unicode_width::UnicodeWidthStr;
 
 /// Severity / visual style of a notification.
@@ -75,9 +73,8 @@ impl NotificationQueue {
     /// Remove all expired notifications.  Call this once per render frame.
     pub fn tick(&mut self) {
         let now = Instant::now();
-        self.notifications.retain(|n| {
-            n.expires_at.is_none_or(|exp| exp > now)
-        });
+        self.notifications
+            .retain(|n| n.expires_at.is_none_or(|exp| exp > now));
     }
 
     /// Return the currently visible (most recent) notification, if any.
@@ -95,7 +92,8 @@ impl NotificationQueue {
     }
 
     pub fn current_is_error(&self) -> bool {
-        self.current().is_some_and(|n| n.kind == NotificationKind::Error)
+        self.current()
+            .is_some_and(|n| n.kind == NotificationKind::Error)
     }
 
     /// Return `true` if there are no active notifications.
@@ -156,7 +154,11 @@ pub fn render_notification_banner(frame: &mut Frame, queue: &NotificationQueue, 
     let toast_area = Rect {
         x: area.x + area.width.saturating_sub(toast_width + 2),
         // Position at bottom if not enough space at top
-        y: if area.height >= 4 { area.y + 1 } else { area.y + area.height.saturating_sub(toast_height) },
+        y: if area.height >= 4 {
+            area.y + 1
+        } else {
+            area.y + area.height.saturating_sub(toast_height)
+        },
         width: toast_width,
         height: toast_height,
     };
@@ -172,7 +174,11 @@ pub fn render_notification_banner(frame: &mut Frame, queue: &NotificationQueue, 
     let esc_hint = "  esc";
     let icon_with_spaces = format!(" {} ", notif.kind.icon());
     let icon_width = icon_with_spaces.width();
-    let esc_width = if notif.dismissible { esc_hint.width() } else { 0 };
+    let esc_width = if notif.dismissible {
+        esc_hint.width()
+    } else {
+        0
+    };
 
     // Available width for message: use inner_w as the base
     let msg_width_budget = inner_w.saturating_sub(icon_width + esc_width);
@@ -185,7 +191,8 @@ pub fn render_notification_banner(frame: &mut Frame, queue: &NotificationQueue, 
             let mut truncated = String::new();
             for ch in notif.message.chars() {
                 let test = format!("{}{}", truncated, ch);
-                if test.width() + 1 > msg_width_budget { // +1 for ellipsis
+                if test.width() + 1 > msg_width_budget {
+                    // +1 for ellipsis
                     break;
                 }
                 truncated.push(ch);
@@ -197,17 +204,27 @@ pub fn render_notification_banner(frame: &mut Frame, queue: &NotificationQueue, 
     };
 
     let mut row0_spans = vec![
-        Span::styled(icon_with_spaces.clone(), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            icon_with_spaces.clone(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(message, Style::default().fg(CLAURST_TEXT)),
     ];
     if notif.dismissible {
-        row0_spans.push(Span::styled(esc_hint.to_string(), Style::default().fg(CLAURST_MUTED)));
+        row0_spans.push(Span::styled(
+            esc_hint.to_string(),
+            Style::default().fg(CLAURST_MUTED),
+        ));
     }
 
     // ── Row 1: thin progress bar for timed notifications ──
     let progress_line = if let Some(exp) = notif.expires_at {
         let now = Instant::now();
-        let remaining = if exp > now { (exp - now).as_millis() } else { 0 };
+        let remaining = if exp > now {
+            (exp - now).as_millis()
+        } else {
+            0
+        };
         let total_ms = (exp - notif.pushed_at).as_millis().max(1);
         let frac = (remaining as f64 / total_ms as f64).min(1.0);
         let bar_w = (inner_w as f64 * frac) as usize;
@@ -309,10 +326,7 @@ pub fn render_notification_banner(frame: &mut Frame, queue: &NotificationQueue, 
             width: toast_width.saturating_sub(2),
             height: 1,
         };
-        frame.render_widget(
-            Paragraph::new("").style(Style::default().bg(bg)),
-            pad_rect,
-        );
+        frame.render_widget(Paragraph::new("").style(Style::default().bg(bg)), pad_rect);
     }
 }
 

@@ -67,11 +67,11 @@ fn parse_unified_diff(patch: &str) -> Result<Vec<FilePatch>, String> {
             // Don't extract the path here — we do it from the +++ line.
         } else if let Some(raw) = line.strip_prefix("+++ ") {
             // Extract target path, stripping the "b/" prefix if present.
-            let path = raw
-                .trim_start_matches("b/")
-                .trim()
-                .to_string();
-            current_file = Some(FilePatch { path, hunks: Vec::new() });
+            let path = raw.trim_start_matches("b/").trim().to_string();
+            current_file = Some(FilePatch {
+                path,
+                hunks: Vec::new(),
+            });
         } else if line.starts_with("@@ ") {
             // Finalise the previous hunk.
             if let Some(h) = current_hunk.take() {
@@ -165,14 +165,13 @@ fn apply_hunk(lines: Vec<String>, hunk: &Hunk) -> Result<Vec<String>, String> {
     // We start searching from `orig_start` (the hint) but fall back to a
     // full scan if the hint is off (e.g. after earlier hunks shifted lines).
     let search_start = hunk.orig_start.min(lines.len());
-    let pos = find_context_position(&lines, &expected, search_start)
-        .ok_or_else(|| {
-            format!(
-                "Context not found near line {} (looking for {} lines of context/removes)",
-                hunk.orig_start + 1,
-                expected.len()
-            )
-        })?;
+    let pos = find_context_position(&lines, &expected, search_start).ok_or_else(|| {
+        format!(
+            "Context not found near line {} (looking for {} lines of context/removes)",
+            hunk.orig_start + 1,
+            expected.len()
+        )
+    })?;
 
     // Build the replacement: remove '-' and ' ' lines at `pos`, insert '+' and ' '.
     let mut output_prefix = lines[..pos].to_vec();
@@ -204,11 +203,7 @@ fn apply_hunk(lines: Vec<String>, hunk: &Hunk) -> Result<Vec<String>, String> {
 }
 
 /// Search for `expected` lines starting at `hint` and falling back to a full scan.
-fn find_context_position(
-    lines: &[String],
-    expected: &[&str],
-    hint: usize,
-) -> Option<usize> {
+fn find_context_position(lines: &[String], expected: &[&str], hint: usize) -> Option<usize> {
     if expected.is_empty() {
         // A pure-insertion hunk always applies at the hint position.
         return Some(hint.min(lines.len()));
@@ -222,9 +217,7 @@ fn find_context_position(
     };
 
     // Try hint first, then scan forward and backward.
-    let candidates: Vec<usize> = std::iter::once(hint)
-        .chain(0..=max_start)
-        .collect();
+    let candidates: Vec<usize> = std::iter::once(hint).chain(0..=max_start).collect();
 
     for &start in &candidates {
         if start > max_start {
@@ -248,7 +241,9 @@ fn find_context_position(
 #[async_trait]
 impl Tool for ApplyPatchTool {
     // Gates itself: calls `ctx.check_permission` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
         claurst_core::constants::TOOL_NAME_APPLY_PATCH
@@ -333,11 +328,7 @@ impl Tool for ApplyPatchTool {
                 match tokio::fs::read_to_string(&path).await {
                     Ok(c) => c,
                     Err(e) => {
-                        return ToolResult::error(format!(
-                            "Cannot read {}: {}",
-                            path.display(),
-                            e
-                        ))
+                        return ToolResult::error(format!("Cannot read {}: {}", path.display(), e))
                     }
                 }
             } else {
@@ -351,10 +342,7 @@ impl Tool for ApplyPatchTool {
             let eol = crate::line_endings::LineEnding::detect(&original_content);
 
             // Split into lines (line endings are re-applied on join below).
-            let mut lines: Vec<String> = original_content
-                .lines()
-                .map(|l| l.to_string())
-                .collect();
+            let mut lines: Vec<String> = original_content.lines().map(|l| l.to_string()).collect();
 
             let mut file_added: i64 = 0;
             let mut file_removed: i64 = 0;
@@ -430,11 +418,7 @@ impl Tool for ApplyPatchTool {
 
         for (path, original_bytes, new_content) in &to_write {
             if let Err(e) = crate::write_atomic(path, new_content.as_bytes()).await {
-                return ToolResult::error(format!(
-                    "Failed to write {}: {}",
-                    path.display(),
-                    e
-                ));
+                return ToolResult::error(format!("Failed to write {}: {}", path.display(), e));
             }
             ctx.record_file_change(
                 path.clone(),
@@ -568,7 +552,9 @@ mod tests {
 
         let ctx = crate::test_support::allow_all_context(dir.path().to_path_buf());
         let patch = "--- a/foo.txt\n+++ b/foo.txt\n@@ -1,2 +1,2 @@\n hello\n-world\n+rust\n";
-        let res = ApplyPatchTool.execute(json!({ "patch": patch }), &ctx).await;
+        let res = ApplyPatchTool
+            .execute(json!({ "patch": patch }), &ctx)
+            .await;
         assert!(!res.is_error, "apply patch failed: {}", res.content);
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\nrust\n");

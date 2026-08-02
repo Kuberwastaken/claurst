@@ -1,7 +1,7 @@
-pub mod types;
-pub mod shadow;
 pub mod registry;
+pub mod shadow;
+pub mod types;
 
-pub use types::{FileDiff, FileStatus, Patch};
-pub use shadow::ShadowSnapshot;
 pub use registry::{get_or_create, remove};
+pub use shadow::ShadowSnapshot;
+pub use types::{FileDiff, FileStatus, Patch};

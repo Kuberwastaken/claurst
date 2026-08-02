@@ -13,8 +13,12 @@ pub struct TerminalSetupCommand;
 
 #[async_trait]
 impl SlashCommand for StatuslineCommand {
-    fn name(&self) -> &str { "statusline" }
-    fn description(&self) -> &str { "Configure what is shown in the status line" }
+    fn name(&self) -> &str {
+        "statusline"
+    }
+    fn description(&self) -> &str {
+        "Configure what is shown in the status line"
+    }
     fn help(&self) -> &str {
         "Usage: /statusline [show|hide] [cost|tokens|model|time|all]\n\n\
          Controls which items appear in the TUI status bar at the bottom.\n\
@@ -68,10 +72,12 @@ impl SlashCommand for StatuslineCommand {
                 s.statusline_show_model = Some(show);
                 s.statusline_show_time = Some(show);
             }) {
-                Ok(_) => return CommandResult::Message(format!(
-                    "Status line: all items {}.",
-                    if show { "shown" } else { "hidden" }
-                )),
+                Ok(_) => {
+                    return CommandResult::Message(format!(
+                        "Status line: all items {}.",
+                        if show { "shown" } else { "hidden" }
+                    ))
+                }
                 Err(e) => return CommandResult::Error(format!("Failed to save: {}", e)),
             }
         }
@@ -101,15 +107,23 @@ impl SlashCommand for StatuslineCommand {
 }
 
 fn fmt_bool(v: bool) -> &'static str {
-    if v { "on" } else { "off" }
+    if v {
+        "on"
+    } else {
+        "off"
+    }
 }
 
 // ---- /security-review ----------------------------------------------------
 
 #[async_trait]
 impl SlashCommand for SecurityReviewCommand {
-    fn name(&self) -> &str { "security-review" }
-    fn description(&self) -> &str { "Run a security review of the current project" }
+    fn name(&self) -> &str {
+        "security-review"
+    }
+    fn description(&self) -> &str {
+        "Run a security review of the current project"
+    }
     fn help(&self) -> &str {
         "Usage: /security-review [path]\n\n\
          Asks Claurst to perform a security review of the codebase.\n\
@@ -153,8 +167,12 @@ impl SlashCommand for SecurityReviewCommand {
 
 #[async_trait]
 impl SlashCommand for TerminalSetupCommand {
-    fn name(&self) -> &str { "terminal-setup" }
-    fn description(&self) -> &str { "Help configure your terminal for optimal Claurst use" }
+    fn name(&self) -> &str {
+        "terminal-setup"
+    }
+    fn description(&self) -> &str {
+        "Help configure your terminal for optimal Claurst use"
+    }
     fn help(&self) -> &str {
         "Usage: /terminal-setup\n\n\
          Diagnoses your terminal environment and gives recommendations for\n\
@@ -192,10 +210,15 @@ impl SlashCommand for TerminalSetupCommand {
         // Check if UNICODE is likely supported
         let lang = std::env::var("LANG").unwrap_or_default();
         let lc_all = std::env::var("LC_ALL").unwrap_or_default();
-        let unicode_env = lang.to_lowercase().contains("utf") || lc_all.to_lowercase().contains("utf");
+        let unicode_env =
+            lang.to_lowercase().contains("utf") || lc_all.to_lowercase().contains("utf");
         checks.push(format!(
             "Unicode/UTF-8: {}",
-            if unicode_env { "likely supported (LANG/LC_ALL contains UTF)" } else { "check LANG env var" }
+            if unicode_env {
+                "likely supported (LANG/LC_ALL contains UTF)"
+            } else {
+                "check LANG env var"
+            }
         ));
 
         // Check for known good terminals
@@ -203,11 +226,15 @@ impl SlashCommand for TerminalSetupCommand {
             term_program.to_lowercase().as_str(),
             "iterm.app" | "iterm2" | "hyper" | "warp" | "alacritty" | "kitty" | "wezterm"
         ) || term_program.to_lowercase().contains("vscode")
-          || term_program.to_lowercase().contains("terminal");
+            || term_program.to_lowercase().contains("terminal");
 
         checks.push(format!(
             "Terminal type: {}",
-            if is_good_terminal { "well-known terminal (good)" } else { "verify settings below" }
+            if is_good_terminal {
+                "well-known terminal (good)"
+            } else {
+                "verify settings below"
+            }
         ));
 
         // Shell detection
@@ -215,8 +242,8 @@ impl SlashCommand for TerminalSetupCommand {
         checks.push(format!("Shell:         {}", shell));
 
         // Check for Nerd Fonts (heuristic: environment variable set by some terminals)
-        let nerd_font = std::env::var("NERD_FONT").is_ok()
-            || std::env::var("TERM_NERD_FONT").is_ok();
+        let nerd_font =
+            std::env::var("NERD_FONT").is_ok() || std::env::var("TERM_NERD_FONT").is_ok();
 
         CommandResult::Message(format!(
             "Terminal Setup Diagnostic\n\

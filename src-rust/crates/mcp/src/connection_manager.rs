@@ -32,10 +32,7 @@ pub enum McpServerStatus {
     /// Cleanly disconnected (or not yet attempted).
     Disconnected { last_error: Option<String> },
     /// Connection failed; a retry is scheduled.
-    Failed {
-        error: String,
-        retry_at: Instant,
-    },
+    Failed { error: String, retry_at: Instant },
 }
 
 impl McpServerStatus {
@@ -43,11 +40,17 @@ impl McpServerStatus {
     pub fn display(&self) -> String {
         match self {
             McpServerStatus::Connected { tool_count } => {
-                format!("connected ({} tool{})", tool_count, if *tool_count == 1 { "" } else { "s" })
+                format!(
+                    "connected ({} tool{})",
+                    tool_count,
+                    if *tool_count == 1 { "" } else { "s" }
+                )
             }
             McpServerStatus::Connecting => "connecting…".to_string(),
             McpServerStatus::Disconnected { last_error: None } => "disconnected".to_string(),
-            McpServerStatus::Disconnected { last_error: Some(e) } => {
+            McpServerStatus::Disconnected {
+                last_error: Some(e),
+            } => {
                 format!("disconnected ({})", e)
             }
             McpServerStatus::Failed { error, retry_at } => {
@@ -116,7 +119,10 @@ impl McpConnectionManager {
         Ok(())
     }
 
-    async fn connect_expanded_config(name: &str, config: &McpServerConfig) -> anyhow::Result<McpClient> {
+    async fn connect_expanded_config(
+        name: &str,
+        config: &McpServerConfig,
+    ) -> anyhow::Result<McpClient> {
         let auth_token = if matches!(config.server_type.as_str(), "sse" | "http") {
             match config.url.as_deref() {
                 Some(server_url) => oauth::get_valid_mcp_access_token(name, server_url).await?,
@@ -176,7 +182,11 @@ impl McpConnectionManager {
                 st.status = McpServerStatus::Disconnected {
                     last_error: Some(msg.clone()),
                 };
-                Err(anyhow::anyhow!("MCP server '{}' connection failed: {}", name, msg))
+                Err(anyhow::anyhow!(
+                    "MCP server '{}' connection failed: {}",
+                    name,
+                    msg
+                ))
             }
         }
     }
@@ -291,10 +301,7 @@ impl McpConnectionManager {
     }
 
     /// Background loop: wait, then attempt reconnect with exponential backoff.
-    async fn reconnect_loop(
-        name: String,
-        state: Arc<DashMap<String, Arc<Mutex<ServerState>>>>,
-    ) {
+    async fn reconnect_loop(name: String, state: Arc<DashMap<String, Arc<Mutex<ServerState>>>>) {
         let mut backoff = Duration::from_secs(1);
         const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
@@ -304,7 +311,9 @@ impl McpConnectionManager {
             if let Some(entry) = state.get(&name) {
                 if let Ok(mut st) = entry.value().try_lock() {
                     let prev_error = match &st.status {
-                        McpServerStatus::Disconnected { last_error: Some(e) } => e.clone(),
+                        McpServerStatus::Disconnected {
+                            last_error: Some(e),
+                        } => e.clone(),
                         McpServerStatus::Failed { error, .. } => error.clone(),
                         _ => "connection lost".to_string(),
                     };

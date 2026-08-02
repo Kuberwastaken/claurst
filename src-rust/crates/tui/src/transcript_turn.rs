@@ -51,24 +51,18 @@ impl<'a> TranscriptTurn<'a> {
 }
 
 pub fn reasoning_heading(text: &str) -> Option<String> {
-    let first = text
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())?;
+    let first = text.lines().map(str::trim).find(|line| !line.is_empty())?;
 
     let cleaned = first
         .trim_start_matches(['#', '*', '-', '>', ' '])
         .trim_start_matches("Thinking:")
         .trim()
-        .trim_end_matches(['*', '#', ' ', ':']);  // strip trailing ** ** etc.
+        .trim_end_matches(['*', '#', ' ', ':']); // strip trailing ** ** etc.
     if cleaned.is_empty() {
         return None;
     }
 
-    let collapsed = cleaned
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.is_empty() {
         return None;
     }
@@ -168,7 +162,11 @@ pub fn build_transcript_turns(app: &App) -> Vec<TranscriptTurn<'_>> {
             last.live_thinking = Some(app.streaming_thinking.as_str());
         }
 
-        last.active = app.is_streaming || last.tool_blocks.iter().any(|block| block.status == ToolStatus::Running);
+        last.active = app.is_streaming
+            || last
+                .tool_blocks
+                .iter()
+                .any(|block| block.status == ToolStatus::Running);
     }
 
     turns

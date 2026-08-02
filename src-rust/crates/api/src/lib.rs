@@ -27,12 +27,12 @@ pub mod bun_tls;
 pub mod codex_adapter;
 
 // Provider-agnostic unified types (Phase 1A).
-pub mod provider_types;
 pub mod provider_error;
+pub mod provider_types;
 
 // Provider abstraction traits (Phase 1B).
-pub mod provider;
 pub mod auth;
+pub mod provider;
 pub mod stream_parser;
 pub mod transform;
 
@@ -69,13 +69,13 @@ pub use streaming::{AnthropicStreamEvent, StreamHandler};
 pub use types::*;
 
 // Phase 1A re-exports — provider-agnostic layer.
-pub use provider_types::*;
 pub use provider_error::ProviderError;
+pub use provider_types::*;
 
 // Phase 1B re-exports — provider abstraction traits.
-pub use provider::{LlmProvider, ModelInfo};
 pub use auth::{AuthProvider, LoginFlow};
-pub use stream_parser::{SseByteDecoder, StreamParser, SseStreamParser, JsonLinesStreamParser};
+pub use provider::{LlmProvider, ModelInfo};
+pub use stream_parser::{JsonLinesStreamParser, SseByteDecoder, SseStreamParser, StreamParser};
 pub use transform::MessageTransformer;
 
 // #228 protocol layer re-exports.
@@ -91,12 +91,12 @@ pub use providers::MinimaxProvider;
 pub use providers::OpenAiProvider;
 
 // Phase 3 re-exports — model registry.
-pub use model_registry::{
-    CostBreakdown, CostTier, CostTierCondition, ExperimentalMode, InterleavedReasoning, Modality,
-    ModelEntry, ModelRegistry, ModelStatus, ProviderEntry, ProviderOverride,
-    effective_model_for_config,
-};
 pub use effort_support::{model_is_reasoning, supported_efforts, variant_ladder};
+pub use model_registry::{
+    effective_model_for_config, CostBreakdown, CostTier, CostTierCondition, ExperimentalMode,
+    InterleavedReasoning, Modality, ModelEntry, ModelRegistry, ModelStatus, ProviderEntry,
+    ProviderOverride,
+};
 pub use variants::{
     variant_efforts, OPENAI_NONE_EFFORT_RELEASE_DATE, OPENAI_XHIGH_EFFORT_RELEASE_DATE,
 };
@@ -111,8 +111,7 @@ pub use providers::CopilotProvider;
 
 // Phase 2B re-exports — OpenAI-compatible generic adapter + common factories.
 pub use providers::{
-    OpenAiCompatProvider,
-    ollama, lm_studio, deepseek, groq, xai, openrouter, mistral, opencode_zen,
+    deepseek, groq, lm_studio, mistral, ollama, opencode_zen, openrouter, xai, OpenAiCompatProvider,
 };
 
 // ---------------------------------------------------------------------------
@@ -138,7 +137,11 @@ static REQUEST_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(DEFAULT_REQUEST_TIMEOUT_
 /// Override the process-wide request timeout. A value of `0` resets to
 /// [`DEFAULT_REQUEST_TIMEOUT_SECS`]. Idempotent; safe to call multiple times.
 pub fn set_request_timeout_secs(secs: u64) {
-    let value = if secs == 0 { DEFAULT_REQUEST_TIMEOUT_SECS } else { secs };
+    let value = if secs == 0 {
+        DEFAULT_REQUEST_TIMEOUT_SECS
+    } else {
+        secs
+    };
     REQUEST_TIMEOUT_SECS.store(value, Ordering::Relaxed);
 }
 
@@ -362,14 +365,9 @@ pub mod streaming {
             content_block: ContentBlock,
         },
         /// Incremental delta for an existing content block.
-        ContentBlockDelta {
-            index: usize,
-            delta: ContentDelta,
-        },
+        ContentBlockDelta { index: usize, delta: ContentDelta },
         /// A content block is finished.
-        ContentBlockStop {
-            index: usize,
-        },
+        ContentBlockStop { index: usize },
         /// Final message-level delta (stop_reason, usage).
         MessageDelta {
             stop_reason: Option<String>,
@@ -378,14 +376,10 @@ pub mod streaming {
         /// The message is complete.
         MessageStop,
         /// An error occurred during streaming.
-        Error {
-            error_type: String,
-            message: String,
-        },
+        Error { error_type: String, message: String },
         /// A ping/keep-alive event.
         Ping,
     }
-
 
     /// The delta payload inside a `content_block_delta` event.
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -485,8 +479,7 @@ pub mod client {
     use super::*;
 
     /// Provider selection for API calls.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    #[derive(Default)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub enum Provider {
         /// Use Anthropic's API
         #[default]
@@ -494,8 +487,6 @@ pub mod client {
         /// Use OpenAI Codex via OAuth
         Codex,
     }
-
-    
 
     /// Configuration for the HTTP client.
     #[derive(Debug, Clone)]
@@ -603,10 +594,12 @@ pub mod client {
                 text,
                 cache_control: None,
             };
-            let billing_block =
-                text_block(claurst_core::oauth_config::claude_code_billing_header(&first_user_text));
-            let identity_block =
-                text_block(claurst_core::oauth_config::CLAUDE_CODE_SYSTEM_PROMPT_PREFIX.to_string());
+            let billing_block = text_block(claurst_core::oauth_config::claude_code_billing_header(
+                &first_user_text,
+            ));
+            let identity_block = text_block(
+                claurst_core::oauth_config::CLAUDE_CODE_SYSTEM_PROMPT_PREFIX.to_string(),
+            );
 
             // Drop a leading "You are Claurst…" / "You are a Claude agent…" line:
             // the injected official identity must be the only one the server sees.
@@ -699,7 +692,11 @@ pub mod client {
                         "Model '{}' is a Google model. Use `--provider google` or set GOOGLE_API_KEY.",
                         model
                     )
-                } else if model.starts_with("gpt-") || model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
+                } else if model.starts_with("gpt-")
+                    || model.starts_with("o1")
+                    || model.starts_with("o3")
+                    || model.starts_with("o4")
+                {
                     format!(
                         "Model '{}' is an OpenAI model. Use `--provider openai` or set OPENAI_API_KEY.",
                         model
@@ -731,11 +728,13 @@ pub mod client {
                     )
                 } else {
                     "Set ANTHROPIC_API_KEY, run `claurst auth login`, \
-                     or use --provider to select a different provider (e.g. --provider openai).".to_string()
+                     or use --provider to select a different provider (e.g. --provider openai)."
+                        .to_string()
                 };
-                return Err(ClaudeError::Auth(
-                    format!("No API key for the selected model. {}", hint)
-                ));
+                return Err(ClaudeError::Auth(format!(
+                    "No API key for the selected model. {}",
+                    hint
+                )));
             }
             // Route to Codex if configured
             if self.config.provider == Provider::Codex {
@@ -748,7 +747,10 @@ pub mod client {
 
             let resp = self.send_with_retry(&body).await?;
             let status = resp.status();
-            let text = resp.text().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
 
             if !status.is_success() {
                 return Err(self.parse_api_error(status.as_u16(), &text));
@@ -778,7 +780,10 @@ pub mod client {
                 .map_err(|e| ClaudeError::Other(format!("Codex request failed: {}", e)))?;
 
             let status = resp.status();
-            let text = resp.text().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
 
             if !status.is_success() {
                 return Err(self.parse_api_error(status.as_u16(), &text));
@@ -818,7 +823,11 @@ pub mod client {
                         "Model '{}' is a Google model. Use `--provider google` or set GOOGLE_API_KEY.",
                         model
                     )
-                } else if model.starts_with("gpt-") || model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
+                } else if model.starts_with("gpt-")
+                    || model.starts_with("o1")
+                    || model.starts_with("o3")
+                    || model.starts_with("o4")
+                {
                     format!(
                         "Model '{}' is an OpenAI model. Use `--provider openai` or set OPENAI_API_KEY.",
                         model
@@ -826,7 +835,10 @@ pub mod client {
                 } else if model.starts_with("deepseek") {
                     format!("Model '{}' is a DeepSeek model. Use `--provider deepseek` or set DEEPSEEK_API_KEY.", model)
                 } else if model.starts_with("grok") {
-                    format!("Model '{}' is an xAI model. Use `--provider xai` or set XAI_API_KEY.", model)
+                    format!(
+                        "Model '{}' is an xAI model. Use `--provider xai` or set XAI_API_KEY.",
+                        model
+                    )
                 } else if model.starts_with("mistral") || model.starts_with("codestral") {
                     format!("Model '{}' is a Mistral model. Use `--provider mistral` or set MISTRAL_API_KEY.", model)
                 } else if model.starts_with("command-") {
@@ -835,11 +847,13 @@ pub mod client {
                     format!("Model '{}' looks like a Llama model. Use `--provider groq` or `--provider ollama` for local.", model)
                 } else {
                     "Set ANTHROPIC_API_KEY, run `claurst auth login`, \
-                     or use --provider to select a different provider (e.g. --provider openai).".to_string()
+                     or use --provider to select a different provider (e.g. --provider openai)."
+                        .to_string()
                 };
-                return Err(ClaudeError::Auth(
-                    format!("No API key for the selected model. {}", hint)
-                ));
+                return Err(ClaudeError::Auth(format!(
+                    "No API key for the selected model. {}",
+                    hint
+                )));
             }
             // Codex provider doesn't support streaming yet
             if self.config.provider == Provider::Codex {
@@ -856,7 +870,10 @@ pub mod client {
             let status = resp.status();
 
             if !status.is_success() {
-                let text = resp.text().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
+                let text = resp
+                    .text()
+                    .await
+                    .map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
                 return Err(self.parse_api_error(status.as_u16(), &text));
             }
 
@@ -927,10 +944,7 @@ pub mod client {
         // ---- Internal helpers --------------------------------------------
 
         /// Build the common request and execute with retry logic.
-        async fn send_with_retry(
-            &self,
-            body: &Value,
-        ) -> Result<wreq::Response, ClaudeError> {
+        async fn send_with_retry(&self, body: &Value) -> Result<wreq::Response, ClaudeError> {
             let url = format!("{}/v1/messages", self.config.api_base);
             let mut attempts = 0u32;
             let mut delay = self.config.initial_retry_delay;
@@ -1072,7 +1086,10 @@ pub mod client {
 
                 let req = req.body(body_str.clone());
 
-                let resp = req.send().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
                 let status = resp.status().as_u16();
 
                 // 200-299: success
@@ -1158,14 +1175,13 @@ pub mod client {
             let mut byte_stream = resp.bytes_stream();
 
             while let Some(chunk_result) = byte_stream.next().await {
-                let chunk = chunk_result.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
+                let chunk =
+                    chunk_result.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
 
                 for line in decoder.push(&chunk) {
                     let line = line.trim_end_matches('\r');
                     if let Some(frame) = parser.feed_line(line) {
-                        if let Some(event) =
-                            Self::frame_to_event(&frame.event, &frame.data)
-                        {
+                        if let Some(event) = Self::frame_to_event(&frame.event, &frame.data) {
                             handler.on_event(&event);
                             if tx.send(event).await.is_err() {
                                 // Receiver dropped – stop reading.
@@ -1443,7 +1459,10 @@ impl StreamAccumulator {
                         name: name.clone(),
                         json_buf: String::new(),
                     },
-                    ContentBlock::Thinking { thinking, signature } => PartialBlock::Thinking {
+                    ContentBlock::Thinking {
+                        thinking,
+                        signature,
+                    } => PartialBlock::Thinking {
                         thinking_buf: thinking.clone(),
                         signature_buf: signature.clone(),
                     },
@@ -1488,7 +1507,12 @@ impl StreamAccumulator {
                         PartialBlock::ToolUse { id, name, json_buf } => {
                             let input = serde_json::from_str(&json_buf)
                                 .unwrap_or(Value::Object(Default::default()));
-                            ContentBlock::ToolUse { id, name, input, thought_signature: None }
+                            ContentBlock::ToolUse {
+                                id,
+                                name,
+                                input,
+                                thought_signature: None,
+                            }
                         }
                         PartialBlock::Thinking {
                             thinking_buf,
@@ -1643,15 +1667,13 @@ mod tests {
 
         // A byte stream that never yields models a provider that begins a
         // streamed response and then pauses indefinitely (issue #185).
-        let mut stalled =
-            futures::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
+        let mut stalled = futures::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
 
         // The exact construct used by the streaming loops: wrapping the chunk
         // read in tokio::time::timeout must elapse rather than hang forever.
         // A short duration keeps the test fast; production uses the generous
         // stream_idle_timeout() value asserted below.
-        let result =
-            tokio::time::timeout(Duration::from_millis(50), stalled.next()).await;
+        let result = tokio::time::timeout(Duration::from_millis(50), stalled.next()).await;
         assert!(
             result.is_err(),
             "a stalled stream must hit the idle timeout, not hang"

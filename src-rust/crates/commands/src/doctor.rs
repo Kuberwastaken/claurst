@@ -11,8 +11,12 @@ pub struct DoctorCommand;
 
 #[async_trait]
 impl SlashCommand for DoctorCommand {
-    fn name(&self) -> &str { "doctor" }
-    fn description(&self) -> &str { "Check system health and diagnose issues" }
+    fn name(&self) -> &str {
+        "doctor"
+    }
+    fn description(&self) -> &str {
+        "Check system health and diagnose issues"
+    }
     fn help(&self) -> &str {
         "Usage: /doctor\n\
          Runs a comprehensive system diagnostics check:\n\
@@ -38,14 +42,19 @@ impl SlashCommand for DoctorCommand {
 
         // ── API / Auth ──────────────────────────────────────────────────────
         lines.push("Authentication".to_string());
-        let anthropic_auth = ctx.config.resolve_anthropic_auth_async().await.unwrap_or((String::new(), false));
+        let anthropic_auth = ctx
+            .config
+            .resolve_anthropic_auth_async()
+            .await
+            .unwrap_or((String::new(), false));
         let client_config = claurst_api::client::ClientConfig {
             api_key: anthropic_auth.0,
             api_base: ctx.config.resolve_anthropic_api_base(),
             use_bearer_auth: anthropic_auth.1,
             ..Default::default()
         };
-        let provider_registry = claurst_api::ProviderRegistry::from_config(&ctx.config, client_config);
+        let provider_registry =
+            claurst_api::ProviderRegistry::from_config(&ctx.config, client_config);
         let provider_id = claurst_core::ProviderId::new(ctx.config.selected_provider_id());
         match provider_registry.get(&provider_id) {
             Some(provider) => match provider.health_check().await {
@@ -56,10 +65,18 @@ impl SlashCommand for DoctorCommand {
                     lines.push(format!("  ⚠ {} is degraded: {}", provider.name(), reason));
                 }
                 Ok(claurst_api::provider_types::ProviderStatus::Unavailable { reason }) => {
-                    lines.push(format!("  ✗ {} is unavailable: {}", provider.name(), reason));
+                    lines.push(format!(
+                        "  ✗ {} is unavailable: {}",
+                        provider.name(),
+                        reason
+                    ));
                 }
                 Err(err) => {
-                    lines.push(format!("  ✗ {} health check failed: {}", provider.name(), err));
+                    lines.push(format!(
+                        "  ✗ {} health check failed: {}",
+                        provider.name(),
+                        err
+                    ));
                 }
             },
             None => {
@@ -75,7 +92,10 @@ impl SlashCommand for DoctorCommand {
             }
         }
         // Show which model is active
-        lines.push(format!("  • Active model: {}", ctx.config.effective_model()));
+        lines.push(format!(
+            "  • Active model: {}",
+            ctx.config.effective_model()
+        ));
         lines.push(String::new());
 
         // ── Git ─────────────────────────────────────────────────────────────
@@ -107,7 +127,9 @@ impl SlashCommand for DoctorCommand {
                     .to_string();
                 lines.push(format!("  ✓ ripgrep: {first}"));
             }
-            _ => lines.push("  ⚠ ripgrep (rg) not found — Grep tool will fall back to built-in".to_string()),
+            _ => lines.push(
+                "  ⚠ ripgrep (rg) not found — Grep tool will fall back to built-in".to_string(),
+            ),
         }
         lines.push(String::new());
 
@@ -184,10 +206,10 @@ impl SlashCommand for DoctorCommand {
                         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
                     {
                         Some(_) => lines.push(
-                            "  ⚠ settings.json is JSON but has unexpected structure".to_string()
+                            "  ⚠ settings.json is JSON but has unexpected structure".to_string(),
                         ),
                         None => lines.push(
-                            "  ✗ settings.json is invalid JSON — run /config to repair".to_string()
+                            "  ✗ settings.json is invalid JSON — run /config to repair".to_string(),
                         ),
                     }
                 }
@@ -201,7 +223,9 @@ impl SlashCommand for DoctorCommand {
         if claude_md.exists() {
             lines.push("  ✓ AGENTS.md present in working directory".to_string());
         } else {
-            lines.push("  • No AGENTS.md in working directory (run /init to create one)".to_string());
+            lines.push(
+                "  • No AGENTS.md in working directory (run /init to create one)".to_string(),
+            );
         }
         lines.push(String::new());
 
@@ -216,13 +240,19 @@ impl SlashCommand for DoctorCommand {
             for srv in ctx.config.mcp_servers.iter().take(12) {
                 let status_str = match statuses.get(&srv.name) {
                     Some(claurst_mcp::McpServerStatus::Connected { tool_count }) => {
-                        format!("  ✓ {} — connected ({} tool{})",
-                            srv.name, tool_count, if *tool_count == 1 { "" } else { "s" })
+                        format!(
+                            "  ✓ {} — connected ({} tool{})",
+                            srv.name,
+                            tool_count,
+                            if *tool_count == 1 { "" } else { "s" }
+                        )
                     }
                     Some(claurst_mcp::McpServerStatus::Connecting) => {
                         format!("  ⚠ {} — connecting…", srv.name)
                     }
-                    Some(claurst_mcp::McpServerStatus::Disconnected { last_error: Some(e) }) => {
+                    Some(claurst_mcp::McpServerStatus::Disconnected {
+                        last_error: Some(e),
+                    }) => {
                         format!("  ✗ {} — failed: {}", srv.name, e)
                     }
                     Some(claurst_mcp::McpServerStatus::Disconnected { last_error: None }) => {
@@ -240,7 +270,9 @@ impl SlashCommand for DoctorCommand {
             }
         } else {
             // No live manager — just show configured names
-            lines.push(format!("  ✓ {mcp_count} MCP server(s) configured (not yet connected):"));
+            lines.push(format!(
+                "  ✓ {mcp_count} MCP server(s) configured (not yet connected):"
+            ));
             for srv in ctx.config.mcp_servers.iter().take(8) {
                 lines.push(format!("    - {}", srv.name));
             }
@@ -256,8 +288,10 @@ impl SlashCommand for DoctorCommand {
         if hook_count == 0 {
             lines.push("  • No hooks configured".to_string());
         } else {
-            lines.push(format!("  ✓ {hook_count} hook(s) configured across {} event(s)",
-                ctx.config.hooks.len()));
+            lines.push(format!(
+                "  ✓ {hook_count} hook(s) configured across {} event(s)",
+                ctx.config.hooks.len()
+            ));
         }
         lines.push(String::new());
 
@@ -271,15 +305,21 @@ impl SlashCommand for DoctorCommand {
         let allowed_count = ctx.config.allowed_tools.len();
         let denied_count = ctx.config.disallowed_tools.len();
         // Tools not in allowed or denied lists require user confirmation
-        let explicit_tools: std::collections::HashSet<&str> = ctx.config.allowed_tools.iter()
+        let explicit_tools: std::collections::HashSet<&str> = ctx
+            .config
+            .allowed_tools
+            .iter()
             .chain(ctx.config.disallowed_tools.iter())
             .map(|s| s.as_str())
             .collect();
-        let confirm_count = all_tool_names.iter()
+        let confirm_count = all_tool_names
+            .iter()
             .filter(|n| !explicit_tools.contains(n.as_str()))
             .count();
         let mode_label = match ctx.config.permission_mode {
-            claurst_core::PermissionMode::BypassPermissions => "bypass-permissions (no confirmation required)",
+            claurst_core::PermissionMode::BypassPermissions => {
+                "bypass-permissions (no confirmation required)"
+            }
             claurst_core::PermissionMode::AcceptEdits => "accept-edits (file edits auto-approved)",
             claurst_core::PermissionMode::Plan => "plan (read-only, no writes)",
             claurst_core::PermissionMode::Default => "default (confirm destructive actions)",
@@ -287,17 +327,24 @@ impl SlashCommand for DoctorCommand {
         lines.push(format!("  • Mode: {mode_label}"));
         lines.push(format!("  • Total built-in tools: {total_tools}"));
         if allowed_count > 0 {
-            lines.push(format!("  ✓ Always allowed: {} tool(s) — {}",
+            lines.push(format!(
+                "  ✓ Always allowed: {} tool(s) — {}",
                 allowed_count,
-                ctx.config.allowed_tools.join(", ")));
+                ctx.config.allowed_tools.join(", ")
+            ));
         }
         if denied_count > 0 {
-            lines.push(format!("  ✗ Always denied: {} tool(s) — {}",
+            lines.push(format!(
+                "  ✗ Always denied: {} tool(s) — {}",
                 denied_count,
-                ctx.config.disallowed_tools.join(", ")));
+                ctx.config.disallowed_tools.join(", ")
+            ));
         }
         if ctx.config.permission_mode == claurst_core::PermissionMode::Default {
-            lines.push(format!("  ⚠ Require confirmation: {} tool(s)", confirm_count));
+            lines.push(format!(
+                "  ⚠ Require confirmation: {} tool(s)",
+                confirm_count
+            ));
         }
         lines.push(String::new());
 

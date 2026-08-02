@@ -187,11 +187,7 @@ impl FreeProvider {
     /// Decide how to route a user-facing model id into the chain.
     fn resolve_route(&self, model: &str) -> Route {
         let trimmed = model.trim();
-        if trimmed.is_empty()
-            || trimmed == "free"
-            || trimmed == "auto"
-            || trimmed == "free/auto"
-        {
+        if trimmed.is_empty() || trimmed == "free" || trimmed == "auto" || trimmed == "free/auto" {
             return Route::Auto;
         }
 
@@ -282,8 +278,9 @@ impl LlmProvider for FreeProvider {
         if self.chain.is_empty() {
             return Err(ProviderError::AuthFailed {
                 provider: self.id.clone(),
-                message: "Free mode has no configured upstreams — add at least one API key via /connect."
-                    .to_string(),
+                message:
+                    "Free mode has no configured upstreams — add at least one API key via /connect."
+                        .to_string(),
             });
         }
 
@@ -321,15 +318,14 @@ impl LlmProvider for FreeProvider {
     async fn create_message_stream(
         &self,
         request: ProviderRequest,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
-        ProviderError,
-    > {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
+    {
         if self.chain.is_empty() {
             return Err(ProviderError::AuthFailed {
                 provider: self.id.clone(),
-                message: "Free mode has no configured upstreams — add at least one API key via /connect."
-                    .to_string(),
+                message:
+                    "Free mode has no configured upstreams — add at least one API key via /connect."
+                        .to_string(),
             });
         }
 
@@ -382,7 +378,10 @@ impl LlmProvider for FreeProvider {
         )];
 
         for entry in &self.chain {
-            let label = format!("{} \u{2014} {}", entry.upstream.title, entry.upstream.default_model);
+            let label = format!(
+                "{} \u{2014} {}",
+                entry.upstream.title, entry.upstream.default_model
+            );
             models.push(mk(
                 &format!("{}/{}", entry.upstream.id, entry.upstream.default_model),
                 &label,
@@ -550,7 +549,10 @@ mod tests {
         let provider = FreeProvider::new(vec![entry("groq", true), entry("cerebras", true)]);
         let route = provider.resolve_route("cerebras/qwen-3-235b");
         match route {
-            Route::Pinned { start_idx, pinned_model } => {
+            Route::Pinned {
+                start_idx,
+                pinned_model,
+            } => {
                 assert_eq!(start_idx, 1);
                 assert_eq!(pinned_model, "qwen-3-235b");
             }
@@ -560,13 +562,14 @@ mod tests {
 
     #[test]
     fn legacy_zen_prefix_routes_to_opencode_zen() {
-        let provider = FreeProvider::new(vec![
-            entry("opencode-zen", true),
-            entry("openrouter", true),
-        ]);
+        let provider =
+            FreeProvider::new(vec![entry("opencode-zen", true), entry("openrouter", true)]);
         let route = provider.resolve_route("zen/big-pickle");
         match route {
-            Route::Pinned { start_idx, pinned_model } => {
+            Route::Pinned {
+                start_idx,
+                pinned_model,
+            } => {
                 assert_eq!(start_idx, 0);
                 assert_eq!(pinned_model, "big-pickle");
             }

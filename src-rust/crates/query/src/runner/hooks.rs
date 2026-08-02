@@ -59,7 +59,11 @@ pub fn fire_post_sampling_hooks(
 
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let body = if !stderr.trim().is_empty() { stderr } else { stdout };
+        let body = if !stderr.trim().is_empty() {
+            stderr
+        } else {
+            stdout
+        };
 
         tracing::warn!(
             command = %entry.command,

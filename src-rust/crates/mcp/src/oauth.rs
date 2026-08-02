@@ -25,7 +25,9 @@ pub struct McpToken {
 impl McpToken {
     /// Returns `true` if the token is expired or will expire within `grace_secs`.
     pub fn is_expired(&self, grace_secs: u64) -> bool {
-        let Some(exp) = self.expires_at else { return false };
+        let Some(exp) = self.expires_at else {
+            return false;
+        };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -62,8 +64,7 @@ pub fn store_mcp_token(token: &McpToken) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_string_pretty(token)
-        .map_err(std::io::Error::other)?;
+    let json = serde_json::to_string_pretty(token).map_err(std::io::Error::other)?;
     std::fs::write(&path, json)
 }
 
@@ -84,9 +85,7 @@ pub fn remove_mcp_token(server_name: &str) -> std::io::Result<()> {
     }
 }
 
-pub fn token_expiry_datetime(
-    expires_at: Option<u64>,
-) -> Option<chrono::DateTime<chrono::Utc>> {
+pub fn token_expiry_datetime(expires_at: Option<u64>) -> Option<chrono::DateTime<chrono::Utc>> {
     expires_at.map(|timestamp| {
         chrono::DateTime::<chrono::Utc>::from(
             std::time::UNIX_EPOCH + std::time::Duration::from_secs(timestamp),
@@ -133,11 +132,7 @@ fn fallback_oauth_metadata(server_url: &str) -> McpOAuthMetadata {
     }
 }
 
-fn build_mcp_auth_url(
-    authorization_endpoint: &str,
-    redirect_uri: &str,
-    verifier: &str,
-) -> String {
+fn build_mcp_auth_url(authorization_endpoint: &str, redirect_uri: &str, verifier: &str) -> String {
     let challenge = pkce_challenge(verifier);
     format!(
         "{}?client_id=claurst&redirect_uri={}&response_type=code&code_challenge={}&code_challenge_method=S256",
@@ -179,20 +174,13 @@ pub async fn fetch_oauth_metadata(server_url: &str) -> anyhow::Result<McpOAuthMe
     }
 }
 
-pub async fn begin_mcp_auth(
-    server_name: &str,
-    server_url: &str,
-) -> anyhow::Result<McpAuthSession> {
+pub async fn begin_mcp_auth(server_name: &str, server_url: &str) -> anyhow::Result<McpAuthSession> {
     let metadata = fetch_oauth_metadata(server_url).await?;
     let redirect_port = oauth_port_alloc()
         .map_err(|e| anyhow::anyhow!("Failed to allocate OAuth redirect port: {}", e))?;
     let redirect_uri = format!("http://127.0.0.1:{}/callback", redirect_port);
     let verifier = pkce_verifier();
-    let auth_url = build_mcp_auth_url(
-        &metadata.authorization_endpoint,
-        &redirect_uri,
-        &verifier,
-    );
+    let auth_url = build_mcp_auth_url(&metadata.authorization_endpoint, &redirect_uri, &verifier);
 
     Ok(McpAuthSession {
         server_name: server_name.to_string(),
@@ -222,7 +210,14 @@ async fn bind_callback_listener(
     };
     let listener = TcpListener::bind((host.as_str(), port))
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to bind OAuth callback listener on {}:{}: {}", host, port, e))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to bind OAuth callback listener on {}:{}: {}",
+                host,
+                port,
+                e
+            )
+        })?;
 
     Ok((listener, host, callback_path))
 }
@@ -411,10 +406,7 @@ pub struct XaaLoginState {
 ///
 /// Opens the browser to the IdP authorization URL with PKCE parameters.
 /// Returns the login state needed to complete the exchange.
-pub fn initiate_xaa_login(
-    server_name: &str,
-    idp_url: &str,
-) -> std::io::Result<XaaLoginState> {
+pub fn initiate_xaa_login(server_name: &str, idp_url: &str) -> std::io::Result<XaaLoginState> {
     let port = oauth_port_alloc()?;
     let verifier = pkce_verifier();
     let challenge = pkce_challenge(&verifier);
@@ -491,7 +483,10 @@ pub async fn exchange_code(
         scope: Option<String>,
     }
 
-    let tr: TokenResponse = resp.json().await.map_err(|e| anyhow::anyhow!("exchange_code: bad JSON: {}", e))?;
+    let tr: TokenResponse = resp
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("exchange_code: bad JSON: {}", e))?;
 
     let expires_at = tr.expires_in.map(|secs| {
         std::time::SystemTime::now()
@@ -511,7 +506,10 @@ pub async fn exchange_code(
 }
 
 /// Refresh an existing MCP token using the stored refresh token.
-pub async fn refresh_mcp_token(server_name: &str, token_endpoint: &str) -> anyhow::Result<McpToken> {
+pub async fn refresh_mcp_token(
+    server_name: &str,
+    token_endpoint: &str,
+) -> anyhow::Result<McpToken> {
     let existing = get_mcp_token(server_name)
         .ok_or_else(|| anyhow::anyhow!("No stored token for {}", server_name))?;
     let refresh = existing
@@ -521,7 +519,10 @@ pub async fn refresh_mcp_token(server_name: &str, token_endpoint: &str) -> anyho
         .to_string();
 
     let client = reqwest::Client::new();
-    let params = [("grant_type", "refresh_token"), ("refresh_token", refresh.as_str())];
+    let params = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh.as_str()),
+    ];
 
     let resp = client
         .post(token_endpoint)
@@ -596,7 +597,10 @@ mod tests {
             metadata.authorization_endpoint,
             "https://example.com/mcp/oauth/authorize"
         );
-        assert_eq!(metadata.token_endpoint, "https://example.com/mcp/oauth/token");
+        assert_eq!(
+            metadata.token_endpoint,
+            "https://example.com/mcp/oauth/token"
+        );
     }
 
     #[test]

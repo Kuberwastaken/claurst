@@ -12,8 +12,12 @@ pub struct VimCommand;
 
 #[async_trait]
 impl SlashCommand for ContextCommand {
-    fn name(&self) -> &str { "context" }
-    fn description(&self) -> &str { "Show context window usage (tokens used / available)" }
+    fn name(&self) -> &str {
+        "context"
+    }
+    fn description(&self) -> &str {
+        "Show context window usage (tokens used / available)"
+    }
     fn help(&self) -> &str {
         "Usage: /context\n\n\
          Displays the current context window utilization:\n\
@@ -70,9 +74,15 @@ impl SlashCommand for ContextCommand {
 
 #[async_trait]
 impl SlashCommand for VimCommand {
-    fn name(&self) -> &str { "vim" }
-    fn aliases(&self) -> Vec<&str> { vec!["vi"] }
-    fn description(&self) -> &str { "Toggle vim keybinding mode on/off" }
+    fn name(&self) -> &str {
+        "vim"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["vi"]
+    }
+    fn description(&self) -> &str {
+        "Toggle vim keybinding mode on/off"
+    }
     fn help(&self) -> &str {
         "Usage: /vim [on|off]\n\n\
          Toggles vim keybinding mode in the REPL input.\n\
@@ -89,7 +99,11 @@ impl SlashCommand for VimCommand {
             "off" | "normal" => "normal",
             "" => {
                 // Toggle
-                if current_mode == "vim" { "normal" } else { "vim" }
+                if current_mode == "vim" {
+                    "normal"
+                } else {
+                    "vim"
+                }
             }
             other => {
                 return CommandResult::Error(format!(

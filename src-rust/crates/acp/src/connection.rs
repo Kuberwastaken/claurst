@@ -224,7 +224,8 @@ where
 
         if has_id && (has_result || has_error) && !has_method {
             // Response — route to pending.
-            let id: acp::RequestId = serde_json::from_value(v["id"].clone()).unwrap_or(acp::RequestId::Null);
+            let id: acp::RequestId =
+                serde_json::from_value(v["id"].clone()).unwrap_or(acp::RequestId::Null);
             if has_result {
                 let value = v["result"].clone();
                 connection.complete_pending(&id, Ok(value));
@@ -237,17 +238,15 @@ where
             }
         } else if has_id && has_method {
             // Request.
-            let id: acp::RequestId = serde_json::from_value(v["id"].clone()).unwrap_or(acp::RequestId::Null);
+            let id: acp::RequestId =
+                serde_json::from_value(v["id"].clone()).unwrap_or(acp::RequestId::Null);
             let method = v
                 .get("method")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
             let params = v.get("params").cloned();
-            if tx
-                .send(Inbound::Request { id, method, params })
-                .is_err()
-            {
+            if tx.send(Inbound::Request { id, method, params }).is_err() {
                 break;
             }
         } else if has_method {
@@ -349,9 +348,7 @@ mod tests {
             .await
             .unwrap();
         writer_handle
-            .write_all(
-                b"{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{\"orphan\":true}}\n",
-            )
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{\"orphan\":true}}\n")
             .await
             .unwrap();
         drop(writer_handle); // EOF the reader
@@ -383,8 +380,7 @@ mod tests {
         let (server_to_client_reader, server_to_client) = duplex(8192);
         let connection = Connection::new(server_to_client);
         let (tx, _rx) = mpsc::unbounded_channel();
-        let reader_handle =
-            tokio::spawn(run_reader(connection.clone(), server_reader, tx));
+        let reader_handle = tokio::spawn(run_reader(connection.clone(), server_reader, tx));
 
         // Background: as a fake client, read the outbound request and write a
         // matching response.
@@ -403,8 +399,7 @@ mod tests {
                     break;
                 }
             }
-            let outbound: serde_json::Value =
-                serde_json::from_slice(buf.trim_ascii_end()).unwrap();
+            let outbound: serde_json::Value = serde_json::from_slice(buf.trim_ascii_end()).unwrap();
             let id = outbound["id"].clone();
             // Send the response back through the client_to_server pipe.
             let response = serde_json::json!({
@@ -429,4 +424,3 @@ mod tests {
         let _ = reader_handle.await;
     }
 }
-

@@ -18,9 +18,15 @@ pub struct CommitCommand;
 
 #[async_trait]
 impl SlashCommand for SkillsCommand {
-    fn name(&self) -> &str { "skills" }
-    fn aliases(&self) -> Vec<&str> { vec!["skill"] }
-    fn description(&self) -> &str { "List available skills in .claurst/commands/" }
+    fn name(&self) -> &str {
+        "skills"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["skill"]
+    }
+    fn description(&self) -> &str {
+        "List available skills in .claurst/commands/"
+    }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         let mut found: Vec<String> = Vec::new();
@@ -75,15 +81,13 @@ impl SlashCommand for SkillsCommand {
         }
 
         // Include discovered skills from .claurst/skills/ and configured paths/URLs.
-        let discovered = claurst_core::discover_skills(
-            &ctx.working_dir,
-            &ctx.config.skills,
-        );
+        let discovered = claurst_core::discover_skills(&ctx.working_dir, &ctx.config.skills);
 
         let mut output = if found.is_empty() && discovered.is_empty() {
             return CommandResult::Message(
                 "No skills found.\nCreate .md files in .claurst/commands/ to define skills.\n\
-                 Example: .claurst/commands/review.md".to_string(),
+                 Example: .claurst/commands/review.md"
+                    .to_string(),
             );
         } else if found.is_empty() {
             String::new()
@@ -92,7 +96,11 @@ impl SlashCommand for SkillsCommand {
             format!(
                 "Available skills ({}):\n{}",
                 found.len(),
-                found.iter().map(|s| format!("  /{}", s)).collect::<Vec<_>>().join("\n")
+                found
+                    .iter()
+                    .map(|s| format!("  /{}", s))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             )
         };
 
@@ -123,8 +131,12 @@ impl SlashCommand for SkillsCommand {
 
 #[async_trait]
 impl SlashCommand for RewindCommand {
-    fn name(&self) -> &str { "rewind" }
-    fn description(&self) -> &str { "Interactively select a message to rewind to" }
+    fn name(&self) -> &str {
+        "rewind"
+    }
+    fn description(&self) -> &str {
+        "Interactively select a message to rewind to"
+    }
     fn help(&self) -> &str {
         "Usage: /rewind\n\
          Opens an interactive overlay to select the message to rewind to.\n\
@@ -133,7 +145,9 @@ impl SlashCommand for RewindCommand {
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         if ctx.messages.is_empty() {
-            return CommandResult::Message("Nothing to rewind — conversation is empty.".to_string());
+            return CommandResult::Message(
+                "Nothing to rewind — conversation is empty.".to_string(),
+            );
         }
         CommandResult::OpenRewindOverlay
     }
@@ -143,8 +157,12 @@ impl SlashCommand for RewindCommand {
 
 #[async_trait]
 impl SlashCommand for StatsCommand {
-    fn name(&self) -> &str { "stats" }
-    fn description(&self) -> &str { "Show token usage and cost statistics" }
+    fn name(&self) -> &str {
+        "stats"
+    }
+    fn description(&self) -> &str {
+        "Show token usage and cost statistics"
+    }
     fn help(&self) -> &str {
         "Usage: /stats\n\n\
          Shows detailed token usage and cost breakdown for the current session,\n\
@@ -162,15 +180,21 @@ impl SlashCommand for StatsCommand {
         let model = ctx.config.effective_model();
 
         // Count user/assistant turns separately.
-        let user_turns = ctx.messages.iter()
+        let user_turns = ctx
+            .messages
+            .iter()
             .filter(|m| m.role == claurst_core::types::Role::User)
             .count();
-        let assistant_turns = ctx.messages.iter()
+        let assistant_turns = ctx
+            .messages
+            .iter()
             .filter(|m| m.role == claurst_core::types::Role::Assistant)
             .count();
 
         // Count tool-use invocations.
-        let tool_calls: usize = ctx.messages.iter()
+        let tool_calls: usize = ctx
+            .messages
+            .iter()
             .map(|m| m.get_tool_use_blocks().len())
             .sum();
 
@@ -221,14 +245,19 @@ impl SlashCommand for StatsCommand {
 
 #[async_trait]
 impl SlashCommand for FilesCommand {
-    fn name(&self) -> &str { "files" }
-    fn description(&self) -> &str { "List files referenced in the current conversation" }
+    fn name(&self) -> &str {
+        "files"
+    }
+    fn description(&self) -> &str {
+        "List files referenced in the current conversation"
+    }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         use std::collections::HashSet;
         // Scan message content for file paths (simple heuristic)
         let mut files: HashSet<String> = HashSet::new();
-        let path_re = regex::Regex::new(r#"(?m)([A-Za-z]:[\\/][^\s,;:"'<>]+|/[^\s,;:"'<>]{3,})"#).ok();
+        let path_re =
+            regex::Regex::new(r#"(?m)([A-Za-z]:[\\/][^\s,;:"'<>]+|/[^\s,;:"'<>]{3,})"#).ok();
 
         for msg in &ctx.messages {
             let text = msg.get_all_text();
@@ -254,7 +283,11 @@ impl SlashCommand for FilesCommand {
         CommandResult::Message(format!(
             "Referenced files ({}):\n{}",
             sorted.len(),
-            sorted.iter().map(|f| format!("  {}", f)).collect::<Vec<_>>().join("\n")
+            sorted
+                .iter()
+                .map(|f| format!("  {}", f))
+                .collect::<Vec<_>>()
+                .join("\n")
         ))
     }
 }
@@ -263,8 +296,12 @@ impl SlashCommand for FilesCommand {
 
 #[async_trait]
 impl SlashCommand for RenameCommand {
-    fn name(&self) -> &str { "rename" }
-    fn description(&self) -> &str { "Rename the current session" }
+    fn name(&self) -> &str {
+        "rename"
+    }
+    fn description(&self) -> &str {
+        "Rename the current session"
+    }
     fn help(&self) -> &str {
         "Usage: /rename [new name]\n\n\
          With a name: sets the session title immediately.\n\
@@ -296,12 +333,18 @@ impl SlashCommand for RenameCommand {
             .take(20)
             .filter_map(|m| {
                 let text = m.get_all_text();
-                if text.is_empty() { return None; }
+                if text.is_empty() {
+                    return None;
+                }
                 let role = match m.role {
                     claurst_core::types::Role::User => "User",
                     claurst_core::types::Role::Assistant => "Assistant",
                 };
-                Some(format!("{}: {}", role, text.chars().take(300).collect::<String>()))
+                Some(format!(
+                    "{}: {}",
+                    role,
+                    text.chars().take(300).collect::<String>()
+                ))
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -348,7 +391,9 @@ impl SlashCommand for RenameCommand {
 
         match provider.create_message(request).await {
             Ok(response) => {
-                let raw_text = text_from_content_blocks(&response.content).trim().to_string();
+                let raw_text = text_from_content_blocks(&response.content)
+                    .trim()
+                    .to_string();
 
                 let generated = raw_text
                     .to_lowercase()
@@ -361,7 +406,8 @@ impl SlashCommand for RenameCommand {
                 if cleaned.is_empty() {
                     return CommandResult::Error(
                         "Could not generate a valid name from conversation. \
-                         Use /rename <name> to set manually.".to_string(),
+                         Use /rename <name> to set manually."
+                            .to_string(),
                     );
                 }
 
@@ -379,8 +425,12 @@ impl SlashCommand for RenameCommand {
 
 #[async_trait]
 impl SlashCommand for EffortCommand {
-    fn name(&self) -> &str { "effort" }
-    fn description(&self) -> &str { "Set the model's thinking effort (low | normal | high)" }
+    fn name(&self) -> &str {
+        "effort"
+    }
+    fn description(&self) -> &str {
+        "Set the model's thinking effort (low | normal | high)"
+    }
     fn help(&self) -> &str {
         "Usage: /effort [low|normal|high]\n\
          Sets how much computation the model uses for reasoning.\n\
@@ -389,7 +439,9 @@ impl SlashCommand for EffortCommand {
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         match args.trim() {
-            "" => CommandResult::Message("Current effort: normal\nUse /effort [low|normal|high] to change.".to_string()),
+            "" => CommandResult::Message(
+                "Current effort: normal\nUse /effort [low|normal|high] to change.".to_string(),
+            ),
             "low" => {
                 // Low effort: smaller max_tokens
                 ctx.config.max_tokens = Some(4096);
@@ -415,8 +467,12 @@ impl SlashCommand for EffortCommand {
 
 #[async_trait]
 impl SlashCommand for SummaryCommand {
-    fn name(&self) -> &str { "summary" }
-    fn description(&self) -> &str { "Generate a brief summary of the conversation so far" }
+    fn name(&self) -> &str {
+        "summary"
+    }
+    fn description(&self) -> &str {
+        "Generate a brief summary of the conversation so far"
+    }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         let count = ctx.messages.len();
@@ -437,8 +493,12 @@ impl SlashCommand for SummaryCommand {
 
 #[async_trait]
 impl SlashCommand for CommitCommand {
-    fn name(&self) -> &str { "commit" }
-    fn description(&self) -> &str { "Ask Claurst to commit staged changes" }
+    fn name(&self) -> &str {
+        "commit"
+    }
+    fn description(&self) -> &str {
+        "Ask Claurst to commit staged changes"
+    }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
         let extra = if args.trim().is_empty() {

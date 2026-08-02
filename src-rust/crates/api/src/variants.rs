@@ -70,7 +70,8 @@ const OPENAI_GPT5_CODEX_3_PLUS_EFFORTS: &[&str] = &["none", "low", "medium", "hi
 static GPT5_FAMILY_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?:^|/)gpt-5(?:[.-]|$)").unwrap());
 static GPT5_VERSION_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?:^|/)gpt-5[.-](\d+)(?:[.-]|$)").unwrap());
-static GPT5_PRO_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?:^|/)gpt-5[.-]?pro(?:[.-]|$)").unwrap());
+static GPT5_PRO_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?:^|/)gpt-5[.-]?pro(?:[.-]|$)").unwrap());
 static GPT5_VERSIONED_PRO_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?:^|/)gpt-5[.-]\d+[.-]pro(?:[.-]|$)").unwrap());
 
@@ -78,8 +79,9 @@ static GPT5_VERSIONED_PRO_RE: Lazy<Regex> =
 static ANTHROPIC_OPUS_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)opus-(\d+)[.-](\d+)(?:[.@-]|$)|claude-(\d+)[.-](\d+)-opus(?:[.@-]|$)").unwrap()
 });
-static ANTHROPIC_SONNET_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)sonnet-(\d+)(?:[.@-]|$)|claude-(\d+)-sonnet(?:[.@-]|$)").unwrap());
+static ANTHROPIC_SONNET_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)sonnet-(\d+)(?:[.@-]|$)|claude-(\d+)-sonnet(?:[.@-]|$)").unwrap()
+});
 
 // SAP case: `/\bo[1-9]/.test(id)` — an OpenAI o-series id (o1..o9).
 static O_SERIES_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\bo[1-9]").unwrap());
@@ -94,7 +96,11 @@ static O_SERIES_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\bo[1-9]").unwrap())
 fn gpt5_version(id: &str) -> Option<u32> {
     let caps = GPT5_VERSION_RE.captures(id)?;
     let n: u32 = caps.get(1)?.as_str().parse().ok()?;
-    if n == 0 { None } else { Some(n) }
+    if n == 0 {
+        None
+    } else {
+        Some(n)
+    }
 }
 
 fn versioned_gpt5_reasoning_efforts(id: &str) -> Option<&'static [&'static str]> {
@@ -185,8 +191,14 @@ fn openai_compatible_reasoning_efforts(id: &str) -> Vec<&'static str> {
 fn anthropic_opus_47_or_later(id: &str) -> bool {
     match ANTHROPIC_OPUS_RE.captures(id) {
         Some(c) => {
-            let major = c.get(1).or_else(|| c.get(3)).and_then(|m| m.as_str().parse::<u32>().ok());
-            let minor = c.get(2).or_else(|| c.get(4)).and_then(|m| m.as_str().parse::<u32>().ok());
+            let major = c
+                .get(1)
+                .or_else(|| c.get(3))
+                .and_then(|m| m.as_str().parse::<u32>().ok());
+            let minor = c
+                .get(2)
+                .or_else(|| c.get(4))
+                .and_then(|m| m.as_str().parse::<u32>().ok());
             match (major, minor) {
                 (Some(major), Some(minor)) => major > 4 || (major == 4 && minor >= 7),
                 _ => false,
@@ -213,7 +225,13 @@ fn anthropic_adaptive_efforts(id: &str) -> Option<Vec<&'static str>> {
         return Some(vec!["low", "medium", "high", "xhigh", "max"]);
     }
     const V46: &[&str] = &[
-        "opus-4-6", "opus-4.6", "4-6-opus", "4.6-opus", "sonnet-4-6", "sonnet-4.6", "4-6-sonnet",
+        "opus-4-6",
+        "opus-4.6",
+        "4-6-opus",
+        "4.6-opus",
+        "sonnet-4-6",
+        "sonnet-4.6",
+        "4-6-sonnet",
         "4.6-sonnet",
     ];
     if V46.iter().any(|v| id.contains(v)) {
@@ -292,9 +310,12 @@ pub(crate) fn variant_effort_keys(
     let id = id.to_ascii_lowercase();
     let id = id.as_str();
 
-    let glm52 = ["glm-5.2", "glm-5-2", "glm-5p2"].iter().any(|n| id.contains(n));
+    let glm52 = ["glm-5.2", "glm-5-2", "glm-5p2"]
+        .iter()
+        .any(|n| id.contains(n));
 
-    if id.contains("minimax-m3") && (npm == "@ai-sdk/anthropic" || npm == "@ai-sdk/openai-compatible")
+    if id.contains("minimax-m3")
+        && (npm == "@ai-sdk/anthropic" || npm == "@ai-sdk/openai-compatible")
     {
         return vec!["none", "thinking"];
     }
@@ -486,12 +507,7 @@ pub fn variant_efforts(
 mod tests {
     use super::*;
 
-    fn keys(
-        npm: &str,
-        id: &str,
-        rd: &str,
-        provider_id: &str,
-    ) -> Vec<EffortLevel> {
+    fn keys(npm: &str, id: &str, rd: &str, provider_id: &str) -> Vec<EffortLevel> {
         variant_efforts(npm, id, rd, provider_id, true)
     }
 
@@ -500,26 +516,51 @@ mod tests {
         use EffortLevel::*;
         // Opus 4.7+ and Sonnet 5+ get the full adaptive ladder incl. xhigh + max.
         assert_eq!(
-            keys("@ai-sdk/anthropic", "claude-opus-4-8", "2026-06-15", "anthropic"),
+            keys(
+                "@ai-sdk/anthropic",
+                "claude-opus-4-8",
+                "2026-06-15",
+                "anthropic"
+            ),
             vec![Low, Medium, High, XHigh, Max]
         );
         // 4.6-era opus/sonnet: low/medium/high/max (no xhigh).
         assert_eq!(
-            keys("@ai-sdk/anthropic", "claude-opus-4-6", "2026-02-05", "anthropic"),
+            keys(
+                "@ai-sdk/anthropic",
+                "claude-opus-4-6",
+                "2026-02-05",
+                "anthropic"
+            ),
             vec![Low, Medium, High, Max]
         );
         assert_eq!(
-            keys("@ai-sdk/anthropic", "claude-sonnet-4-6", "2026-02-17", "anthropic"),
+            keys(
+                "@ai-sdk/anthropic",
+                "claude-sonnet-4-6",
+                "2026-02-17",
+                "anthropic"
+            ),
             vec![Low, Medium, High, Max]
         );
         // Opus 4.5 is the WIDELY special-case: low/medium/high only.
         assert_eq!(
-            keys("@ai-sdk/anthropic", "claude-opus-4-5", "2025-11-24", "anthropic"),
+            keys(
+                "@ai-sdk/anthropic",
+                "claude-opus-4-5",
+                "2025-11-24",
+                "anthropic"
+            ),
             vec![Low, Medium, High]
         );
         // Non-adaptive thinking model (haiku 4.5): budget-based high/max.
         assert_eq!(
-            keys("@ai-sdk/anthropic", "claude-haiku-4-5", "2025-10-15", "anthropic"),
+            keys(
+                "@ai-sdk/anthropic",
+                "claude-haiku-4-5",
+                "2025-10-15",
+                "anthropic"
+            ),
             vec![High, Max]
         );
     }
@@ -533,13 +574,7 @@ mod tests {
             vec![None, High]
         );
         assert!(
-            keys(
-                "@ai-sdk/anthropic",
-                "MiniMax-M2.7",
-                "2026-03-18",
-                "minimax"
-            )
-            .is_empty(),
+            keys("@ai-sdk/anthropic", "MiniMax-M2.7", "2026-03-18", "minimax").is_empty(),
             "always-on M2.7 thinking must not expose a disable toggle"
         );
     }
@@ -572,9 +607,18 @@ mod tests {
     fn openai_chat_pro_codex_special_cases() {
         use EffortLevel::*;
         // gpt-5-chat-latest: handled but empty (no effort selector).
-        assert!(keys("@ai-sdk/openai", "gpt-5-chat-latest", "2025-08-07", "openai").is_empty());
+        assert!(keys(
+            "@ai-sdk/openai",
+            "gpt-5-chat-latest",
+            "2025-08-07",
+            "openai"
+        )
+        .is_empty());
         // gpt-5-pro: "high" only.
-        assert_eq!(keys("@ai-sdk/openai", "gpt-5-pro", "2025-10-06", "openai"), vec![High]);
+        assert_eq!(
+            keys("@ai-sdk/openai", "gpt-5-pro", "2025-10-06", "openai"),
+            vec![High]
+        );
         // gpt-5-codex (version-less): WIDELY.
         assert_eq!(
             keys("@ai-sdk/openai", "gpt-5-codex", "2025-09-15", "openai"),
@@ -584,7 +628,9 @@ mod tests {
 
     #[test]
     fn non_reasoning_model_has_no_variants() {
-        assert!(variant_efforts("@ai-sdk/openai", "gpt-4o", "2024-05-13", "openai", false).is_empty());
+        assert!(
+            variant_efforts("@ai-sdk/openai", "gpt-4o", "2024-05-13", "openai", false).is_empty()
+        );
     }
 
     #[test]
@@ -625,7 +671,12 @@ mod tests {
         use EffortLevel::*;
         // Bedrock anthropic 4.6: adaptive low/medium/high/max.
         assert_eq!(
-            keys("@ai-sdk/amazon-bedrock", "anthropic.claude-opus-4-6-v1", "2026-02-05", "amazon-bedrock"),
+            keys(
+                "@ai-sdk/amazon-bedrock",
+                "anthropic.claude-opus-4-6-v1",
+                "2026-02-05",
+                "amazon-bedrock"
+            ),
             vec![Low, Medium, High, Max]
         );
         // Bedrock anthropic 4.5 (non-adaptive): budget high/max (NOT the native
@@ -641,7 +692,12 @@ mod tests {
         );
         // Amazon Nova (non-anthropic): WIDELY.
         assert_eq!(
-            keys("@ai-sdk/amazon-bedrock", "amazon.nova-pro-v1:0", "2024-12-03", "amazon-bedrock"),
+            keys(
+                "@ai-sdk/amazon-bedrock",
+                "amazon.nova-pro-v1:0",
+                "2024-12-03",
+                "amazon-bedrock"
+            ),
             vec![Low, Medium, High]
         );
     }
@@ -654,11 +710,21 @@ mod tests {
             vec![High, Max]
         );
         assert_eq!(
-            keys("@ai-sdk/google", "gemini-3-flash-preview", "2025-12-17", "google"),
+            keys(
+                "@ai-sdk/google",
+                "gemini-3-flash-preview",
+                "2025-12-17",
+                "google"
+            ),
             vec![Minimal, Low, Medium, High]
         );
         assert_eq!(
-            keys("@ai-sdk/google", "gemini-3-pro-preview", "2025-11-18", "google"),
+            keys(
+                "@ai-sdk/google",
+                "gemini-3-pro-preview",
+                "2025-11-18",
+                "google"
+            ),
             vec![Low, Medium, High]
         );
     }
@@ -668,7 +734,12 @@ mod tests {
         use EffortLevel::*;
         // OpenRouter maps xhigh to glm-5.2's native max.
         assert_eq!(
-            keys("@openrouter/ai-sdk-provider", "z-ai/glm-5.2", "2026-05-01", "openrouter"),
+            keys(
+                "@openrouter/ai-sdk-provider",
+                "z-ai/glm-5.2",
+                "2026-05-01",
+                "openrouter"
+            ),
             vec![High, XHigh]
         );
         assert_eq!(
@@ -686,7 +757,10 @@ mod tests {
     #[test]
     fn grok_and_groq() {
         use EffortLevel::*;
-        assert_eq!(keys("@ai-sdk/xai", "grok-3-mini", "2025-04-01", "xai"), vec![Low, High]);
+        assert_eq!(
+            keys("@ai-sdk/xai", "grok-3-mini", "2025-04-01", "xai"),
+            vec![Low, High]
+        );
         // Other grok models expose no effort variants.
         assert!(keys("@ai-sdk/xai", "grok-4", "2025-07-01", "xai").is_empty());
         // groq prepends `none` to widely.
@@ -701,19 +775,41 @@ mod tests {
         use EffortLevel::*;
         // openrouter "openai/gpt-5" (version-less) → OPENAI_EFFORTS (all six).
         assert_eq!(
-            keys("@openrouter/ai-sdk-provider", "openai/gpt-5", "2025-08-07", "openrouter"),
+            keys(
+                "@openrouter/ai-sdk-provider",
+                "openai/gpt-5",
+                "2025-08-07",
+                "openrouter"
+            ),
             vec![None, Minimal, Low, Medium, High, XHigh]
         );
         // A non-openai openrouter model → widely.
         assert_eq!(
-            keys("@openrouter/ai-sdk-provider", "meta-llama/llama-3.1-70b", "2024-07-23", "openrouter"),
+            keys(
+                "@openrouter/ai-sdk-provider",
+                "meta-llama/llama-3.1-70b",
+                "2024-07-23",
+                "openrouter"
+            ),
             vec![Low, Medium, High]
         );
     }
 
     #[test]
     fn cohere_and_perplexity_have_no_variants() {
-        assert!(keys("@ai-sdk/cohere", "command-a-03-2025", "2025-03-01", "cohere").is_empty());
-        assert!(keys("@ai-sdk/perplexity", "sonar-reasoning", "2025-01-01", "perplexity").is_empty());
+        assert!(keys(
+            "@ai-sdk/cohere",
+            "command-a-03-2025",
+            "2025-03-01",
+            "cohere"
+        )
+        .is_empty());
+        assert!(keys(
+            "@ai-sdk/perplexity",
+            "sonar-reasoning",
+            "2025-01-01",
+            "perplexity"
+        )
+        .is_empty());
     }
 }

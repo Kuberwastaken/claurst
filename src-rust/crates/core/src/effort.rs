@@ -197,9 +197,7 @@ impl EffortLevel {
             Self::Minimal => "The smallest reasoning budget for the quickest thinking",
             Self::Low => "Quick, straightforward implementation with minimal overhead",
             Self::Medium => "Balanced approach with standard implementation and testing",
-            Self::High => {
-                "Comprehensive implementation with extensive testing and documentation"
-            }
+            Self::High => "Comprehensive implementation with extensive testing and documentation",
             Self::XHigh => "Extended reasoning with a higher thinking budget for hard problems",
             Self::Max => "Maximum capability with the deepest reasoning",
             Self::Ultracode => {
@@ -439,7 +437,12 @@ mod tests {
     fn from_str_roundtrips() {
         for level in ALL_LEVELS {
             let parsed = EffortLevel::from_str(level.as_str());
-            assert_eq!(parsed, Some(level), "from_str({:?}) should round-trip", level);
+            assert_eq!(
+                parsed,
+                Some(level),
+                "from_str({:?}) should round-trip",
+                level
+            );
         }
     }
 
@@ -447,7 +450,12 @@ mod tests {
     fn declaration_order_is_ascending() {
         // Ord is derived from declaration order; the ladders rely on it.
         for pair in ALL_LEVELS.windows(2) {
-            assert!(pair[0] < pair[1], "{:?} must rank below {:?}", pair[0], pair[1]);
+            assert!(
+                pair[0] < pair[1],
+                "{:?} must rank below {:?}",
+                pair[0],
+                pair[1]
+            );
         }
         assert_eq!(*ALL_LEVELS.iter().min().unwrap(), EffortLevel::None);
         assert_eq!(*ALL_LEVELS.iter().max().unwrap(), EffortLevel::Ultracode);
@@ -488,7 +496,10 @@ mod tests {
         assert_eq!(EffortLevel::Max.thinking_budget_tokens(), Some(20_000));
         // XHigh slots between High and Max; Ultracode = top reasoning.
         assert_eq!(EffortLevel::XHigh.thinking_budget_tokens(), Some(16_000));
-        assert_eq!(EffortLevel::Ultracode.thinking_budget_tokens(), Some(20_000));
+        assert_eq!(
+            EffortLevel::Ultracode.thinking_budget_tokens(),
+            Some(20_000)
+        );
         // New rungs: None disables thinking, Minimal is the smallest budget.
         assert_eq!(EffortLevel::None.thinking_budget_tokens(), None);
         assert_eq!(EffortLevel::Minimal.thinking_budget_tokens(), Some(1_024));
@@ -506,7 +517,11 @@ mod tests {
             EffortLevel::Max,
             EffortLevel::Ultracode,
         ] {
-            assert_eq!(level.temperature(), None, "{level:?} temp should be default");
+            assert_eq!(
+                level.temperature(),
+                None,
+                "{level:?} temp should be default"
+            );
         }
     }
 
@@ -584,7 +599,10 @@ mod tests {
 
     #[test]
     fn serde_roundtrips_none_and_minimal() {
-        assert_eq!(serde_json::to_string(&EffortLevel::None).unwrap(), "\"none\"");
+        assert_eq!(
+            serde_json::to_string(&EffortLevel::None).unwrap(),
+            "\"none\""
+        );
         assert_eq!(
             serde_json::to_string(&EffortLevel::Minimal).unwrap(),
             "\"minimal\""
@@ -644,6 +662,9 @@ mod tests {
         assert!(add.contains("## Your task"));
         assert!(add.contains("Agent"));
         assert!(add.contains("TeamCreate"));
-        assert!(!add.contains("$ARGUMENTS"), "no template placeholder should remain");
+        assert!(
+            !add.contains("$ARGUMENTS"),
+            "no template placeholder should remain"
+        );
     }
 }

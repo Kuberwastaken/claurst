@@ -12,8 +12,12 @@ pub struct ExtraUsageCommand;
 
 #[async_trait]
 impl SlashCommand for UsageCommand {
-    fn name(&self) -> &str { "usage" }
-    fn description(&self) -> &str { "Show API usage, quotas, and rate limit status" }
+    fn name(&self) -> &str {
+        "usage"
+    }
+    fn description(&self) -> &str {
+        "Show API usage, quotas, and rate limit status"
+    }
     fn help(&self) -> &str {
         "Usage: /usage\n\n\
          Shows current session API usage and account quota information.\n\
@@ -81,8 +85,12 @@ impl SlashCommand for UsageCommand {
 
 #[async_trait]
 impl SlashCommand for ExtraUsageCommand {
-    fn name(&self) -> &str { "extra-usage" }
-    fn description(&self) -> &str { "Show detailed usage statistics: calls, cache, tools" }
+    fn name(&self) -> &str {
+        "extra-usage"
+    }
+    fn description(&self) -> &str {
+        "Show detailed usage statistics: calls, cache, tools"
+    }
     fn help(&self) -> &str {
         "Usage: /extra-usage\n\n\
          Displays extended usage statistics beyond /cost:\n\
@@ -101,7 +109,9 @@ impl SlashCommand for ExtraUsageCommand {
         let cost = ctx.cost_tracker.total_cost_usd();
 
         // Estimate API calls from messages (each assistant message ~ 1 API call)
-        let api_calls = ctx.messages.iter()
+        let api_calls = ctx
+            .messages
+            .iter()
             .filter(|m| m.role == claurst_core::types::Role::Assistant)
             .count();
         let api_calls = api_calls.max(1); // at least 1 if we have any data
@@ -159,7 +169,11 @@ impl SlashCommand for ExtraUsageCommand {
                 "No cache activity"
             },
             cost = cost,
-            cost_per_k = if total > 0 { cost / (total as f64 / 1000.0) } else { 0.0 },
+            cost_per_k = if total > 0 {
+                cost / (total as f64 / 1000.0)
+            } else {
+                0.0
+            },
         ))
     }
 }

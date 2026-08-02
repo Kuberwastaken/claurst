@@ -68,7 +68,9 @@ fn extensions_for_type(t: &str) -> Vec<&'static str> {
 #[async_trait]
 impl Tool for GrepTool {
     // Gates itself: calls `ctx.check_permission_for_path` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
         claurst_core::constants::TOOL_NAME_GREP
@@ -235,10 +237,7 @@ impl Tool for GrepTool {
 
             // Type filter
             if !type_exts.is_empty() {
-                let ext = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("");
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                 if !type_exts.contains(&ext) {
                     continue;
                 }
@@ -338,7 +337,9 @@ impl GrepTool {
     ) -> ToolResult {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
-            Err(e) => return ToolResult::error(format!("Failed to read {}: {}", path.display(), e)),
+            Err(e) => {
+                return ToolResult::error(format!("Failed to read {}: {}", path.display(), e))
+            }
         };
 
         let lines: Vec<&str> = content.lines().collect();
@@ -351,19 +352,12 @@ impl GrepTool {
         }
 
         if matching_lines.is_empty() {
-            return ToolResult::success(format!(
-                "No matches found in {}",
-                path.display()
-            ));
+            return ToolResult::success(format!("No matches found in {}", path.display()));
         }
 
         match output_mode {
             "files_with_matches" => ToolResult::success(path.display().to_string()),
-            "count" => ToolResult::success(format!(
-                "{}:{}",
-                path.display(),
-                matching_lines.len()
-            )),
+            "count" => ToolResult::success(format!("{}:{}", path.display(), matching_lines.len())),
             _ => {
                 let mut results = Vec::new();
                 for line_idx in &matching_lines {

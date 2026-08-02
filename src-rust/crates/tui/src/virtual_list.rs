@@ -302,7 +302,10 @@ impl<T: VirtualItem> VirtualList<T> {
     /// Scroll to the next search match after `current_idx`.
     pub fn next_match(&mut self, query: &str, current_idx: usize, width: u16) -> Option<usize> {
         let matches = self.find_matches(query).to_vec();
-        let next = matches.iter().find(|&&i| i > current_idx).copied()
+        let next = matches
+            .iter()
+            .find(|&&i| i > current_idx)
+            .copied()
             .or_else(|| matches.first().copied());
         if let Some(idx) = next {
             self.scroll_to_index(idx, width);
@@ -313,7 +316,11 @@ impl<T: VirtualItem> VirtualList<T> {
     /// Scroll to the previous search match before `current_idx`.
     pub fn prev_match(&mut self, query: &str, current_idx: usize, width: u16) -> Option<usize> {
         let matches = self.find_matches(query).to_vec();
-        let prev = matches.iter().rev().find(|&&i| i < current_idx).copied()
+        let prev = matches
+            .iter()
+            .rev()
+            .find(|&&i| i < current_idx)
+            .copied()
             .or_else(|| matches.last().copied());
         if let Some(idx) = prev {
             self.scroll_to_index(idx, width);
@@ -323,7 +330,9 @@ impl<T: VirtualItem> VirtualList<T> {
 }
 
 impl<T: VirtualItem> Default for VirtualList<T> {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -336,16 +345,24 @@ mod tests {
     /// the transcript uses, so it reproduces the trailing-cell ghosting.
     struct TextItem(String);
     impl VirtualItem for TextItem {
-        fn measure_height(&self, _w: u16) -> u16 { 1 }
+        fn measure_height(&self, _w: u16) -> u16 {
+            1
+        }
         fn render(&self, area: Rect, buf: &mut Buffer, _sel: bool) {
             Paragraph::new(Line::from(self.0.clone())).render(area, buf);
         }
-        fn search_text(&self) -> String { self.0.clone() }
+        fn search_text(&self) -> String {
+            self.0.clone()
+        }
     }
 
     fn row_string(buf: &Buffer, y: u16, width: u16) -> String {
         (0..width)
-            .map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()).unwrap_or_else(|| " ".into()))
+            .map(|x| {
+                buf.cell((x, y))
+                    .map(|c| c.symbol().to_string())
+                    .unwrap_or_else(|| " ".into())
+            })
             .collect()
     }
 
@@ -371,7 +388,10 @@ mod tests {
         assert!(row.starts_with("hi"), "new content should render: {row:?}");
         // "CONTENT" sits well past the new "hi", entirely in the ghost region —
         // without the row clear it would survive and this would fail.
-        assert!(!row.contains("CONTENT"), "old text must not ghost through: {row:?}");
+        assert!(
+            !row.contains("CONTENT"),
+            "old text must not ghost through: {row:?}"
+        );
         assert_eq!(row.trim_end(), "hi");
     }
 }
@@ -379,25 +399,40 @@ mod tests {
 #[cfg(test)]
 mod reset_probe {
     use super::*;
-    use ratatui::{Terminal, backend::TestBackend, text::Line, widgets::{Paragraph, Widget}};
+    use ratatui::{
+        backend::TestBackend,
+        text::Line,
+        widgets::{Paragraph, Widget},
+        Terminal,
+    };
 
     struct Item(String);
     impl VirtualItem for Item {
-        fn measure_height(&self, _w: u16) -> u16 { 1 }
+        fn measure_height(&self, _w: u16) -> u16 {
+            1
+        }
         fn render(&self, area: Rect, buf: &mut Buffer, _s: bool) {
             Paragraph::new(Line::from(self.0.clone())).render(area, buf);
         }
-        fn search_text(&self) -> String { self.0.clone() }
+        fn search_text(&self) -> String {
+            self.0.clone()
+        }
     }
     fn row0(t: &Terminal<TestBackend>) -> String {
         let b = t.backend().buffer();
-        (0..b.area.width).map(|x| b.cell((x,0)).map(|c| c.symbol().to_string()).unwrap_or_default()).collect()
+        (0..b.area.width)
+            .map(|x| {
+                b.cell((x, 0))
+                    .map(|c| c.symbol().to_string())
+                    .unwrap_or_default()
+            })
+            .collect()
     }
 
     #[test]
     fn does_terminal_draw_reset_between_frames() {
         let mut t = Terminal::new(TestBackend::new(20, 3)).unwrap();
-        let area = Rect::new(0,0,20,1);
+        let area = Rect::new(0, 0, 20, 1);
         // Frame 1: long content
         t.draw(|f| {
             let mut l: VirtualList<Item> = VirtualList::new();
@@ -405,7 +440,8 @@ mod reset_probe {
             l.set_items(vec![Item("LONGLINECONTENT1234".into())]);
             l.scroll_offset = 0;
             l.render(area, f.buffer_mut());
-        }).unwrap();
+        })
+        .unwrap();
         // Frame 2: SHORT content at the same row — if draw() resets, no ghost.
         t.draw(|f| {
             let mut l: VirtualList<Item> = VirtualList::new();
@@ -413,9 +449,14 @@ mod reset_probe {
             l.set_items(vec![Item("hi".into())]);
             l.scroll_offset = 0;
             l.render(area, f.buffer_mut());
-        }).unwrap();
+        })
+        .unwrap();
         let r = row0(&t);
         eprintln!("ROW0 AFTER FRAME2 = {:?}", r);
-        assert_eq!(r.trim_end(), "hi", "terminal.draw did NOT reset → ghost: {r:?}");
+        assert_eq!(
+            r.trim_end(),
+            "hi",
+            "terminal.draw did NOT reset → ghost: {r:?}"
+        );
     }
 }

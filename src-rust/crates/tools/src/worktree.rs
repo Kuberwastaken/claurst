@@ -57,9 +57,13 @@ struct EnterWorktreeInput {
 impl Tool for EnterWorktreeTool {
     // Gates itself: prompts for worktree creation AND for the post_create_command
     // in `execute()` (#210). The central backstop must not also prompt.
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
-    fn name(&self) -> &str { "EnterWorktree" }
+    fn name(&self) -> &str {
+        "EnterWorktree"
+    }
 
     fn description(&self) -> &str {
         "Create a new git worktree and switch the session's working directory to it. \
@@ -68,7 +72,9 @@ impl Tool for EnterWorktreeTool {
          Use ExitWorktree to return to the original directory."
     }
 
-    fn permission_level(&self) -> PermissionLevel { PermissionLevel::Write }
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::Write
+    }
 
     fn input_schema(&self) -> Value {
         json!({
@@ -106,11 +112,7 @@ impl Tool for EnterWorktreeTool {
             }
         }
 
-        if let Err(e) = ctx.check_permission(
-            self.name(),
-            "Create a git worktree",
-            false,
-        ) {
+        if let Err(e) = ctx.check_permission(self.name(), "Create a git worktree", false) {
             return ToolResult::error(e.to_string());
         }
 
@@ -132,7 +134,10 @@ impl Tool for EnterWorktreeTool {
             let day_of_year = days % 365;
             let month = day_of_year / 30 + 1;
             let day = day_of_year % 30 + 1;
-            format!("claurst-{:04}{:02}{:02}-{:02}{:02}{:02}", year, month, day, h, m, s)
+            format!(
+                "claurst-{:04}{:02}{:02}-{:02}{:02}{:02}",
+                year, month, day, h, m, s
+            )
         });
 
         // Determine worktree path
@@ -246,17 +251,27 @@ impl Tool for EnterWorktreeTool {
                         match shell_result {
                             Ok(out) if out.status.success() => {
                                 let stdout = String::from_utf8_lossy(&out.stdout);
-                                format!("\nPost-create command '{}' completed successfully.{}",
+                                format!(
+                                    "\nPost-create command '{}' completed successfully.{}",
                                     cmd,
-                                    if stdout.trim().is_empty() { String::new() } else { format!("\nOutput: {}", stdout.trim()) }
+                                    if stdout.trim().is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!("\nOutput: {}", stdout.trim())
+                                    }
                                 )
                             }
                             Ok(out) => {
                                 let stderr = String::from_utf8_lossy(&out.stderr);
-                                format!("\nPost-create command '{}' exited with error.\nStderr: {}",
-                                    cmd, stderr.trim())
+                                format!(
+                                    "\nPost-create command '{}' exited with error.\nStderr: {}",
+                                    cmd,
+                                    stderr.trim()
+                                )
                             }
-                            Err(e) => format!("\nCould not run post-create command '{}': {}", cmd, e),
+                            Err(e) => {
+                                format!("\nCould not run post-create command '{}': {}", cmd, e)
+                            }
                         }
                     }
                 } else {
@@ -299,11 +314,15 @@ struct ExitWorktreeInput {
     discard_changes: bool,
 }
 
-fn default_action() -> String { "keep".to_string() }
+fn default_action() -> String {
+    "keep".to_string()
+}
 
 #[async_trait]
 impl Tool for ExitWorktreeTool {
-    fn name(&self) -> &str { "ExitWorktree" }
+    fn name(&self) -> &str {
+        "ExitWorktree"
+    }
 
     fn description(&self) -> &str {
         "Exit the current worktree session created by EnterWorktree and restore the \
@@ -312,7 +331,9 @@ impl Tool for ExitWorktreeTool {
          by EnterWorktree in this session."
     }
 
-    fn permission_level(&self) -> PermissionLevel { PermissionLevel::Write }
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::Write
+    }
 
     fn input_schema(&self) -> Value {
         json!({
@@ -402,7 +423,13 @@ impl Tool for ExitWorktreeTool {
                 // but keep the directory on disk.
                 let _ = run_git(
                     &session.original_cwd,
-                    &["worktree", "lock", "--reason", "kept by ExitWorktree", &worktree_str],
+                    &[
+                        "worktree",
+                        "lock",
+                        "--reason",
+                        "kept by ExitWorktree",
+                        &worktree_str,
+                    ],
                 )
                 .await;
 
@@ -424,11 +451,7 @@ impl Tool for ExitWorktreeTool {
 
                 // Delete the branch if we created it
                 if let Some(ref branch) = session.branch {
-                    let _ = run_git(
-                        &session.original_cwd,
-                        &["branch", "-D", branch],
-                    )
-                    .await;
+                    let _ = run_git(&session.original_cwd, &["branch", "-D", branch]).await;
                 }
 
                 ToolResult::success(format!(
@@ -481,7 +504,9 @@ mod tests {
     impl PermissionHandler for DenyPostCreateHandler {
         fn check_permission(&self, request: &PermissionRequest) -> PermissionDecision {
             if request.description.contains("post-create command") {
-                PermissionDecision::Ask { reason: "denied in test".to_string() }
+                PermissionDecision::Ask {
+                    reason: "denied in test".to_string(),
+                }
             } else {
                 PermissionDecision::Allow
             }
@@ -493,11 +518,17 @@ mod tests {
 
     async fn init_git_repo(dir: &std::path::Path) {
         run_git(dir, &["init"]).await.expect("git init");
-        run_git(dir, &["config", "user.email", "t@example.com"]).await.expect("git config email");
-        run_git(dir, &["config", "user.name", "Test"]).await.expect("git config name");
+        run_git(dir, &["config", "user.email", "t@example.com"])
+            .await
+            .expect("git config email");
+        run_git(dir, &["config", "user.name", "Test"])
+            .await
+            .expect("git config name");
         std::fs::write(dir.join("README.md"), b"hi").unwrap();
         run_git(dir, &["add", "."]).await.expect("git add");
-        run_git(dir, &["commit", "-m", "init"]).await.expect("git commit");
+        run_git(dir, &["commit", "-m", "init"])
+            .await
+            .expect("git commit");
     }
 
     async fn reset_session() {
@@ -528,7 +559,10 @@ mod tests {
             "Critical post-create command must be reported as blocked: {}",
             result.content
         );
-        assert!(!marker.exists(), "Critical post-create command must NOT run");
+        assert!(
+            !marker.exists(),
+            "Critical post-create command must NOT run"
+        );
         reset_session().await;
     }
 

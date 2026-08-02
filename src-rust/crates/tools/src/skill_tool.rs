@@ -31,9 +31,13 @@ struct SkillInput {
 #[async_trait]
 impl Tool for SkillTool {
     // Gates itself: calls `ctx.check_permission_for_path` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
-    fn name(&self) -> &str { "Skill" }
+    fn name(&self) -> &str {
+        "Skill"
+    }
 
     fn description(&self) -> &str {
         "Execute a skill (custom prompt template) by name. \
@@ -42,7 +46,9 @@ impl Tool for SkillTool {
          The expanded skill prompt is returned for you to act on."
     }
 
-    fn permission_level(&self) -> PermissionLevel { PermissionLevel::ReadOnly }
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::ReadOnly
+    }
 
     fn input_schema(&self) -> Value {
         json!({
@@ -131,9 +137,7 @@ impl Tool for SkillTool {
 // ---------------------------------------------------------------------------
 
 fn skill_search_dirs(ctx: &ToolContext) -> Vec<PathBuf> {
-    let mut dirs = vec![
-        ctx.working_dir.join(".claurst").join("commands"),
-    ];
+    let mut dirs = vec![ctx.working_dir.join(".claurst").join("commands")];
     dirs.push(claurst_core::config::Settings::config_dir().join("commands"));
     dirs
 }

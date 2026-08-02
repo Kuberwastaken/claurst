@@ -11,8 +11,12 @@ pub struct MemoryCommand;
 
 #[async_trait]
 impl SlashCommand for MemoryCommand {
-    fn name(&self) -> &str { "memory" }
-    fn description(&self) -> &str { "View, edit, or clear AGENTS.md memory files" }
+    fn name(&self) -> &str {
+        "memory"
+    }
+    fn description(&self) -> &str {
+        "View, edit, or clear AGENTS.md memory files"
+    }
     fn help(&self) -> &str {
         "Usage: /memory [edit|clear] [global]\n\n\
          Shows the content of AGENTS.md files that provide project context to Claurst.\n\
@@ -45,7 +49,10 @@ impl SlashCommand for MemoryCommand {
 
         // ---- /memory edit [global|project] ------------------------------------
         if cmd == "edit" || cmd.starts_with("edit ") {
-            let target_hint = cmd.strip_prefix("edit").map(|s| s.trim()).unwrap_or("project");
+            let target_hint = cmd
+                .strip_prefix("edit")
+                .map(|s| s.trim())
+                .unwrap_or("project");
             let target = match target_hint {
                 "global" => {
                     // Ensure global dir exists
@@ -86,11 +93,10 @@ impl SlashCommand for MemoryCommand {
             } else if let Ok(ed) = std::env::var("EDITOR") {
                 format!("Using $EDITOR=\"{}\".", ed)
             } else {
-                "To use a different editor, set the $EDITOR or $VISUAL environment variable.".to_string()
+                "To use a different editor, set the $EDITOR or $VISUAL environment variable."
+                    .to_string()
             };
-            let spawn_result = std::process::Command::new(&editor)
-                .arg(&target)
-                .status();
+            let spawn_result = std::process::Command::new(&editor).arg(&target).status();
             return match spawn_result {
                 Ok(_) => CommandResult::Message(format!(
                     "Opened {} in your editor.\n{}",
@@ -99,14 +105,20 @@ impl SlashCommand for MemoryCommand {
                 )),
                 Err(e) => CommandResult::Message(format!(
                     "Could not launch '{}': {}. Edit {} manually.\n{}",
-                    editor, e, target.display(), editor_hint
+                    editor,
+                    e,
+                    target.display(),
+                    editor_hint
                 )),
             };
         }
 
         // ---- /memory clear [global|project] -----------------------------------
         if cmd == "clear" || cmd.starts_with("clear ") {
-            let target_hint = cmd.strip_prefix("clear").map(|s| s.trim()).unwrap_or("project");
+            let target_hint = cmd
+                .strip_prefix("clear")
+                .map(|s| s.trim())
+                .unwrap_or("project");
             let (label, target) = match target_hint {
                 "global" => ("global (~/.claurst/AGENTS.md)", global_path.clone()),
                 _ => {
@@ -130,9 +142,9 @@ impl SlashCommand for MemoryCommand {
                     label,
                     target.display()
                 )),
-                Err(e) => CommandResult::Error(format!(
-                    "Failed to clear {}: {}", target.display(), e
-                )),
+                Err(e) => {
+                    CommandResult::Error(format!("Failed to clear {}: {}", target.display(), e))
+                }
             };
         }
 
@@ -156,7 +168,11 @@ impl SlashCommand for MemoryCommand {
                             lines = lines,
                             chars = chars,
                             content = if content.len() > 2000 {
-                                format!("{}…\n(truncated — file is {} chars)", &content[..2000], chars)
+                                format!(
+                                    "{}…\n(truncated — file is {} chars)",
+                                    &content[..2000],
+                                    chars
+                                )
                             } else {
                                 content.clone()
                             }
@@ -164,7 +180,9 @@ impl SlashCommand for MemoryCommand {
                     }
                     Err(e) => output.push_str(&format!(
                         "\n[{label}] — Error reading {}: {}\n",
-                        path.display(), e, label = label
+                        path.display(),
+                        e,
+                        label = label
                     )),
                 }
             }
@@ -174,7 +192,7 @@ impl SlashCommand for MemoryCommand {
             output.push_str(
                 "\nNo AGENTS.md files found.\n\
                  Use /init to create one in the current project.\n\
-                 Use /memory edit to create and open a memory file."
+                 Use /memory edit to create and open a memory file.",
             );
         } else {
             output.push_str(
@@ -182,7 +200,7 @@ impl SlashCommand for MemoryCommand {
                  /memory edit          — edit project AGENTS.md\n\
                  /memory edit global   — edit global ~/.claurst/AGENTS.md\n\
                  /memory clear         — clear project AGENTS.md\n\
-                 /memory clear global  — clear global AGENTS.md"
+                 /memory clear global  — clear global AGENTS.md",
             );
         }
 

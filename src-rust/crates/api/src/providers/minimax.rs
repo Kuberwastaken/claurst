@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use claurst_core::provider_id::ProviderId;
 use claurst_core::types::{ContentBlock, UsageInfo};
 use futures::Stream;
-use reqwest::{Client, header};
+use reqwest::{header, Client};
 use serde_json::Value;
 
 use crate::provider::LlmProvider;
@@ -34,7 +34,11 @@ impl MinimaxProvider {
         let api_base = std::env::var("MINIMAX_BASE_URL")
             .unwrap_or_else(|_| claurst_core::constants::MINIMAX_ANTHROPIC_API_BASE.to_string());
         let mut headers = header::HeaderMap::new();
-        headers.insert("X-Api-Key", header::HeaderValue::from_str(&api_key).expect("unable to parse api key for http header"));
+        headers.insert(
+            "X-Api-Key",
+            header::HeaderValue::from_str(&api_key)
+                .expect("unable to parse api key for http header"),
+        );
         let http_client = Client::builder()
             .default_headers(headers)
             .timeout(crate::request_timeout())
@@ -66,10 +70,8 @@ impl MinimaxProvider {
 
     fn build_request(request: &ProviderRequest) -> CreateMessageRequest {
         let normalized_messages = normalize_anthropic_messages(&request.messages);
-        let api_messages: Vec<ApiMessage> = normalized_messages
-            .iter()
-            .map(ApiMessage::from)
-            .collect();
+        let api_messages: Vec<ApiMessage> =
+            normalized_messages.iter().map(ApiMessage::from).collect();
 
         let api_tools: Option<Vec<ApiToolDefinition>> = if request.tools.is_empty() {
             None
@@ -107,10 +109,7 @@ impl MinimaxProvider {
         builder.build()
     }
 
-    fn build_request_body(
-        &self,
-        request: &ProviderRequest,
-    ) -> Result<Value, serde_json::Error> {
+    fn build_request_body(&self, request: &ProviderRequest) -> Result<Value, serde_json::Error> {
         let mut body = serde_json::to_value(Self::build_request(request))?;
         if let Some(service_tier) = &self.service_tier {
             body["service_tier"] = Value::String(service_tier.clone());
@@ -136,7 +135,11 @@ impl MinimaxProvider {
                 let id = value.get("message")?.get("id")?.as_str()?.to_string();
                 let model = value.get("message")?.get("model")?.as_str()?.to_string();
                 let usage = UsageInfo {
-                    input_tokens: value.get("message")?.get("usage")?.get("input_tokens")?.as_u64()?,
+                    input_tokens: value
+                        .get("message")?
+                        .get("usage")?
+                        .get("input_tokens")?
+                        .as_u64()?,
                     output_tokens: 0,
                     cache_creation_input_tokens: 0,
                     cache_read_input_tokens: 0,
@@ -153,7 +156,11 @@ impl MinimaxProvider {
                     },
                     "tool_use" => {
                         let id = value.get("content_block")?.get("id")?.as_str()?.to_string();
-                        let name = value.get("content_block")?.get("name")?.as_str()?.to_string();
+                        let name = value
+                            .get("content_block")?
+                            .get("name")?
+                            .as_str()?
+                            .to_string();
                         ContentBlock::ToolUse {
                             id,
                             name,
@@ -164,7 +171,10 @@ impl MinimaxProvider {
                     _ => return None,
                 };
 
-                Some(StreamEvent::ContentBlockStart { index, content_block })
+                Some(StreamEvent::ContentBlockStart {
+                    index,
+                    content_block,
+                })
             }
             "content_block_delta" => {
                 let index = value.get("index")?.as_u64()? as usize;
@@ -184,8 +194,15 @@ impl MinimaxProvider {
                         Some(StreamEvent::SignatureDelta { index, signature })
                     }
                     "input_json_delta" => {
-                        let partial_json = value.get("delta")?.get("partial_json")?.as_str()?.to_string();
-                        Some(StreamEvent::InputJsonDelta { index, partial_json })
+                        let partial_json = value
+                            .get("delta")?
+                            .get("partial_json")?
+                            .as_str()?
+                            .to_string();
+                        Some(StreamEvent::InputJsonDelta {
+                            index,
+                            partial_json,
+                        })
                     }
                     _ => None,
                 }
@@ -195,31 +212,37 @@ impl MinimaxProvider {
                 Some(StreamEvent::ContentBlockStop { index })
             }
             "message_delta" => {
-                let stop_reason = value.get("delta")?
+                let stop_reason = value
+                    .get("delta")?
                     .get("stop_reason")?
                     .as_str()
                     .map(Self::map_stop_reason);
 
-                let usage = value.get("delta")?.get("usage")
-                    .and_then(|u| {
-                        Some(UsageInfo {
-                            input_tokens: u.get("input_tokens")?.as_u64()?,
-                            output_tokens: u.get("output_tokens")?.as_u64()?,
-                            cache_creation_input_tokens: u.get("cache_creation_input_tokens")?.as_u64().unwrap_or(0),
-                            cache_read_input_tokens: u.get("cache_read_input_tokens")?.as_u64().unwrap_or(0),
-                        })
-                    });
+                let usage = value.get("delta")?.get("usage").and_then(|u| {
+                    Some(UsageInfo {
+                        input_tokens: u.get("input_tokens")?.as_u64()?,
+                        output_tokens: u.get("output_tokens")?.as_u64()?,
+                        cache_creation_input_tokens: u
+                            .get("cache_creation_input_tokens")?
+                            .as_u64()
+                            .unwrap_or(0),
+                        cache_read_input_tokens: u
+                            .get("cache_read_input_tokens")?
+                            .as_u64()
+                            .unwrap_or(0),
+                    })
+                });
 
-                Some(StreamEvent::MessageDelta {
-                    stop_reason,
-                    usage,
-                })
+                Some(StreamEvent::MessageDelta { stop_reason, usage })
             }
             "message_stop" => Some(StreamEvent::MessageStop),
             "error" => {
                 let error_type = value.get("error")?.get("type")?.as_str()?.to_string();
                 let message = value.get("error")?.get("message")?.as_str()?.to_string();
-                Some(StreamEvent::Error { error_type, message })
+                Some(StreamEvent::Error {
+                    error_type,
+                    message,
+                })
             }
             "ping" => None,
             _ => None,
@@ -282,7 +305,10 @@ impl LlmProvider for MinimaxProvider {
                             }
                         }
                         StreamEvent::MessageStop => break,
-                        StreamEvent::Error { error_type, message } => {
+                        StreamEvent::Error {
+                            error_type,
+                            message,
+                        } => {
                             return Err(ProviderError::StreamError {
                                 provider: self.id.clone(),
                                 message: format!("[{}] {}", error_type, message),
@@ -471,7 +497,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener should bind");
-        let address = listener.local_addr().expect("listener should have an address");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address");
         let capture = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("request should connect");
             let mut raw_request = Vec::new();

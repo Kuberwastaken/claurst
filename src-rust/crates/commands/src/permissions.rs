@@ -11,8 +11,12 @@ pub struct PermissionsCommand;
 
 #[async_trait]
 impl SlashCommand for PermissionsCommand {
-    fn name(&self) -> &str { "permissions" }
-    fn description(&self) -> &str { "View or change tool permission settings" }
+    fn name(&self) -> &str {
+        "permissions"
+    }
+    fn description(&self) -> &str {
+        "View or change tool permission settings"
+    }
     fn help(&self) -> &str {
         "Usage: /permissions [set <mode>|allow <tool>|deny <tool>|reset]\n\n\
          Modes: default, accept-edits, bypass-permissions, plan\n\n\
@@ -47,9 +51,7 @@ impl SlashCommand for PermissionsCommand {
                  Use /permissions set <mode> to change the permission mode.\n\
                  Use /permissions allow|deny <tool> to override individual tools.\n\
                  Use /permissions reset to clear all overrides.",
-                ctx.config.permission_mode,
-                allowed_display,
-                denied_display,
+                ctx.config.permission_mode, allowed_display, denied_display,
             ));
         }
 
@@ -61,16 +63,24 @@ impl SlashCommand for PermissionsCommand {
             "set" => {
                 let mode = match arg.to_lowercase().as_str() {
                     "default" => claurst_core::config::PermissionMode::Default,
-                    "accept-edits" | "accept_edits" => claurst_core::config::PermissionMode::AcceptEdits,
-                    "bypass-permissions" | "bypass_permissions" => claurst_core::config::PermissionMode::BypassPermissions,
+                    "accept-edits" | "accept_edits" => {
+                        claurst_core::config::PermissionMode::AcceptEdits
+                    }
+                    "bypass-permissions" | "bypass_permissions" => {
+                        claurst_core::config::PermissionMode::BypassPermissions
+                    }
                     "plan" => claurst_core::config::PermissionMode::Plan,
-                    _ => return CommandResult::Error(
-                        "Mode must be: default, accept-edits, bypass-permissions, or plan".to_string()
-                    ),
+                    _ => {
+                        return CommandResult::Error(
+                            "Mode must be: default, accept-edits, bypass-permissions, or plan"
+                                .to_string(),
+                        )
+                    }
                 };
                 let mut new_config = ctx.config.clone();
                 new_config.permission_mode = mode.clone();
-                if let Err(e) = save_settings_mutation(|s| s.config.permission_mode = mode.clone()) {
+                if let Err(e) = save_settings_mutation(|s| s.config.permission_mode = mode.clone())
+                {
                     return CommandResult::Error(format!("Failed to save: {}", e));
                 }
                 CommandResult::ConfigChangeMessage(

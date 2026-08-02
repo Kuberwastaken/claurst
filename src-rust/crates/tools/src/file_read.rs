@@ -20,7 +20,9 @@ struct FileReadInput {
 #[async_trait]
 impl Tool for FileReadTool {
     // Gates itself: calls `ctx.check_permission_for_path` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
         claurst_core::constants::TOOL_NAME_FILE_READ
@@ -128,10 +130,7 @@ impl Tool for FileReadTool {
         };
 
         if content.is_empty() {
-            return ToolResult::success(format!(
-                "[File {} exists but is empty]",
-                path.display()
-            ));
+            return ToolResult::success(format!("[File {} exists but is empty]", path.display()));
         }
 
         let lines: Vec<&str> = content.lines().collect();

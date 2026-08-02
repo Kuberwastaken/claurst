@@ -9,10 +9,10 @@
 //! Tests are async and require git to be on PATH.  They are skipped gracefully
 //! when git is unavailable.
 
-use std::path::{Path, PathBuf};
+use claurst_core::snapshot::{Patch, ShadowSnapshot};
 use std::fs;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
-use claurst_core::snapshot::{ShadowSnapshot, Patch};
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -38,7 +38,10 @@ async fn bootstrap() -> (TempDir, String, String) {
 
 fn rand_str() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let n = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos();
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
     format!("{n:08x}")
 }
 
@@ -93,7 +96,10 @@ async fn tracks_deleted_files() {
     fs::remove_file(p.join("a.txt")).unwrap();
 
     let patch = snap.patch(&before).await;
-    assert!(patch.files.contains(&fwd(p, "a.txt")), "deleted file in patch");
+    assert!(
+        patch.files.contains(&fwd(p, "a.txt")),
+        "deleted file in patch"
+    );
 }
 
 #[tokio::test]
@@ -108,7 +114,10 @@ async fn revert_removes_new_files() {
     let patch = snap.patch(&before).await;
     snap.revert(&[patch]).await;
 
-    assert!(!p.join("new.txt").exists(), "new file should be deleted after revert");
+    assert!(
+        !p.join("new.txt").exists(),
+        "new file should be deleted after revert"
+    );
 }
 
 #[tokio::test]
@@ -171,10 +180,16 @@ async fn binary_file_tracked_and_reverted() {
     fs::write(p.join("image.png"), [0x89u8, 0x50, 0x4e, 0x47]).unwrap();
 
     let patch = snap.patch(&before).await;
-    assert!(patch.files.contains(&fwd(p, "image.png")), "binary file in patch");
+    assert!(
+        patch.files.contains(&fwd(p, "image.png")),
+        "binary file in patch"
+    );
 
     snap.revert(&[patch]).await;
-    assert!(!p.join("image.png").exists(), "binary file removed after revert");
+    assert!(
+        !p.join("image.png").exists(),
+        "binary file removed after revert"
+    );
 }
 
 #[tokio::test]
@@ -302,7 +317,10 @@ async fn gitignore_respected() {
     let patch = snap.patch(&before).await;
     assert!(patch.files.contains(&fwd(p, "new-tracked.txt")));
     assert!(!patch.files.contains(&fwd(p, "new.ignored")));
-    assert!(!patch.files.iter().any(|f| f.to_string_lossy().contains("build/")));
+    assert!(!patch
+        .files
+        .iter()
+        .any(|f| f.to_string_lossy().contains("build/")));
 }
 
 #[tokio::test]
@@ -314,7 +332,11 @@ async fn revert_with_empty_patches_noop() {
     snap.revert(&[]).await;
     assert_eq!(fs::read_to_string(p.join("a.txt")).unwrap(), a_content);
 
-    snap.revert(&[Patch { hash: "dummy".into(), files: vec![] }]).await;
+    snap.revert(&[Patch {
+        hash: "dummy".into(),
+        files: vec![],
+    }])
+    .await;
     assert_eq!(fs::read_to_string(p.join("a.txt")).unwrap(), a_content);
 }
 
@@ -336,7 +358,10 @@ async fn revert_preserves_existing_file_deleted_then_recreated() {
 
     assert!(!p.join("newfile.txt").exists(), "new file deleted");
     assert!(p.join("existing.txt").exists(), "existing restored");
-    assert_eq!(fs::read_to_string(p.join("existing.txt")).unwrap(), "original");
+    assert_eq!(
+        fs::read_to_string(p.join("existing.txt")).unwrap(),
+        "original"
+    );
 }
 
 #[tokio::test]
@@ -358,7 +383,10 @@ async fn snapshot_isolation_between_projects() {
     fs::write(p2.join("project2.txt"), "p2").unwrap();
     let patch2 = snap2.patch(&before2).await;
     assert!(patch2.files.contains(&fwd(p2, "project2.txt")));
-    assert!(!patch2.files.iter().any(|f| f.to_string_lossy().contains("project1")));
+    assert!(!patch2
+        .files
+        .iter()
+        .any(|f| f.to_string_lossy().contains("project1")));
 }
 
 #[tokio::test]
@@ -382,13 +410,25 @@ async fn diff_full_sets_status() {
     assert_eq!(diffs.len(), 4);
 
     let added = diffs.iter().find(|d| d.file == "added.txt").expect("added");
-    assert_eq!(added.status, Some(claurst_core::snapshot::FileStatus::Added));
+    assert_eq!(
+        added.status,
+        Some(claurst_core::snapshot::FileStatus::Added)
+    );
 
-    let deleted = diffs.iter().find(|d| d.file == "delete.txt").expect("deleted");
-    assert_eq!(deleted.status, Some(claurst_core::snapshot::FileStatus::Deleted));
+    let deleted = diffs
+        .iter()
+        .find(|d| d.file == "delete.txt")
+        .expect("deleted");
+    assert_eq!(
+        deleted.status,
+        Some(claurst_core::snapshot::FileStatus::Deleted)
+    );
 
     let grow = diffs.iter().find(|d| d.file == "grow.txt").expect("grow");
-    assert_eq!(grow.status, Some(claurst_core::snapshot::FileStatus::Modified));
+    assert_eq!(
+        grow.status,
+        Some(claurst_core::snapshot::FileStatus::Modified)
+    );
     assert!(grow.additions > 0);
     assert_eq!(grow.deletions, 0);
 }

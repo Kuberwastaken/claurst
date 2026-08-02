@@ -390,7 +390,9 @@ pub fn render_dialog_select(frame: &mut Frame, state: &DialogSelectState, area: 
     let visible = body_area.height;
     let max_scroll = total_lines.saturating_sub(visible);
     let scroll_y = if selected_item_line + 3 >= visible {
-        (selected_item_line + 3).saturating_sub(visible).min(max_scroll)
+        (selected_item_line + 3)
+            .saturating_sub(visible)
+            .min(max_scroll)
     } else {
         0
     };

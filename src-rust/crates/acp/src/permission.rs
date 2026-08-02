@@ -14,7 +14,7 @@ use std::sync::Arc;
 use agent_client_protocol_schema as acp;
 use claurst_core::permissions::{PermissionDecision, PermissionRequest};
 use claurst_core::PermissionHandler;
-use claurst_tools::{PendingPermissionStore, PendingPermissionRequest};
+use claurst_tools::{PendingPermissionRequest, PendingPermissionStore};
 use tracing::{debug, warn};
 
 use crate::connection::Connection;
@@ -56,7 +56,10 @@ pub async fn forward_pending(
     } = pending;
 
     let Some(decision_tx) = decision_tx else {
-        warn!(tool_use_id, "ACP permission: pending request had no decision_tx");
+        warn!(
+            tool_use_id,
+            "ACP permission: pending request had no decision_tx"
+        );
         return;
     };
 
@@ -130,7 +133,9 @@ fn infer_tool_kind(request: &PermissionRequest) -> acp::ToolKind {
         return acp::ToolKind::Read;
     }
     match request.tool_name.as_str() {
-        "Edit" | "FileEdit" | "Write" | "FileWrite" | "BatchEdit" | "ApplyPatch" => acp::ToolKind::Edit,
+        "Edit" | "FileEdit" | "Write" | "FileWrite" | "BatchEdit" | "ApplyPatch" => {
+            acp::ToolKind::Edit
+        }
         "Bash" | "Shell" | "Execute" => acp::ToolKind::Execute,
         "WebFetch" | "WebSearch" => acp::ToolKind::Fetch,
         "Glob" | "Grep" | "GlobTool" => acp::ToolKind::Search,

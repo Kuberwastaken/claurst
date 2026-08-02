@@ -200,12 +200,10 @@ async fn forward_events(
                         kind,
                     },
                 );
-                let mut tool_call = acp::ToolCall::new(
-                    acp::ToolCallId::new(tool_id.as_str()),
-                    title,
-                )
-                .kind(kind)
-                .status(acp::ToolCallStatus::InProgress);
+                let mut tool_call =
+                    acp::ToolCall::new(acp::ToolCallId::new(tool_id.as_str()), title)
+                        .kind(kind)
+                        .status(acp::ToolCallStatus::InProgress);
                 if let Some(input) = raw_input {
                     tool_call = tool_call.raw_input(Some(input));
                 }
@@ -230,20 +228,17 @@ async fn forward_events(
                 let content = vec![acp::ToolCallContent::Content(acp::Content::new(
                     acp::ContentBlock::Text(acp::TextContent::new(result.clone())),
                 ))];
-                let raw_output =
-                    serde_json::from_str::<serde_json::Value>(&result).ok().or_else(|| {
-                        Some(serde_json::Value::String(result.clone()))
-                    });
+                let raw_output = serde_json::from_str::<serde_json::Value>(&result)
+                    .ok()
+                    .or_else(|| Some(serde_json::Value::String(result.clone())));
                 let mut fields = acp::ToolCallUpdateFields::new()
                     .status(status)
                     .content(content);
                 if let Some(out) = raw_output {
                     fields = fields.raw_output(Some(out));
                 }
-                let update = acp::ToolCallUpdate::new(
-                    acp::ToolCallId::new(tool_id.as_str()),
-                    fields,
-                );
+                let update =
+                    acp::ToolCallUpdate::new(acp::ToolCallId::new(tool_id.as_str()), fields);
                 send_session_update(
                     &connection,
                     &session_id,
@@ -253,8 +248,13 @@ async fn forward_events(
                 active_tools.remove(&tool_id);
             }
             QueryEvent::Error(msg) => {
-                send_text_chunk(&connection, &session_id, &format!("\n[error: {}]", msg), false)
-                    .await;
+                send_text_chunk(
+                    &connection,
+                    &session_id,
+                    &format!("\n[error: {}]", msg),
+                    false,
+                )
+                .await;
             }
             _ => {}
         }

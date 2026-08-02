@@ -12,9 +12,15 @@ pub struct ThinkBackPlayCommand;
 
 #[async_trait]
 impl SlashCommand for ThinkBackCommand {
-    fn name(&self) -> &str { "think-back" }
-    fn aliases(&self) -> Vec<&str> { vec!["thinkback"] }
-    fn description(&self) -> &str { "Show thinking traces from previous responses in this session" }
+    fn name(&self) -> &str {
+        "think-back"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["thinkback"]
+    }
+    fn description(&self) -> &str {
+        "Show thinking traces from previous responses in this session"
+    }
     fn help(&self) -> &str {
         "Usage: /think-back [n]\n\n\
          Displays the thinking/reasoning traces from the most recent model responses.\n\
@@ -46,7 +52,11 @@ impl SlashCommand for ThinkBackCommand {
                     })
                     .collect::<Vec<_>>()
                     .join("\n\n");
-                if thinking.is_empty() { None } else { Some((idx, thinking)) }
+                if thinking.is_empty() {
+                    None
+                } else {
+                    Some((idx, thinking))
+                }
             })
             .collect();
 
@@ -82,8 +92,12 @@ impl SlashCommand for ThinkBackCommand {
 
 #[async_trait]
 impl SlashCommand for ThinkBackPlayCommand {
-    fn name(&self) -> &str { "thinkback-play" }
-    fn description(&self) -> &str { "Replay a thinking trace as an animated walkthrough" }
+    fn name(&self) -> &str {
+        "thinkback-play"
+    }
+    fn description(&self) -> &str {
+        "Replay a thinking trace as an animated walkthrough"
+    }
     fn help(&self) -> &str {
         "Usage: /thinkback-play [n]\n\n\
          Replays a previous thinking trace, formatted for easy reading.\n\
@@ -113,7 +127,11 @@ impl SlashCommand for ThinkBackPlayCommand {
                     })
                     .collect::<Vec<_>>()
                     .join("\n\n");
-                if t.is_empty() { None } else { Some(t) }
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t)
+                }
             })
             .collect();
 

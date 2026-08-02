@@ -15,7 +15,8 @@ fn parse_token_budget(s: &str) -> Option<u64> {
     if s.is_empty() {
         return None;
     }
-    let (num_str, multiplier) = if let Some(n) = s.strip_suffix('K').or_else(|| s.strip_suffix('k')) {
+    let (num_str, multiplier) = if let Some(n) = s.strip_suffix('K').or_else(|| s.strip_suffix('k'))
+    {
         (n, 1_000u64)
     } else if let Some(n) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
         (n, 1_000_000u64)
@@ -27,8 +28,12 @@ fn parse_token_budget(s: &str) -> Option<u64> {
 
 #[async_trait]
 impl SlashCommand for GoalCommand {
-    fn name(&self) -> &str { "goal" }
-    fn description(&self) -> &str { "Set or manage a durable long-running goal for autonomous work" }
+    fn name(&self) -> &str {
+        "goal"
+    }
+    fn description(&self) -> &str {
+        "Set or manage a durable long-running goal for autonomous work"
+    }
     fn help(&self) -> &str {
         "Usage:\n\
          /goal <objective>              — set a new goal and begin working autonomously\n\
@@ -50,7 +55,8 @@ impl SlashCommand for GoalCommand {
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         if !claurst_core::goals_enabled() {
             return CommandResult::Message(
-                "Goals are disabled. Unset CLAURST_GOALS=0 (or remove it) to re-enable.".to_string(),
+                "Goals are disabled. Unset CLAURST_GOALS=0 (or remove it) to re-enable."
+                    .to_string(),
             );
         }
 
@@ -80,7 +86,9 @@ impl SlashCommand for GoalCommand {
                 if let Err(e) = store.set_status(session_id, claurst_core::GoalStatus::Paused) {
                     return CommandResult::Error(format!("Failed to pause goal: {}", e));
                 }
-                return CommandResult::Message("Goal paused. Use /goal resume to continue.".to_string());
+                return CommandResult::Message(
+                    "Goal paused. Use /goal resume to continue.".to_string(),
+                );
             }
             "resume" => {
                 let store = match open_goal_store() {
@@ -102,7 +110,9 @@ impl SlashCommand for GoalCommand {
                 if let Err(e) = store.set_status(session_id, claurst_core::GoalStatus::Active) {
                     return CommandResult::Error(format!("Failed to resume goal: {}", e));
                 }
-                return CommandResult::Message("Goal resumed. Claurst will continue on the next message.".to_string());
+                return CommandResult::Message(
+                    "Goal resumed. Claurst will continue on the next message.".to_string(),
+                );
             }
             "clear" => {
                 let store = match open_goal_store() {
@@ -171,12 +181,9 @@ impl SlashCommand for GoalCommand {
         };
 
         match store.set_goal(session_id, objective, token_budget) {
-            Err(claurst_core::GoalError::ObjectiveTooLong { len, max }) => {
-                CommandResult::Error(format!(
-                    "Objective too long ({} chars). Max {} chars.",
-                    len, max
-                ))
-            }
+            Err(claurst_core::GoalError::ObjectiveTooLong { len, max }) => CommandResult::Error(
+                format!("Objective too long ({} chars). Max {} chars.", len, max),
+            ),
             Err(e) => CommandResult::Error(format!("Failed to set goal: {}", e)),
             Ok(goal) => {
                 // Return UserMessage so the query loop fires immediately and the
@@ -198,9 +205,9 @@ fn goal_status(session_id: &str) -> CommandResult {
         None => return CommandResult::Error("Could not open goal store.".to_string()),
     };
     match store.get_goal(session_id) {
-        None => CommandResult::Message(
-            "No active goal. Set one with:\n  /goal <objective>".to_string(),
-        ),
+        None => {
+            CommandResult::Message("No active goal. Set one with:\n  /goal <objective>".to_string())
+        }
         Some(g) => {
             let budget_line = g
                 .budget_display()

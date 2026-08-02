@@ -11,8 +11,12 @@ pub struct UltrareviewCommand;
 
 #[async_trait]
 impl SlashCommand for UltrareviewCommand {
-    fn name(&self) -> &str { "ultrareview" }
-    fn description(&self) -> &str { "Run an exhaustive multi-dimensional code review" }
+    fn name(&self) -> &str {
+        "ultrareview"
+    }
+    fn description(&self) -> &str {
+        "Run an exhaustive multi-dimensional code review"
+    }
     fn help(&self) -> &str {
         "Usage: /ultrareview [path]\n\n\
          Runs a comprehensive code review that goes beyond /review and\n\

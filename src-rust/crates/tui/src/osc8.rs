@@ -295,8 +295,14 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         write_hits(&mut out, &hits).unwrap();
         let s = String::from_utf8(out).unwrap();
-        assert!(s.contains("\x1b]8;;https://example.com\x1b\\"), "missing OSC 8 open in: {s:?}");
-        assert!(s.contains("\x1b]8;;\x1b\\"), "missing OSC 8 close in: {s:?}");
+        assert!(
+            s.contains("\x1b]8;;https://example.com\x1b\\"),
+            "missing OSC 8 open in: {s:?}"
+        );
+        assert!(
+            s.contains("\x1b]8;;\x1b\\"),
+            "missing OSC 8 close in: {s:?}"
+        );
         assert!(s.contains("https://example.com"));
     }
 

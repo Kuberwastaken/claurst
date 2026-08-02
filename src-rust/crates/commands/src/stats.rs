@@ -67,21 +67,23 @@ fn parse_args(raw: &[&str]) -> Result<Args, String> {
         let arg = raw[i];
         match arg {
             "--days" | "-n" => {
-                let v = raw.get(i + 1).ok_or_else(|| {
-                    format!("{arg} requires a number, e.g. `--days 7`")
-                })?;
-                days = Some(v.parse::<u32>().map_err(|_| {
-                    format!("Invalid value for {arg}: {v}")
-                })?);
+                let v = raw
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{arg} requires a number, e.g. `--days 7`"))?;
+                days = Some(
+                    v.parse::<u32>()
+                        .map_err(|_| format!("Invalid value for {arg}: {v}"))?,
+                );
                 i += 2;
             }
             "--top" | "-t" => {
-                let v = raw.get(i + 1).ok_or_else(|| {
-                    format!("{arg} requires a number, e.g. `--top 10`")
-                })?;
-                top = Some(v.parse::<usize>().map_err(|_| {
-                    format!("Invalid value for {arg}: {v}")
-                })?);
+                let v = raw
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{arg} requires a number, e.g. `--top 10`"))?;
+                top = Some(
+                    v.parse::<usize>()
+                        .map_err(|_| format!("Invalid value for {arg}: {v}"))?,
+                );
                 i += 2;
             }
             "--all-projects" | "-a" => {
@@ -114,9 +116,7 @@ fn parse_args(raw: &[&str]) -> Result<Args, String> {
             "session" => {
                 session_id = positional.get(1).map(|s| s.to_string());
                 if session_id.is_none() {
-                    return Err(
-                        "Usage: claurst stats session <session-id>".to_string(),
-                    );
+                    return Err("Usage: claurst stats session <session-id>".to_string());
                 }
                 Subcommand::SessionDetail
             }
@@ -193,10 +193,7 @@ struct SessionStats {
 
 impl SessionStats {
     fn total_tokens(&self) -> u64 {
-        self.input_tokens
-            + self.output_tokens
-            + self.cache_creation_tokens
-            + self.cache_read_tokens
+        self.input_tokens + self.output_tokens + self.cache_creation_tokens + self.cache_read_tokens
     }
 
     fn duration_secs(&self) -> Option<i64> {
@@ -296,8 +293,7 @@ fn parse_jsonl_sync(path: &Path) -> Vec<TranscriptEntry> {
     };
 
     // First pass: collect tombstoned uuids.
-    let mut tombstoned: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut tombstoned: std::collections::HashSet<String> = std::collections::HashSet::new();
     for line in raw.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -308,8 +304,7 @@ fn parse_jsonl_sync(path: &Path) -> Vec<TranscriptEntry> {
         {
             continue;
         }
-        if let Ok(TranscriptEntry::Tombstone(t)) =
-            serde_json::from_str::<TranscriptEntry>(trimmed)
+        if let Ok(TranscriptEntry::Tombstone(t)) = serde_json::from_str::<TranscriptEntry>(trimmed)
         {
             tombstoned.insert(t.deleted_uuid);
         }
@@ -676,7 +671,10 @@ fn render_scope_line(agg: &Aggregated, ctx: &CommandContext) -> String {
         Some(d) => format!("last {d} day{}", if d == 1 { "" } else { "s" }),
         None => "all time".to_string(),
     };
-    format!("Scope: {scope} · {window} · {} sessions", agg.sessions.len())
+    format!(
+        "Scope: {scope} · {window} · {} sessions",
+        agg.sessions.len()
+    )
 }
 
 fn render_summary(agg: &Aggregated, ctx: &CommandContext) -> String {
@@ -782,9 +780,7 @@ fn render_summary(agg: &Aggregated, ctx: &CommandContext) -> String {
         }
     }
 
-    out.push_str(
-        "\nTry: claurst stats sessions · claurst stats tools · claurst stats daily\n",
-    );
+    out.push_str("\nTry: claurst stats sessions · claurst stats tools · claurst stats daily\n");
     out
 }
 
@@ -851,9 +847,7 @@ fn render_sessions(agg: &Aggregated, top: Option<usize>, ctx: &CommandContext) -
             ));
         }
     }
-    out.push_str(
-        "\nUse `claurst stats session <id>` to drill into a session.\n",
-    );
+    out.push_str("\nUse `claurst stats session <id>` to drill into a session.\n");
     out
 }
 
@@ -916,10 +910,7 @@ fn render_tools(agg: &Aggregated, top: Option<usize>, ctx: &CommandContext) -> S
 
     if let Some(n) = top {
         if tools.len() > n {
-            out.push_str(&format!(
-                "\n  … {} more tool(s) hidden.\n",
-                tools.len() - n
-            ));
+            out.push_str(&format!("\n  … {} more tool(s) hidden.\n", tools.len() - n));
         }
     }
     out
@@ -951,7 +942,8 @@ fn render_daily(agg: &Aggregated, ctx: &CommandContext) -> String {
         let date = if let Some(ts) = s.last_ts {
             ts.date_naive()
         } else if let Some(m) = s.mtime {
-            let secs = m.duration_since(SystemTime::UNIX_EPOCH)
+            let secs = m
+                .duration_since(SystemTime::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
             DateTime::<Utc>::from_timestamp(secs, 0)
@@ -1044,11 +1036,7 @@ fn render_daily(agg: &Aggregated, ctx: &CommandContext) -> String {
     out
 }
 
-fn render_session_detail(
-    agg: &Aggregated,
-    session_id: &str,
-    ctx: &CommandContext,
-) -> String {
+fn render_session_detail(agg: &Aggregated, session_id: &str, ctx: &CommandContext) -> String {
     let s = match agg.sessions.iter().find(|s| s.session_id == session_id) {
         Some(s) => s,
         None => {
@@ -1070,10 +1058,7 @@ fn render_session_detail(
         out.push_str(&format!("  Title:          {}\n", truncate(t, 60)));
     }
     if let Some(lp) = &s.last_prompt {
-        out.push_str(&format!(
-            "  Last prompt:    {}\n",
-            truncate(lp.trim(), 60)
-        ));
+        out.push_str(&format!("  Last prompt:    {}\n", truncate(lp.trim(), 60)));
     }
     if let Some(first) = s.first_ts {
         out.push_str(&format!(
@@ -1096,10 +1081,7 @@ fn render_session_detail(
 
     out.push_str("\nConversation\n────────────\n");
     out.push_str(&format!("  User turns:        {:>8}\n", s.user_turns));
-    out.push_str(&format!(
-        "  Assistant turns:   {:>8}\n",
-        s.assistant_turns
-    ));
+    out.push_str(&format!("  Assistant turns:   {:>8}\n", s.assistant_turns));
     out.push_str(&format!("  Tool calls:        {:>8}\n", s.tool_calls));
 
     out.push_str("\nTokens\n──────\n");
@@ -1328,13 +1310,8 @@ mod tests {
                 .to_string();
             let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
             let entries = parse_jsonl_sync(&path);
-            let mut stats = session_stats_from_entries(
-                session_id,
-                project_dir,
-                path.clone(),
-                mtime,
-                &entries,
-            );
+            let mut stats =
+                session_stats_from_entries(session_id, project_dir, path.clone(), mtime, &entries);
             if stats.last_prompt.is_none() || stats.title.is_none() {
                 let (lp, t) = read_session_tail_metadata_sync(&path);
                 if stats.last_prompt.is_none() {
@@ -1369,13 +1346,7 @@ mod tests {
                     "2024-01-15T10:00:05Z",
                 ),
                 make_user("2024-01-15T10:01:00Z"),
-                make_assistant_with_cost(
-                    200,
-                    80,
-                    0.005,
-                    &["bash"],
-                    "2024-01-15T10:01:10Z",
-                ),
+                make_assistant_with_cost(200, 80, 0.005, &["bash"], "2024-01-15T10:01:10Z"),
             ],
         )
         .await;

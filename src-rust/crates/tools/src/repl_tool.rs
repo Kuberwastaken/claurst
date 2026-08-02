@@ -107,8 +107,8 @@ async fn get_or_spawn_session(
     }
 
     // Spawn a new interpreter
-    let (cmd, args) = interpreter_for(language)
-        .ok_or_else(|| format!("Unsupported language: {}", language))?;
+    let (cmd, args) =
+        interpreter_for(language).ok_or_else(|| format!("Unsupported language: {}", language))?;
 
     let mut child = tokio::process::Command::new(cmd)
         .args(&args)
@@ -203,7 +203,9 @@ struct ReplInput {
 #[async_trait]
 impl Tool for ReplTool {
     // Gates itself: calls `ctx.check_permission` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
         "REPL"
@@ -243,11 +245,7 @@ impl Tool for ReplTool {
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
 
-        let language = params
-            .language
-            .as_deref()
-            .unwrap_or("bash")
-            .to_lowercase();
+        let language = params.language.as_deref().unwrap_or("bash").to_lowercase();
 
         // ── Security gate (issue #209) ───────────────────────────────────────
         // REPL executes arbitrary, model-supplied code in a live interpreter, so
@@ -256,7 +254,12 @@ impl Tool for ReplTool {
         // on our behalf, so we gate here.  `is_read_only = false` ensures the
         // action is treated as arbitrary execution (never auto-approved in
         // Default/Plan/AcceptEdits modes).
-        let preview: String = params.code.chars().take(80).collect::<String>().replace('\n', " ");
+        let preview: String = params
+            .code
+            .chars()
+            .take(80)
+            .collect::<String>()
+            .replace('\n', " ");
         let reason = format!("REPL ({}): {}", language, preview);
         if let Err(e) = ctx.check_permission(self.name(), &reason, false) {
             return ToolResult::error(e.to_string());

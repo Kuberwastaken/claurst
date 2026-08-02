@@ -191,8 +191,7 @@ mod tests {
 
     #[test]
     fn replace_lf_stays_lf() {
-        let (out, n) =
-            replace_preserving_eol("a\nb\nc\n", "b", "B", LineEnding::Lf, false);
+        let (out, n) = replace_preserving_eol("a\nb\nc\n", "b", "B", LineEnding::Lf, false);
         assert_eq!(out, "a\nB\nc\n");
         assert_eq!(n, 1);
     }
@@ -200,8 +199,7 @@ mod tests {
     #[test]
     fn replace_crlf_keeps_crlf_and_only_target_changes() {
         // LF-normalized old_string matches a CRLF region; every other EOL stays.
-        let (out, n) =
-            replace_preserving_eol("a\r\nb\r\nc\r\n", "b", "B", LineEnding::Crlf, false);
+        let (out, n) = replace_preserving_eol("a\r\nb\r\nc\r\n", "b", "B", LineEnding::Crlf, false);
         assert_eq!(out, "a\r\nB\r\nc\r\n");
         assert_eq!(n, 1);
     }
@@ -220,8 +218,7 @@ mod tests {
 
     #[test]
     fn replace_all_crlf() {
-        let (out, n) =
-            replace_preserving_eol("x\r\nx\r\nx\r\n", "x", "y", LineEnding::Crlf, true);
+        let (out, n) = replace_preserving_eol("x\r\nx\r\nx\r\n", "x", "y", LineEnding::Crlf, true);
         assert_eq!(out, "y\r\ny\r\ny\r\n");
         assert_eq!(n, 3);
     }

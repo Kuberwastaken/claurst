@@ -107,10 +107,7 @@ pub trait StreamParser: Send + Sync {
     async fn parse(
         &self,
         response: reqwest::Response,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
-        ProviderError,
-    >;
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -139,10 +136,8 @@ impl StreamParser for SseStreamParser {
     async fn parse(
         &self,
         _response: reqwest::Response,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
-        ProviderError,
-    > {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
+    {
         // Will be implemented in Phase 2A.
         Err(ProviderError::Other {
             provider: ProviderId::new("unknown"),
@@ -179,10 +174,8 @@ impl StreamParser for JsonLinesStreamParser {
     async fn parse(
         &self,
         _response: reqwest::Response,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
-        ProviderError,
-    > {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
+    {
         // Will be implemented in Phase 2A.
         Err(ProviderError::Other {
             provider: ProviderId::new("unknown"),
@@ -280,7 +273,10 @@ mod tests {
                 serde_json::from_str(data).expect("valid JSON regardless of split point");
             assert_eq!(v["arguments"]["q"], "café ☕");
         }
-        assert_eq!(assembled, vec!["data: {\"name\":\"search\",\"arguments\":{\"q\":\"café ☕\"}}"]);
+        assert_eq!(
+            assembled,
+            vec!["data: {\"name\":\"search\",\"arguments\":{\"q\":\"café ☕\"}}"]
+        );
     }
 
     /// Multiple complete lines that arrive together are all returned; the split

@@ -2,18 +2,16 @@
 
 use crate::figures;
 use once_cell::sync::Lazy;
-use regex::Regex;
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
+use regex::Regex;
 use unicode_width::UnicodeWidthStr;
 
 /// Regex pattern to detect URLs (http://, https://, ftp://, www.)
-static URL_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?:https?|ftp)://\S+|www\.\S+")
-        .expect("Invalid URL regex pattern")
-});
+static URL_PATTERN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?:https?|ftp)://\S+|www\.\S+").expect("Invalid URL regex pattern"));
 
 /// Regex pattern to detect email addresses
 static EMAIL_PATTERN: Lazy<Regex> = Lazy::new(|| {
@@ -286,7 +284,10 @@ fn word_wrap(text: &str, width: usize) -> Vec<String> {
     let mut current_line = String::new();
     let mut current_width = 0usize;
 
-    let push_long_word = |word: &str, result: &mut Vec<String>, current_line: &mut String, current_width: &mut usize| {
+    let push_long_word = |word: &str,
+                          result: &mut Vec<String>,
+                          current_line: &mut String,
+                          current_width: &mut usize| {
         // Hard-break a word that on its own exceeds `width` (e.g. URLs).
         if !current_line.is_empty() {
             result.push(std::mem::take(current_line));

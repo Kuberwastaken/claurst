@@ -76,7 +76,11 @@ impl FileInjectionDialogState {
 
     /// Check if all oversized items are directories.
     pub fn is_directory_only(&self) -> bool {
-        !self.oversized.is_empty() && self.oversized.iter().all(|(_, _, issue)| matches!(issue, AtFileIssue::IsDirectory))
+        !self.oversized.is_empty()
+            && self
+                .oversized
+                .iter()
+                .all(|(_, _, issue)| matches!(issue, AtFileIssue::IsDirectory))
     }
 
     /// Returns the currently-selected outcome option.
@@ -176,11 +180,18 @@ pub fn render_file_injection_dialog(
         .borders(Borders::ALL)
         .title(Line::from(vec![Span::styled(
             title,
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )]))
         .border_style(Style::default().fg(Color::Yellow))
         .style(Style::default().bg(bg))
-        .padding(Padding { left: 2, right: 2, top: 0, bottom: 0 });
+        .padding(Padding {
+            left: 2,
+            right: 2,
+            top: 0,
+            bottom: 0,
+        });
 
     let inner = block.inner(dialog_area);
     frame.render_widget(Clear, dialog_area);
@@ -192,13 +203,23 @@ pub fn render_file_injection_dialog(
 
     // Header: label + limit info
     let label_word = if is_directory {
-        if n_files == 1 { "directory" } else { "directories" }
-    } else if n_files == 1 { "file" } else { "files" }
-    ;
+        if n_files == 1 {
+            "directory"
+        } else {
+            "directories"
+        }
+    } else if n_files == 1 {
+        "file"
+    } else {
+        "files"
+    };
     let header = if is_directory {
         format!("The following {} cannot be auto-injected:", label_word)
     } else if state.limit_kb > 0 {
-        format!("The following {} is over the file size limit ({} KB):", label_word, state.limit_kb)
+        format!(
+            "The following {} is over the file size limit ({} KB):",
+            label_word, state.limit_kb
+        )
     } else {
         format!("The following {} cannot be auto-injected:", label_word)
     };
@@ -229,7 +250,9 @@ pub fn render_file_injection_dialog(
     if is_directory {
         lines.push(Line::from(vec![Span::styled(
             "  Enter or Esc to dismiss",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         )]));
     } else {
         lines.push(Line::from(vec![
@@ -239,7 +262,9 @@ pub fn render_file_injection_dialog(
             ),
             Span::styled(
                 "  ·  Esc to abort",
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
             ),
         ]));
     }
@@ -250,7 +275,6 @@ pub fn render_file_injection_dialog(
         .wrap(Wrap { trim: false })
         .render(inner, frame.buffer_mut());
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -268,7 +292,13 @@ mod tests {
     #[test]
     fn file_injection_dialog_show_sets_visible() {
         let mut state = FileInjectionDialogState::new();
-        state.show("input".to_string(), vec![], vec![("file.txt".to_string(), 100, AtFileIssue::TooLarge(100))], 100, None);
+        state.show(
+            "input".to_string(),
+            vec![],
+            vec![("file.txt".to_string(), 100, AtFileIssue::TooLarge(100))],
+            100,
+            None,
+        );
         assert!(state.visible);
         assert_eq!(state.selected, 0);
         assert!(!state.oversized.is_empty());
@@ -277,7 +307,13 @@ mod tests {
     #[test]
     fn file_injection_dialog_directory_only_defaults_to_abort() {
         let mut state = FileInjectionDialogState::new();
-        state.show("input".to_string(), vec![], vec![("dir".to_string(), 0, AtFileIssue::IsDirectory)], 0, None);
+        state.show(
+            "input".to_string(),
+            vec![],
+            vec![("dir".to_string(), 0, AtFileIssue::IsDirectory)],
+            0,
+            None,
+        );
         assert_eq!(state.current_outcome(), FileInjectionOutcome::Abort);
     }
 
@@ -355,46 +391,92 @@ mod tests {
     fn display_path_strips_cwd() {
         let mut state = FileInjectionDialogState::new();
         state.cwd = Some(PathBuf::from("/home/user/project"));
-        assert_eq!(state.display_path("/home/user/project/src/main.rs"), "src/main.rs");
+        assert_eq!(
+            state.display_path("/home/user/project/src/main.rs"),
+            "src/main.rs"
+        );
         assert_eq!(state.display_path("/other/path"), "/other/path");
     }
 
     #[test]
     fn display_path_without_cwd_returns_input_unchanged() {
         let state = FileInjectionDialogState::new(); // cwd = None
-        assert_eq!(state.display_path("/some/absolute/path.rs"), "/some/absolute/path.rs");
+        assert_eq!(
+            state.display_path("/some/absolute/path.rs"),
+            "/some/absolute/path.rs"
+        );
     }
 
     fn render_to_string(state: &FileInjectionDialogState) -> String {
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|frame| {
-            render_file_injection_dialog(frame, state, frame.area());
-        }).unwrap();
-        terminal.backend().buffer().clone().content().iter().map(|c| c.symbol().chars().next().unwrap_or(' ')).collect()
+        terminal
+            .draw(|frame| {
+                render_file_injection_dialog(frame, state, frame.area());
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .clone()
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect()
     }
 
     #[test]
     fn file_injection_dialog_renders_too_large_annotation() {
         let mut state = FileInjectionDialogState::new();
-        state.show("input".to_string(), vec![], vec![("large.rs".to_string(), 250, AtFileIssue::TooLarge(250))], 100, None);
+        state.show(
+            "input".to_string(),
+            vec![],
+            vec![("large.rs".to_string(), 250, AtFileIssue::TooLarge(250))],
+            100,
+            None,
+        );
         let content = render_to_string(&state);
-        assert!(content.contains("too large"), "Expected '(too large)' annotation in rendered output");
+        assert!(
+            content.contains("too large"),
+            "Expected '(too large)' annotation in rendered output"
+        );
     }
 
     #[test]
     fn file_injection_dialog_renders_unreadable_annotation() {
         let mut state = FileInjectionDialogState::new();
-        state.show("input".to_string(), vec![], vec![("secret.rs".to_string(), 0, AtFileIssue::Unreadable("Permission denied".to_string()))], 0, None);
+        state.show(
+            "input".to_string(),
+            vec![],
+            vec![(
+                "secret.rs".to_string(),
+                0,
+                AtFileIssue::Unreadable("Permission denied".to_string()),
+            )],
+            0,
+            None,
+        );
         let content = render_to_string(&state);
-        assert!(content.contains("unreadable"), "Expected '(unreadable: ...)' annotation in rendered output");
+        assert!(
+            content.contains("unreadable"),
+            "Expected '(unreadable: ...)' annotation in rendered output"
+        );
     }
 
     #[test]
     fn file_injection_dialog_hint_uses_anyway_not_anyways() {
         let mut state = FileInjectionDialogState::new();
-        state.show("input".to_string(), vec![], vec![("file.rs".to_string(), 250, AtFileIssue::TooLarge(250))], 100, None);
+        state.show(
+            "input".to_string(),
+            vec![],
+            vec![("file.rs".to_string(), 250, AtFileIssue::TooLarge(250))],
+            100,
+            None,
+        );
         let content = render_to_string(&state);
-        assert!(!content.contains("anyways"), "Should use 'anyway' not 'anyways'");
+        assert!(
+            !content.contains("anyways"),
+            "Should use 'anyway' not 'anyways'"
+        );
         assert!(content.contains("anyway"), "Expected 'anyway' in hint text");
     }
 }

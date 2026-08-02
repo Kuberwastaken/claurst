@@ -18,8 +18,8 @@ use crate::error_handling::parse_error_response;
 use crate::provider::{LlmProvider, ModelInfo};
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
-    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus,
-    StreamEvent, SystemPromptStyle,
+    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StreamEvent,
+    SystemPromptStyle,
 };
 
 // Re-use the message transformation helpers from openai.rs.
@@ -32,8 +32,12 @@ use super::request_options::merge_openai_compatible_options;
 
 /// Provider-specific behavioural quirks that alter how the generic adapter
 /// builds and interprets requests/responses.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ProviderQuirks {
+    /// Whether this provider supports SSE streaming.  Default: `true`.
+    /// When `false`, the query engine falls back to non-streaming requests.
+    pub streaming: bool,
+
     /// Truncate tool call IDs to at most this many characters before sending.
     /// For example, Mistral requires tool IDs of at most 9 characters.
     pub tool_id_max_len: Option<usize>,
@@ -93,6 +97,26 @@ pub struct ProviderQuirks {
     /// Native LM Studio host used to discover loaded model instances and their
     /// configured context lengths from `/api/v1/models`.
     pub lm_studio_native_host: Option<String>,
+}
+
+impl Default for ProviderQuirks {
+    fn default() -> Self {
+        Self {
+            streaming: true,
+            tool_id_max_len: None,
+            tool_id_alphanumeric_only: false,
+            overflow_patterns: Vec::new(),
+            include_usage_in_stream: false,
+            default_temperature: None,
+            fix_tool_user_sequence: false,
+            reasoning_field: None,
+            requires_reasoning_roundtrip: false,
+            max_tokens_cap: None,
+            no_api_key_required: false,
+            ollama_native_host: None,
+            lm_studio_native_host: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -171,11 +195,7 @@ impl OpenAiCompatProvider {
     }
 
     /// Append a custom header sent on every request.
-    pub fn with_header(
-        mut self,
-        name: impl Into<String>,
-        value: impl Into<String>,
-    ) -> Self {
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.extra_headers.push((name.into(), value.into()));
         self
     }
@@ -191,9 +211,7 @@ impl OpenAiCompatProvider {
     /// Keep any native API host in sync with the OpenAI-compatible base URL.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
-        if self.quirks.ollama_native_host.is_some()
-            || self.quirks.lm_studio_native_host.is_some()
-        {
+        if self.quirks.ollama_native_host.is_some() || self.quirks.lm_studio_native_host.is_some() {
             let native_host = self
                 .base_url
                 .trim_end_matches('/')
@@ -266,20 +284,11 @@ impl OpenAiCompatProvider {
     fn apply_fix_tool_user_sequence(messages: &mut Vec<Value>) {
         let mut i = 0;
         while i + 1 < messages.len() {
-            let current_is_tool = messages[i]
-                .get("role")
-                .and_then(|v| v.as_str())
-                == Some("tool");
-            let next_is_user = messages[i + 1]
-                .get("role")
-                .and_then(|v| v.as_str())
-                == Some("user");
+            let current_is_tool = messages[i].get("role").and_then(|v| v.as_str()) == Some("tool");
+            let next_is_user = messages[i + 1].get("role").and_then(|v| v.as_str()) == Some("user");
 
             if current_is_tool && next_is_user {
-                messages.insert(
-                    i + 1,
-                    json!({ "role": "assistant", "content": "Done." }),
-                );
+                messages.insert(i + 1, json!({ "role": "assistant", "content": "Done." }));
                 i += 2; // skip past the inserted message and the user message
             } else {
                 i += 1;
@@ -306,11 +315,7 @@ impl OpenAiCompatProvider {
         // Only providers with requires_reasoning_roundtrip=true need this.
         if self.quirks.requires_reasoning_roundtrip {
             if let Some(ref field) = self.quirks.reasoning_field {
-                Self::inject_reasoning_for_tool_turns(
-                    &mut messages,
-                    &request.messages,
-                    field,
-                );
+                Self::inject_reasoning_for_tool_turns(&mut messages, &request.messages, field);
             }
         }
 
@@ -380,8 +385,7 @@ impl OpenAiCompatProvider {
             if reasoning_idx >= reasoning_texts.len() {
                 break;
             }
-            let is_assistant =
-                msg.get("role").and_then(|r| r.as_str()) == Some("assistant");
+            let is_assistant = msg.get("role").and_then(|r| r.as_str()) == Some("assistant");
             let has_tool_calls = msg
                 .get("tool_calls")
                 .and_then(|tc| tc.as_array())
@@ -407,8 +411,7 @@ impl OpenAiCompatProvider {
     /// validation while preserving semantics.
     fn ensure_content_not_null(messages: &mut [Value]) {
         for msg in messages.iter_mut() {
-            let is_assistant =
-                msg.get("role").and_then(|r| r.as_str()) == Some("assistant");
+            let is_assistant = msg.get("role").and_then(|r| r.as_str()) == Some("assistant");
             if !is_assistant {
                 continue;
             }
@@ -429,10 +432,7 @@ impl OpenAiCompatProvider {
     }
 
     /// Attach the authorization header if an API key is configured.
-    fn apply_auth(
-        &self,
-        builder: reqwest::RequestBuilder,
-    ) -> reqwest::RequestBuilder {
+    fn apply_auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if let Some(key) = &self.api_key {
             builder.header("Authorization", format!("Bearer {}", key))
         } else {
@@ -441,10 +441,7 @@ impl OpenAiCompatProvider {
     }
 
     /// Attach all configured extra headers.
-    fn apply_extra_headers(
-        &self,
-        mut builder: reqwest::RequestBuilder,
-    ) -> reqwest::RequestBuilder {
+    fn apply_extra_headers(&self, mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         for (name, value) in &self.extra_headers {
             builder = builder.header(name.as_str(), value.as_str());
         }
@@ -522,13 +519,12 @@ impl OpenAiCompatProvider {
             return Err(self.map_http_error(status, &text));
         }
 
-        let json: Value =
-            serde_json::from_str(&text).map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("Failed to parse response JSON: {}", e),
-                status: Some(status),
-                body: Some(text.clone()),
-            })?;
+        let json: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Other {
+            provider: self.id.clone(),
+            message: format!("Failed to parse response JSON: {}", e),
+            status: Some(status),
+            body: Some(text.clone()),
+        })?;
 
         OpenAiProvider::parse_non_streaming_response_pub(&json, &self.id)
     }
@@ -619,14 +615,17 @@ impl OpenAiCompatProvider {
     ) -> Result<Vec<ModelInfo>, ProviderError> {
         let tags_url = format!("{}/api/tags", ollama_host.trim_end_matches('/'));
 
-        let resp = self.http_client.get(&tags_url).send().await.map_err(|e| {
-            ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("Ollama /api/tags request failed: {}", e),
-                status: None,
-                body: None,
-            }
-        })?;
+        let resp =
+            self.http_client
+                .get(&tags_url)
+                .send()
+                .await
+                .map_err(|e| ProviderError::Other {
+                    provider: self.id.clone(),
+                    message: format!("Ollama /api/tags request failed: {}", e),
+                    status: None,
+                    body: None,
+                })?;
 
         let status = resp.status().as_u16();
         let text = resp.text().await.map_err(|e| ProviderError::Other {
@@ -724,10 +723,7 @@ impl OpenAiCompatProvider {
                 if !seen.insert(instance.id.clone()) {
                     continue;
                 }
-                let context_window = instance
-                    .config
-                    .context_length
-                    .unwrap_or(max_context);
+                let context_window = instance.config.context_length.unwrap_or(max_context);
                 discovered.push(ModelInfo {
                     id: ModelId::new(instance.id),
                     provider_id: provider_id.clone(),
@@ -775,10 +771,7 @@ impl OpenAiCompatProvider {
         // Extract parameter size from model_info.
         let param_size = json
             .get("model_info")
-            .and_then(|mi| {
-                mi.get("general.parameter_count")
-                    .and_then(|v| v.as_u64())
-            })
+            .and_then(|mi| mi.get("general.parameter_count").and_then(|v| v.as_u64()))
             .unwrap_or(0);
 
         // Extract num_ctx from the modelfile parameters or model_info.
@@ -793,9 +786,7 @@ impl OpenAiCompatProvider {
             .get("model_info")
             .and_then(|mi| mi.get("general.basename").and_then(|v| v.as_str()))
             .unwrap_or("");
-        let is_coder = is_coder_by_name
-            || family.contains("code")
-            || family.contains("coder");
+        let is_coder = is_coder_by_name || family.contains("code") || family.contains("coder");
 
         (num_ctx, max_output, is_coder, param_size)
     }
@@ -1020,10 +1011,7 @@ impl LlmProvider for OpenAiCompatProvider {
             return self.discover_models_ollama_native(ollama_host).await;
         }
         if let Some(ref lm_studio_host) = self.quirks.lm_studio_native_host {
-            if let Some(models) = self
-                .discover_models_lm_studio_native(lm_studio_host)
-                .await
-            {
+            if let Some(models) = self.discover_models_lm_studio_native(lm_studio_host).await {
                 return Ok(models);
             }
         }
@@ -1052,13 +1040,12 @@ impl LlmProvider for OpenAiCompatProvider {
             return Err(self.map_http_error(status, &text));
         }
 
-        let json: Value =
-            serde_json::from_str(&text).map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("Failed to parse models JSON: {}", e),
-                status: Some(status),
-                body: Some(text),
-            })?;
+        let json: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Other {
+            provider: self.id.clone(),
+            message: format!("Failed to parse models JSON: {}", e),
+            status: Some(status),
+            body: Some(text),
+        })?;
 
         let data = match json.get("data").and_then(|d| d.as_array()) {
             Some(d) => d,
@@ -1076,9 +1063,8 @@ impl LlmProvider for OpenAiCompatProvider {
                     name: id.to_string(),
                     context_window: match id {
                         "gpt-5" | "gpt-5.4" | "gpt-5.2" | "gpt-5-mini" | "gpt-5-nano"
-                        | "gpt-5-chat-latest"
-                        | "gpt-5.2-codex" | "gpt-5.1-codex" | "gpt-5.1-codex-mini"
-                        | "gpt-5.1-codex-max" => 400_000,
+                        | "gpt-5-chat-latest" | "gpt-5.2-codex" | "gpt-5.1-codex"
+                        | "gpt-5.1-codex-mini" | "gpt-5.1-codex-max" => 400_000,
                         "o3" | "o3-mini" | "o4-mini" => 200_000,
                         _ => 128_000,
                     },
@@ -1141,7 +1127,7 @@ impl LlmProvider for OpenAiCompatProvider {
 
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
-            streaming: true,
+            streaming: self.quirks.streaming,
             tool_calling: true,
             thinking: self.quirks.reasoning_field.is_some(),
             image_input: true,
