@@ -4,12 +4,12 @@
 // in a single scrollable list with live search filtering.
 // Changes are persisted via Settings::save_sync() or settings.json writes.
 
-use claurst_core::config::{Config, Settings};
-use claurst_core::output_styles::{builtin_styles, find_style};
 use crate::overlays::{
     centered_rect, modal_search_line, render_dark_overlay, render_dialog_bg, CLAURST_ACCENT,
     CLAURST_MUTED, CLAURST_PANEL_BG,
 };
+use claurst_core::config::{Config, Settings};
+use claurst_core::output_styles::{builtin_styles, find_style};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -72,6 +72,7 @@ pub struct SettingsScreen {
     pub file_autocomplete_limit: String,
     pub file_autocomplete_show_hidden_files: bool,
     pub file_injection_max_size: String,
+    pub auto_poke_enabled: bool,
 }
 
 impl SettingsScreen {
@@ -106,6 +107,7 @@ impl SettingsScreen {
             file_autocomplete_limit: "15".to_string(),
             file_autocomplete_show_hidden_files: false,
             file_injection_max_size: "100".to_string(),
+            auto_poke_enabled: false,
         };
         // Apply settings from snapshot immediately on initialization
         screen.apply_settings_from_snapshot();
@@ -118,7 +120,12 @@ impl SettingsScreen {
         self.auto_compact = self.settings_snapshot.auto_compact;
         self.notifications = self.settings_snapshot.notifications;
         self.show_turn_duration = self.settings_snapshot.show_turn_duration;
-        self.output_style = self.settings_snapshot.config.output_style.clone().unwrap_or_else(|| "default".to_string());
+        self.output_style = self
+            .settings_snapshot
+            .config
+            .output_style
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
         self.reduce_motion = self.settings_snapshot.reduce_motion;
         self.terminal_progress_bar = self.settings_snapshot.terminal_progress_bar;
         self.verbose = self.settings_snapshot.config.verbose;
@@ -136,9 +143,21 @@ impl SettingsScreen {
         };
         self.disable_claude_mds = self.settings_snapshot.config.disable_claude_mds;
         self.file_injection_enabled = self.settings_snapshot.config.file_injection_enabled;
-        self.file_autocomplete_limit = self.settings_snapshot.config.file_autocomplete_limit.to_string();
-        self.file_autocomplete_show_hidden_files = self.settings_snapshot.config.file_autocomplete_show_hidden_files;
-        self.file_injection_max_size = self.settings_snapshot.config.file_injection_max_size.to_string();
+        self.file_autocomplete_limit = self
+            .settings_snapshot
+            .config
+            .file_autocomplete_limit
+            .to_string();
+        self.file_autocomplete_show_hidden_files = self
+            .settings_snapshot
+            .config
+            .file_autocomplete_show_hidden_files;
+        self.file_injection_max_size = self
+            .settings_snapshot
+            .config
+            .file_injection_max_size
+            .to_string();
+        self.auto_poke_enabled = self.settings_snapshot.auto_poke_enabled;
     }
 
     pub fn open(&mut self) {
@@ -390,6 +409,13 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
             kind: SettingKind::Bool,
             value: if screen.file_injection_enabled { "true" } else { "false" }.to_string(),
         },
+        SettingsEntry {
+            key: "auto_poke_enabled",
+            label: "Auto-poke",
+            description: "Automatically continue when todos are incomplete.",
+            kind: SettingKind::Bool,
+            value: if screen.auto_poke_enabled { "true" } else { "false" }.to_string(),
+        },
     ];
 
     // Only show these if file injection is enabled
@@ -406,7 +432,12 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
             label: "Show hidden files",
             description: "Include hidden files (.) in @ autocomplete.",
             kind: SettingKind::Bool,
-            value: if screen.file_autocomplete_show_hidden_files { "true" } else { "false" }.to_string(),
+            value: if screen.file_autocomplete_show_hidden_files {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
         });
         entries.push(SettingsEntry {
             key: "fileInjectionMaxSize",
@@ -432,8 +463,12 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
     render_dark_overlay(frame, area);
 
     // 80% width, 90% height, centred
-    let w = (area.width * 4 / 5).max(60).min(area.width.saturating_sub(2));
-    let h = (area.height * 9 / 10).max(20).min(area.height.saturating_sub(2));
+    let w = (area.width * 4 / 5)
+        .max(60)
+        .min(area.width.saturating_sub(2));
+    let h = (area.height * 9 / 10)
+        .max(20)
+        .min(area.height.saturating_sub(2));
     let popup = centered_rect(w, h, area);
     render_dialog_bg(frame, popup);
 
@@ -470,26 +505,51 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
 
     // Header
     let title = Line::from(vec![
-        Span::styled(" Settings", Style::default().fg(CLAURST_ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " Settings",
+            Style::default()
+                .fg(CLAURST_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" — Claurst", Style::default().fg(CLAURST_MUTED)),
         Span::styled(
-            format!("{:>width$}", "Esc close", width = inner.width.saturating_sub(19) as usize),
+            format!(
+                "{:>width$}",
+                "Esc close",
+                width = inner.width.saturating_sub(19) as usize
+            ),
             Style::default().fg(CLAURST_MUTED),
         ),
     ]);
-    frame.render_widget(Paragraph::new(title).style(Style::default().bg(CLAURST_PANEL_BG)), header_area);
+    frame.render_widget(
+        Paragraph::new(title).style(Style::default().bg(CLAURST_PANEL_BG)),
+        header_area,
+    );
 
     // Search
-    let search_line = modal_search_line(&screen.search_query, "Type to search settings...", Color::DarkGray, CLAURST_ACCENT);
-    frame.render_widget(Paragraph::new(search_line).style(Style::default().bg(CLAURST_PANEL_BG)), search_area);
+    let search_line = modal_search_line(
+        &screen.search_query,
+        "Type to search settings...",
+        Color::DarkGray,
+        CLAURST_ACCENT,
+    );
+    frame.render_widget(
+        Paragraph::new(search_line).style(Style::default().bg(CLAURST_PANEL_BG)),
+        search_area,
+    );
 
     // Content
     render_settings_list(frame, screen, content_area);
 
     // Description of selected entry
     let all = all_entries(screen);
-    let filtered: Vec<_> = all.iter()
-        .filter(|e| e.label.to_lowercase().contains(&screen.search_query.to_lowercase()))
+    let filtered: Vec<_> = all
+        .iter()
+        .filter(|e| {
+            e.label
+                .to_lowercase()
+                .contains(&screen.search_query.to_lowercase())
+        })
         .collect();
 
     let desc_text = if let Some(entry) = filtered.get(screen.selected_idx) {
@@ -498,9 +558,16 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
             let mut lines = vec![entry.description.to_string(), String::new()];
 
             let all_styles = builtin_styles();
-            let current_style_name = if screen.output_style.is_empty() { "default" } else { &screen.output_style };
+            let current_style_name = if screen.output_style.is_empty() {
+                "default"
+            } else {
+                &screen.output_style
+            };
             if let Some(current_style) = find_style(&all_styles, current_style_name) {
-                lines.push(format!("Current: {} — {}", current_style.label, current_style.description));
+                lines.push(format!(
+                    "Current: {} — {}",
+                    current_style.label, current_style.description
+                ));
                 lines.push(String::new());
             }
 
@@ -524,18 +591,43 @@ pub fn render_settings_screen(frame: &mut Frame, screen: &SettingsScreen, area: 
     // Footer
     let footer = if screen.edit_field.is_some() {
         Line::from(vec![
-            Span::styled(" Enter ", Style::default().fg(CLAURST_ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " Enter ",
+                Style::default()
+                    .fg(CLAURST_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("save  "),
-            Span::styled(" Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " Esc ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("cancel"),
         ])
     } else {
         Line::from(vec![
-            Span::styled(" ↑↓ ", Style::default().fg(CLAURST_ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " ↑↓ ",
+                Style::default()
+                    .fg(CLAURST_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("navigate  "),
-            Span::styled(" Enter ", Style::default().fg(CLAURST_ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " Enter ",
+                Style::default()
+                    .fg(CLAURST_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("toggle/edit  "),
-            Span::styled(" Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " Esc ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("close"),
         ])
     };
@@ -551,11 +643,16 @@ fn render_settings_list(frame: &mut Frame, screen: &SettingsScreen, area: Rect) 
     // Filter entries by search query
     let filtered: Vec<_> = all
         .iter()
-        .filter(|e| e.label.to_lowercase().contains(&screen.search_query.to_lowercase()))
+        .filter(|e| {
+            e.label
+                .to_lowercase()
+                .contains(&screen.search_query.to_lowercase())
+        })
         .collect();
 
     if filtered.is_empty() {
-        let para = Paragraph::new("No settings match your search.").style(Style::default().fg(Color::DarkGray));
+        let para = Paragraph::new("No settings match your search.")
+            .style(Style::default().fg(Color::DarkGray));
         frame.render_widget(para, area);
         return;
     }
@@ -572,7 +669,7 @@ fn render_settings_list(frame: &mut Frame, screen: &SettingsScreen, area: Rect) 
 
         // Show edit value if currently editing this field, otherwise show the entry value
         let value_str = if screen.edit_field.as_deref() == Some(entry.key) && is_selected {
-            format!("{}_ ", screen.edit_value)  // Add cursor indicator
+            format!("{}_ ", screen.edit_value) // Add cursor indicator
         } else {
             entry.value.clone()
         };
@@ -669,7 +766,11 @@ pub fn handle_settings_key(
             let all = all_entries(screen);
             let filtered: Vec<_> = all
                 .iter()
-                .filter(|e| e.label.to_lowercase().contains(&screen.search_query.to_lowercase()))
+                .filter(|e| {
+                    e.label
+                        .to_lowercase()
+                        .contains(&screen.search_query.to_lowercase())
+                })
                 .collect();
             screen.select_next(filtered.len());
             update_scroll_offset_for_selection(screen);
@@ -695,7 +796,11 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen) {
     let all = all_entries(screen);
     let filtered: Vec<_> = all
         .iter()
-        .filter(|e| e.label.to_lowercase().contains(&screen.search_query.to_lowercase()))
+        .filter(|e| {
+            e.label
+                .to_lowercase()
+                .contains(&screen.search_query.to_lowercase())
+        })
         .collect();
 
     if let Some(entry) = filtered.get(screen.selected_idx) {
@@ -762,7 +867,8 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen) {
                     }
                     "auto_commits" => {
                         screen.auto_commits = new_value;
-                        screen.settings_snapshot.config.auto_commits = if new_value { Some(true) } else { None };
+                        screen.settings_snapshot.config.auto_commits =
+                            if new_value { Some(true) } else { None };
                         let _ = screen.settings_snapshot.save_sync();
                     }
                     "disable_claude_mds" => {
@@ -777,7 +883,15 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen) {
                     }
                     "fileAutocompleteShowHiddenFiles" => {
                         screen.file_autocomplete_show_hidden_files = new_value;
-                        screen.settings_snapshot.config.file_autocomplete_show_hidden_files = new_value;
+                        screen
+                            .settings_snapshot
+                            .config
+                            .file_autocomplete_show_hidden_files = new_value;
+                        let _ = screen.settings_snapshot.save_sync();
+                    }
+                    "auto_poke_enabled" => {
+                        screen.auto_poke_enabled = new_value;
+                        screen.settings_snapshot.auto_poke_enabled = new_value;
                         let _ = screen.settings_snapshot.save_sync();
                     }
                     _ => {}
@@ -836,8 +950,16 @@ mod tests {
         let screen = SettingsScreen::new();
         let entries = all_entries(&screen);
         // Base settings are always present, plus 0-3 conditional file injection settings
-        assert!(entries.len() >= 16, "Should have at least 16 editable settings, got {}", entries.len());
-        assert!(entries.len() <= 20, "Should have at most 20 editable settings, got {}", entries.len());
+        assert!(
+            entries.len() >= 16,
+            "Should have at least 16 editable settings, got {}",
+            entries.len()
+        );
+        assert!(
+            entries.len() <= 22,
+            "Should have at most 22 editable settings, got {}",
+            entries.len()
+        );
     }
 
     #[test]
@@ -848,7 +970,11 @@ mod tests {
             .iter()
             .filter(|e| e.label.to_lowercase().contains("token"))
             .collect();
-        assert_eq!(filtered.len(), 1, "Should find exactly 1 entry matching 'token'");
+        assert_eq!(
+            filtered.len(),
+            1,
+            "Should find exactly 1 entry matching 'token'"
+        );
         assert_eq!(filtered[0].label, "Max Tokens");
     }
 

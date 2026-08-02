@@ -1138,6 +1138,108 @@ impl SlashCommand for NamedCommandAdapter {
 }
 
 // ---------------------------------------------------------------------------
+// /autopoke — toggle auto-poke on/off
+// ---------------------------------------------------------------------------
+
+pub struct AutopokeCommand;
+
+#[async_trait]
+impl SlashCommand for AutopokeCommand {
+    fn name(&self) -> &str {
+        "autopoke"
+    }
+    fn description(&self) -> &str {
+        "Toggle auto-poke on or off"
+    }
+    fn help(&self) -> &str {
+        "Usage: /autopoke [on|off]\n\n\
+         Without arguments: shows current auto-poke status.\n\n\
+         /autopoke on   — enable auto-poke (default)\n\
+         /autopoke off  — disable auto-poke"
+    }
+
+    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
+        let args = args.trim();
+        if args.is_empty() {
+            let settings = claurst_core::Settings::load_sync().unwrap_or_default();
+            let status = if settings.auto_poke_enabled { "on" } else { "off" };
+            return CommandResult::Message(format!("Auto-poke is currently {status}."));
+        }
+        let enabled = match args {
+            "on" | "true" | "yes" => true,
+            "off" | "false" | "no" => false,
+            _ => return CommandResult::Message("Usage: /autopoke [on|off]".to_string()),
+        };
+        if let Ok(mut settings) = claurst_core::Settings::load_sync() {
+            settings.auto_poke_enabled = enabled;
+            let _ = settings.save_sync();
+        }
+        let status = if enabled { "enabled" } else { "disabled" };
+        CommandResult::Message(format!("Auto-poke {status}."))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /todos — todo list status + auto-poke toggle
+// ---------------------------------------------------------------------------
+
+pub struct TodosCommand;
+
+#[async_trait]
+impl SlashCommand for TodosCommand {
+    fn name(&self) -> &str { "todos" }
+    fn description(&self) -> &str { "Show todo list status and toggle inline card" }
+    fn help(&self) -> &str {
+        "Usage: /todos [auto-poke on|off]\n\n\
+         Without arguments: toggles the inline todo card in the transcript.\n\n\
+         /todos auto-poke on   — enable auto-poke (default)\n\
+         /todos auto-poke off  — disable auto-poke"
+    }
+
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let args = args.trim();
+        if args.starts_with("auto-poke") {
+            let parts: Vec<&str> = args.split_whitespace().collect();
+            if parts.len() < 2 {
+                return CommandResult::Message("Usage: /todos auto-poke on|off".to_string());
+            }
+            let enabled = match parts[1] {
+                "on" | "true" | "yes" => true,
+                "off" | "false" | "no" => false,
+                _ => return CommandResult::Message("Usage: /todos auto-poke on|off".to_string()),
+            };
+            // Update settings.
+            if let Ok(mut settings) = claurst_core::Settings::load_sync() {
+                settings.auto_poke_enabled = enabled;
+                let _ = settings.save_sync();
+            }
+            return CommandResult::Message(format!(
+                "Auto-poke {}.",
+                if enabled { "enabled" } else { "disabled" }
+            ));
+        }
+
+        // Show current todo status.
+        let todos = claurst_tools::todo_write::load_todos(&ctx.session_id);
+        if todos.is_empty() {
+            return CommandResult::Message("No todos for this session.".to_string());
+        }
+        let total = todos.len();
+        let completed = todos.iter().filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("completed")).count();
+        let in_progress = todos.iter().filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("in_progress")).count();
+        let pending = total - completed - in_progress;
+        let mut output = format!("Todos: {} total — {} pending, {} in_progress, {} completed\n\n", total, pending, in_progress, completed);
+        for t in &todos {
+            let status = t.get("status").and_then(|s| s.as_str()).unwrap_or("?");
+            let content = t.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            let icon = match status { "pending" => "[ ]", "in_progress" => "[~]", "completed" => "[x]", _ => "[?]" };
+            output.push_str(&format!("{} {}\n", icon, content));
+        }
+        CommandResult::Message(output)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
@@ -1318,6 +1420,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         // Multi-provider support
         Box::new(ProvidersCommand),
         Box::new(ConnectCommand),
+        Box::new(AddCustomProviderCommand),
         // Named agent system
         Box::new(AgentCommand),
         // Session search (SQLite)
@@ -1329,6 +1432,8 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         // Session navigation ported from opencode: /new (lazy home) + /move.
         Box::new(NewCommand),
         Box::new(MoveCommand),
+        // Todo management
+        Box::new(TodosCommand),
     ]
 }
 

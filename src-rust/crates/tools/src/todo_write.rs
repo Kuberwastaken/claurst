@@ -139,33 +139,28 @@ struct TodoItem {
     #[serde(default)]
     #[allow(dead_code)]
     priority: Option<String>,
-    /// Optional 0-100 estimate of the evidence that this task can be
-    /// completed correctly.
-    #[serde(default, deserialize_with = "deserialize_confidence")]
+    // --- NEW FIELDS ---
+    #[serde(default)]
+    #[allow(dead_code)]
+    group: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
     confidence: Option<u8>,
-    /// Optional 0-100 estimate recorded when a task is completed.
-    #[serde(default, deserialize_with = "deserialize_confidence")]
+    #[serde(default)]
+    #[allow(dead_code)]
     completion_confidence: Option<u8>,
-}
-
-fn deserialize_confidence<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Value::deserialize(deserializer)?;
-    let score = match value {
-        Value::Null => return Ok(None),
-        Value::Number(number) => number.as_f64(),
-        Value::String(raw) if raw.trim().is_empty() => return Ok(None),
-        Value::String(raw) => raw.trim().parse::<f64>().ok(),
-        _ => None,
-    };
-    let score = score
-        .filter(|score| {
-            score.is_finite() && score.fract() == 0.0 && (0.0..=100.0).contains(score)
-        })
-        .ok_or_else(|| serde::de::Error::custom("confidence must be an integer from 0 to 100"))?;
-    Ok(Some(score as u8))
+    #[serde(default)]
+    #[allow(dead_code)]
+    confidence_history: Vec<u8>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    blocked_by: Vec<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    assigned_to: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    force_reopen: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -182,23 +177,25 @@ where
 /// Forbidden:
 ///   completed   → anything      ✗  (completed tasks cannot be reopened)
 ///   in_progress → pending       ✗  (cannot move backwards)
-fn validate_transition(id: &str, old: &TodoStatus, new: &TodoStatus) -> Result<(), String> {
+fn validate_transition(
+    id: &str,
+    old: &TodoStatus,
+    new: &TodoStatus,
+    force_reopen: bool,
+) -> Result<(), String> {
     if old == new {
         return Ok(());
     }
     match (old, new) {
-        // Completed tasks are immutable.
-        (TodoStatus::Completed, _) => Err(format!(
-            "Task {:?}: cannot change status of a completed task (currently \"completed\" → \"{}\").",
+        (TodoStatus::Completed, _) if !force_reopen => Err(format!(
+            "Task {:?}: cannot change status of a completed task (currently \"completed\" → \"{}\"). Use force_reopen: true if poke verification found a false completion.",
             id, new
         )),
-        // Cannot move in_progress backwards to pending.
+        (TodoStatus::Completed, _) if force_reopen => Ok(()), // Force reopen allowed
         (TodoStatus::InProgress, TodoStatus::Pending) => Err(format!(
             "Task {:?}: cannot move status backwards (\"in_progress\" → \"pending\").",
             id
         )),
-        // All other transitions (pending→in_progress, pending→completed,
-        // in_progress→completed) are valid.
         _ => Ok(()),
     }
 }
@@ -216,8 +213,7 @@ impl Tool for TodoWriteTool {
     fn description(&self) -> &str {
         "Write and manage a todo/task list. Provide the complete list of todos \
          each time (this replaces the entire list). Use this to track progress \
-         on multi-step tasks. Each item may include a confidence percentage from \
-         0 to 100, plus a completion_confidence percentage when completed."
+         on multi-step tasks."
     }
 
     fn permission_level(&self) -> PermissionLevel {
@@ -240,18 +236,13 @@ impl Tool for TodoWriteTool {
                                 "enum": ["pending", "in_progress", "completed"]
                             },
                             "priority": { "type": "string" },
-                            "confidence": {
-                                "type": "integer",
-                                "minimum": 0,
-                                "maximum": 100,
-                                "description": "Optional confidence percentage that this task can be completed correctly."
-                            },
-                            "completion_confidence": {
-                                "type": "integer",
-                                "minimum": 0,
-                                "maximum": 100,
-                                "description": "Optional confidence percentage recorded when this task is completed."
-                            }
+                            "group": { "type": "string" },
+                            "confidence": { "type": "integer", "minimum": 0, "maximum": 100 },
+                            "completion_confidence": { "type": "integer", "minimum": 0, "maximum": 100 },
+                            "confidence_history": { "type": "array", "items": { "type": "integer" } },
+                            "blocked_by": { "type": "array", "items": { "type": "string" } },
+                            "assigned_to": { "type": "string" },
+                            "force_reopen": { "type": "boolean" }
                         },
                         "required": ["id", "content", "status"]
                     },
@@ -307,11 +298,12 @@ impl Tool for TodoWriteTool {
             match existing.get(item.id.as_str()) {
                 Some(old_status) => {
                     // Existing task — validate the transition.
-                    if let Err(e) = validate_transition(&item.id, old_status, &item.status) {
+                    if let Err(e) =
+                        validate_transition(&item.id, old_status, &item.status, item.force_reopen)
+                    {
                         return ToolResult::error(e);
                     }
-                    if old_status != &TodoStatus::Completed
-                        && item.status == TodoStatus::Completed
+                    if old_status != &TodoStatus::Completed && item.status == TodoStatus::Completed
                     {
                         newly_completed_ids.insert(&item.id);
                     }
@@ -350,12 +342,6 @@ impl Tool for TodoWriteTool {
                 TodoStatus::Completed => "[x]",
             };
             output.push_str(&format!("{} {} ({})\n", icon, item.content, item.id));
-            if let Some(confidence) = item.confidence {
-                output.push_str(&format!("    confidence: {}%\n", confidence));
-            }
-            if let Some(confidence) = item.completion_confidence {
-                output.push_str(&format!("    completion confidence: {}%\n", confidence));
-            }
         }
 
         // --- 6. Persist to disk ----------------------------------------------
@@ -371,11 +357,34 @@ impl Tool for TodoWriteTool {
                 if let Some(ref p) = t.priority {
                     obj["priority"] = json!(p);
                 }
-                if let Some(confidence) = t.confidence {
-                    obj["confidence"] = json!(confidence);
+                if let Some(ref g) = t.group {
+                    obj["group"] = json!(g);
                 }
-                if let Some(confidence) = t.completion_confidence {
-                    obj["completion_confidence"] = json!(confidence);
+                if let Some(c) = t.confidence {
+                    obj["confidence"] = json!(c);
+                }
+                if let Some(c) = t.completion_confidence {
+                    obj["completion_confidence"] = json!(c);
+                }
+                if !t.confidence_history.is_empty() {
+                    // Cap at 20 entries (ring buffer).
+                    let history: Vec<u8> = t
+                        .confidence_history
+                        .iter()
+                        .rev()
+                        .take(20)
+                        .copied()
+                        .collect::<Vec<u8>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    obj["confidence_history"] = json!(history);
+                }
+                if !t.blocked_by.is_empty() {
+                    obj["blocked_by"] = json!(t.blocked_by);
+                }
+                if let Some(ref a) = t.assigned_to {
+                    obj["assigned_to"] = json!(a);
                 }
                 obj
             })
@@ -419,6 +428,107 @@ impl Tool for TodoWriteTool {
             "pending": pending,
         }))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-poke mechanism (ported from jcode)
+// ---------------------------------------------------------------------------
+
+/// Build the synthetic continuation message sent when the model stops with
+/// incomplete todos. The message instructs the model to continue working.
+pub fn build_auto_poke_message(incomplete_count: usize) -> String {
+    format!(
+        "{} incomplete todo{}. Continue.",
+        incomplete_count,
+        if incomplete_count == 1 { "" } else { "s" },
+    )
+}
+
+/// Check whether a message is an auto-poke synthetic continuation prompt.
+/// Used by the TUI to hide the raw message and show "Auto-poking..." instead.
+pub fn is_auto_poke_message(message: &str) -> bool {
+    (message.starts_with("You have ")
+        && message.contains(" incomplete todo")
+        && message.contains("Continue working, or update the todo tool."))
+        || (message.contains(" incomplete todo") && message.ends_with("Continue."))
+}
+
+/// Count incomplete (pending + in_progress) todos for a session.
+pub fn count_incomplete_todos(session_id: &str) -> usize {
+    let todos = load_todos(session_id);
+    todos
+        .iter()
+        .filter_map(|t| t.get("status").and_then(|s| s.as_str()))
+        .filter(|s| *s == "pending" || *s == "in_progress")
+        .count()
+}
+
+/// Compute a hash of the current todo state (sorted [(id, status)] pairs).
+/// Used for no-progress detection: if the hash is unchanged for 3 consecutive
+/// turns, auto-poking stops.
+pub fn todo_state_hash(session_id: &str) -> String {
+    let todos = load_todos(session_id);
+    let mut pairs: Vec<(String, String)> = todos
+        .iter()
+        .filter_map(|t| {
+            let id = t.get("id").and_then(|v| v.as_str())?.to_string();
+            let status = t.get("status").and_then(|v| v.as_str())?.to_string();
+            Some((id, status))
+        })
+        .collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    // Simple hash: concatenate id:status pairs.
+    pairs
+        .iter()
+        .map(|(id, s)| format!("{}:{}", id, s))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// Maximum auto-pokes per session (safety budget).
+pub const MAX_AUTO_POKES: u32 = 48;
+
+/// No-progress threshold: stop after this many consecutive no-progress turns.
+pub const NO_PROGRESS_THRESHOLD: u32 = 3;
+
+/// Maximum consecutive guardrail (provider refusal) errors before auto-poke stops.
+pub const MAX_GUARDRAIL_STOPS: u32 = 3;
+
+/// Check whether an error message indicates a non-retryable condition
+/// (billing, auth, payload size, quota). Auto-poke should stop immediately.
+pub fn is_non_retryable_error(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("billing")
+        || lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("payload too large")
+        || lower.contains("413")
+        || lower.contains("quota exceeded")
+        || lower.contains("rate limit")
+        || lower.contains("context length exceeded")
+        || lower.contains("maximum context")
+        || lower.contains("insufficient_quota")
+        || lower.contains("invalid_api_key")
+        || lower.contains("permission_denied")
+}
+
+/// Check whether an error message indicates a guardrail/content-policy refusal.
+/// Auto-poke increments a counter; after MAX_GUARDRAIL_STOPS it stops.
+pub fn is_guardrail_error(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("content policy")
+        || lower.contains("content_policy")
+        || lower.contains("safety filter")
+        || lower.contains("safety_filter")
+        || lower.contains("refused to generate")
+        || lower.contains("i cannot assist")
+        || lower.contains("i can't assist")
+        || lower.contains("i'm unable to help")
+        || lower.contains("content_filter")
+        || lower.contains("content filter")
+        || lower.contains("policy violation")
 }
 
 // ---------------------------------------------------------------------------
@@ -479,53 +589,22 @@ mod tests {
         // tempdir cleans up automatically.
     }
 
-    #[test]
-    fn test_confidence_accepts_integer_and_numeric_string() {
-        let input: TodoWriteInput = serde_json::from_value(json!({
-            "todos": [
-                {
-                    "id": "1",
-                    "content": "Task one",
-                    "status": "pending",
-                    "confidence": 80
-                },
-                {
-                    "id": "2",
-                    "content": "Task two",
-                    "status": "completed",
-                    "confidence": "70",
-                    "completion_confidence": 95.0
-                }
-            ]
-        }))
-        .expect("valid confidence values should parse");
-
-        assert_eq!(input.todos[0].confidence, Some(80));
-        assert_eq!(input.todos[1].confidence, Some(70));
-        assert_eq!(input.todos[1].completion_confidence, Some(95));
-    }
-
-    #[test]
-    fn test_confidence_rejects_values_outside_percentage_range() {
-        let result = serde_json::from_value::<TodoWriteInput>(json!({
-            "todos": [{
-                "id": "1",
-                "content": "Task",
-                "status": "pending",
-                "confidence": 101
-            }]
-        }));
-
-        assert!(result.is_err());
-    }
-
     // --- Status parsing ------------------------------------------------------
 
     #[test]
     fn test_status_parsing_case_insensitive() {
-        assert_eq!(TodoStatus::from_str_ci("PENDING").unwrap(), TodoStatus::Pending);
-        assert_eq!(TodoStatus::from_str_ci("In_Progress").unwrap(), TodoStatus::InProgress);
-        assert_eq!(TodoStatus::from_str_ci("COMPLETED").unwrap(), TodoStatus::Completed);
+        assert_eq!(
+            TodoStatus::from_str_ci("PENDING").unwrap(),
+            TodoStatus::Pending
+        );
+        assert_eq!(
+            TodoStatus::from_str_ci("In_Progress").unwrap(),
+            TodoStatus::InProgress
+        );
+        assert_eq!(
+            TodoStatus::from_str_ci("COMPLETED").unwrap(),
+            TodoStatus::Completed
+        );
         assert!(TodoStatus::from_str_ci("done").is_err());
         assert!(TodoStatus::from_str_ci("").is_err());
     }
@@ -542,26 +621,52 @@ mod tests {
     #[test]
     fn test_valid_transitions() {
         // pending → in_progress
-        assert!(validate_transition("t1", &TodoStatus::Pending, &TodoStatus::InProgress).is_ok());
+        assert!(
+            validate_transition("t1", &TodoStatus::Pending, &TodoStatus::InProgress, false).is_ok()
+        );
         // pending → completed
-        assert!(validate_transition("t2", &TodoStatus::Pending, &TodoStatus::Completed).is_ok());
+        assert!(
+            validate_transition("t2", &TodoStatus::Pending, &TodoStatus::Completed, false).is_ok()
+        );
         // in_progress → completed
-        assert!(validate_transition("t3", &TodoStatus::InProgress, &TodoStatus::Completed).is_ok());
+        assert!(
+            validate_transition("t3", &TodoStatus::InProgress, &TodoStatus::Completed, false)
+                .is_ok()
+        );
         // no-op transitions are always fine
-        assert!(validate_transition("t4", &TodoStatus::Pending, &TodoStatus::Pending).is_ok());
-        assert!(validate_transition("t5", &TodoStatus::InProgress, &TodoStatus::InProgress).is_ok());
-        assert!(validate_transition("t6", &TodoStatus::Completed, &TodoStatus::Completed).is_ok());
+        assert!(
+            validate_transition("t4", &TodoStatus::Pending, &TodoStatus::Pending, false).is_ok()
+        );
+        assert!(validate_transition(
+            "t5",
+            &TodoStatus::InProgress,
+            &TodoStatus::InProgress,
+            false
+        )
+        .is_ok());
+        assert!(
+            validate_transition("t6", &TodoStatus::Completed, &TodoStatus::Completed, false)
+                .is_ok()
+        );
     }
 
     #[test]
     fn test_invalid_transition_completed_to_anything() {
-        assert!(validate_transition("t1", &TodoStatus::Completed, &TodoStatus::Pending).is_err());
-        assert!(validate_transition("t2", &TodoStatus::Completed, &TodoStatus::InProgress).is_err());
+        assert!(
+            validate_transition("t1", &TodoStatus::Completed, &TodoStatus::Pending, false).is_err()
+        );
+        assert!(
+            validate_transition("t2", &TodoStatus::Completed, &TodoStatus::InProgress, false)
+                .is_err()
+        );
     }
 
     #[test]
     fn test_invalid_transition_in_progress_to_pending() {
-        assert!(validate_transition("t1", &TodoStatus::InProgress, &TodoStatus::Pending).is_err());
+        assert!(
+            validate_transition("t1", &TodoStatus::InProgress, &TodoStatus::Pending, false)
+                .is_err()
+        );
     }
 
     // --- ID uniqueness -------------------------------------------------------
@@ -569,7 +674,104 @@ mod tests {
     #[test]
     fn test_status_from_str_invalid() {
         let err = TodoStatus::from_str_ci("banana").unwrap_err();
-        assert!(err.contains("Invalid status"), "error should mention invalid status");
+        assert!(
+            err.contains("Invalid status"),
+            "error should mention invalid status"
+        );
         assert!(err.contains("banana"), "error should echo the bad value");
+    }
+
+    // --- Auto-poke ----------------------------------------------------------
+
+    #[test]
+    fn build_auto_poke_message_singular() {
+        let msg = build_auto_poke_message(1);
+        assert!(msg.contains("1 incomplete todo"));
+        assert!(!msg.contains("todos"));
+        assert!(msg.ends_with("Continue."));
+    }
+
+    #[test]
+    fn build_auto_poke_message_plural() {
+        let msg = build_auto_poke_message(5);
+        assert!(msg.contains("5 incomplete todos"));
+        assert!(msg.ends_with("Continue."));
+    }
+
+    #[test]
+    fn is_auto_poke_message_recognizes_poke() {
+        let msg = build_auto_poke_message(3);
+        assert!(is_auto_poke_message(&msg));
+    }
+
+    #[test]
+    fn is_auto_poke_message_rejects_normal() {
+        assert!(!is_auto_poke_message("Hello, can you help me?"));
+        assert!(!is_auto_poke_message("Continue working on the task."));
+    }
+
+    #[test]
+    fn is_non_retryable_error_detects_billing() {
+        assert!(is_non_retryable_error("billing issue detected"));
+        assert!(is_non_retryable_error("401 Unauthorized"));
+        assert!(is_non_retryable_error("quota exceeded"));
+        assert!(is_non_retryable_error("context length exceeded"));
+        assert!(!is_non_retryable_error("network timeout"));
+    }
+
+    #[test]
+    fn is_guardrail_error_detects_refusal() {
+        assert!(is_guardrail_error("content policy violation"));
+        assert!(is_guardrail_error("I cannot assist with that"));
+        assert!(!is_guardrail_error("network error"));
+        assert!(!is_guardrail_error("billing issue"));
+    }
+
+    // --- TodoItem deserialization with new fields ----------------------------
+
+    #[test]
+    fn todo_item_deserialize_with_old_schema() {
+        let json = r#"{"id":"1","content":"Test","status":"pending"}"#;
+        let item: TodoItem = serde_json::from_str(json).unwrap();
+        assert_eq!(item.id, "1");
+        assert!(item.group.is_none());
+        assert!(item.confidence.is_none());
+        assert!(item.confidence_history.is_empty());
+        assert!(item.blocked_by.is_empty());
+        assert!(!item.force_reopen);
+    }
+
+    #[test]
+    fn todo_item_deserialize_with_new_schema() {
+        let json = r#"{
+            "id": "2",
+            "content": "New fields test",
+            "status": "in_progress",
+            "priority": "high",
+            "group": "Phase 1",
+            "confidence": 75,
+            "blocked_by": ["1"],
+            "force_reopen": false
+        }"#;
+        let item: TodoItem = serde_json::from_str(json).unwrap();
+        assert_eq!(item.group.as_deref(), Some("Phase 1"));
+        assert_eq!(item.confidence, Some(75));
+        assert_eq!(item.blocked_by, vec!["1"]);
+    }
+
+    // --- Force reopen transition --------------------------------------------
+
+    #[test]
+    fn validate_transition_force_reopen_allows_completed_to_pending() {
+        let result =
+            validate_transition("test", &TodoStatus::Completed, &TodoStatus::Pending, true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_transition_without_force_reopen_blocks_completed_to_pending() {
+        let result =
+            validate_transition("test", &TodoStatus::Completed, &TodoStatus::Pending, false);
+        assert!(result.is_err());
     }
 }

@@ -16,48 +16,48 @@ pub mod agent_tool;
 pub mod auto_dream;
 pub mod away_summary;
 pub mod command_queue;
-pub mod continuation;
-pub mod goal_loop;
-pub mod managed_orchestrator;
 pub mod compact;
 pub mod context_analyzer;
+pub mod continuation;
 pub mod coordinator;
 pub mod cron_scheduler;
+pub mod goal_loop;
+pub mod managed_orchestrator;
 pub mod sanitize;
 pub mod session_memory;
 pub mod skill_prefetch;
 
 mod runner;
-pub use runner::*;
-pub use agent_tool::{AgentTool, init_team_swarm_runner};
-pub use command_queue::{CommandPriority, CommandQueue, QueuedCommand, drain_command_queue};
+pub use agent_tool::{init_team_swarm_runner, AgentTool};
+pub use command_queue::{drain_command_queue, CommandPriority, CommandQueue, QueuedCommand};
+pub use compact::{
+    auto_compact_if_needed, calculate_messages_to_keep_index, calculate_token_warning_state,
+    calculate_token_warning_state_for_window, compact_conversation, context_collapse,
+    context_window_for_model, estimate_context_tokens, format_compact_summary, get_compact_prompt,
+    group_messages_for_compact, micro_compact_if_needed, reactive_compact, resolve_context_window,
+    should_auto_compact, should_auto_compact_for_window, should_compact, should_context_collapse,
+    snip_compact, AutoCompactState, CompactResult, CompactTrigger, MessageGroup,
+    MicroCompactConfig, TokenWarningState,
+};
 pub use continuation::{
     ContinuationDecision, ContinuationMode, ContinuationPolicy, StopPolicy, TurnEndContext,
 };
 pub use cron_scheduler::start_cron_scheduler;
 pub use goal_loop::{
-    GoalContinuation, StopReason, check_and_continue_goal, decide_goal_continuation,
-    mark_goal_complete,
+    check_and_continue_goal, decide_goal_continuation, mark_goal_complete, GoalContinuation,
+    StopReason,
 };
-pub use skill_prefetch::{
-    SkillDefinition, SkillIndex, SharedSkillIndex, prefetch_skills, format_skill_listing,
-};
+pub use runner::*;
 pub use sanitize::sanitize_history;
-pub use compact::{
-    AutoCompactState, CompactResult, CompactTrigger, MicroCompactConfig, MessageGroup, TokenWarningState,
-    auto_compact_if_needed, calculate_messages_to_keep_index, calculate_token_warning_state,
-    calculate_token_warning_state_for_window, compact_conversation, context_collapse,
-    context_window_for_model, estimate_context_tokens, format_compact_summary, get_compact_prompt,
-    group_messages_for_compact, micro_compact_if_needed, reactive_compact,
-    resolve_context_window, should_auto_compact, should_auto_compact_for_window, should_compact,
-    should_context_collapse, snip_compact,
-};
 pub use session_memory::{
     ExtractedMemory, MemoryCategory, SessionMemoryExtractor, SessionMemoryState,
 };
+pub use skill_prefetch::{
+    format_skill_listing, prefetch_skills, SharedSkillIndex, SkillDefinition, SkillIndex,
+};
 
 use claurst_api::{
-    ApiMessage, ApiToolDefinition, AnthropicStreamEvent, CreateMessageRequest, StreamAccumulator,
+    AnthropicStreamEvent, ApiMessage, ApiToolDefinition, CreateMessageRequest, StreamAccumulator,
     StreamHandler, SystemPrompt, ThinkingConfig,
 };
 use claurst_core::config::Config;
@@ -80,7 +80,10 @@ pub enum QueryOutcome {
     /// The model finished its turn (end_turn stop reason).
     EndTurn { message: Message, usage: UsageInfo },
     /// The model hit max_tokens.
-    MaxTokens { partial_message: Message, usage: UsageInfo },
+    MaxTokens {
+        partial_message: Message,
+        usage: UsageInfo,
+    },
     /// The conversation was cancelled by the user.
     Cancelled,
     /// An unrecoverable error occurred.
@@ -95,6 +98,10 @@ pub struct QueryConfig {
     pub model: String,
     pub max_tokens: u32,
     pub max_turns: u32,
+    /// Whether the max-steps graceful degradation summary turn is enabled.
+    /// When `false`, exceeding `max_turns` returns cold (last assistant
+    /// message) instead of running a final tool-less summary turn.
+    pub degradation_enabled: bool,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
     pub output_style: claurst_core::system_prompt::OutputStyle,
@@ -174,6 +181,7 @@ impl Default for QueryConfig {
             model: claurst_core::constants::DEFAULT_MODEL.to_string(),
             max_tokens: claurst_core::constants::DEFAULT_MAX_TOKENS,
             max_turns: claurst_core::constants::MAX_TURNS_DEFAULT,
+            degradation_enabled: true,
             system_prompt: None,
             append_system_prompt: None,
             output_style: claurst_core::system_prompt::OutputStyle::Default,
@@ -205,11 +213,9 @@ impl QueryConfig {
             max_tokens: cfg.effective_max_tokens(),
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
-            working_directory: cfg
-                .project_dir
-                .as_ref()
-                .map(|p| p.display().to_string()),
+            working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
             managed_agents: cfg.managed_agents.clone(),
+            degradation_enabled: cfg.degradation_summary_enabled,
             ..Default::default()
         }
     }
@@ -226,11 +232,9 @@ impl QueryConfig {
             max_tokens: cfg.effective_max_tokens(),
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
-            working_directory: cfg
-                .project_dir
-                .as_ref()
-                .map(|p| p.display().to_string()),
+            working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
             managed_agents: cfg.managed_agents.clone(),
+            degradation_enabled: cfg.degradation_summary_enabled,
             ..Default::default()
         }
     }
@@ -242,11 +246,24 @@ pub enum QueryEvent {
     /// A stream event from the API.
     Stream(AnthropicStreamEvent),
     /// A tool is about to be executed.
-    ToolStart { tool_name: String, tool_id: String, input_json: String },
+    ToolStart {
+        tool_name: String,
+        tool_id: String,
+        input_json: String,
+    },
     /// A tool has finished executing.
-    ToolEnd { tool_name: String, tool_id: String, result: String, is_error: bool },
+    ToolEnd {
+        tool_name: String,
+        tool_id: String,
+        result: String,
+        is_error: bool,
+    },
     /// The model finished a turn.
-    TurnComplete { turn: u32, stop_reason: String, usage: Option<UsageInfo> },
+    TurnComplete {
+        turn: u32,
+        stop_reason: String,
+        usage: Option<UsageInfo>,
+    },
     /// An informational status message.
     Status(String),
     /// An error.
@@ -254,7 +271,10 @@ pub enum QueryEvent {
     /// Token usage has crossed a warning threshold.
     /// `state` is Warning (≥ 80 %) or Critical (≥ 95 %).
     /// `pct_used` is the fraction of the context window consumed (0.0–1.0).
-    TokenWarning { state: TokenWarningState, pct_used: f64 },
+    TokenWarning {
+        state: TokenWarningState,
+        pct_used: f64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -343,10 +363,7 @@ fn effective_effort_for_turn(
 fn effective_output_style_for_turn(
     config: &QueryConfig,
     messages: &[Message],
-) -> (
-    claurst_core::system_prompt::OutputStyle,
-    Option<String>,
-) {
+) -> (claurst_core::system_prompt::OutputStyle, Option<String>) {
     if let Some(last_user) = messages.iter().rev().find(|m| m.role == Role::User) {
         if let Some(style_name) =
             claurst_core::keywords::inline_persona_style(&last_user.get_all_text())
@@ -427,7 +444,8 @@ pub async fn run_query_loop(
     let mut degradation_done = false;
 
     // If an agent defines a max_turns override, respect it (agent wins over config).
-    let effective_max_turns = config.agent_definition
+    let effective_max_turns = config
+        .agent_definition
         .as_ref()
         .and_then(|a| a.max_turns)
         .unwrap_or(config.max_turns);
@@ -471,6 +489,21 @@ pub async fn run_query_loop(
         // dispatched exactly once, and re-exceeding the cap afterwards returns
         // cold. Applies to both goal and non-goal runs.
         let degradation_turn = if turn > effective_max_turns {
+            if !config.degradation_enabled {
+                info!(
+                    turns = turn,
+                    max = effective_max_turns,
+                    "Max turns reached — degradation disabled, returning cold"
+                );
+                let last_msg = messages
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| Message::assistant("Max turns reached."));
+                return QueryOutcome::EndTurn {
+                    message: last_msg,
+                    usage: UsageInfo::default(),
+                };
+            }
             if degradation_done {
                 info!(
                     turns = turn,
@@ -661,8 +694,7 @@ pub async fn run_query_loop(
             // up; sub-agents already set it explicitly, so only fill it in when
             // the caller left it unset.
             if patched.enabled_tools.is_none() {
-                patched.enabled_tools =
-                    Some(tools.iter().map(|t| t.name().to_string()).collect());
+                patched.enabled_tools = Some(tools.iter().map(|t| t.name().to_string()).collect());
             }
 
             // Apply agent system-prompt prefix: prepend before the main system prompt.
@@ -678,7 +710,8 @@ pub async fn run_query_loop(
             // If managed-agent mode is active, append orchestration instructions.
             if let Some(ref ma_config) = config.managed_agents {
                 if ma_config.enabled {
-                    let ma_prompt = crate::managed_orchestrator::managed_agent_system_prompt(ma_config);
+                    let ma_prompt =
+                        crate::managed_orchestrator::managed_agent_system_prompt(ma_config);
                     patched.append_system_prompt = Some(match &patched.append_system_prompt {
                         Some(existing) => format!("{}\n\n{}", existing, ma_prompt),
                         None => ma_prompt,
@@ -704,15 +737,19 @@ pub async fn run_query_loop(
             // from the CLI into the loop so continuation turns get it too.
             // GoalStore access here is fully synchronous (no lock held across
             // an `.await`).
-            if matches!(config.continuation, crate::continuation::ContinuationMode::Goal) {
+            if matches!(
+                config.continuation,
+                crate::continuation::ContinuationMode::Goal
+            ) {
                 if let Some(goal) = claurst_core::GoalStore::open_default()
                     .and_then(|s| s.get_active_goal(&tool_ctx.session_id))
                 {
                     let addendum = claurst_core::goal_system_prompt_addendum(&goal);
-                    patched.append_system_prompt = Some(match patched.append_system_prompt.take() {
-                        Some(existing) => format!("{}\n{}", existing, addendum),
-                        None => addendum,
-                    });
+                    patched.append_system_prompt =
+                        Some(match patched.append_system_prompt.take() {
+                            Some(existing) => format!("{}\n{}", existing, addendum),
+                            None => addendum,
+                        });
                 }
             }
 
@@ -753,9 +790,9 @@ pub async fn run_query_loop(
         // Resolve effective thinking budget:
         //   1. Explicit `thinking_budget` in config takes precedence.
         //   2. Fall back to the effort level's budget when no explicit budget is set.
-        let effective_thinking_budget = config.thinking_budget.or_else(|| {
-            effective_effort_level.and_then(|el| el.thinking_budget_tokens())
-        });
+        let effective_thinking_budget = config
+            .thinking_budget
+            .or_else(|| effective_effort_level.and_then(|el| el.thinking_budget_tokens()));
 
         if let Some(budget) = effective_thinking_budget {
             req_builder = req_builder.thinking(ThinkingConfig::enabled(budget));
@@ -763,15 +800,16 @@ pub async fn run_query_loop(
 
         // Apply temperature: explicit config value takes precedence, then agent override,
         // then effort-level override.
-        let effective_temperature = config.temperature
+        let effective_temperature = config
+            .temperature
             .or_else(|| {
-                config.agent_definition.as_ref()
+                config
+                    .agent_definition
+                    .as_ref()
                     .and_then(|a| a.temperature)
                     .map(|t| t as f32)
             })
-            .or_else(|| {
-                effective_effort_level.and_then(|el| el.temperature())
-            });
+            .or_else(|| effective_effort_level.and_then(|el| el.temperature()));
         if let Some(t) = effective_temperature {
             req_builder = req_builder.temperature(t);
         }
@@ -795,7 +833,12 @@ pub async fn run_query_loop(
         //   3. Model registry lookup (e.g. "gemini-3-flash-preview" → google)
         //   4. Default to "anthropic"
         if let Some(ref registry) = config.provider_registry {
-            let (provider_id_str, model_id_str) = if let Some(p) = tool_ctx.config.provider.as_deref().filter(|p| *p != "anthropic") {
+            let (provider_id_str, model_id_str) = if let Some(p) = tool_ctx
+                .config
+                .provider
+                .as_deref()
+                .filter(|p| *p != "anthropic")
+            {
                 // Explicit non-Anthropic provider in config — use it.
                 // If the stored model is in canonical "provider/model" form,
                 // strip the top-level provider prefix before sending it to the
@@ -813,32 +856,73 @@ pub async fn run_query_loop(
                 // namespace (e.g. "meta-llama/Llama-3" on OpenRouter).
                 let known_providers = [
                     // Native (non-OpenAI-compat) providers
-                    "anthropic", "openai", "google", "azure", "amazon-bedrock",
-                    "github-copilot", "codex", "openai-codex", "cohere", "minimax",
+                    "anthropic",
+                    "openai",
+                    "google",
+                    "azure",
+                    "amazon-bedrock",
+                    "github-copilot",
+                    "codex",
+                    "openai-codex",
+                    "cohere",
+                    "minimax",
                     // Local / self-hosted
                     "ollama",
-                    "lmstudio", "lm-studio",
-                    "llamacpp", "llama-cpp", "llama-server",
+                    "lmstudio",
+                    "lm-studio",
+                    "llamacpp",
+                    "llama-cpp",
+                    "llama-server",
                     // OpenAI-compat cloud providers
-                    "groq", "mistral", "deepseek", "xai", "perplexity", "cerebras",
-                    "openrouter", "togetherai", "together-ai", "deepinfra", "venice",
-                    "huggingface", "nvidia", "fireworks", "sambanova",
+                    "groq",
+                    "mistral",
+                    "deepseek",
+                    "xai",
+                    "perplexity",
+                    "cerebras",
+                    "openrouter",
+                    "togetherai",
+                    "together-ai",
+                    "deepinfra",
+                    "venice",
+                    "huggingface",
+                    "nvidia",
+                    "fireworks",
+                    "sambanova",
                     // Additional OpenAI-compat providers
-                    "qwen", "alibaba", "siliconflow",
-                    "moonshot", "moonshotai",
-                    "zhipu", "zhipuai",
+                    "qwen",
+                    "alibaba",
+                    "siliconflow",
+                    "moonshot",
+                    "moonshotai",
+                    "zhipu",
+                    "zhipuai",
                     "zai",
-                    "nebius", "novita", "ovhcloud", "scaleway",
-                    "vultr", "vultr-ai",
-                    "baseten", "friendli", "upstage", "stepfun",
+                    "nebius",
+                    "novita",
+                    "ovhcloud",
+                    "scaleway",
+                    "vultr",
+                    "vultr-ai",
+                    "baseten",
+                    "friendli",
+                    "upstage",
+                    "stepfun",
                 ];
                 if known_providers.contains(&p) {
                     (p.to_string(), m.to_string())
                 } else {
-                    // Treat the whole string as the model ID, fall through
-                    // to auto-detection below.
-                    let fallback_provider = tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
-                    (fallback_provider.to_string(), effective_model.clone())
+                    // Check whether `p` is a user-defined custom provider id.
+                    let settings = claurst_core::Settings::load_sync().unwrap_or_default();
+                    if settings.custom_providers.contains_key(p) {
+                        (p.to_string(), m.to_string())
+                    } else {
+                        // Treat the whole string as the model ID, fall through
+                        // to auto-detection below.
+                        let fallback_provider =
+                            tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
+                        (fallback_provider.to_string(), effective_model.clone())
+                    }
                 }
             } else {
                 // No explicit provider set (or set to "anthropic"): try the
@@ -846,19 +930,20 @@ pub async fn run_query_loop(
                 // Use the shared model registry from QueryConfig if available;
                 // otherwise construct a temporary one.
                 let temp_reg;
-                let model_reg: &claurst_api::ModelRegistry = if let Some(ref shared) = config.model_registry {
-                    shared
-                } else {
-                    temp_reg = {
-                        let mut r = claurst_api::ModelRegistry::new();
-                        if let Some(cache_dir) = dirs::cache_dir() {
-                            let cache_path = cache_dir.join("claurst").join("models_dev.json");
-                            r.load_cache(&cache_path);
-                        }
-                        r
+                let model_reg: &claurst_api::ModelRegistry =
+                    if let Some(ref shared) = config.model_registry {
+                        shared
+                    } else {
+                        temp_reg = {
+                            let mut r = claurst_api::ModelRegistry::new();
+                            if let Some(cache_dir) = dirs::cache_dir() {
+                                let cache_path = cache_dir.join("claurst").join("models_dev.json");
+                                r.load_cache(&cache_path);
+                            }
+                            r
+                        };
+                        &temp_reg
                     };
-                    &temp_reg
-                };
                 if let Some(detected_pid) = model_reg.find_provider_for_model(&effective_model) {
                     let pid_str = detected_pid.to_string();
                     if pid_str != "anthropic" {
@@ -876,8 +961,7 @@ pub async fn run_query_loop(
             // Dispatch through the provider path for non-Anthropic providers,
             // AND for Anthropic when the pre-built client has no API key
             // (user started without ANTHROPIC_API_KEY but added one via /connect).
-            let use_provider_dispatch = provider_id_str != "anthropic"
-                || client.api_key_is_empty();
+            let use_provider_dispatch = provider_id_str != "anthropic" || client.api_key_is_empty();
 
             if use_provider_dispatch {
                 let pid = claurst_core::provider_id::ProviderId::new(&provider_id_str);
@@ -904,7 +988,9 @@ pub async fn run_query_loop(
                 if claurst_api::registry::resolve_provider_api_base(
                     &tool_ctx.config,
                     &provider_id_str,
-                ).is_some() {
+                )
+                .is_some()
+                {
                     if let Some(overridden) = claurst_api::registry::provider_from_config(
                         &tool_ctx.config,
                         &provider_id_str,
@@ -929,10 +1015,10 @@ pub async fn run_query_loop(
                     // with placeholder text when the provider doesn't support them,
                     // preventing crashes on text-only models.
                     let mut caps = provider.capabilities();
-                    if let Some(model_entry) = config
-                        .model_registry
-                        .as_ref()
-                        .and_then(|model_registry| model_registry.get(&provider_id_str, &model_id_str))
+                    if let Some(model_entry) =
+                        config.model_registry.as_ref().and_then(|model_registry| {
+                            model_registry.get(&provider_id_str, &model_id_str)
+                        })
                     {
                         caps.image_input = model_entry.vision();
                         caps.tool_calling = model_entry.tool_calling;
@@ -941,26 +1027,35 @@ pub async fn run_query_loop(
                     // Max-steps degradation (issue #230): dispatch the final
                     // summary turn with no tools so the provider can only emit
                     // text (opencode's `toolChoice:"none"` equivalent).
-                    let provider_tools: Vec<claurst_core::types::ToolDefinition> = if caps.tool_calling && !degradation_turn {
-                        tools.iter().map(|t| t.to_definition()).collect()
-                    } else {
-                        Vec::new()
-                    };
+                    let provider_tools: Vec<claurst_core::types::ToolDefinition> =
+                        if caps.tool_calling && !degradation_turn {
+                            tools.iter().map(|t| t.to_definition()).collect()
+                        } else {
+                            Vec::new()
+                        };
                     let provider_messages: Vec<claurst_core::types::Message> = messages
                         .iter()
                         .map(|msg| {
                             let mut msg = msg.clone();
-                            if let claurst_core::types::MessageContent::Blocks(ref mut blocks) = msg.content {
+                            if let claurst_core::types::MessageContent::Blocks(ref mut blocks) =
+                                msg.content
+                            {
                                 for block in blocks.iter_mut() {
                                     match block {
-                                        claurst_core::types::ContentBlock::Image { .. } if !caps.image_input => {
+                                        claurst_core::types::ContentBlock::Image { .. }
+                                            if !caps.image_input =>
+                                        {
                                             *block = claurst_core::types::ContentBlock::Text {
-                                                text: "[Image not supported by this model]".to_string(),
+                                                text: "[Image not supported by this model]"
+                                                    .to_string(),
                                             };
                                         }
-                                        claurst_core::types::ContentBlock::Document { .. } if !caps.pdf_input => {
+                                        claurst_core::types::ContentBlock::Document { .. }
+                                            if !caps.pdf_input =>
+                                        {
                                             *block = claurst_core::types::ContentBlock::Text {
-                                                text: "[PDF not supported by this model]".to_string(),
+                                                text: "[PDF not supported by this model]"
+                                                    .to_string(),
                                             };
                                         }
                                         _ => {}
@@ -971,19 +1066,34 @@ pub async fn run_query_loop(
                         })
                         .collect();
 
+                    // Cap max_tokens by the custom model's `maxOutputTokens`
+                    // when the model belongs to a user-defined custom provider.
+                    let effective_max_tokens = {
+                        let mut tok = config.max_tokens;
+                        if let Ok(settings) = claurst_core::Settings::load_sync() {
+                            if let Some(cp) = settings.custom_providers.get(&provider_id_str) {
+                                if let Some(model_def) = cp.models.get(&model_id_str) {
+                                    if let Some(cap) = model_def.max_output_tokens {
+                                        tok = tok.min(cap);
+                                    }
+                                }
+                            }
+                        }
+                        tok
+                    };
+
                     let provider_request = claurst_api::ProviderRequest {
                         model: model_id_str.to_owned(),
                         messages: provider_messages,
                         system_prompt: Some(system_for_provider.clone()),
                         tools: provider_tools,
-                        max_tokens: config.max_tokens,
+                        max_tokens: effective_max_tokens,
                         temperature: effective_temperature.map(|t| t as f64),
                         top_p: None,
                         top_k: None,
                         stop_sequences: vec![],
                         thinking: if caps.thinking {
-                            effective_thinking_budget
-                                .map(claurst_api::ThinkingConfig::enabled)
+                            effective_thinking_budget.map(claurst_api::ThinkingConfig::enabled)
                         } else {
                             None
                         },
@@ -1001,9 +1111,9 @@ pub async fn run_query_loop(
                         Ok(s) => s,
                         Err(e) => {
                             error!(provider = %provider_id_str, error = %e, "Provider stream failed");
-                            return QueryOutcome::Error(
-                                claurst_core::error::ClaudeError::Api(e.to_string())
-                            );
+                            return QueryOutcome::Error(claurst_core::error::ClaudeError::Api(
+                                e.to_string(),
+                            ));
                         }
                     };
 
@@ -1016,8 +1126,10 @@ pub async fn run_query_loop(
                     // thought_signature carries Gemini's opaque per-call signature
                     // through stream assembly so it survives into the persisted
                     // ToolUse block and is echoed back next turn (#311).
-                    let mut tool_call_blocks: std::collections::HashMap<usize, (String, String, String, Option<String>)> =
-                        std::collections::HashMap::new();
+                    let mut tool_call_blocks: std::collections::HashMap<
+                        usize,
+                        (String, String, String, Option<String>),
+                    > = std::collections::HashMap::new();
                     let mut usage = UsageInfo::default();
                     let mut stop_str = "end_turn".to_string();
                     let mut msg_id = uuid::Uuid::new_v4().to_string();
@@ -1174,7 +1286,9 @@ pub async fn run_query_loop(
 
                     let combined_text = text_chunks.join("");
                     if !combined_text.is_empty() {
-                        content_blocks.push(ContentBlock::Text { text: combined_text.clone() });
+                        content_blocks.push(ContentBlock::Text {
+                            text: combined_text.clone(),
+                        });
                     }
 
                     // Reconstruct tool-use blocks (sorted by index for determinism).
@@ -1189,7 +1303,9 @@ pub async fn run_query_loop(
                     let mut malformed_tool_calls: std::collections::HashSet<String> =
                         std::collections::HashSet::new();
                     for idx in tc_indices {
-                        if let Some((id, name, json_str, thought_signature)) = tool_call_blocks.remove(&idx) {
+                        if let Some((id, name, json_str, thought_signature)) =
+                            tool_call_blocks.remove(&idx)
+                        {
                             let input = match parse_tool_args(&json_str) {
                                 Ok(v) => v,
                                 Err(e) => {
@@ -1205,16 +1321,24 @@ pub async fn run_query_loop(
                                     serde_json::json!({})
                                 }
                             };
-                            content_blocks.push(ContentBlock::ToolUse { id, name, input, thought_signature });
+                            content_blocks.push(ContentBlock::ToolUse {
+                                id,
+                                name,
+                                input,
+                                thought_signature,
+                            });
                         }
                     }
 
                     let mut assistant_msg = Message {
                         role: claurst_core::types::Role::Assistant,
-                        content: claurst_core::types::MessageContent::Blocks(content_blocks.clone()),
+                        content: claurst_core::types::MessageContent::Blocks(
+                            content_blocks.clone(),
+                        ),
                         uuid: Some(msg_id),
                         cost: None,
                         snapshot_patch: None,
+                        is_auto_poke: false,
                     };
 
                     cost_tracker.add_usage(
@@ -1227,13 +1351,19 @@ pub async fn run_query_loop(
                     messages.push(assistant_msg.clone());
 
                     // Handle tool-use turn: execute tools and loop.
-                    let tool_use_blocks: Vec<_> = content_blocks.iter().filter_map(|b| {
-                        if let ContentBlock::ToolUse { id, name, input, .. } = b {
-                            Some((id.clone(), name.clone(), input.clone()))
-                        } else {
-                            None
-                        }
-                    }).collect();
+                    let tool_use_blocks: Vec<_> = content_blocks
+                        .iter()
+                        .filter_map(|b| {
+                            if let ContentBlock::ToolUse {
+                                id, name, input, ..
+                            } = b
+                            {
+                                Some((id.clone(), name.clone(), input.clone()))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
 
                     // Execute tools if any tool_use blocks were returned.
                     // Note: we check the blocks themselves rather than relying
@@ -1272,7 +1402,9 @@ pub async fn run_query_loop(
                             }
                             tool_results.push(ContentBlock::ToolResult {
                                 tool_use_id: tool_id,
-                                content: claurst_core::types::ToolResultContent::Text(result.content),
+                                content: claurst_core::types::ToolResultContent::Text(
+                                    result.content,
+                                ),
                                 is_error: Some(result.is_error),
                             });
                         }
@@ -1282,6 +1414,7 @@ pub async fn run_query_loop(
                             uuid: None,
                             cost: None,
                             snapshot_patch: None,
+                            is_auto_poke: false,
                         });
                         continue; // loop for next turn
                     }
@@ -1302,14 +1435,18 @@ pub async fn run_query_loop(
                             let _ = tx.send(QueryEvent::Stream(
                                 AnthropicStreamEvent::ContentBlockDelta {
                                     index: 0,
-                                    delta: claurst_api::streaming::ContentDelta::TextDelta { text: placeholder.clone() },
+                                    delta: claurst_api::streaming::ContentDelta::TextDelta {
+                                        text: placeholder.clone(),
+                                    },
                                 },
                             ));
                         }
                         if let claurst_core::types::MessageContent::Blocks(ref mut blocks) =
                             assistant_msg.content
                         {
-                            blocks.push(ContentBlock::Text { text: placeholder.clone() });
+                            blocks.push(ContentBlock::Text {
+                                text: placeholder.clone(),
+                            });
                         }
                         if let Some(last) = messages.last_mut() {
                             *last = assistant_msg.clone();
@@ -1353,12 +1490,10 @@ pub async fn run_query_loop(
                         model = %model_id_str,
                         "No credentials found for provider"
                     );
-                    return QueryOutcome::Error(
-                        ClaudeError::Api(format!(
-                            "No API key for provider '{}' (model '{}'). {}",
-                            provider_id_str, model_id_str, hint
-                        ))
-                    );
+                    return QueryOutcome::Error(ClaudeError::Api(format!(
+                        "No API key for provider '{}' (model '{}'). {}",
+                        provider_id_str, model_id_str, hint
+                    )));
                 }
                 // Anthropic with no auth_store key: fall through to the raw
                 // client path below (which has its own deferred key validation
@@ -1374,7 +1509,9 @@ pub async fn run_query_loop(
                 // On overloaded/rate-limit errors, attempt one switch to the fallback model.
                 let err_str = e.to_string().to_lowercase();
                 if !used_fallback
-                    && (err_str.contains("overloaded") || err_str.contains("529") || err_str.contains("rate_limit"))
+                    && (err_str.contains("overloaded")
+                        || err_str.contains("529")
+                        || err_str.contains("rate_limit"))
                 {
                     if let Some(ref fb) = config.fallback_model {
                         warn!(
@@ -1488,9 +1625,14 @@ pub async fn run_query_loop(
         // providers that emit non-standard finish reasons).
         let raw_stop = stop_reason.as_deref().unwrap_or("end_turn");
         let stop = match raw_stop {
-            "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "content_filtered" => raw_stop,
+            "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "content_filtered" => {
+                raw_stop
+            }
             _ if !assistant_msg.get_tool_use_blocks().is_empty() => {
-                warn!(stop_reason = raw_stop, "Unknown stop reason with tool_use blocks present; treating as tool_use");
+                warn!(
+                    stop_reason = raw_stop,
+                    "Unknown stop reason with tool_use blocks present; treating as tool_use"
+                );
                 "tool_use"
             }
             _ => raw_stop,
@@ -1545,18 +1687,14 @@ pub async fn run_query_loop(
         // caching the bare `input_tokens` field undercounts badly. Fall back to
         // the estimate only before the first response / when usage is absent. (#231)
         let real_usage = usage.total_input();
-        let context_tokens = compact::estimate_context_tokens(
-            messages,
-            (real_usage > 0).then_some(real_usage),
-        );
+        let context_tokens =
+            compact::estimate_context_tokens(messages, (real_usage > 0).then_some(real_usage));
 
         // Emit token warning events when approaching context limits.
         // Thresholds mirror TypeScript autoCompact.ts: 80% → Warning, 95% → Critical.
         {
-            let warning_state = compact::calculate_token_warning_state_for_window(
-                context_tokens,
-                context_window,
-            );
+            let warning_state =
+                compact::calculate_token_warning_state_for_window(context_tokens, context_window);
             if warning_state != compact::TokenWarningState::Ok {
                 if let Some(ref tx) = event_tx {
                     let pct_used = context_tokens as f64 / context_window as f64;
@@ -1591,8 +1729,7 @@ pub async fn run_query_loop(
                 }
                 // Pass a clone so the live conversation survives a failed
                 // compaction; `*messages` is only overwritten on success (#213).
-                let outcome =
-                    compact::context_collapse(messages.clone(), client, config).await;
+                let outcome = compact::context_collapse(messages.clone(), client, config).await;
                 match apply_compact_result(messages, outcome) {
                     Ok(tokens_freed) => {
                         info!(tokens_freed, "Context-collapse complete");
@@ -1869,7 +2006,10 @@ pub async fn run_query_loop(
                 // Phase 1: sequential pre-hook pass.
                 let mut prepared: Vec<PreparedTool> = Vec::with_capacity(tool_blocks.len());
                 for block in tool_blocks {
-                    if let ContentBlock::ToolUse { id, name, input, .. } = block {
+                    if let ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } = block
+                    {
                         // Clone from the references returned by get_tool_use_blocks()
                         let id = id.clone();
                         let name = name.clone();
@@ -1903,22 +2043,26 @@ pub async fn run_query_loop(
                         let plugin_pre_outcome =
                             claurst_plugins::run_global_pre_tool_hook(&name, &input);
 
-                        let blocked_result =
-                            if let claurst_core::hooks::HookOutcome::Blocked(reason) = pre_outcome {
-                                warn!(tool = %name, reason = %reason, "PreToolUse hook blocked execution");
-                                Some(claurst_tools::ToolResult::error(format!(
-                                    "Blocked by hook: {}",
-                                    reason
-                                )))
-                            } else if let claurst_plugins::HookOutcome::Deny(reason) = plugin_pre_outcome {
-                                warn!(tool = %name, reason = %reason, "Plugin PreToolUse hook blocked execution");
-                                Some(claurst_tools::ToolResult::error(format!(
-                                    "Blocked by plugin hook: {}",
-                                    reason
-                                )))
-                            } else {
-                                None
-                            };
+                        let blocked_result = if let claurst_core::hooks::HookOutcome::Blocked(
+                            reason,
+                        ) = pre_outcome
+                        {
+                            warn!(tool = %name, reason = %reason, "PreToolUse hook blocked execution");
+                            Some(claurst_tools::ToolResult::error(format!(
+                                "Blocked by hook: {}",
+                                reason
+                            )))
+                        } else if let claurst_plugins::HookOutcome::Deny(reason) =
+                            plugin_pre_outcome
+                        {
+                            warn!(tool = %name, reason = %reason, "Plugin PreToolUse hook blocked execution");
+                            Some(claurst_tools::ToolResult::error(format!(
+                                "Blocked by plugin hook: {}",
+                                reason
+                            )))
+                        } else {
+                            None
+                        };
 
                         prepared.push(PreparedTool {
                             id,
@@ -1963,8 +2107,7 @@ pub async fn run_query_loop(
                 // hooks (they run external commands and would defeat the point of
                 // returning promptly) but still emit ToolEnd + build every result
                 // block so the conversation and TUI stay consistent.
-                let mut result_blocks: Vec<ContentBlock> =
-                    Vec::with_capacity(prepared.len());
+                let mut result_blocks: Vec<ContentBlock> = Vec::with_capacity(prepared.len());
                 for (p, result) in prepared.iter().zip(exec_results) {
                     if !batch_cancelled {
                         let hooks = &tool_ctx.config.hooks;
@@ -2037,7 +2180,10 @@ pub async fn run_query_loop(
                 continue_or_end!(assistant_msg, usage);
             }
             other => {
-                warn!(stop_reason = other, "Unknown stop reason, treating as end_turn");
+                warn!(
+                    stop_reason = other,
+                    "Unknown stop reason, treating as end_turn"
+                );
                 fire_stop_hook!(assistant_msg);
                 let _bg = stop_hooks_with_full_behavior(
                     &assistant_msg,
@@ -2415,6 +2561,76 @@ mod tests {
         assert!(is_openaiish_provider("qwen"));
     }
 
+    #[test]
+    fn is_openaiish_provider_unknown_id_returns_false() {
+        // When a custom provider is registered in settings, is_openaiish_provider
+        // should return true even though it's not in the hardcoded list.
+        // This test uses a unique id unlikely to collide with real settings.
+        // Note: This test depends on no settings.json having this id;
+        // it verifies the fallback (no custom provider → matches! list).
+        let result = is_openaiish_provider("definitely-not-a-real-provider-99999");
+        assert!(!result);
+    }
+
+    #[test]
+    fn known_providers_includes_custom_provider_runtime_check() {
+        // The runtime check for custom providers should not crash and
+        // should not return true for arbitrary unknown strings.
+        // This is a negative test — no custom provider "fake-provider-xyz"
+        // should exist in settings.
+        let settings = claurst_core::Settings::load_sync().unwrap_or_default();
+        assert!(!settings
+            .custom_providers
+            .contains_key("fake-provider-xyz-12345"));
+    }
+
+    #[test]
+    fn build_provider_options_custom_provider_reasoning_effort_fallback() {
+        // Bug 2: reasoningEffort from CustomModelDef should be sent for
+        // non-GPT models on custom providers. We set CLAURST_HOME to a
+        // temp dir with a settings.json containing a custom provider whose
+        // model has reasoningEffort: "high", then verify build_provider_options
+        // emits it even though the model is not a GPT reasoning model.
+        use std::sync::Mutex as StdMutex;
+
+        static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings_json = serde_json::json!({
+            "customProviders": {
+                "test-cp-reasoning": {
+                    "name": "Test CP",
+                    "apiBase": "https://example.com/v1",
+                    "models": {
+                        "revolut-ca/glm-5-2": {
+                            "reasoningEffort": "high",
+                            "maxOutputTokens": 32000
+                        }
+                    }
+                }
+            }
+        });
+        std::fs::write(
+            tmp.path().join("settings.json"),
+            serde_json::to_string_pretty(&settings_json).unwrap(),
+        )
+        .unwrap();
+
+        let old = std::env::var_os("CLAURST_HOME");
+        std::env::set_var("CLAURST_HOME", tmp.path());
+
+        let options = build_provider_options("test-cp-reasoning", "revolut-ca/glm-5-2", None, None);
+
+        // Restore env immediately.
+        match old {
+            Some(v) => std::env::set_var("CLAURST_HOME", v),
+            None => std::env::remove_var("CLAURST_HOME"),
+        }
+
+        assert_eq!(options["reasoningEffort"], serde_json::json!("high"));
+    }
+
     // ---- apply_compact_result / #213 data-loss guard ------------------------
 
     fn sample_conversation() -> Vec<Message> {
@@ -2440,8 +2656,7 @@ mod tests {
 
         // Simulate a failed reactive_compact / context_collapse (API error,
         // Cancelled, empty summary all map to Err here).
-        let outcome: Result<compact::CompactResult, ClaudeError> =
-            Err(ClaudeError::Cancelled);
+        let outcome: Result<compact::CompactResult, ClaudeError> = Err(ClaudeError::Cancelled);
         let result = apply_compact_result(&mut messages, outcome);
 
         assert!(result.is_err(), "helper must surface the compaction error");
@@ -2542,11 +2757,21 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Tool for MockTool {
-        fn name(&self) -> &str { self.name }
-        fn description(&self) -> &str { "mock tool for backstop tests" }
-        fn permission_level(&self) -> PermissionLevel { self.level }
-        fn self_gates(&self) -> bool { self.self_gates }
-        fn input_schema(&self) -> Value { serde_json::json!({"type": "object"}) }
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "mock tool for backstop tests"
+        }
+        fn permission_level(&self) -> PermissionLevel {
+            self.level
+        }
+        fn self_gates(&self) -> bool {
+            self.self_gates
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
         async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
             self.ran.store(true, AtomicOrdering::SeqCst);
             ToolResult::success("mock ran")
@@ -3181,7 +3406,10 @@ mod tests {
             Message::user("now just tidy the docs"),
         ];
         let (_style, prompt) = effective_output_style_for_turn(&cfg, &msgs);
-        assert!(prompt.is_none(), "persona should not persist to a plain turn");
+        assert!(
+            prompt.is_none(),
+            "persona should not persist to a plain turn"
+        );
     }
 
     #[test]

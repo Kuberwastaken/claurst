@@ -32,8 +32,12 @@ use super::request_options::merge_openai_compatible_options;
 
 /// Provider-specific behavioural quirks that alter how the generic adapter
 /// builds and interprets requests/responses.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ProviderQuirks {
+    /// Whether this provider supports SSE streaming.  Default: `true`.
+    /// When `false`, the query engine falls back to non-streaming requests.
+    pub streaming: bool,
+
     /// Truncate tool call IDs to at most this many characters before sending.
     /// For example, Mistral requires tool IDs of at most 9 characters.
     pub tool_id_max_len: Option<usize>,
@@ -93,6 +97,26 @@ pub struct ProviderQuirks {
     /// Native LM Studio host used to discover loaded model instances and their
     /// configured context lengths from `/api/v1/models`.
     pub lm_studio_native_host: Option<String>,
+}
+
+impl Default for ProviderQuirks {
+    fn default() -> Self {
+        Self {
+            streaming: true,
+            tool_id_max_len: None,
+            tool_id_alphanumeric_only: false,
+            overflow_patterns: Vec::new(),
+            include_usage_in_stream: false,
+            default_temperature: None,
+            fix_tool_user_sequence: false,
+            reasoning_field: None,
+            requires_reasoning_roundtrip: false,
+            max_tokens_cap: None,
+            no_api_key_required: false,
+            ollama_native_host: None,
+            lm_studio_native_host: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1141,7 +1165,7 @@ impl LlmProvider for OpenAiCompatProvider {
 
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
-            streaming: true,
+            streaming: self.quirks.streaming,
             tool_calling: true,
             thinking: self.quirks.reasoning_field.is_some(),
             image_input: true,
