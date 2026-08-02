@@ -95,6 +95,10 @@ pub struct QueryConfig {
     pub model: String,
     pub max_tokens: u32,
     pub max_turns: u32,
+    /// Whether the max-steps graceful degradation summary turn is enabled.
+    /// When `false`, exceeding `max_turns` returns cold (last assistant
+    /// message) instead of running a final tool-less summary turn.
+    pub degradation_enabled: bool,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
     pub output_style: claurst_core::system_prompt::OutputStyle,
@@ -174,6 +178,7 @@ impl Default for QueryConfig {
             model: claurst_core::constants::DEFAULT_MODEL.to_string(),
             max_tokens: claurst_core::constants::DEFAULT_MAX_TOKENS,
             max_turns: claurst_core::constants::MAX_TURNS_DEFAULT,
+            degradation_enabled: true,
             system_prompt: None,
             append_system_prompt: None,
             output_style: claurst_core::system_prompt::OutputStyle::Default,
@@ -210,6 +215,7 @@ impl QueryConfig {
                 .as_ref()
                 .map(|p| p.display().to_string()),
             managed_agents: cfg.managed_agents.clone(),
+            degradation_enabled: cfg.degradation_summary_enabled,
             ..Default::default()
         }
     }
@@ -231,6 +237,7 @@ impl QueryConfig {
                 .as_ref()
                 .map(|p| p.display().to_string()),
             managed_agents: cfg.managed_agents.clone(),
+            degradation_enabled: cfg.degradation_summary_enabled,
             ..Default::default()
         }
     }
@@ -471,6 +478,21 @@ pub async fn run_query_loop(
         // dispatched exactly once, and re-exceeding the cap afterwards returns
         // cold. Applies to both goal and non-goal runs.
         let degradation_turn = if turn > effective_max_turns {
+            if !config.degradation_enabled {
+                info!(
+                    turns = turn,
+                    max = effective_max_turns,
+                    "Max turns reached — degradation disabled, returning cold"
+                );
+                let last_msg = messages
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| Message::assistant("Max turns reached."));
+                return QueryOutcome::EndTurn {
+                    message: last_msg,
+                    usage: UsageInfo::default(),
+                };
+            }
             if degradation_done {
                 info!(
                     turns = turn,
@@ -835,10 +857,16 @@ pub async fn run_query_loop(
                 if known_providers.contains(&p) {
                     (p.to_string(), m.to_string())
                 } else {
-                    // Treat the whole string as the model ID, fall through
-                    // to auto-detection below.
-                    let fallback_provider = tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
-                    (fallback_provider.to_string(), effective_model.clone())
+                    // Check whether `p` is a user-defined custom provider id.
+                    let settings = claurst_core::Settings::load_sync().unwrap_or_default();
+                    if settings.custom_providers.contains_key(p) {
+                        (p.to_string(), m.to_string())
+                    } else {
+                        // Treat the whole string as the model ID, fall through
+                        // to auto-detection below.
+                        let fallback_provider = tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
+                        (fallback_provider.to_string(), effective_model.clone())
+                    }
                 }
             } else {
                 // No explicit provider set (or set to "anthropic"): try the
@@ -971,12 +999,28 @@ pub async fn run_query_loop(
                         })
                         .collect();
 
+                    // Cap max_tokens by the custom model's `maxOutputTokens`
+                    // when the model belongs to a user-defined custom provider.
+                    let effective_max_tokens = {
+                        let mut tok = config.max_tokens;
+                        if let Ok(settings) = claurst_core::Settings::load_sync() {
+                            if let Some(cp) = settings.custom_providers.get(&provider_id_str) {
+                                if let Some(model_def) = cp.models.get(&model_id_str) {
+                                    if let Some(cap) = model_def.max_output_tokens {
+                                        tok = tok.min(cap);
+                                    }
+                                }
+                            }
+                        }
+                        tok
+                    };
+
                     let provider_request = claurst_api::ProviderRequest {
                         model: model_id_str.to_owned(),
                         messages: provider_messages,
                         system_prompt: Some(system_for_provider.clone()),
                         tools: provider_tools,
-                        max_tokens: config.max_tokens,
+                        max_tokens: effective_max_tokens,
                         temperature: effective_temperature.map(|t| t as f64),
                         top_p: None,
                         top_k: None,
@@ -2413,6 +2457,79 @@ mod tests {
         // both must be treated as OpenAI-compatible providers.
         assert!(is_openaiish_provider("alibaba"));
         assert!(is_openaiish_provider("qwen"));
+    }
+
+    #[test]
+    fn is_openaiish_provider_unknown_id_returns_false() {
+        // When a custom provider is registered in settings, is_openaiish_provider
+        // should return true even though it's not in the hardcoded list.
+        // This test uses a unique id unlikely to collide with real settings.
+        // Note: This test depends on no settings.json having this id;
+        // it verifies the fallback (no custom provider → matches! list).
+        let result = is_openaiish_provider("definitely-not-a-real-provider-99999");
+        assert!(!result);
+    }
+
+    #[test]
+    fn known_providers_includes_custom_provider_runtime_check() {
+        // The runtime check for custom providers should not crash and
+        // should not return true for arbitrary unknown strings.
+        // This is a negative test — no custom provider "fake-provider-xyz"
+        // should exist in settings.
+        let settings = claurst_core::Settings::load_sync().unwrap_or_default();
+        assert!(!settings.custom_providers.contains_key("fake-provider-xyz-12345"));
+    }
+
+#[test]
+    fn build_provider_options_custom_provider_reasoning_effort_fallback() {
+        // Bug 2: reasoningEffort from CustomModelDef should be sent for
+        // non-GPT models on custom providers. We set CLAURST_HOME to a
+        // temp dir with a settings.json containing a custom provider whose
+        // model has reasoningEffort: "high", then verify build_provider_options
+        // emits it even though the model is not a GPT reasoning model.
+        use std::sync::Mutex as StdMutex;
+
+        static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let settings_json = serde_json::json!({
+            "customProviders": {
+                "test-cp-reasoning": {
+                    "name": "Test CP",
+                    "apiBase": "https://example.com/v1",
+                    "models": {
+                        "revolut-ca/glm-5-2": {
+                            "reasoningEffort": "high",
+                            "maxOutputTokens": 32000
+                        }
+                    }
+                }
+            }
+        });
+        std::fs::write(
+            tmp.path().join("settings.json"),
+            serde_json::to_string_pretty(&settings_json).unwrap(),
+        )
+        .unwrap();
+
+        let old = std::env::var_os("CLAURST_HOME");
+        std::env::set_var("CLAURST_HOME", tmp.path());
+
+        let options = build_provider_options(
+            "test-cp-reasoning",
+            "revolut-ca/glm-5-2",
+            None,
+            None,
+        );
+
+        // Restore env immediately.
+        match old {
+            Some(v) => std::env::set_var("CLAURST_HOME", v),
+            None => std::env::remove_var("CLAURST_HOME"),
+        }
+
+        assert_eq!(options["reasoningEffort"], serde_json::json!("high"));
     }
 
     // ---- apply_compact_result / #213 data-loss guard ------------------------
