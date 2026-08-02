@@ -1049,6 +1049,8 @@ async fn run_models_command(args: &[String]) -> anyhow::Result<()> {
         .map(|s| s.effective_config().model_overrides)
         .unwrap_or_default();
     registry.apply_model_overrides(&overrides);
+    let settings = claurst_core::Settings::load_sync().unwrap_or_default();
+    registry.apply_custom_providers(&settings.custom_providers);
 
     let mut entries: Vec<&claurst_api::ModelEntry> = match &provider_filter {
         Some(pid) => registry.list_by_provider(pid),
@@ -1191,6 +1193,8 @@ fn load_cached_model_registry(config: &Config) -> Arc<claurst_api::ModelRegistry
     // Layer user metadata overrides on top of the catalog (issue #309). Stored
     // in the registry, so any later cache reload re-asserts them automatically.
     reg.apply_model_overrides(&config.model_overrides);
+    let settings = claurst_core::Settings::load_sync().unwrap_or_default();
+    reg.apply_custom_providers(&settings.custom_providers);
     Arc::new(reg)
 }
 
@@ -1884,6 +1888,8 @@ async fn run_interactive(
     // arrive as their final character, so re-shifting them would corrupt input
     // (issue #183: typing `/` produced `?`).
     app.kitty_keyboard_active = claurst_tui::keyboard_enhancement_active();
+    // Wire session ID so auto-poke + todo persistence can find the right list.
+    app.session_id = session.id.clone();
     // Seed the project-MCP approval queue: untrusted project servers that the
     // user must approve before they are allowed to launch (issue #123).
     app.mcp_project_root = mcp_project_root;
@@ -2344,6 +2350,16 @@ async fn run_interactive(
                             continue;
                         }
 
+                        // Check for bang command (! prefix) — execute directly in
+                        // the shell, no model dispatch, zero token consumption.
+                        if claurst_tui::input::is_bang_command(&input) {
+                            let command = input[1..].trim().to_string();
+                            if !command.is_empty() {
+                                app.execute_bang_command(command);
+                            }
+                            continue;
+                        }
+
                         // Check for slash command
                         if input.starts_with('/') {
                             let (cmd_name, cmd_args) =
@@ -2427,6 +2443,7 @@ async fn run_interactive(
                                     tool_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_title = None;
+                                    app.session_id = session.id.clone();
                                     // Reset per-turn diff/turn bookkeeping, as
                                     // ResumeSession does when swapping sessions.
                                     tool_ctx.file_history = Arc::new(ParkingMutex::new(
@@ -2527,6 +2544,7 @@ async fn run_interactive(
                                     tool_ctx.config.model = Some(session.model.clone());
                                     app.model_name = session.model.clone();
                                     tool_ctx.session_id = session.id.clone();
+                                    app.session_id = session.id.clone();
                                     tool_ctx.file_history = Arc::new(ParkingMutex::new(
                                         claurst_core::file_history::FileHistory::new(),
                                     ));
@@ -3144,6 +3162,10 @@ async fn run_interactive(
                             tools_arc = all_tools_arc.clone();
                         }
                     }
+                    // Apply /turns override if set (takes precedence over agent defaults).
+                    if let Some(turns) = app.max_turns_override {
+                        base_query_config.max_turns = turns;
+                    }
                     if !app.is_streaming && app.messages.len() < messages.len() {
                         messages = app.messages.clone();
                         session.messages = messages.clone();
@@ -3690,8 +3712,14 @@ async fn run_interactive(
                     } else {
                         app.model_picker.merge_models(entries);
                     }
-                    for m in &mut app.model_picker.models {
-                        m.is_current = m.id == current;
+                    // In all-providers mode, open_with_title already set
+                    // is_current correctly (dual-match: bare id OR
+                    // provider-prefixed form). Don't override it with a
+                    // single-provider strip that would wipe the preselection.
+                    if !app.model_picker.all_providers_mode {
+                        for m in &mut app.model_picker.models {
+                            m.is_current = m.id == current;
+                        }
                     }
                     app.model_picker.loading_models = false;
                     app.model_fetch_rx = None;
@@ -3797,6 +3825,7 @@ async fn run_interactive(
                                                                 ctx_for(&id, m.context_window),
                                                             ),
                                                         is_current: false,
+                                                        provider_id: provider_key.clone(),
                                                     }
                                                 })
                                             })
@@ -3814,6 +3843,7 @@ async fn run_interactive(
                                                         ),
                                                     id,
                                                     is_current: false,
+                                                    provider_id: provider_key.clone(),
                                                 }
                                             })
                                             .collect()
