@@ -42,8 +42,12 @@ fn apply_persona(ctx: &CommandContext, style: &str, confirm: &str) -> CommandRes
 
 #[async_trait]
 impl SlashCommand for CavemanCommand {
-    fn name(&self) -> &str { "caveman" }
-    fn description(&self) -> &str { "Caveman persona — why use many token when few token do trick" }
+    fn name(&self) -> &str {
+        "caveman"
+    }
+    fn description(&self) -> &str {
+        "Caveman persona — why use many token when few token do trick"
+    }
     fn help(&self) -> &str {
         "Usage: /caveman\n\n\
          Switch the output style to the caveman persona (concise, few words) and \
@@ -58,8 +62,12 @@ impl SlashCommand for CavemanCommand {
 
 #[async_trait]
 impl SlashCommand for RockyCommand {
-    fn name(&self) -> &str { "rocky" }
-    fn description(&self) -> &str { "Rocky persona — Eridian engineer from Project Hail Mary. Good good good." }
+    fn name(&self) -> &str {
+        "rocky"
+    }
+    fn description(&self) -> &str {
+        "Rocky persona — Eridian engineer from Project Hail Mary. Good good good."
+    }
     fn help(&self) -> &str {
         "Usage: /rocky\n\n\
          Switch the output style to the Rocky persona (Project Hail Mary's Eridian \
@@ -74,8 +82,12 @@ impl SlashCommand for RockyCommand {
 
 #[async_trait]
 impl SlashCommand for NormalCommand {
-    fn name(&self) -> &str { "normal" }
-    fn description(&self) -> &str { "Reset the output style / persona to default" }
+    fn name(&self) -> &str {
+        "normal"
+    }
+    fn description(&self) -> &str {
+        "Reset the output style / persona to default"
+    }
     fn help(&self) -> &str {
         "Usage: /normal\n\nDeactivate any active persona/output style and return to the default. \
          Equivalent to /output-style default. Typing `normal` inline resets for one turn only."

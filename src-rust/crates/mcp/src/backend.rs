@@ -1,6 +1,6 @@
 use crate::types::{
-    CallToolResult, GetPromptResult, McpPrompt, McpResource, McpTool,
-    ResourceContents, ServerCapabilities, ServerInfo,
+    CallToolResult, GetPromptResult, McpPrompt, McpResource, McpTool, ResourceContents,
+    ServerCapabilities, ServerInfo,
 };
 use async_trait::async_trait;
 use futures::stream::BoxStream;

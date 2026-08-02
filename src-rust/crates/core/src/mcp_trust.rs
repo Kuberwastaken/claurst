@@ -135,8 +135,7 @@ impl McpTrustStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let content = serde_json::to_string_pretty(self)
-            .map_err(std::io::Error::other)?;
+        let content = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         // Write-then-rename so a concurrent reader never sees a half-written
         // (corrupt) trust file. Rename is atomic within the same directory.
         let tmp = path.with_extension("json.tmp");
@@ -322,10 +321,8 @@ mod tests {
 
     #[test]
     fn persisted_approval_roundtrips() {
-        let root = std::env::temp_dir().join(format!(
-            "claurst-mcp-trust-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("claurst-mcp-trust-test-{}", uuid::Uuid::new_v4()));
         let server = project_server("p", "evil");
         let mut store = McpTrustStore::default();
         assert!(!store.is_approved(&root, &server));

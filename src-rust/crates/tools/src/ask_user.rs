@@ -85,10 +85,10 @@ impl Tool for AskUserQuestionTool {
                 Ok(answer) if answer.is_empty() => {
                     ToolResult::success("The user dismissed the question without answering.")
                 }
-                Ok(answer) => {
-                    ToolResult::success(format!("The user answered: {}", answer))
+                Ok(answer) => ToolResult::success(format!("The user answered: {}", answer)),
+                Err(_) => {
+                    ToolResult::error("Question channel closed before answer received".to_string())
                 }
-                Err(_) => ToolResult::error("Question channel closed before answer received".to_string()),
             }
         } else {
             // No channel wired up — return metadata so a future TUI integration
@@ -98,8 +98,7 @@ impl Tool for AskUserQuestionTool {
                 "options": params.options,
                 "type": "ask_user",
             });
-            ToolResult::success(format!("Question: {}", params.question))
-                .with_metadata(meta)
+            ToolResult::success(format!("Question: {}", params.question)).with_metadata(meta)
         }
     }
 }

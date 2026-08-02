@@ -64,8 +64,12 @@ mod teleport_bundle {
 
 #[async_trait]
 impl SlashCommand for TeleportCommand {
-    fn name(&self) -> &str { "teleport" }
-    fn description(&self) -> &str { "Export/import/link session context as a portable bundle" }
+    fn name(&self) -> &str {
+        "teleport"
+    }
+    fn description(&self) -> &str {
+        "Export/import/link session context as a portable bundle"
+    }
     fn help(&self) -> &str {
         "Usage:\n\
          \n\
@@ -136,7 +140,9 @@ impl SlashCommand for TeleportCommand {
                                         for key in &candidates {
                                             if let Some(v) = input.get(key) {
                                                 if let Some(s) = v.as_str() {
-                                                    if !s.is_empty() && !seen.contains(&s.to_string()) {
+                                                    if !s.is_empty()
+                                                        && !seen.contains(&s.to_string())
+                                                    {
                                                         seen.push(s.to_string());
                                                     }
                                                 }
@@ -171,10 +177,12 @@ impl SlashCommand for TeleportCommand {
                     .map(str::to_string)
                     .collect();
                 redacted_env_vars.extend(
-                    claurst_core::config::api_key_env_vars_for_provider(ctx.config.selected_provider_id())
-                        .iter()
-                        .copied()
-                        .map(str::to_string),
+                    claurst_core::config::api_key_env_vars_for_provider(
+                        ctx.config.selected_provider_id(),
+                    )
+                    .iter()
+                    .copied()
+                    .map(str::to_string),
                 );
                 let env: std::collections::HashMap<String, String> = std::env::vars()
                     .filter(|(k, _)| !redacted_env_vars.contains(k))
@@ -204,7 +212,11 @@ impl SlashCommand for TeleportCommand {
                             action: PermissionAction::Deny,
                         });
                     }
-                    TeleportPermissions { allowed, denied, rules }
+                    TeleportPermissions {
+                        allowed,
+                        denied,
+                        rules,
+                    }
                 };
 
                 // ---- build bundle -----------------------------------------
@@ -224,7 +236,9 @@ impl SlashCommand for TeleportCommand {
                 // ---- serialize and write ----------------------------------
                 let json = match serde_json::to_string_pretty(&bundle) {
                     Ok(j) => j,
-                    Err(e) => return CommandResult::Error(format!("Failed to serialize bundle: {}", e)),
+                    Err(e) => {
+                        return CommandResult::Error(format!("Failed to serialize bundle: {}", e))
+                    }
                 };
 
                 if let Err(e) = std::fs::write(&output_path, &json) {
@@ -254,28 +268,30 @@ impl SlashCommand for TeleportCommand {
 
             "import" => {
                 if rest.is_empty() {
-                    return CommandResult::Error(
-                        "Usage: /teleport import <file>".to_string(),
-                    );
+                    return CommandResult::Error("Usage: /teleport import <file>".to_string());
                 }
 
                 let path = std::path::PathBuf::from(rest);
 
                 let data = match std::fs::read_to_string(&path) {
                     Ok(s) => s,
-                    Err(e) => return CommandResult::Error(format!(
-                        "Cannot read teleport bundle '{}': {}",
-                        path.display(),
-                        e
-                    )),
+                    Err(e) => {
+                        return CommandResult::Error(format!(
+                            "Cannot read teleport bundle '{}': {}",
+                            path.display(),
+                            e
+                        ))
+                    }
                 };
 
                 let bundle: TeleportBundle = match serde_json::from_str(&data) {
                     Ok(b) => b,
-                    Err(e) => return CommandResult::Error(format!(
-                        "Failed to parse teleport bundle: {}",
-                        e
-                    )),
+                    Err(e) => {
+                        return CommandResult::Error(format!(
+                            "Failed to parse teleport bundle: {}",
+                            e
+                        ))
+                    }
                 };
 
                 // ---- validate version ------------------------------------
@@ -329,7 +345,11 @@ impl SlashCommand for TeleportCommand {
                     exported_at,
                     msg_count,
                     working_dir_display,
-                    if dir_restored { " (restored)" } else { " (path not found, skipped)" },
+                    if dir_restored {
+                        " (restored)"
+                    } else {
+                        " (path not found, skipped)"
+                    },
                     allowed_count,
                     denied_count,
                     files_count,
@@ -338,8 +358,8 @@ impl SlashCommand for TeleportCommand {
 
             "link" => {
                 // ---- build a minimal bundle for the link (no env vars) ---
-                use teleport_bundle::TeleportBundle;
                 use base64::Engine as _;
+                use teleport_bundle::TeleportBundle;
 
                 let permissions = {
                     let allowed = ctx.config.allowed_tools.clone();
@@ -360,7 +380,11 @@ impl SlashCommand for TeleportCommand {
                             action: PermissionAction::Deny,
                         });
                     }
-                    TeleportPermissions { allowed, denied, rules }
+                    TeleportPermissions {
+                        allowed,
+                        denied,
+                        rules,
+                    }
                 };
 
                 let bundle = TeleportBundle {
@@ -371,22 +395,28 @@ impl SlashCommand for TeleportCommand {
                     permissions,
                     model: ctx.config.model.clone(),
                     effort: None,
-                    files: Vec::new(), // keep link compact
+                    files: Vec::new(),                     // keep link compact
                     env: std::collections::HashMap::new(), // omit env for security
                     exported_at: chrono::Utc::now().to_rfc3339(),
                 };
 
                 let json = match serde_json::to_string(&bundle) {
                     Ok(j) => j,
-                    Err(e) => return CommandResult::Error(format!("Failed to serialize bundle: {}", e)),
+                    Err(e) => {
+                        return CommandResult::Error(format!("Failed to serialize bundle: {}", e))
+                    }
                 };
 
-                let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.as_bytes());
+                let encoded =
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.as_bytes());
                 let link = format!("teleport://{}", encoded);
 
                 // Warn if the link is very long.
                 let size_hint = if link.len() > 8192 {
-                    format!("\n(Link is {} bytes — consider /teleport export for large sessions)", link.len())
+                    format!(
+                        "\n(Link is {} bytes — consider /teleport export for large sessions)",
+                        link.len()
+                    )
                 } else {
                     String::new()
                 };
@@ -394,9 +424,7 @@ impl SlashCommand for TeleportCommand {
                 CommandResult::Message(format!(
                     "Teleport link generated for session {}:\n\n{}{}\n\n\
                      Share this link or use: /teleport import <link-url>",
-                    ctx.session_id,
-                    link,
-                    size_hint,
+                    ctx.session_id, link, size_hint,
                 ))
             }
 
@@ -407,7 +435,8 @@ impl SlashCommand for TeleportCommand {
                      \x20 /teleport export [--output <file>]   export session to .teleport bundle\n\
                      \x20 /teleport import <file>              restore a .teleport bundle\n\
                      \x20 /teleport link                       generate a teleport:// deep link\n\
-                     \nSee /help teleport for details.".to_string()
+                     \nSee /help teleport for details."
+                        .to_string(),
                 )
             }
 

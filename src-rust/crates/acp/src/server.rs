@@ -97,10 +97,9 @@ impl AgentServer {
         debug!(method, "ACP: dispatch notification");
         match method {
             "session/cancel" => {
-                let parsed: Result<acp::CancelNotification, _> =
-                    params.map(serde_json::from_value).unwrap_or(Err(serde::de::Error::custom(
-                        "missing params",
-                    )));
+                let parsed: Result<acp::CancelNotification, _> = params
+                    .map(serde_json::from_value)
+                    .unwrap_or(Err(serde::de::Error::custom("missing params")));
                 match parsed {
                     Ok(notif) => {
                         if let Some(session) = self.sessions.get(&notif.session_id) {
@@ -155,8 +154,9 @@ impl AgentServer {
         req: acp::NewSessionRequest,
     ) -> Result<acp::NewSessionResponse, acp::Error> {
         if !req.cwd.is_absolute() {
-            return Err(acp::Error::invalid_params()
-                .data(Some(serde_json::json!({ "reason": "cwd must be absolute" }))));
+            return Err(acp::Error::invalid_params().data(Some(
+                serde_json::json!({ "reason": "cwd must be absolute" }),
+            )));
         }
         let session_id = acp::SessionId::new(format!("acp-{}", uuid::Uuid::new_v4()));
         let state = SessionState::new(session_id.clone(), req.cwd.clone());
@@ -187,19 +187,15 @@ impl AgentServer {
                 }))));
             }
         };
-        crate::prompt::handle(
-            self.runtime.clone(),
-            self.connection.clone(),
-            session,
-            req,
-        )
-        .await
+        crate::prompt::handle(self.runtime.clone(), self.connection.clone(), session, req).await
     }
 }
 
 fn parse_params<T: serde::de::DeserializeOwned>(params: Option<Value>) -> Result<T, acp::Error> {
     let value = params.ok_or_else(acp::Error::invalid_params)?;
     serde_json::from_value(value).map_err(|e| {
-        acp::Error::invalid_params().data(Some(serde_json::json!({ "deserialize_error": e.to_string() })))
+        acp::Error::invalid_params().data(Some(
+            serde_json::json!({ "deserialize_error": e.to_string() }),
+        ))
     })
 }

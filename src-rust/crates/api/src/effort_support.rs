@@ -339,15 +339,20 @@ mod tests {
         // reasoning=true still gets a non-empty raw ladder.
         let mut registry = ModelRegistry::new();
         let json = r#"{"acme":{"id":"acme","name":"Acme","npm":"@ai-sdk/openai-compatible","models":{"reasoner-x":{"id":"reasoner-x","name":"Reasoner X","reasoning":true,"limit":{"context":200000,"output":64000}},"plain-y":{"id":"plain-y","name":"Plain Y","reasoning":false,"limit":{"context":128000,"output":32000}}}}}"#;
-        let path = std::env::temp_dir()
-            .join(format!("claurst_effort_support_{}.json", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "claurst_effort_support_{}.json",
+            std::process::id()
+        ));
         std::fs::write(&path, json).expect("write temp catalog");
         registry.load_cache(&path);
         let _ = std::fs::remove_file(&path);
 
         // reasoning=true → openai-compatible OPENAI_EFFORTS.
         let reasoner = variant_ladder("acme", "reasoner-x", Some(&registry));
-        assert!(!reasoner.is_empty(), "reasoning=true must yield a ladder: {reasoner:?}");
+        assert!(
+            !reasoner.is_empty(),
+            "reasoning=true must yield a ladder: {reasoner:?}"
+        );
         // reasoning=false → empty raw ladder, base ladder from supported_efforts.
         assert!(variant_ladder("acme", "plain-y", Some(&registry)).is_empty());
         let plain = supported_efforts("acme", "plain-y", Some(&registry));

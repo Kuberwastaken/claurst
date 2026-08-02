@@ -62,7 +62,9 @@ pub struct ComputerUseTool;
 #[async_trait]
 impl Tool for ComputerUseTool {
     // Gates itself: calls `ctx.check_permission` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
         "computer"
@@ -193,28 +195,22 @@ async fn execute_action(_params: ComputerUseInput) -> ToolResult {
 
 #[cfg(feature = "computer-use")]
 async fn execute_action(params: ComputerUseInput) -> ToolResult {
-    use enigo::{
-        Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings,
-    };
+    use enigo::{Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 
     match params.action.as_str() {
         // ── Screenshot ───────────────────────────────────────────────────
         "screenshot" => take_screenshot(),
 
         // ── Cursor position ──────────────────────────────────────────────
-        "get_cursor_position" => {
-            match Enigo::new(&Settings::default()) {
-                Ok(enigo) => {
-                    match enigo.location() {
-                        Ok((x, y)) => ToolResult::success(
-                            format!("Cursor position: {{\"x\": {}, \"y\": {}}}", x, y)
-                        ),
-                        Err(e) => ToolResult::error(format!("Failed to get cursor position: {}", e)),
-                    }
+        "get_cursor_position" => match Enigo::new(&Settings::default()) {
+            Ok(enigo) => match enigo.location() {
+                Ok((x, y)) => {
+                    ToolResult::success(format!("Cursor position: {{\"x\": {}, \"y\": {}}}", x, y))
                 }
-                Err(e) => ToolResult::error(format!("Failed to initialise input controller: {}", e)),
-            }
-        }
+                Err(e) => ToolResult::error(format!("Failed to get cursor position: {}", e)),
+            },
+            Err(e) => ToolResult::error(format!("Failed to initialise input controller: {}", e)),
+        },
 
         // ── Mouse move ───────────────────────────────────────────────────
         "mouse_move" => {
@@ -223,13 +219,13 @@ async fn execute_action(params: ComputerUseInput) -> ToolResult {
                 None => return ToolResult::error("mouse_move requires 'coordinate' field"),
             };
             match Enigo::new(&Settings::default()) {
-                Ok(mut enigo) => {
-                    match enigo.move_mouse(x, y, Coordinate::Abs) {
-                        Ok(()) => ToolResult::success(format!("Moved mouse to ({}, {})", x, y)),
-                        Err(e) => ToolResult::error(format!("mouse_move failed: {}", e)),
-                    }
+                Ok(mut enigo) => match enigo.move_mouse(x, y, Coordinate::Abs) {
+                    Ok(()) => ToolResult::success(format!("Moved mouse to ({}, {})", x, y)),
+                    Err(e) => ToolResult::error(format!("mouse_move failed: {}", e)),
+                },
+                Err(e) => {
+                    ToolResult::error(format!("Failed to initialise input controller: {}", e))
                 }
-                Err(e) => ToolResult::error(format!("Failed to initialise input controller: {}", e)),
             }
         }
 
@@ -249,7 +245,9 @@ async fn execute_action(params: ComputerUseInput) -> ToolResult {
                         Err(e) => ToolResult::error(format!("left_click failed: {}", e)),
                     }
                 }
-                Err(e) => ToolResult::error(format!("Failed to initialise input controller: {}", e)),
+                Err(e) => {
+                    ToolResult::error(format!("Failed to initialise input controller: {}", e))
+                }
             }
         }
 
@@ -269,7 +267,9 @@ async fn execute_action(params: ComputerUseInput) -> ToolResult {
                         Err(e) => ToolResult::error(format!("right_click failed: {}", e)),
                     }
                 }
-                Err(e) => ToolResult::error(format!("Failed to initialise input controller: {}", e)),
+                Err(e) => {
+                    ToolResult::error(format!("Failed to initialise input controller: {}", e))
+                }
             }
         }
 
@@ -285,14 +285,21 @@ async fn execute_action(params: ComputerUseInput) -> ToolResult {
                         return ToolResult::error(format!("double_click move failed: {}", e));
                     }
                     if let Err(e) = enigo.button(Button::Left, Direction::Click) {
-                        return ToolResult::error(format!("double_click first click failed: {}", e));
+                        return ToolResult::error(format!(
+                            "double_click first click failed: {}",
+                            e
+                        ));
                     }
                     match enigo.button(Button::Left, Direction::Click) {
                         Ok(()) => ToolResult::success(format!("Double-clicked at ({}, {})", x, y)),
-                        Err(e) => ToolResult::error(format!("double_click second click failed: {}", e)),
+                        Err(e) => {
+                            ToolResult::error(format!("double_click second click failed: {}", e))
+                        }
                     }
                 }
-                Err(e) => ToolResult::error(format!("Failed to initialise input controller: {}", e)),
+                Err(e) => {
+                    ToolResult::error(format!("Failed to initialise input controller: {}", e))
+                }
             }
         }
 
@@ -300,17 +307,24 @@ async fn execute_action(params: ComputerUseInput) -> ToolResult {
         "left_click_drag" => {
             let [sx, sy] = match params.start_coordinate {
                 Some(c) => c,
-                None => return ToolResult::error("left_click_drag requires 'start_coordinate' field"),
+                None => {
+                    return ToolResult::error("left_click_drag requires 'start_coordinate' field")
+                }
             };
             let [ex, ey] = match params.end_coordinate {
                 Some(c) => c,
-                None => return ToolResult::error("left_click_drag requires 'end_coordinate' field"),
+                None => {
+                    return ToolResult::error("left_click_drag requires 'end_coordinate' field")
+                }
             };
             match Enigo::new(&Settings::default()) {
                 Ok(mut enigo) => {
                     // Move to start, press, move to end, release.
                     if let Err(e) = enigo.move_mouse(sx, sy, Coordinate::Abs) {
-                        return ToolResult::error(format!("left_click_drag: move to start failed: {}", e));
+                        return ToolResult::error(format!(
+                            "left_click_drag: move to start failed: {}",
+                            e
+                        ));
                     }
                     if let Err(e) = enigo.button(Button::Left, Direction::Press) {
                         return ToolResult::error(format!("left_click_drag: press failed: {}", e));
@@ -318,16 +332,24 @@ async fn execute_action(params: ComputerUseInput) -> ToolResult {
                     if let Err(e) = enigo.move_mouse(ex, ey, Coordinate::Abs) {
                         // Best-effort release on error.
                         let _ = enigo.button(Button::Left, Direction::Release);
-                        return ToolResult::error(format!("left_click_drag: drag move failed: {}", e));
+                        return ToolResult::error(format!(
+                            "left_click_drag: drag move failed: {}",
+                            e
+                        ));
                     }
                     match enigo.button(Button::Left, Direction::Release) {
                         Ok(()) => ToolResult::success(format!(
-                            "Dragged from ({}, {}) to ({}, {})", sx, sy, ex, ey
+                            "Dragged from ({}, {}) to ({}, {})",
+                            sx, sy, ex, ey
                         )),
-                        Err(e) => ToolResult::error(format!("left_click_drag: release failed: {}", e)),
+                        Err(e) => {
+                            ToolResult::error(format!("left_click_drag: release failed: {}", e))
+                        }
                     }
                 }
-                Err(e) => ToolResult::error(format!("Failed to initialise input controller: {}", e)),
+                Err(e) => {
+                    ToolResult::error(format!("Failed to initialise input controller: {}", e))
+                }
             }
         }
 
@@ -338,13 +360,15 @@ async fn execute_action(params: ComputerUseInput) -> ToolResult {
                 None => return ToolResult::error("type_text requires 'text' field"),
             };
             match Enigo::new(&Settings::default()) {
-                Ok(mut enigo) => {
-                    match enigo.text(&text) {
-                        Ok(()) => ToolResult::success(format!("Typed {} characters", text.chars().count())),
-                        Err(e) => ToolResult::error(format!("type_text failed: {}", e)),
+                Ok(mut enigo) => match enigo.text(&text) {
+                    Ok(()) => {
+                        ToolResult::success(format!("Typed {} characters", text.chars().count()))
                     }
+                    Err(e) => ToolResult::error(format!("type_text failed: {}", e)),
+                },
+                Err(e) => {
+                    ToolResult::error(format!("Failed to initialise input controller: {}", e))
                 }
-                Err(e) => ToolResult::error(format!("Failed to initialise input controller: {}", e)),
             }
         }
 
@@ -355,13 +379,13 @@ async fn execute_action(params: ComputerUseInput) -> ToolResult {
                 None => return ToolResult::error("key requires 'text' field with key sequence"),
             };
             match Enigo::new(&Settings::default()) {
-                Ok(mut enigo) => {
-                    match press_key_sequence(&mut enigo, &key_str) {
-                        Ok(()) => ToolResult::success(format!("Pressed key: {}", key_str)),
-                        Err(e) => ToolResult::error(format!("key failed: {}", e)),
-                    }
+                Ok(mut enigo) => match press_key_sequence(&mut enigo, &key_str) {
+                    Ok(()) => ToolResult::success(format!("Pressed key: {}", key_str)),
+                    Err(e) => ToolResult::error(format!("key failed: {}", e)),
+                },
+                Err(e) => {
+                    ToolResult::error(format!("Failed to initialise input controller: {}", e))
                 }
-                Err(e) => ToolResult::error(format!("Failed to initialise input controller: {}", e)),
             }
         }
 
@@ -387,18 +411,24 @@ async fn execute_action(params: ComputerUseInput) -> ToolResult {
                         "down" => enigo.scroll(amount, enigo::Axis::Vertical),
                         "left" => enigo.scroll(-amount, enigo::Axis::Horizontal),
                         "right" => enigo.scroll(amount, enigo::Axis::Horizontal),
-                        other => return ToolResult::error(format!(
-                            "scroll: unknown direction '{}'. Use up/down/left/right", other
-                        )),
+                        other => {
+                            return ToolResult::error(format!(
+                                "scroll: unknown direction '{}'. Use up/down/left/right",
+                                other
+                            ))
+                        }
                     };
                     match result {
                         Ok(()) => ToolResult::success(format!(
-                            "Scrolled {} by {} at ({}, {})", direction, amount, x, y
+                            "Scrolled {} by {} at ({}, {})",
+                            direction, amount, x, y
                         )),
                         Err(e) => ToolResult::error(format!("scroll failed: {}", e)),
                     }
                 }
-                Err(e) => ToolResult::error(format!("Failed to initialise input controller: {}", e)),
+                Err(e) => {
+                    ToolResult::error(format!("Failed to initialise input controller: {}", e))
+                }
             }
         }
 
@@ -444,11 +474,9 @@ fn take_screenshot() -> ToolResult {
     let scaled = if scale < 1.0 {
         let new_w = (orig_w as f64 * scale).round() as u32;
         let new_h = (orig_h as f64 * scale).round() as u32;
-        image::DynamicImage::ImageRgba8(image).resize(
-            new_w,
-            new_h,
-            image::imageops::FilterType::Lanczos3,
-        ).to_rgba8()
+        image::DynamicImage::ImageRgba8(image)
+            .resize(new_w, new_h, image::imageops::FilterType::Lanczos3)
+            .to_rgba8()
     } else {
         image
     };
@@ -457,7 +485,8 @@ fn take_screenshot() -> ToolResult {
     let mut jpeg_bytes: Vec<u8> = Vec::new();
     {
         let mut cursor = std::io::Cursor::new(&mut jpeg_bytes);
-        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, JPEG_QUALITY);
+        let mut encoder =
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, JPEG_QUALITY);
         if let Err(e) = encoder.encode_image(&image::DynamicImage::ImageRgba8(scaled)) {
             return ToolResult::error(format!("JPEG encoding failed: {}", e));
         }
@@ -467,7 +496,10 @@ fn take_screenshot() -> ToolResult {
 
     ToolResult::success(format!(
         "Screenshot captured ({}x{} → JPEG, {} bytes base64).\ndata:image/jpeg;base64,{}",
-        orig_w, orig_h, b64.len(), b64
+        orig_w,
+        orig_h,
+        b64.len(),
+        b64
     ))
 }
 
@@ -551,39 +583,39 @@ fn parse_key(s: &str) -> Result<enigo::Key, Box<dyn std::error::Error + Send + S
 
     let key = match s.to_ascii_lowercase().as_str() {
         // Modifiers
-        "ctrl" | "control"              => Key::Control,
-        "alt"                           => Key::Alt,
-        "shift"                         => Key::Shift,
+        "ctrl" | "control" => Key::Control,
+        "alt" => Key::Alt,
+        "shift" => Key::Shift,
         "super" | "meta" | "win" | "cmd" | "command" => Key::Meta,
 
         // Navigation / special
-        "return" | "enter"              => Key::Return,
-        "escape" | "esc"                => Key::Escape,
-        "tab"                           => Key::Tab,
-        "backspace"                     => Key::Backspace,
-        "delete" | "del"                => Key::Delete,
-        "insert"                        => Key::Insert,
-        "home"                          => Key::Home,
-        "end"                           => Key::End,
-        "pageup" | "page_up"            => Key::PageUp,
-        "pagedown" | "page_down"        => Key::PageDown,
-        "up"                            => Key::UpArrow,
-        "down"                          => Key::DownArrow,
-        "left"                          => Key::LeftArrow,
-        "right"                         => Key::RightArrow,
-        "space"                         => Key::Space,
-        "capslock" | "caps_lock"        => Key::CapsLock,
+        "return" | "enter" => Key::Return,
+        "escape" | "esc" => Key::Escape,
+        "tab" => Key::Tab,
+        "backspace" => Key::Backspace,
+        "delete" | "del" => Key::Delete,
+        "insert" => Key::Insert,
+        "home" => Key::Home,
+        "end" => Key::End,
+        "pageup" | "page_up" => Key::PageUp,
+        "pagedown" | "page_down" => Key::PageDown,
+        "up" => Key::UpArrow,
+        "down" => Key::DownArrow,
+        "left" => Key::LeftArrow,
+        "right" => Key::RightArrow,
+        "space" => Key::Space,
+        "capslock" | "caps_lock" => Key::CapsLock,
 
         // Function keys
-        "f1"  => Key::F1,
-        "f2"  => Key::F2,
-        "f3"  => Key::F3,
-        "f4"  => Key::F4,
-        "f5"  => Key::F5,
-        "f6"  => Key::F6,
-        "f7"  => Key::F7,
-        "f8"  => Key::F8,
-        "f9"  => Key::F9,
+        "f1" => Key::F1,
+        "f2" => Key::F2,
+        "f3" => Key::F3,
+        "f4" => Key::F4,
+        "f5" => Key::F5,
+        "f6" => Key::F6,
+        "f7" => Key::F7,
+        "f8" => Key::F8,
+        "f9" => Key::F9,
         "f10" => Key::F10,
         "f11" => Key::F11,
         "f12" => Key::F12,
@@ -755,12 +787,18 @@ mod tests {
     fn test_computer_use_tool_schema_has_action() {
         let schema = ComputerUseTool.input_schema();
         let props = schema["properties"].as_object().unwrap();
-        assert!(props.contains_key("action"), "schema must have 'action' property");
+        assert!(
+            props.contains_key("action"),
+            "schema must have 'action' property"
+        );
     }
 
     #[test]
     fn test_computer_use_permission_level_is_dangerous() {
-        assert_eq!(ComputerUseTool.permission_level(), PermissionLevel::Dangerous);
+        assert_eq!(
+            ComputerUseTool.permission_level(),
+            PermissionLevel::Dangerous
+        );
     }
 
     #[test]

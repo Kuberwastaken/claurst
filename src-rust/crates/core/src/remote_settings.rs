@@ -145,14 +145,8 @@ impl RemoteSettingsManager {
         }
         if let Some(ref token) = self.config.oauth_token {
             if !token.is_empty() {
-                headers.insert(
-                    "Authorization".to_string(),
-                    format!("Bearer {}", token),
-                );
-                headers.insert(
-                    "anthropic-beta".to_string(),
-                    "oauth-2025-04-20".to_string(),
-                );
+                headers.insert("Authorization".to_string(), format!("Bearer {}", token));
+                headers.insert("anthropic-beta".to_string(), "oauth-2025-04-20".to_string());
                 return Some(headers);
             }
         }
@@ -229,15 +223,14 @@ impl RemoteSettingsManager {
 
         // Try to parse as the expected response shape, but be permissive —
         // accept raw settings object if the wrapper is missing.
-        let (settings, _checksum) = if let Ok(parsed) =
-            serde_json::from_value::<RemoteSettingsResponse>(body.clone())
-        {
-            (parsed.settings, parsed.checksum)
-        } else if body.is_object() {
-            (body, None)
-        } else {
-            anyhow::bail!("Remote settings: unexpected response shape");
-        };
+        let (settings, _checksum) =
+            if let Ok(parsed) = serde_json::from_value::<RemoteSettingsResponse>(body.clone()) {
+                (parsed.settings, parsed.checksum)
+            } else if body.is_object() {
+                (body, None)
+            } else {
+                anyhow::bail!("Remote settings: unexpected response shape");
+            };
 
         Ok(Some(settings))
     }
@@ -284,14 +277,9 @@ impl RemoteSettingsManager {
             .as_deref()
             .and_then(|t| serde_json::from_str(t).ok());
 
-        let cached_checksum = cached_settings
-            .as_ref()
-            .map(compute_checksum_from_settings);
+        let cached_checksum = cached_settings.as_ref().map(compute_checksum_from_settings);
 
-        match self
-            .fetch_with_retry(cached_checksum.as_deref())
-            .await
-        {
+        match self.fetch_with_retry(cached_checksum.as_deref()).await {
             Ok(Some(new_settings)) => {
                 // Got fresh settings — persist and return.
                 let checksum = compute_checksum_from_settings(&new_settings);

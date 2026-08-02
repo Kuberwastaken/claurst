@@ -12,7 +12,9 @@ pub struct LinksCommand;
 
 #[async_trait]
 impl SlashCommand for ShareCommand {
-    fn name(&self) -> &str { "share" }
+    fn name(&self) -> &str {
+        "share"
+    }
     fn description(&self) -> &str {
         "Upload the current session as a secret GitHub gist and return a shareable URL"
     }
@@ -67,7 +69,11 @@ impl SlashCommand for ShareCommand {
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
             .collect();
-        let stem = if safe_id.is_empty() { "session".to_string() } else { safe_id };
+        let stem = if safe_id.is_empty() {
+            "session".to_string()
+        } else {
+            safe_id
+        };
         let tmp = std::env::temp_dir().join(format!("claurst-session-{stem}.html"));
 
         if let Err(e) = write_session_html(&tmp, &ctx.messages, &meta) {
@@ -130,9 +136,7 @@ impl SlashCommand for ShareCommand {
             "Could not auto-open the link. Copy the URL above. The gist is secret (unlisted); delete the gist to revoke access."
         };
 
-        CommandResult::Message(format!(
-            "Share URL: {viewer}\nGist: {gist_url}\n\n{footer}"
-        ))
+        CommandResult::Message(format!("Share URL: {viewer}\nGist: {gist_url}\n\n{footer}"))
     }
 }
 
@@ -150,7 +154,10 @@ fn links_url_regex() -> &'static regex::Regex {
 fn strip_trailing_punct(url: &str) -> String {
     let mut s = url.to_string();
     while let Some(c) = s.chars().last() {
-        if matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"' | '>') {
+        if matches!(
+            c,
+            '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '\'' | '"' | '>'
+        ) {
             s.pop();
         } else {
             break;
@@ -192,8 +199,12 @@ fn extract_session_urls(messages: &[Message]) -> Vec<String> {
 
 #[async_trait]
 impl SlashCommand for LinksCommand {
-    fn name(&self) -> &str { "links" }
-    fn aliases(&self) -> Vec<&str> { vec!["link"] }
+    fn name(&self) -> &str {
+        "links"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["link"]
+    }
     fn description(&self) -> &str {
         "List URLs in this session and open them in your browser"
     }

@@ -59,8 +59,8 @@ pub async fn run_upgrade(args: &[String]) -> Result<()> {
     }
 
     // -------- locate current exe --------
-    let exe_path = std::env::current_exe()
-        .context("could not determine current executable path")?;
+    let exe_path =
+        std::env::current_exe().context("could not determine current executable path")?;
     let exe_path = std::fs::canonicalize(&exe_path).unwrap_or(exe_path);
     println!("Installed at:    {}", exe_path.display());
 
@@ -246,7 +246,12 @@ fn extract_archive(archive: &Path, dest: &Path, is_zip: bool) -> Result<()> {
         }
         // tar -xf works on Windows 10+ via bsdtar.
         let status = std::process::Command::new("tar")
-            .args(["-xf", &archive.to_string_lossy(), "-C", &dest.to_string_lossy()])
+            .args([
+                "-xf",
+                &archive.to_string_lossy(),
+                "-C",
+                &dest.to_string_lossy(),
+            ])
             .status()
             .context("failed to spawn tar")?;
         if !status.success() {
@@ -255,7 +260,12 @@ fn extract_archive(archive: &Path, dest: &Path, is_zip: bool) -> Result<()> {
         Ok(())
     } else {
         let status = std::process::Command::new("tar")
-            .args(["-xzf", &archive.to_string_lossy(), "-C", &dest.to_string_lossy()])
+            .args([
+                "-xzf",
+                &archive.to_string_lossy(),
+                "-C",
+                &dest.to_string_lossy(),
+            ])
             .status()
             .context("failed to spawn tar")?;
         if !status.success() {
@@ -363,8 +373,9 @@ fn swap_binary(current: &Path, new: &Path) -> Result<()> {
         let mut sidelined = current.to_path_buf();
         sidelined.set_extension("exe.old");
         let _ = std::fs::remove_file(&sidelined);
-        std::fs::rename(current, &sidelined)
-            .with_context(|| format!("failed to sideline current exe to {}", sidelined.display()))?;
+        std::fs::rename(current, &sidelined).with_context(|| {
+            format!("failed to sideline current exe to {}", sidelined.display())
+        })?;
         if let Err(e) = std::fs::copy(new, current) {
             // Try to roll back the rename so the user isn't left without claurst.
             let _ = std::fs::rename(&sidelined, current);

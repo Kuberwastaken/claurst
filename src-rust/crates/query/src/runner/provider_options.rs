@@ -52,6 +52,12 @@ pub(crate) fn is_openai_reasoning_model(model_id: &str) -> bool {
 }
 
 pub(crate) fn is_openaiish_provider(provider_id: &str) -> bool {
+    // Custom providers from Settings are always OpenAI-compatible.
+    if let Ok(settings) = claurst_core::Settings::load_sync() {
+        if settings.custom_providers.contains_key(provider_id) {
+            return true;
+        }
+    }
     matches!(
         provider_id,
         "openai"
@@ -120,10 +126,7 @@ pub(crate) fn build_provider_options(
                 "reasoningEffort".to_string(),
                 serde_json::json!(reasoning_effort),
             );
-            options.insert(
-                "reasoningSummary".to_string(),
-                serde_json::json!("auto"),
-            );
+            options.insert("reasoningSummary".to_string(), serde_json::json!("auto"));
             options.insert(
                 "include".to_string(),
                 serde_json::json!(["reasoning.encrypted_content"]),
@@ -133,10 +136,7 @@ pub(crate) fn build_provider_options(
                 && !model_id.contains("codex")
                 && !model_id.contains("-chat")
             {
-                options.insert(
-                    "textVerbosity".to_string(),
-                    serde_json::json!("low"),
-                );
+                options.insert("textVerbosity".to_string(), serde_json::json!("low"));
             }
         }
     }
@@ -227,10 +227,7 @@ pub(crate) fn build_provider_options(
             && !model_id.contains("-chat")
             && provider_id != "azure"
         {
-            options.insert(
-                "textVerbosity".to_string(),
-                serde_json::json!("low"),
-            );
+            options.insert("textVerbosity".to_string(), serde_json::json!("low"));
 
             // DeepSeek V4 thinking mode: map effort level to thinking/reasoning_effort params.
             // DeepSeek docs: thinking={"type":"enabled/disabled"}, reasoning_effort="high"|"max"
@@ -269,6 +266,23 @@ pub(crate) fn build_provider_options(
         }
     }
 
+    // Fallback for custom (user-defined) providers: when the model is not a
+    // GPT reasoning model (so the block above did not insert `reasoningEffort`),
+    // check the model definition in Settings for a `reasoningEffort` override
+    // and apply it. This lets non-GPT models on custom providers (e.g. GLM-5.2)
+    // still send `reasoningEffort` to the API.
+    if !options.contains_key("reasoningEffort") {
+        if let Ok(settings) = claurst_core::Settings::load_sync() {
+            if let Some(cp) = settings.custom_providers.get(provider_id) {
+                if let Some(model_def) = cp.models.get(&model_id) {
+                    if let Some(ref effort) = model_def.reasoning_effort {
+                        options.insert("reasoningEffort".to_string(), serde_json::json!(effort));
+                    }
+                }
+            }
+        }
+    }
+
     if provider_id == "openrouter" {
         options.insert("usage".to_string(), serde_json::json!({ "include": true }));
         if model_id.contains("gemini-3") {
@@ -279,9 +293,7 @@ pub(crate) fn build_provider_options(
         }
     }
 
-    if provider_id == "qwen"
-        && thinking_budget.is_some()
-        && !model_id.contains("kimi-k2-thinking")
+    if provider_id == "qwen" && thinking_budget.is_some() && !model_id.contains("kimi-k2-thinking")
     {
         options.insert("enable_thinking".to_string(), serde_json::json!(true));
     }

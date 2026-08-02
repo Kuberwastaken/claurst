@@ -13,8 +13,12 @@ pub struct RefreshCommand;
 
 #[async_trait]
 impl SlashCommand for LoginCommand {
-    fn name(&self) -> &str { "login" }
-    fn description(&self) -> &str { "Authenticate with Anthropic or Codex (multi-account)" }
+    fn name(&self) -> &str {
+        "login"
+    }
+    fn description(&self) -> &str {
+        "Authenticate with Anthropic or Codex (multi-account)"
+    }
     fn help(&self) -> &str {
         "Usage: /login [--console] [--codex] [--label <name>]\n\n\
          Start an OAuth login. By default authenticates with Claude.ai. Pass\n\
@@ -60,8 +64,12 @@ fn parse_label_arg(tokens: &[&str]) -> Option<String> {
 
 #[async_trait]
 impl SlashCommand for LogoutCommand {
-    fn name(&self) -> &str { "logout" }
-    fn description(&self) -> &str { "Clear credentials for the active account" }
+    fn name(&self) -> &str {
+        "logout"
+    }
+    fn description(&self) -> &str {
+        "Clear credentials for the active account"
+    }
     fn help(&self) -> &str {
         "Usage: /logout [--codex] [--all]\n\n\
          By default removes the active Anthropic account. `--codex` targets\n\
@@ -107,7 +115,9 @@ impl SlashCommand for LogoutCommand {
             for id in &ids {
                 let _ = registry.remove(claurst_core::accounts::PROVIDER_ANTHROPIC, id);
             }
-            let mut settings = claurst_core::config::Settings::load().await.unwrap_or_default();
+            let mut settings = claurst_core::config::Settings::load()
+                .await
+                .unwrap_or_default();
             settings.config.api_key = None;
             let _ = settings.save().await;
             ctx.config.api_key = None;
@@ -120,7 +130,9 @@ impl SlashCommand for LogoutCommand {
         if let Err(e) = claurst_core::oauth::OAuthTokens::clear().await {
             return CommandResult::Error(format!("Failed to clear OAuth tokens: {}", e));
         }
-        let mut settings = claurst_core::config::Settings::load().await.unwrap_or_default();
+        let mut settings = claurst_core::config::Settings::load()
+            .await
+            .unwrap_or_default();
         settings.config.api_key = None;
         if let Err(e) = settings.save().await {
             return CommandResult::Error(format!("Failed to update settings: {}", e));
@@ -136,8 +148,12 @@ pub struct AccountsCommand;
 
 #[async_trait]
 impl SlashCommand for AccountsCommand {
-    fn name(&self) -> &str { "accounts" }
-    fn description(&self) -> &str { "List stored Anthropic and Codex accounts" }
+    fn name(&self) -> &str {
+        "accounts"
+    }
+    fn description(&self) -> &str {
+        "List stored Anthropic and Codex accounts"
+    }
     fn help(&self) -> &str {
         "Usage: /accounts\n\n\
          Lists every stored Anthropic and Codex account along with the\n\
@@ -183,8 +199,12 @@ pub struct SwitchCommand;
 
 #[async_trait]
 impl SlashCommand for SwitchCommand {
-    fn name(&self) -> &str { "switch" }
-    fn description(&self) -> &str { "Switch the active account for a provider" }
+    fn name(&self) -> &str {
+        "switch"
+    }
+    fn description(&self) -> &str {
+        "Switch the active account for a provider"
+    }
     fn help(&self) -> &str {
         "Usage: /switch [--codex] <profile-id>\n\n\
          Make a stored account active. Defaults to Anthropic; pass `--codex`\n\
@@ -212,10 +232,9 @@ impl SlashCommand for SwitchCommand {
 
         let mut registry = claurst_core::accounts::AccountRegistry::load();
         match registry.switch_to(provider, id) {
-            Ok(()) => CommandResult::Message(format!(
-                "Switched {} active account to '{}'.",
-                display, id
-            )),
+            Ok(()) => {
+                CommandResult::Message(format!("Switched {} active account to '{}'.", display, id))
+            }
             Err(e) => CommandResult::Error(format!("{}", e)),
         }
     }
@@ -225,8 +244,12 @@ impl SlashCommand for SwitchCommand {
 
 #[async_trait]
 impl SlashCommand for RefreshCommand {
-    fn name(&self) -> &str { "refresh" }
-    fn description(&self) -> &str { "Clear saved provider auth and model caches" }
+    fn name(&self) -> &str {
+        "refresh"
+    }
+    fn description(&self) -> &str {
+        "Clear saved provider auth and model caches"
+    }
     fn help(&self) -> &str {
         "Usage: /refresh\n\n\
          Clears saved provider credentials, provider/model selection, and model caches, then rebuilds the live runtime state.\n\

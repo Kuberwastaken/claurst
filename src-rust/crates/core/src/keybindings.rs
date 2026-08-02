@@ -167,11 +167,9 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("ctrl+r", "historySearch", KeyContext::Global),
         ("ctrl+b", "createBranch", KeyContext::Global),
         ("alt+h", "openHelp", KeyContext::Global),
-
         // ========== CHAT / INPUT CONTEXT ==========
         // Message submission
         ("enter", "submit", KeyContext::Chat),
-
         // Newline insertion (Shift+Enter / Ctrl+J for multi-line composing)
         ("shift+enter", "newline", KeyContext::Chat),
         // Fallback for terminals that do not support the kitty keyboard protocol
@@ -188,7 +186,6 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // e.g. legacy iTerm2 / xterm modifyOtherKeys, send Alt+Enter as
         // \x1b\r). Kept as an additional fallback alongside Shift+Enter/Ctrl+J.
         ("alt+enter", "newline", KeyContext::Chat),
-
         // Line start/end navigation
         ("home", "goLineStart", KeyContext::Chat),
         ("cmd+left", "goLineStart", KeyContext::Chat),
@@ -196,35 +193,28 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("end", "goLineEnd", KeyContext::Chat),
         ("cmd+right", "goLineEnd", KeyContext::Chat),
         ("ctrl+e", "goLineEnd", KeyContext::Chat),
-
         // Word navigation
         ("ctrl+left", "moveWordBackward", KeyContext::Chat),
         ("ctrl+right", "moveWordForward", KeyContext::Chat),
-
         // Word deletion
         ("ctrl+w", "killWord", KeyContext::Chat),
         ("alt+backspace", "killWord", KeyContext::Chat),
         ("alt+d", "deleteWord", KeyContext::Chat),
-
         // Character/line deletion
         ("ctrl+h", "deleteCharBefore", KeyContext::Chat),
         ("ctrl+u", "killToStart", KeyContext::Chat),
         ("ctrl+l", "clearLine", KeyContext::Chat),
-
         // History navigation
         ("up", "historyPrev", KeyContext::Chat),
         ("ctrl+o", "historyPrev", KeyContext::Chat),
         ("down", "historyNext", KeyContext::Chat),
         ("ctrl+i", "historyNext", KeyContext::Chat),
-
         // Message navigation
         ("alt+left", "previousMessage", KeyContext::Chat),
         ("alt+right", "nextMessage", KeyContext::Chat),
-
         // Error/issue navigation
         ("ctrl+.", "jumpToNextError", KeyContext::Chat),
         ("ctrl+shift+.", "jumpToPreviousError", KeyContext::Chat),
-
         // Searching
         ("ctrl+f", "findInMessage", KeyContext::Chat),
         ("ctrl+shift+f", "globalSearch", KeyContext::Chat),
@@ -233,23 +223,18 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("shift+f3", "findPrev", KeyContext::Chat),
         ("ctrl+[", "findPrev", KeyContext::Chat),
         ("ctrl+g", "goToLine", KeyContext::Chat),
-
         // Indentation
         ("tab", "indent", KeyContext::Chat),
         ("shift+tab", "reverseIndent", KeyContext::Chat),
-
         // Paste placeholders — expand `[Pasted text #N ...]` back into the
         // full pasted body (clicking the placeholder does the same).
         ("alt+e", "expandPaste", KeyContext::Chat),
-
         // Scrolling
         ("pageup", "scrollUp", KeyContext::Chat),
         ("pagedown", "scrollDown", KeyContext::Chat),
-
         // App shortcuts
         ("ctrl+shift+a", "openModelPicker", KeyContext::Chat),
         ("ctrl+k", "openCommandPalette", KeyContext::Chat),
-
         // ========== CONFIRMATION DIALOGS ==========
         ("y", "yes", KeyContext::Confirmation),
         ("enter", "yes", KeyContext::Confirmation),
@@ -257,7 +242,6 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("escape", "no", KeyContext::Confirmation),
         ("up", "prevOption", KeyContext::Confirmation),
         ("down", "nextOption", KeyContext::Confirmation),
-
         // ========== HELP OVERLAY ==========
         ("escape", "close", KeyContext::Help),
         ("q", "close", KeyContext::Help),
@@ -265,14 +249,12 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("down", "scrollDown", KeyContext::Help),
         ("pageup", "pageUp", KeyContext::Help),
         ("pagedown", "pageDown", KeyContext::Help),
-
         // ========== HISTORY SEARCH ==========
         ("up", "prevResult", KeyContext::HistorySearch),
         ("down", "nextResult", KeyContext::HistorySearch),
         ("enter", "select", KeyContext::HistorySearch),
         ("escape", "cancel", KeyContext::HistorySearch),
         ("tab", "togglePreview", KeyContext::HistorySearch),
-
         // ========== TRANSCRIPT / MESSAGE SELECTION ==========
         ("up", "prevMessage", KeyContext::Transcript),
         ("down", "nextMessage", KeyContext::Transcript),
@@ -282,7 +264,6 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("end", "goEnd", KeyContext::Transcript),
         ("enter", "selectMessage", KeyContext::Transcript),
         ("escape", "cancel", KeyContext::Transcript),
-
         // ========== MESSAGE SELECTOR OVERLAY ==========
         ("up", "prevMessage", KeyContext::MessageSelector),
         ("down", "nextMessage", KeyContext::MessageSelector),
@@ -290,7 +271,6 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("j", "nextMessage", KeyContext::MessageSelector),
         ("enter", "select", KeyContext::MessageSelector),
         ("escape", "cancel", KeyContext::MessageSelector),
-
         // ========== THEME & MODEL PICKERS ==========
         ("up", "prev", KeyContext::ThemePicker),
         ("down", "next", KeyContext::ThemePicker),
@@ -300,14 +280,12 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("pagedown", "pageDown", KeyContext::ThemePicker),
         ("enter", "select", KeyContext::ThemePicker),
         ("escape", "cancel", KeyContext::ThemePicker),
-
         // ========== TASK LIST ==========
         ("up", "prevTask", KeyContext::Task),
         ("down", "nextTask", KeyContext::Task),
         ("enter", "selectTask", KeyContext::Task),
         ("escape", "closeTask", KeyContext::Task),
         ("x", "toggleDone", KeyContext::Task),
-
         // ========== DIFF DIALOG ==========
         ("up", "prevDiff", KeyContext::DiffDialog),
         ("down", "nextDiff", KeyContext::DiffDialog),
@@ -317,7 +295,6 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("escape", "rejectDiff", KeyContext::DiffDialog),
         ("pageup", "pageUp", KeyContext::DiffDialog),
         ("pagedown", "pageDown", KeyContext::DiffDialog),
-
         // ========== MODAL SELECT (Generic) ==========
         ("up", "prev", KeyContext::Select),
         ("down", "next", KeyContext::Select),
@@ -328,7 +305,6 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("enter", "select", KeyContext::Select),
         ("escape", "cancel", KeyContext::Select),
         ("/", "search", KeyContext::Select),
-
         // ========== PLUGIN & ATTACHMENTS ==========
         ("up", "prev", KeyContext::Plugin),
         ("down", "next", KeyContext::Plugin),
@@ -402,8 +378,14 @@ impl UserKeybindings {
         let original_len = kb.bindings.len();
         kb.bindings.retain(|binding| {
             let normalized = binding.chord.to_lowercase();
-            if NON_REBINDABLE.iter().any(|protected| normalized == *protected) {
-                warn!("Cannot rebind protected key '{}' in keybindings.json", binding.chord);
+            if NON_REBINDABLE
+                .iter()
+                .any(|protected| normalized == *protected)
+            {
+                warn!(
+                    "Cannot rebind protected key '{}' in keybindings.json",
+                    binding.chord
+                );
                 return false;
             }
             true
@@ -455,11 +437,14 @@ impl UserKeybindings {
             .into_iter()
             .flat_map(|block| {
                 let context = block.context;
-                block.bindings.into_iter().map(move |(chord, action)| UserBinding {
-                    chord,
-                    action,
-                    context: Some(context.clone()),
-                })
+                block
+                    .bindings
+                    .into_iter()
+                    .map(move |(chord, action)| UserBinding {
+                        chord,
+                        action,
+                        context: Some(context.clone()),
+                    })
             })
             .collect();
         Ok(Self {
@@ -498,8 +483,7 @@ impl UserKeybindings {
                 continue;
             }
 
-            user_customizations
-                .insert(binding.chord.clone(), binding.action.clone());
+            user_customizations.insert(binding.chord.clone(), binding.action.clone());
         }
 
         // Get current defaults and integrate customizations
@@ -737,8 +721,14 @@ mod tests {
                     && b.context == KeyContext::Global
             })
         };
-        assert!(!has("c"), "ctrl+c must be handled directly, not via the resolver");
-        assert!(!has("d"), "ctrl+d must be handled directly, not via the resolver");
+        assert!(
+            !has("c"),
+            "ctrl+c must be handled directly, not via the resolver"
+        );
+        assert!(
+            !has("d"),
+            "ctrl+d must be handled directly, not via the resolver"
+        );
     }
 
     #[test]
@@ -759,7 +749,10 @@ mod tests {
                 && b.context == KeyContext::Chat
         });
 
-        assert_eq!(ctrl_shift_a.and_then(|b| b.action.as_deref()), Some("openModelPicker"));
+        assert_eq!(
+            ctrl_shift_a.and_then(|b| b.action.as_deref()),
+            Some("openModelPicker")
+        );
         assert_eq!(
             ctrl_k.and_then(|b| b.action.as_deref()),
             Some("openCommandPalette")
@@ -832,7 +825,10 @@ mod tests {
         assert_eq!(user.bindings.len(), 2);
         assert_eq!(user.bindings[0].context.as_deref(), Some("Chat"));
         assert_eq!(user.bindings[0].chord, "ctrl+g");
-        assert_eq!(user.bindings[0].action.as_deref(), Some("chat:externalEditor"));
+        assert_eq!(
+            user.bindings[0].action.as_deref(),
+            Some("chat:externalEditor")
+        );
         assert_eq!(user.bindings[1].chord, "space");
         assert_eq!(user.bindings[1].action, None);
     }
@@ -869,8 +865,16 @@ mod tests {
                 })
                 .and_then(|b| b.action.as_deref())
         };
-        assert_eq!(find(false, false, true, "enter"), Some("newline"), "shift+enter");
-        assert_eq!(find(false, true, false, "enter"), Some("newline"), "alt+enter");
+        assert_eq!(
+            find(false, false, true, "enter"),
+            Some("newline"),
+            "shift+enter"
+        );
+        assert_eq!(
+            find(false, true, false, "enter"),
+            Some("newline"),
+            "alt+enter"
+        );
         // And a bare Enter still submits.
         assert_eq!(find(false, false, false, "enter"), Some("submit"), "enter");
     }
@@ -881,21 +885,45 @@ mod tests {
         let bindings = default_bindings();
 
         // Build list of keybinding actions
-        let actions: Vec<String> = bindings
-            .iter()
-            .filter_map(|b| b.action.clone())
-            .collect();
+        let actions: Vec<String> = bindings.iter().filter_map(|b| b.action.clone()).collect();
 
         // Check Phase 1 keybinding actions exist
-        assert!(actions.contains(&"clearLine".to_string()), "clearLine action not found");
-        assert!(actions.contains(&"submit".to_string()), "submit action not found");
-        assert!(actions.contains(&"jumpToNextError".to_string()), "jumpToNextError action not found");
-        assert!(actions.contains(&"jumpToPreviousError".to_string()), "jumpToPreviousError action not found");
-        assert!(actions.contains(&"previousMessage".to_string()), "previousMessage action not found");
-        assert!(actions.contains(&"nextMessage".to_string()), "nextMessage action not found");
-        assert!(actions.contains(&"openHelp".to_string()), "openHelp action not found");
-        assert!(actions.contains(&"deleteCharBefore".to_string()), "deleteCharBefore action not found");
-        assert!(actions.contains(&"reverseIndent".to_string()), "reverseIndent action not found");
+        assert!(
+            actions.contains(&"clearLine".to_string()),
+            "clearLine action not found"
+        );
+        assert!(
+            actions.contains(&"submit".to_string()),
+            "submit action not found"
+        );
+        assert!(
+            actions.contains(&"jumpToNextError".to_string()),
+            "jumpToNextError action not found"
+        );
+        assert!(
+            actions.contains(&"jumpToPreviousError".to_string()),
+            "jumpToPreviousError action not found"
+        );
+        assert!(
+            actions.contains(&"previousMessage".to_string()),
+            "previousMessage action not found"
+        );
+        assert!(
+            actions.contains(&"nextMessage".to_string()),
+            "nextMessage action not found"
+        );
+        assert!(
+            actions.contains(&"openHelp".to_string()),
+            "openHelp action not found"
+        );
+        assert!(
+            actions.contains(&"deleteCharBefore".to_string()),
+            "deleteCharBefore action not found"
+        );
+        assert!(
+            actions.contains(&"reverseIndent".to_string()),
+            "reverseIndent action not found"
+        );
 
         // Verify we have at least 10 new keybindings (Phase 1 requirement)
         assert!(
@@ -930,7 +958,9 @@ mod tests {
             "meta+left (cmd+left) should be added from defaults after merge"
         );
         assert!(
-            kb.bindings.iter().any(|b| b.chord == "ctrl+shift+a" && b.action.as_deref() == Some("openModelPicker")),
+            kb.bindings.iter().any(
+                |b| b.chord == "ctrl+shift+a" && b.action.as_deref() == Some("openModelPicker")
+            ),
             "User customization (ctrl+shift+a -> openModelPicker) should be preserved"
         );
     }

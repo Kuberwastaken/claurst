@@ -14,8 +14,12 @@ pub struct InsightsCommand;
 
 #[async_trait]
 impl SlashCommand for BtwCommand {
-    fn name(&self) -> &str { "btw" }
-    fn description(&self) -> &str { "Ask a side question without adding it to conversation history" }
+    fn name(&self) -> &str {
+        "btw"
+    }
+    fn description(&self) -> &str {
+        "Ask a side question without adding it to conversation history"
+    }
     fn help(&self) -> &str {
         "Usage: /btw <question>\n\n\
          Submits a background question to the model without it becoming part of\n\
@@ -47,9 +51,15 @@ impl SlashCommand for BtwCommand {
 
 #[async_trait]
 impl SlashCommand for CtxVizCommand {
-    fn name(&self) -> &str { "ctx-viz" }
-    fn aliases(&self) -> Vec<&str> { vec!["context-visualizer", "ctx"] }
-    fn description(&self) -> &str { "Visualize context window usage breakdown by category" }
+    fn name(&self) -> &str {
+        "ctx-viz"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["context-visualizer", "ctx"]
+    }
+    fn description(&self) -> &str {
+        "Visualize context window usage breakdown by category"
+    }
     fn help(&self) -> &str {
         "Usage: /ctx-viz\n\n\
          Shows a detailed breakdown of how the context window is being used:\n\
@@ -65,16 +75,17 @@ impl SlashCommand for CtxVizCommand {
 
         // Estimate system prompt tokens: rough chars/4 approximation
         // Build a minimal system prompt to estimate its size.
-        let sys_prompt_chars: usize = ctx.config.custom_system_prompt
+        let sys_prompt_chars: usize = ctx
+            .config
+            .custom_system_prompt
             .as_deref()
             .map(|s| s.len())
             .unwrap_or(2400 * 4); // fallback: ~2400 tokens worth
         let sys_prompt_tokens = (sys_prompt_chars / 4).max(1) as u64;
 
         // Estimate conversation tokens from messages
-        let (conv_chars, tool_chars): (usize, usize) = ctx.messages.iter().fold(
-            (0, 0),
-            |(conv, tool), msg| {
+        let (conv_chars, tool_chars): (usize, usize) =
+            ctx.messages.iter().fold((0, 0), |(conv, tool), msg| {
                 let text = msg.get_all_text();
                 // Heuristic: if the message looks like a tool result, count separately
                 if msg.role == claurst_core::types::Role::User && text.starts_with('[') {
@@ -82,8 +93,7 @@ impl SlashCommand for CtxVizCommand {
                 } else {
                     (conv + text.len(), tool)
                 }
-            },
-        );
+            });
 
         let conv_tokens = (conv_chars / 4) as u64;
         let tool_tokens = (tool_chars / 4) as u64;
@@ -121,8 +131,12 @@ impl SlashCommand for CtxVizCommand {
 
 #[async_trait]
 impl SlashCommand for HeapdumpCommand {
-    fn name(&self) -> &str { "heapdump" }
-    fn description(&self) -> &str { "Show process memory and diagnostic information" }
+    fn name(&self) -> &str {
+        "heapdump"
+    }
+    fn description(&self) -> &str {
+        "Show process memory and diagnostic information"
+    }
     fn help(&self) -> &str {
         "Usage: /heapdump\n\n\
          Displays a diagnostic snapshot of the current process:\n\
@@ -179,8 +193,12 @@ impl SlashCommand for HeapdumpCommand {
 
 #[async_trait]
 impl SlashCommand for InsightsCommand {
-    fn name(&self) -> &str { "insights" }
-    fn description(&self) -> &str { "Generate a session analysis report with conversation statistics" }
+    fn name(&self) -> &str {
+        "insights"
+    }
+    fn description(&self) -> &str {
+        "Generate a session analysis report with conversation statistics"
+    }
     fn help(&self) -> &str {
         "Usage: /insights\n\n\
          Analyses the current conversation and prints a statistics report:\n\
@@ -191,10 +209,12 @@ impl SlashCommand for InsightsCommand {
         let messages = &ctx.messages;
 
         // Count turns (user / assistant pairs)
-        let user_turns: usize = messages.iter()
+        let user_turns: usize = messages
+            .iter()
             .filter(|m| matches!(m.role, claurst_core::types::Role::User))
             .count();
-        let assistant_turns: usize = messages.iter()
+        let assistant_turns: usize = messages
+            .iter()
             .filter(|m| matches!(m.role, claurst_core::types::Role::Assistant))
             .count();
         let total_turns = user_turns.min(assistant_turns);

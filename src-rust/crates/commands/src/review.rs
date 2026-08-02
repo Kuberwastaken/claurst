@@ -11,8 +11,12 @@ pub struct ReviewCommand;
 
 #[async_trait]
 impl SlashCommand for ReviewCommand {
-    fn name(&self) -> &str { "review" }
-    fn description(&self) -> &str { "Review code changes via LLM and optionally post to GitHub PR" }
+    fn name(&self) -> &str {
+        "review"
+    }
+    fn description(&self) -> &str {
+        "Review code changes via LLM and optionally post to GitHub PR"
+    }
     fn help(&self) -> &str {
         "Usage: /review [base-ref]\n\n\
          Runs `git diff <base>...HEAD` (or `git diff --cached` when no base is given),\n\
@@ -56,10 +60,7 @@ impl SlashCommand for ReviewCommand {
                 }
                 Ok(o) => {
                     let stderr = String::from_utf8_lossy(&o.stderr);
-                    return CommandResult::Error(format!(
-                        "git diff failed: {}",
-                        stderr.trim()
-                    ));
+                    return CommandResult::Error(format!("git diff failed: {}", stderr.trim()));
                 }
                 Err(e) => return CommandResult::Error(format!("Failed to run git: {}", e)),
             }
@@ -222,14 +223,11 @@ impl SlashCommand for ReviewCommand {
                         Ok(resp) => {
                             let status = resp.status().as_u16();
                             let body = resp.text().await.unwrap_or_default();
-                            github_post_result = Some(format!(
-                                "\nGitHub API returned {}: {}",
-                                status, body
-                            ));
+                            github_post_result =
+                                Some(format!("\nGitHub API returned {}: {}", status, body));
                         }
                         Err(e) => {
-                            github_post_result =
-                                Some(format!("\nFailed to post to GitHub: {}", e));
+                            github_post_result = Some(format!("\nFailed to post to GitHub: {}", e));
                         }
                     }
                 } else {

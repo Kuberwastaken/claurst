@@ -11,9 +11,15 @@ pub struct ConfigCommand;
 
 #[async_trait]
 impl SlashCommand for ConfigCommand {
-    fn name(&self) -> &str { "config" }
-    fn aliases(&self) -> Vec<&str> { vec!["settings"] }
-    fn description(&self) -> &str { "Show or modify configuration settings" }
+    fn name(&self) -> &str {
+        "config"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["settings"]
+    }
+    fn description(&self) -> &str {
+        "Show or modify configuration settings"
+    }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         let args = args.trim();
@@ -32,10 +38,9 @@ impl SlashCommand for ConfigCommand {
                     "output-style = {}",
                     current_output_style_name(&ctx.config)
                 )),
-                "model" => CommandResult::Message(format!(
-                    "model = {}",
-                    ctx.config.effective_model()
-                )),
+                "model" => {
+                    CommandResult::Message(format!("model = {}", ctx.config.effective_model()))
+                }
                 "permission-mode" | "permission_mode" => CommandResult::Message(format!(
                     "permission-mode = {:?}",
                     ctx.config.permission_mode
@@ -49,7 +54,8 @@ impl SlashCommand for ConfigCommand {
                 "model" => {
                     let mut new_config = ctx.config.clone();
                     new_config.model = None;
-                    if let Err(err) = save_settings_mutation(|settings| settings.config.model = None)
+                    if let Err(err) =
+                        save_settings_mutation(|settings| settings.config.model = None)
                     {
                         return CommandResult::Error(format!(
                             "Failed to save configuration: {}",
@@ -120,8 +126,7 @@ impl SlashCommand for ConfigCommand {
                 }
 
                 let mut new_config = ctx.config.clone();
-                new_config.output_style =
-                    (normalized != "default").then(|| normalized.clone());
+                new_config.output_style = (normalized != "default").then(|| normalized.clone());
                 if let Err(err) = save_settings_mutation(|settings| {
                     settings.config.output_style =
                         (normalized != "default").then(|| normalized.clone());
@@ -154,10 +159,7 @@ impl SlashCommand for ConfigCommand {
                 }) {
                     return CommandResult::Error(format!("Failed to save configuration: {}", err));
                 }
-                CommandResult::ConfigChangeMessage(
-                    new_config,
-                    format!("Model set to {}.", value),
-                )
+                CommandResult::ConfigChangeMessage(new_config, format!("Model set to {}.", value))
             }
             "permission-mode" | "permission_mode" => {
                 let mode = match value.trim().to_lowercase().as_str() {

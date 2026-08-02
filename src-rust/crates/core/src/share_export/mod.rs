@@ -150,8 +150,10 @@ mod tests {
 
     #[test]
     fn html_escape_handles_specials() {
-        assert_eq!(html_escape("<a href=\"x\">&amp;</a>"),
-                   "&lt;a href=&quot;x&quot;&gt;&amp;amp;&lt;/a&gt;");
+        assert_eq!(
+            html_escape("<a href=\"x\">&amp;</a>"),
+            "&lt;a href=&quot;x&quot;&gt;&amp;amp;&lt;/a&gt;"
+        );
     }
 
     // Both viewer-url scenarios live in one test because they manipulate a

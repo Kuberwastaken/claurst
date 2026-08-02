@@ -138,8 +138,7 @@ pub struct GoalStore {
 impl GoalStore {
     /// Open (or create) the goal database.
     pub fn open(db_path: &std::path::Path) -> Result<Self, GoalError> {
-        let conn = rusqlite::Connection::open(db_path)
-            .map_err(|e| GoalError::Db(e.to_string()))?;
+        let conn = rusqlite::Connection::open(db_path).map_err(|e| GoalError::Db(e.to_string()))?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS goals (
@@ -239,8 +238,7 @@ impl GoalStore {
                         id: row.get(0)?,
                         session_id: row.get(1)?,
                         objective: row.get(2)?,
-                        status: GoalStatus::from_str(&status_str)
-                            .unwrap_or(GoalStatus::Paused),
+                        status: GoalStatus::from_str(&status_str).unwrap_or(GoalStatus::Paused),
                         token_budget: row.get(4)?,
                         tokens_used: row.get::<_, i64>(5)? as u64,
                         time_used_secs: row.get::<_, i64>(6)? as u64,
@@ -481,7 +479,9 @@ mod tests {
     fn test_replace_goal() {
         let store = open_tmp();
         store.set_goal("sess1", "first goal", None).unwrap();
-        store.set_goal("sess1", "second goal", Some(100_000)).unwrap();
+        store
+            .set_goal("sess1", "second goal", Some(100_000))
+            .unwrap();
         let g = store.get_goal("sess1").unwrap();
         assert_eq!(g.objective, "second goal");
         assert_eq!(g.token_budget, Some(100_000));

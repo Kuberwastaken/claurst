@@ -30,7 +30,9 @@ pub fn copy_as_markdown(message: &Message) -> String {
                             signature, thinking
                         ))
                     }
-                    claurst_core::ContentBlock::ToolUse { id, name, input, .. } => {
+                    claurst_core::ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => {
                         // Format tool use as code block
                         Some(format!(
                             "```json\n// Tool: {}\n// ID: {}\n{}\n```",
@@ -51,21 +53,16 @@ pub fn copy_as_markdown(message: &Message) -> String {
                         };
                         let result_text = match content {
                             claurst_core::ToolResultContent::Text(text) => text.clone(),
-                            claurst_core::ToolResultContent::Blocks(blocks) => {
-                                blocks
-                                    .iter()
-                                    .filter_map(|b| match b {
-                                        claurst_core::ContentBlock::Text { text } => Some(text.clone()),
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            }
+                            claurst_core::ToolResultContent::Blocks(blocks) => blocks
+                                .iter()
+                                .filter_map(|b| match b {
+                                    claurst_core::ContentBlock::Text { text } => Some(text.clone()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n"),
                         };
-                        Some(format!(
-                            "```\n{}{}\n```",
-                            error_marker, result_text
-                        ))
+                        Some(format!("```\n{}{}\n```", error_marker, result_text))
                     }
                     _ => None,
                 })
@@ -81,47 +78,43 @@ pub fn copy_as_markdown(message: &Message) -> String {
 pub fn copy_as_plaintext(message: &Message) -> String {
     let content = match &message.content {
         claurst_core::MessageContent::Text(text) => strip_markdown(text),
-        claurst_core::MessageContent::Blocks(blocks) => {
-            blocks
-                .iter()
-                .filter_map(|block| match block {
-                    claurst_core::ContentBlock::Text { text } => Some(strip_markdown(text)),
-                    claurst_core::ContentBlock::Thinking { thinking, .. } => {
-                        Some(format!("[Thinking]\n{}", thinking))
-                    }
-                    claurst_core::ContentBlock::ToolUse { name, input, .. } => {
-                        Some(format!(
-                            "[Tool: {}]\n{}",
-                            name,
-                            serde_json::to_string_pretty(input).unwrap_or_default()
-                        ))
-                    }
-                    claurst_core::ContentBlock::ToolResult { content, is_error, .. } => {
-                        let error_marker = if is_error.unwrap_or(false) {
-                            "[ERROR] "
-                        } else {
-                            ""
-                        };
-                        let result_text = match content {
-                            claurst_core::ToolResultContent::Text(text) => text.clone(),
-                            claurst_core::ToolResultContent::Blocks(blocks) => {
-                                blocks
-                                    .iter()
-                                    .filter_map(|b| match b {
-                                        claurst_core::ContentBlock::Text { text } => Some(text.clone()),
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            }
-                        };
-                        Some(format!("{}{}", error_marker, result_text))
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        }
+        claurst_core::MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|block| match block {
+                claurst_core::ContentBlock::Text { text } => Some(strip_markdown(text)),
+                claurst_core::ContentBlock::Thinking { thinking, .. } => {
+                    Some(format!("[Thinking]\n{}", thinking))
+                }
+                claurst_core::ContentBlock::ToolUse { name, input, .. } => Some(format!(
+                    "[Tool: {}]\n{}",
+                    name,
+                    serde_json::to_string_pretty(input).unwrap_or_default()
+                )),
+                claurst_core::ContentBlock::ToolResult {
+                    content, is_error, ..
+                } => {
+                    let error_marker = if is_error.unwrap_or(false) {
+                        "[ERROR] "
+                    } else {
+                        ""
+                    };
+                    let result_text = match content {
+                        claurst_core::ToolResultContent::Text(text) => text.clone(),
+                        claurst_core::ToolResultContent::Blocks(blocks) => blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                claurst_core::ContentBlock::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    };
+                    Some(format!("{}{}", error_marker, result_text))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n"),
     };
 
     let role_str = match message.role {
@@ -330,7 +323,9 @@ fn format_block_for_json(block: &claurst_core::ContentBlock) -> String {
     match block {
         claurst_core::ContentBlock::Text { text } => text.clone(),
         claurst_core::ContentBlock::Image { .. } => "[Image content]".to_string(),
-        claurst_core::ContentBlock::ToolUse { id, name, input, .. } => {
+        claurst_core::ContentBlock::ToolUse {
+            id, name, input, ..
+        } => {
             format!(
                 "[Tool: {} (ID: {})]\n{}",
                 name,
@@ -350,16 +345,14 @@ fn format_block_for_json(block: &claurst_core::ContentBlock) -> String {
             };
             let result_text = match content {
                 claurst_core::ToolResultContent::Text(text) => text.clone(),
-                claurst_core::ToolResultContent::Blocks(blocks) => {
-                    blocks
-                        .iter()
-                        .filter_map(|b| match b {
-                            claurst_core::ContentBlock::Text { text } => Some(text.clone()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                }
+                claurst_core::ToolResultContent::Blocks(blocks) => blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        claurst_core::ContentBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
             };
             format!("{}{}", error_marker, result_text)
         }
@@ -394,7 +387,11 @@ pub fn copy_to_clipboard(text: &str) -> bool {
         {
             let escaped = text.replace('\'', "''");
             if let Ok(mut child) = std::process::Command::new("powershell")
-                .args(["-NoProfile", "-Command", &format!("Set-Clipboard '{}'", escaped)])
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    &format!("Set-Clipboard '{}'", escaped),
+                ])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()

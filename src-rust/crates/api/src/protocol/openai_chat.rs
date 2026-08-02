@@ -15,8 +15,8 @@ use serde_json::{json, Value};
 use tracing::debug;
 
 use crate::protocol::LineStreamDecoder;
-use crate::providers::openai::OpenAiProvider;
 use crate::provider_types::StreamEvent;
+use crate::providers::openai::OpenAiProvider;
 
 /// Dedicated index for the Thinking content block emitted when a provider
 /// streams a `reasoning_content` field (DeepSeek V4, etc.). Chosen to avoid
@@ -92,7 +92,9 @@ impl OpenAiChatDecoder {
             });
             out.push(StreamEvent::ContentBlockStart {
                 index: 0,
-                content_block: ContentBlock::Text { text: String::new() },
+                content_block: ContentBlock::Text {
+                    text: String::new(),
+                },
             });
             self.message_started = true;
         }
@@ -341,7 +343,10 @@ mod tests {
         ));
         assert!(matches!(
             &events[1],
-            StreamEvent::ContentBlockStart { index: 0, content_block: ContentBlock::Text { .. } }
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: ContentBlock::Text { .. }
+            }
         ));
 
         let text: String = events
@@ -357,9 +362,13 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, StreamEvent::ContentBlockStop { index: 0 })));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, StreamEvent::MessageDelta { stop_reason: Some(_), .. })));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::MessageDelta {
+                stop_reason: Some(_),
+                ..
+            }
+        )));
 
         // finish() flushes MessageStop since content was produced.
         let mut tail = Vec::new();
@@ -407,11 +416,15 @@ mod tests {
         let args: String = events
             .iter()
             .filter_map(|e| match e {
-                StreamEvent::InputJsonDelta { index: 1, partial_json } => Some(partial_json.clone()),
+                StreamEvent::InputJsonDelta {
+                    index: 1,
+                    partial_json,
+                } => Some(partial_json.clone()),
                 _ => None,
             })
             .collect();
-        let parsed: Value = serde_json::from_str(&args).expect("assembled tool args must be valid JSON");
+        let parsed: Value =
+            serde_json::from_str(&args).expect("assembled tool args must be valid JSON");
         assert_eq!(parsed["city"], "Paris");
 
         // finish closes text block 0 and the tool block 1.
@@ -488,7 +501,10 @@ mod tests {
         assert!(!stop);
         assert!(matches!(
             out.as_slice(),
-            [StreamEvent::MessageDelta { stop_reason: None, usage: Some(_) }]
+            [StreamEvent::MessageDelta {
+                stop_reason: None,
+                usage: Some(_)
+            }]
         ));
     }
 }

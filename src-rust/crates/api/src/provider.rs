@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 
 use crate::provider_error::ProviderError;
-use crate::provider_types::{ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StreamEvent};
+use crate::provider_types::{
+    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StreamEvent,
+};
 
 // ---------------------------------------------------------------------------
 // ModelInfo
@@ -90,10 +92,7 @@ pub trait LlmProvider: Send + Sync {
     async fn create_message_stream(
         &self,
         request: ProviderRequest,
-    ) -> Result<
-        Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>,
-        ProviderError,
-    >;
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>;
 
     /// Discover models exposed by a *live* endpoint (e.g. `GET /v1/models` for
     /// a local Ollama/LM Studio server, or a Copilot entitlement query).

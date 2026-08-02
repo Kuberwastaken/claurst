@@ -21,7 +21,9 @@ struct GoalCompleteInput {
 
 #[async_trait]
 impl Tool for GoalCompleteTool {
-    fn name(&self) -> &str { "GoalComplete" }
+    fn name(&self) -> &str {
+        "GoalComplete"
+    }
 
     fn description(&self) -> &str {
         "Mark the active goal as complete. ONLY call this after a genuine completion audit:\n\
@@ -31,7 +33,9 @@ impl Tool for GoalCompleteTool {
          Calling this without a real audit is a goal contract violation."
     }
 
-    fn permission_level(&self) -> PermissionLevel { PermissionLevel::None }
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::None
+    }
 
     fn input_schema(&self) -> Value {
         json!({

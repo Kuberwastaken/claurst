@@ -12,9 +12,15 @@ pub struct ReloadPluginsCommand;
 
 #[async_trait]
 impl SlashCommand for PluginCommand {
-    fn name(&self) -> &str { "plugin" }
-    fn aliases(&self) -> Vec<&str> { vec!["plugins"] }
-    fn description(&self) -> &str { "Manage plugins" }
+    fn name(&self) -> &str {
+        "plugin"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["plugins"]
+    }
+    fn description(&self) -> &str {
+        "Manage plugins"
+    }
     fn help(&self) -> &str {
         "Usage: /plugin [list|info <name>|enable <name>|disable <name>|install <path>|reload]\n\
          Manage Claurst plugins.\n\n\
@@ -33,9 +39,7 @@ impl SlashCommand for PluginCommand {
 
         // Helper: prefer the already-loaded global registry, falling back to a
         // fresh disk scan so the command still works without the global being set.
-        async fn get_registry(
-            project_dir: &std::path::Path,
-        ) -> claurst_plugins::PluginRegistry {
+        async fn get_registry(project_dir: &std::path::Path) -> claurst_plugins::PluginRegistry {
             if let Some(global) = claurst_plugins::global_plugin_registry() {
                 let mut reg = claurst_plugins::PluginRegistry::new();
                 for p in global.all() {
@@ -116,9 +120,7 @@ impl SlashCommand for PluginCommand {
                 )
             }
             claurst_plugins::PluginSubCommand::Install(path) => {
-                let result = claurst_plugins::install_plugin_from_path(
-                    std::path::Path::new(&path),
-                );
+                let result = claurst_plugins::install_plugin_from_path(std::path::Path::new(&path));
                 match result {
                     Ok(name) => CommandResult::Message(format!(
                         "Plugin '{}' installed successfully. Run `/plugin reload` to activate it.",
@@ -133,9 +135,8 @@ impl SlashCommand for PluginCommand {
                     claurst_plugins::reload_plugins(&old_registry, &project_dir, &[]).await;
                 CommandResult::Message(claurst_plugins::format_reload_summary(&new_registry, &diff))
             }
-            claurst_plugins::PluginSubCommand::Help => {
-                CommandResult::Message(
-                    "Plugin commands:\n\
+            claurst_plugins::PluginSubCommand::Help => CommandResult::Message(
+                "Plugin commands:\n\
                      /plugin              — list all installed plugins\n\
                      /plugin list         — list all installed plugins\n\
                      /plugin info <name>  — show plugin details\n\
@@ -143,9 +144,8 @@ impl SlashCommand for PluginCommand {
                      /plugin disable <name>  — disable a plugin\n\
                      /plugin install <path>  — install plugin from local path\n\
                      /plugin reload       — reload plugins from disk"
-                        .to_string(),
-                )
-            }
+                    .to_string(),
+            ),
         }
     }
 }
@@ -154,8 +154,12 @@ impl SlashCommand for PluginCommand {
 
 #[async_trait]
 impl SlashCommand for ReloadPluginsCommand {
-    fn name(&self) -> &str { "reload-plugins" }
-    fn description(&self) -> &str { "Reload all plugins without restarting" }
+    fn name(&self) -> &str {
+        "reload-plugins"
+    }
+    fn description(&self) -> &str {
+        "Reload all plugins without restarting"
+    }
     fn help(&self) -> &str {
         "Usage: /reload-plugins\n\
          Reloads all plugins and shows what changed."
@@ -230,14 +234,15 @@ impl SlashCommand for PluginSlashCommandAdapter {
                 } else {
                     format!("{} {}", command, args)
                 };
-                let cmd_result = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" })
-                    .args(if cfg!(windows) {
-                        vec!["/C", &full_cmd]
-                    } else {
-                        vec!["-c", &full_cmd]
-                    })
-                    .env("CLAUDE_PLUGIN_ROOT", plugin_root)
-                    .output();
+                let cmd_result =
+                    std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" })
+                        .args(if cfg!(windows) {
+                            vec!["/C", &full_cmd]
+                        } else {
+                            vec!["-c", &full_cmd]
+                        })
+                        .env("CLAUDE_PLUGIN_ROOT", plugin_root)
+                        .output();
                 match cmd_result {
                     Ok(out) => {
                         let stdout = String::from_utf8_lossy(&out.stdout);

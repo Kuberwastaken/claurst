@@ -4,8 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
 /// The current state of the remote bridge connection.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum BridgeConnectionState {
     /// No bridge configured / not in use.
     #[default]
@@ -25,7 +24,6 @@ pub enum BridgeConnectionState {
     OutboundOnly,
 }
 
-
 impl BridgeConnectionState {
     /// Return a styled status badge `Span` suitable for the status bar.
     /// Returns `None` when the state should not be shown (Disconnected).
@@ -38,7 +36,11 @@ impl BridgeConnectionState {
 
             BridgeConnectionState::Connected { peer_count, .. } => {
                 let label = if *peer_count > 0 {
-                    format!(" REMOTE ({} peer{}) ", peer_count, if *peer_count == 1 { "" } else { "s" })
+                    format!(
+                        " REMOTE ({} peer{}) ",
+                        peer_count,
+                        if *peer_count == 1 { "" } else { "s" }
+                    )
                 } else {
                     " REMOTE ".to_string()
                 };
@@ -98,7 +100,9 @@ mod tests {
 
     #[test]
     fn disconnected_produces_no_badge() {
-        assert!(BridgeConnectionState::Disconnected.status_badge(0).is_none());
+        assert!(BridgeConnectionState::Disconnected
+            .status_badge(0)
+            .is_none());
     }
 
     #[test]

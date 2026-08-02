@@ -202,10 +202,19 @@ mod tests {
             find_inline_keyword("ultracode").map(|k| k.effect),
             Some(InlineEffect::Effort(EffortLevel::Ultracode))
         ));
-        assert_eq!(find_inline_keyword("rocky").unwrap().persona_style(), Some("rocky"));
-        assert_eq!(find_inline_keyword("caveman").unwrap().persona_style(), Some("caveman"));
+        assert_eq!(
+            find_inline_keyword("rocky").unwrap().persona_style(),
+            Some("rocky")
+        );
+        assert_eq!(
+            find_inline_keyword("caveman").unwrap().persona_style(),
+            Some("caveman")
+        );
         // `normal` resets to the default (no persona).
-        assert_eq!(find_inline_keyword("normal").unwrap().persona_style(), Some("default"));
+        assert_eq!(
+            find_inline_keyword("normal").unwrap().persona_style(),
+            Some("default")
+        );
         assert!(find_inline_keyword("nope").is_none());
     }
 
@@ -221,7 +230,10 @@ mod tests {
     fn inline_persona_style_picks_persona_keyword() {
         assert_eq!(inline_persona_style("please rocky this"), Some("rocky"));
         assert_eq!(inline_persona_style("caveman it up"), Some("caveman"));
-        assert_eq!(inline_persona_style("back to normal please"), Some("default"));
+        assert_eq!(
+            inline_persona_style("back to normal please"),
+            Some("default")
+        );
         assert_eq!(inline_persona_style("nothing special here"), None);
     }
 
@@ -235,7 +247,10 @@ mod tests {
     #[test]
     fn inline_persona_style_last_wins() {
         // A trailing `normal` clears an earlier `rocky`.
-        assert_eq!(inline_persona_style("rocky then back to normal"), Some("default"));
+        assert_eq!(
+            inline_persona_style("rocky then back to normal"),
+            Some("default")
+        );
         // ...and vice-versa.
         assert_eq!(inline_persona_style("normal then rocky"), Some("rocky"));
     }

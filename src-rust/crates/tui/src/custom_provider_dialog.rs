@@ -45,7 +45,12 @@ impl CustomProviderDialogState {
         }
     }
 
-    pub fn open(&mut self, provider_id: String, provider_name: String, current_url: Option<String>) {
+    pub fn open(
+        &mut self,
+        provider_id: String,
+        provider_name: String,
+        current_url: Option<String>,
+    ) {
         self.visible = true;
         self.provider_id = provider_id;
         self.provider_name = provider_name;
@@ -69,7 +74,7 @@ impl CustomProviderDialogState {
     }
 
     pub fn move_prev_field(&mut self) {
-                self.active_field = match self.active_field {
+        self.active_field = match self.active_field {
             CustomProviderField::Url => CustomProviderField::ApiKey,
             CustomProviderField::ApiKey => CustomProviderField::Url,
         };
@@ -137,12 +142,16 @@ pub fn render_custom_provider_dialog(
     let title_pad = inner.width.saturating_sub(title_text.len() as u16 + 5) as usize;
 
     let url_style = if state.active_field == CustomProviderField::Url {
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::White)
     };
     let key_style = if state.active_field == CustomProviderField::ApiKey {
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::White)
     };
@@ -183,20 +192,34 @@ pub fn render_custom_provider_dialog(
         ),
     ]));
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(" URL:", Style::default().fg(muted))]));
+    lines.push(Line::from(vec![Span::styled(
+        " URL:",
+        Style::default().fg(muted),
+    )]));
     lines.push(Line::from(vec![
         Span::styled(format!(" {}", url_text), url_style),
         Span::styled(
-            if state.active_field == CustomProviderField::Url { "_" } else { "" },
+            if state.active_field == CustomProviderField::Url {
+                "_"
+            } else {
+                ""
+            },
             Style::default().fg(pink),
         ),
     ]));
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(" API Key:", Style::default().fg(muted))]));
+    lines.push(Line::from(vec![Span::styled(
+        " API Key:",
+        Style::default().fg(muted),
+    )]));
     lines.push(Line::from(vec![
         Span::styled(format!(" {}", masked_key), key_style),
         Span::styled(
-            if state.active_field == CustomProviderField::ApiKey { "_" } else { "" },
+            if state.active_field == CustomProviderField::ApiKey {
+                "_"
+            } else {
+                ""
+            },
             Style::default().fg(pink),
         ),
     ]));

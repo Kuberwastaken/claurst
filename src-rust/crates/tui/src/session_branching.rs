@@ -210,11 +210,7 @@ impl SessionBranchingState {
 // ---------------------------------------------------------------------------
 
 /// Render the session branching overlay.
-pub fn render_session_branching(
-    state: &SessionBranchingState,
-    area: Rect,
-    buf: &mut Buffer,
-) {
+pub fn render_session_branching(state: &SessionBranchingState, area: Rect, buf: &mut Buffer) {
     if !state.visible {
         return;
     }
@@ -275,7 +271,13 @@ fn render_branch_list(state: &SessionBranchingState, area: Rect, buf: &mut Buffe
                 Span::raw("")
             };
             let line = Line::from(vec![
-                Span::raw(format!("{}[{}] {} ({})", marker, idx + 1, branch.name, branch.created_at)),
+                Span::raw(format!(
+                    "{}[{}] {} ({})",
+                    marker,
+                    idx + 1,
+                    branch.name,
+                    branch.created_at
+                )),
                 badge,
             ]);
             ListItem::new(line)
@@ -320,7 +322,9 @@ fn render_create_branch(state: &SessionBranchingState, area: Rect, buf: &mut Buf
             Span::raw(prompt),
             Span::styled(
                 &state.create_input,
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw("_"),
         ]),
@@ -348,7 +352,10 @@ fn render_confirm_delete(state: &SessionBranchingState, area: Rect, buf: &mut Bu
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled("Y", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Y",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" to confirm | "),
             Span::styled("Esc", Style::default().fg(Color::Cyan)),
             Span::raw(" to cancel"),

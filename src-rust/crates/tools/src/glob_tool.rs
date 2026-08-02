@@ -19,7 +19,9 @@ struct GlobInput {
 #[async_trait]
 impl Tool for GlobTool {
     // Gates itself: calls `ctx.check_permission_for_path` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
         claurst_core::constants::TOOL_NAME_GLOB
@@ -77,10 +79,7 @@ impl Tool for GlobTool {
         debug!(pattern = %params.pattern, dir = %base_dir.display(), "Running glob");
 
         if !base_dir.exists() || !base_dir.is_dir() {
-            return ToolResult::error(format!(
-                "Directory not found: {}",
-                base_dir.display()
-            ));
+            return ToolResult::error(format!("Directory not found: {}", base_dir.display()));
         }
 
         // Build the full glob pattern

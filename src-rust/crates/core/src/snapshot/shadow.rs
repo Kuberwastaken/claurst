@@ -101,7 +101,9 @@ impl ShadowSnapshot {
     /// Prune unreachable git objects older than 7 days.
     pub async fn cleanup(&self) {
         let _g = self.lock.lock().await;
-        if !self.gitdir.exists() { return; }
+        if !self.gitdir.exists() {
+            return;
+        }
         let prune_arg = format!("--prune={PRUNE_PERIOD}");
         let r = self.shadow(vec!["gc", &prune_arg]).await;
         if r.code != 0 {
@@ -121,8 +123,9 @@ impl ShadowSnapshot {
             warn!("snapshot: cannot create gitdir: {e}");
             return None;
         }
-        if !existed
-            && !self.init_shadow().await { return None; }
+        if !existed && !self.init_shadow().await {
+            return None;
+        }
         self.stage().await;
         let r = self.shadow(vec!["write-tree"]).await;
         if r.code != 0 {
@@ -136,61 +139,104 @@ impl ShadowSnapshot {
 
     async fn do_patch(&self, hash: &str) -> Patch {
         self.stage().await;
-        let r = self.shadow(vec![
-            "-c", "core.quotepath=false",
-            "diff", "--cached", "--no-ext-diff", "--name-only", hash, "--", ".",
-        ]).await;
+        let r = self
+            .shadow(vec![
+                "-c",
+                "core.quotepath=false",
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--name-only",
+                hash,
+                "--",
+                ".",
+            ])
+            .await;
         if r.code != 0 {
             warn!("snapshot patch({hash}) failed: {}", r.stderr.trim());
-            return Patch { hash: hash.to_string(), files: vec![] };
+            return Patch {
+                hash: hash.to_string(),
+                files: vec![],
+            };
         }
-        let names: Vec<&str> = r.text.trim().split('\n').filter(|s| !s.is_empty()).collect();
+        let names: Vec<&str> = r
+            .text
+            .trim()
+            .split('\n')
+            .filter(|s| !s.is_empty())
+            .collect();
         let ignored = self.check_ignore_user(&names).await;
-        let files = names.into_iter()
+        let files = names
+            .into_iter()
             .filter(|f| !ignored.contains(*f))
             .map(|f| to_abs_fwd(&self.worktree, f))
             .collect();
-        Patch { hash: hash.to_string(), files }
+        Patch {
+            hash: hash.to_string(),
+            files,
+        }
     }
 
     async fn do_restore(&self, hash: &str) {
-        let r = self.shadow(vec![
-            "-c", "core.longpaths=true", "-c", "core.symlinks=true",
-            "read-tree", hash,
-        ]).await;
+        let r = self
+            .shadow(vec![
+                "-c",
+                "core.longpaths=true",
+                "-c",
+                "core.symlinks=true",
+                "read-tree",
+                hash,
+            ])
+            .await;
         if r.code != 0 {
             warn!("snapshot read-tree({hash}) failed: {}", r.stderr.trim());
             return;
         }
-        let r2 = self.shadow(vec![
-            "-c", "core.longpaths=true", "-c", "core.symlinks=true",
-            "checkout-index", "-a", "-f",
-        ]).await;
+        let r2 = self
+            .shadow(vec![
+                "-c",
+                "core.longpaths=true",
+                "-c",
+                "core.symlinks=true",
+                "checkout-index",
+                "-a",
+                "-f",
+            ])
+            .await;
         if r2.code != 0 {
             warn!("snapshot checkout-index failed: {}", r2.stderr.trim());
         }
     }
 
     async fn do_revert(&self, patches: &[Patch]) {
-        struct Op { hash: String, abs: PathBuf, rel: String }
+        struct Op {
+            hash: String,
+            abs: PathBuf,
+            rel: String,
+        }
 
         let mut ops: Vec<Op> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         for patch in patches {
             for abs in &patch.files {
                 let key = fwd_str(abs);
-                if !seen.insert(key) { continue; }
-                let rel = abs.strip_prefix(&self.worktree)
+                if !seen.insert(key) {
+                    continue;
+                }
+                let rel = abs
+                    .strip_prefix(&self.worktree)
                     .map(fwd_str)
                     .unwrap_or_else(|_| fwd_str(abs));
-                ops.push(Op { hash: patch.hash.clone(), abs: abs.clone(), rel });
+                ops.push(Op {
+                    hash: patch.hash.clone(),
+                    abs: abs.clone(),
+                    rel,
+                });
             }
         }
 
         let clash = |a: &str, b: &str| {
-            a == b
-                || a.starts_with(&format!("{b}/"))
-                || b.starts_with(&format!("{a}/"))
+            a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
         };
 
         let mut i = 0;
@@ -199,14 +245,19 @@ impl ShadowSnapshot {
             let mut end = i + 1;
             while end < ops.len() && end - i < 100 {
                 let next = &ops[end];
-                if next.hash != first_hash { break; }
-                if ops[i..end].iter().any(|o| clash(&o.rel, &next.rel)) { break; }
+                if next.hash != first_hash {
+                    break;
+                }
+                if ops[i..end].iter().any(|o| clash(&o.rel, &next.rel)) {
+                    break;
+                }
                 end += 1;
             }
             let run = &ops[i..end];
 
             if run.len() == 1 {
-                self.revert_one(&ops[i].hash, &ops[i].abs, &ops[i].rel).await;
+                self.revert_one(&ops[i].hash, &ops[i].abs, &ops[i].rel)
+                    .await;
                 i = end;
                 continue;
             }
@@ -218,20 +269,31 @@ impl ShadowSnapshot {
             let tree_r = self.shadow(ls_args).await;
 
             if tree_r.code != 0 {
-                for op in run { self.revert_one(&op.hash, &op.abs, &op.rel).await; }
+                for op in run {
+                    self.revert_one(&op.hash, &op.abs, &op.rel).await;
+                }
                 i = end;
                 continue;
             }
 
-            let have: HashSet<&str> = tree_r.text.trim()
-                .split('\n').filter(|s| !s.is_empty()).collect();
+            let have: HashSet<&str> = tree_r
+                .text
+                .trim()
+                .split('\n')
+                .filter(|s| !s.is_empty())
+                .collect();
 
             // Batch-checkout files that exist in the tree.
-            let present: Vec<&Op> = run.iter().filter(|o| have.contains(o.rel.as_str())).collect();
+            let present: Vec<&Op> = run
+                .iter()
+                .filter(|o| have.contains(o.rel.as_str()))
+                .collect();
             if !present.is_empty() {
                 let mut args: Vec<String> = vec![
-                    "-c".into(), "core.longpaths=true".into(),
-                    "-c".into(), "core.symlinks=true".into(),
+                    "-c".into(),
+                    "core.longpaths=true".into(),
+                    "-c".into(),
+                    "core.symlinks=true".into(),
                 ];
                 args.extend(self.shadow_prefix());
                 args.extend(["checkout".into(), first_hash.clone(), "--".into()]);
@@ -239,7 +301,9 @@ impl ShadowSnapshot {
                 let refs: Vec<&str> = args.iter().map(String::as_str).collect();
                 let r = self.raw_git(&refs, None).await;
                 if r.code != 0 {
-                    for op in run { self.revert_one(&op.hash, &op.abs, &op.rel).await; }
+                    for op in run {
+                        self.revert_one(&op.hash, &op.abs, &op.rel).await;
+                    }
                     i = end;
                     continue;
                 }
@@ -258,14 +322,18 @@ impl ShadowSnapshot {
     async fn revert_one(&self, hash: &str, abs: &Path, rel: &str) {
         let abs_s = abs.to_string_lossy().into_owned();
         let mut args: Vec<String> = vec![
-            "-c".into(), "core.longpaths=true".into(),
-            "-c".into(), "core.symlinks=true".into(),
+            "-c".into(),
+            "core.longpaths=true".into(),
+            "-c".into(),
+            "core.symlinks=true".into(),
         ];
         args.extend(self.shadow_prefix());
         args.extend(["checkout".into(), hash.into(), "--".into(), abs_s]);
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let r = self.raw_git(&refs, None).await;
-        if r.code == 0 { return; }
+        if r.code == 0 {
+            return;
+        }
         // If the file didn't exist in that snapshot, delete it.
         let ls_r = self.shadow(vec!["ls-tree", hash, "--", rel]).await;
         if ls_r.code == 0 && ls_r.text.trim().is_empty() {
@@ -275,10 +343,18 @@ impl ShadowSnapshot {
 
     async fn do_diff(&self, hash: &str) -> String {
         self.stage().await;
-        let r = self.shadow(vec![
-            "-c", "core.quotepath=false",
-            "diff", "--cached", "--no-ext-diff", hash, "--", ".",
-        ]).await;
+        let r = self
+            .shadow(vec![
+                "-c",
+                "core.quotepath=false",
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                hash,
+                "--",
+                ".",
+            ])
+            .await;
         if r.code != 0 {
             warn!("snapshot diff({hash}) failed: {}", r.stderr.trim());
             return String::new();
@@ -288,10 +364,20 @@ impl ShadowSnapshot {
 
     async fn do_diff_full(&self, from: &str, to: &str) -> Vec<FileDiff> {
         // Status per file.
-        let status_r = self.shadow(vec![
-            "-c", "core.quotepath=false",
-            "diff", "--no-ext-diff", "--name-status", "--no-renames", from, to, "--", ".",
-        ]).await;
+        let status_r = self
+            .shadow(vec![
+                "-c",
+                "core.quotepath=false",
+                "diff",
+                "--no-ext-diff",
+                "--name-status",
+                "--no-renames",
+                from,
+                to,
+                "--",
+                ".",
+            ])
+            .await;
         let mut status_map: HashMap<String, FileStatus> = HashMap::new();
         for line in status_r.text.trim().split('\n').filter(|l| !l.is_empty()) {
             let mut parts = line.splitn(2, '\t');
@@ -306,21 +392,46 @@ impl ShadowSnapshot {
         }
 
         // Numstat for add/del line counts.
-        let num_r = self.shadow(vec![
-            "-c", "core.quotepath=false",
-            "diff", "--no-ext-diff", "--no-renames", "--numstat", from, to, "--", ".",
-        ]).await;
+        let num_r = self
+            .shadow(vec![
+                "-c",
+                "core.quotepath=false",
+                "diff",
+                "--no-ext-diff",
+                "--no-renames",
+                "--numstat",
+                from,
+                to,
+                "--",
+                ".",
+            ])
+            .await;
 
-        struct Row { file: String, adds: u32, dels: u32, binary: bool }
+        struct Row {
+            file: String,
+            adds: u32,
+            dels: u32,
+            binary: bool,
+        }
         let mut rows: Vec<Row> = Vec::new();
         for line in num_r.text.trim().split('\n').filter(|l| !l.is_empty()) {
             let parts: Vec<&str> = line.splitn(3, '\t').collect();
-            if parts.len() < 3 { continue; }
+            if parts.len() < 3 {
+                continue;
+            }
             let binary = parts[0] == "-" && parts[1] == "-";
             rows.push(Row {
                 file: parts[2].to_string(),
-                adds: if binary { 0 } else { parts[0].parse().unwrap_or(0) },
-                dels: if binary { 0 } else { parts[1].parse().unwrap_or(0) },
+                adds: if binary {
+                    0
+                } else {
+                    parts[0].parse().unwrap_or(0)
+                },
+                dels: if binary {
+                    0
+                } else {
+                    parts[1].parse().unwrap_or(0)
+                },
                 binary,
             });
         }
@@ -328,10 +439,16 @@ impl ShadowSnapshot {
         // Filter gitignored (collect to owned Strings so we don't borrow `rows`).
         let ignored: std::collections::HashSet<String> = {
             let names: Vec<&str> = rows.iter().map(|r| r.file.as_str()).collect();
-            self.check_ignore_user(&names).await
-                .into_iter().map(|s| s.to_string()).collect()
+            self.check_ignore_user(&names)
+                .await
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect()
         };
-        let rows: Vec<Row> = rows.into_iter().filter(|r| !ignored.contains(&r.file)).collect();
+        let rows: Vec<Row> = rows
+            .into_iter()
+            .filter(|r| !ignored.contains(&r.file))
+            .collect();
 
         let mut result = Vec::with_capacity(rows.len());
         for row in rows {
@@ -374,7 +491,8 @@ impl ShadowSnapshot {
             ("core.symlinks", "true"),
             ("core.fsmonitor", "false"),
         ] {
-            self.raw_git(&["--git-dir", &gitdir_s, "config", k, v], None).await;
+            self.raw_git(&["--git-dir", &gitdir_s, "config", k, v], None)
+                .await;
         }
         info!("snapshot: init at {:?}", self.gitdir);
         true
@@ -383,45 +501,86 @@ impl ShadowSnapshot {
     async fn stage(&self) {
         self.sync_excludes(&[]).await;
 
-        let diff_r = self.shadow(vec![
-            "-c", "core.quotepath=false",
-            "diff-files", "--name-only", "-z", "--", ".",
-        ]).await;
-        let tracked = if diff_r.code == 0 { split_nul(&diff_r.text) } else { vec![] };
+        let diff_r = self
+            .shadow(vec![
+                "-c",
+                "core.quotepath=false",
+                "diff-files",
+                "--name-only",
+                "-z",
+                "--",
+                ".",
+            ])
+            .await;
+        let tracked = if diff_r.code == 0 {
+            split_nul(&diff_r.text)
+        } else {
+            vec![]
+        };
 
-        let ls_r = self.shadow(vec![
-            "-c", "core.quotepath=false",
-            "ls-files", "--others", "--exclude-standard", "-z", "--", ".",
-        ]).await;
-        let untracked = if ls_r.code == 0 { split_nul(&ls_r.text) } else { vec![] };
+        let ls_r = self
+            .shadow(vec![
+                "-c",
+                "core.quotepath=false",
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "--",
+                ".",
+            ])
+            .await;
+        let untracked = if ls_r.code == 0 {
+            split_nul(&ls_r.text)
+        } else {
+            vec![]
+        };
 
         let all: Vec<String> = {
             let mut s: HashSet<String> = HashSet::new();
-            for f in tracked.iter().chain(untracked.iter()) { s.insert(f.clone()); }
+            for f in tracked.iter().chain(untracked.iter()) {
+                s.insert(f.clone());
+            }
             let mut v: Vec<_> = s.into_iter().collect();
             v.sort();
             v
         };
-        if all.is_empty() { return; }
+        if all.is_empty() {
+            return;
+        }
 
         let refs: Vec<&str> = all.iter().map(String::as_str).collect();
         let ignored = self.check_ignore_user(&refs).await;
 
         // Drop now-ignored files from shadow index.
-        let to_drop: Vec<String> = all.iter().filter(|f| ignored.contains(f.as_str())).cloned().collect();
+        let to_drop: Vec<String> = all
+            .iter()
+            .filter(|f| ignored.contains(f.as_str()))
+            .cloned()
+            .collect();
         if !to_drop.is_empty() {
             let stdin = nul_list(&to_drop);
-            self.shadow_stdin(vec![
-                "rm", "--cached", "-f", "--ignore-unmatch",
-                "--pathspec-from-file=-", "--pathspec-file-nul",
-            ], stdin).await;
+            self.shadow_stdin(
+                vec![
+                    "rm",
+                    "--cached",
+                    "-f",
+                    "--ignore-unmatch",
+                    "--pathspec-from-file=-",
+                    "--pathspec-file-nul",
+                ],
+                stdin,
+            )
+            .await;
         }
 
         // Skip large untracked files (exclude them from shadow).
         let mut large: Vec<String> = Vec::new();
         let mut stageable: Vec<String> = Vec::new();
         for f in &all {
-            if ignored.contains(f.as_str()) { continue; }
+            if ignored.contains(f.as_str()) {
+                continue;
+            }
             if untracked.contains(f) {
                 if let Ok(meta) = tokio::fs::metadata(self.worktree.join(f)).await {
                     if meta.len() > SIZE_LIMIT {
@@ -437,10 +596,18 @@ impl ShadowSnapshot {
         }
         if !stageable.is_empty() {
             let stdin = nul_list(&stageable);
-            let r = self.shadow_stdin(vec![
-                "add", "--all", "--sparse",
-                "--pathspec-from-file=-", "--pathspec-file-nul",
-            ], stdin).await;
+            let r = self
+                .shadow_stdin(
+                    vec![
+                        "add",
+                        "--all",
+                        "--sparse",
+                        "--pathspec-from-file=-",
+                        "--pathspec-file-nul",
+                    ],
+                    stdin,
+                )
+                .await;
             if r.code != 0 {
                 warn!("snapshot stage failed: {}", r.stderr.trim());
             }
@@ -454,7 +621,9 @@ impl ShadowSnapshot {
         let mut parts: Vec<String> = Vec::new();
         if let Some(ref c) = user_content {
             let t = c.trim_end().to_string();
-            if !t.is_empty() { parts.push(t); }
+            if !t.is_empty() {
+                parts.push(t);
+            }
         }
         for p in extra {
             parts.push(format!("/{}", p.replace('\\', "/")));
@@ -469,34 +638,60 @@ impl ShadowSnapshot {
 
     async fn read_user_exclude(&self) -> Option<String> {
         let worktree_s = self.worktree.to_string_lossy().into_owned();
-        let r = self.raw_git(
-            &["-C", &worktree_s, "rev-parse", "--path-format=absolute", "--git-path", "info/exclude"],
-            None,
-        ).await;
+        let r = self
+            .raw_git(
+                &[
+                    "-C",
+                    &worktree_s,
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "info/exclude",
+                ],
+                None,
+            )
+            .await;
         let path = r.text.trim().to_string();
-        if path.is_empty() { return None; }
+        if path.is_empty() {
+            return None;
+        }
         tokio::fs::read_to_string(&path).await.ok()
     }
 
     async fn check_ignore_user<'a>(&self, files: &[&'a str]) -> HashSet<&'a str> {
-        if files.is_empty() { return HashSet::new(); }
-        let stdin: Vec<u8> = files.iter().flat_map(|f| {
-            let mut b = f.as_bytes().to_vec();
-            b.push(0);
-            b
-        }).collect();
+        if files.is_empty() {
+            return HashSet::new();
+        }
+        let stdin: Vec<u8> = files
+            .iter()
+            .flat_map(|f| {
+                let mut b = f.as_bytes().to_vec();
+                b.push(0);
+                b
+            })
+            .collect();
         let dot_git = self.worktree.join(".git").to_string_lossy().into_owned();
         let worktree_s = self.worktree.to_string_lossy().into_owned();
-        let r = self.raw_git(
-            &[
-                "-c", "core.quotepath=false",
-                "--git-dir", &dot_git,
-                "--work-tree", &worktree_s,
-                "check-ignore", "--no-index", "--stdin", "-z",
-            ],
-            Some(stdin),
-        ).await;
-        if r.code != 0 && r.code != 1 { return HashSet::new(); }
+        let r = self
+            .raw_git(
+                &[
+                    "-c",
+                    "core.quotepath=false",
+                    "--git-dir",
+                    &dot_git,
+                    "--work-tree",
+                    &worktree_s,
+                    "check-ignore",
+                    "--no-index",
+                    "--stdin",
+                    "-z",
+                ],
+                Some(stdin),
+            )
+            .await;
+        if r.code != 0 && r.code != 1 {
+            return HashSet::new();
+        }
         let raw: Vec<&str> = r.text.split('\0').filter(|s| !s.is_empty()).collect();
         files.iter().copied().filter(|f| raw.contains(f)).collect()
     }
@@ -504,7 +699,11 @@ impl ShadowSnapshot {
     async fn show_blob(&self, hash: &str, file: &str) -> String {
         let spec = format!("{hash}:{file}");
         let r = self.shadow(vec!["show", &spec]).await;
-        if r.code == 0 { r.text } else { String::new() }
+        if r.code == 0 {
+            r.text
+        } else {
+            String::new()
+        }
     }
 
     async fn show_pair(
@@ -538,7 +737,13 @@ impl ShadowSnapshot {
         }
         let mut child = match cmd.spawn() {
             Ok(c) => c,
-            Err(e) => return GitResult { code: 1, text: String::new(), stderr: e.to_string() },
+            Err(e) => {
+                return GitResult {
+                    code: 1,
+                    text: String::new(),
+                    stderr: e.to_string(),
+                }
+            }
         };
         if let Some(data) = stdin_data {
             if let Some(mut si) = child.stdin.take() {
@@ -551,7 +756,11 @@ impl ShadowSnapshot {
                 text: String::from_utf8_lossy(&out.stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             },
-            Err(e) => GitResult { code: 1, text: String::new(), stderr: e.to_string() },
+            Err(e) => GitResult {
+                code: 1,
+                text: String::new(),
+                stderr: e.to_string(),
+            },
         }
     }
 
@@ -586,8 +795,12 @@ impl ShadowSnapshot {
 fn find_repo_root(start: &Path) -> Option<PathBuf> {
     let mut cur = start.to_path_buf();
     loop {
-        if cur.join(".git").exists() { return Some(cur); }
-        if !cur.pop() { return None; }
+        if cur.join(".git").exists() {
+            return Some(cur);
+        }
+        if !cur.pop() {
+            return None;
+        }
     }
 }
 
@@ -607,15 +820,21 @@ fn to_abs_fwd(base: &Path, rel: &str) -> PathBuf {
 }
 
 fn split_nul(s: &str) -> Vec<String> {
-    s.split('\0').filter(|p| !p.is_empty()).map(String::from).collect()
+    s.split('\0')
+        .filter(|p| !p.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 fn nul_list(files: &[String]) -> Vec<u8> {
-    files.iter().flat_map(|f| {
-        let mut b = f.as_bytes().to_vec();
-        b.push(0);
-        b
-    }).collect()
+    files
+        .iter()
+        .flat_map(|f| {
+            let mut b = f.as_bytes().to_vec();
+            b.push(0);
+            b
+        })
+        .collect()
 }
 
 fn make_unified_diff(file: &str, before: &str, after: &str) -> String {

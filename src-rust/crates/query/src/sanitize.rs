@@ -83,8 +83,10 @@ pub fn sanitize_history(messages: Vec<Message>) -> Vec<Message> {
                     // message follows — itself already malformed). Insert a fresh
                     // user message carrying a synthesized result for every
                     // tool_use so the pairing is balanced.
-                    let synth: Vec<ContentBlock> =
-                        tool_use_ids.iter().map(|id| synth_tool_result(id)).collect();
+                    let synth: Vec<ContentBlock> = tool_use_ids
+                        .iter()
+                        .map(|id| synth_tool_result(id))
+                        .collect();
                     out.push(Message::user_blocks(synth));
                     i += 1;
                 }
@@ -259,7 +261,11 @@ mod tests {
                 let next = messages
                     .get(i + 1)
                     .unwrap_or_else(|| panic!("tool_use at {i} has no following message"));
-                assert_eq!(next.role, Role::User, "tool_use at {i} not followed by user");
+                assert_eq!(
+                    next.role,
+                    Role::User,
+                    "tool_use at {i} not followed by user"
+                );
                 let answered: Vec<String> = collect_tool_result_ids(next);
                 for id in &uses {
                     assert!(
@@ -312,7 +318,10 @@ mod tests {
         let out = sanitize_history(messages.clone());
 
         assert_eq!(out.len(), messages.len(), "no messages added or dropped");
-        assert_eq!(pairing(&out), (vec!["t1".to_string()], vec!["t1".to_string()]));
+        assert_eq!(
+            pairing(&out),
+            (vec!["t1".to_string()], vec!["t1".to_string()])
+        );
         assert_balanced(&out);
         // Idempotent: running twice yields the same result.
         assert_eq!(pairing(&sanitize_history(out.clone())), pairing(&out));
@@ -328,7 +337,10 @@ mod tests {
             // Compaction kept messages[0] (system/first) then sliced the tail,
             // stranding this tool_result whose tool_use no longer exists.
             Message::user("original task"),
-            Message::user_blocks(vec![tool_result("gone", "orphaned output"), text_block("and more")]),
+            Message::user_blocks(vec![
+                tool_result("gone", "orphaned output"),
+                text_block("and more"),
+            ]),
             Message::assistant("continuing"),
         ];
 
@@ -373,13 +385,22 @@ mod tests {
 
         let out = sanitize_history(messages);
 
-        assert_eq!(out.len(), 3, "a synthesized answering user message is appended");
-        assert_eq!(pairing(&out), (vec!["t1".to_string()], vec!["t1".to_string()]));
+        assert_eq!(
+            out.len(),
+            3,
+            "a synthesized answering user message is appended"
+        );
+        assert_eq!(
+            pairing(&out),
+            (vec!["t1".to_string()], vec!["t1".to_string()])
+        );
         assert_balanced(&out);
         // The synthesized result is flagged is_error with the placeholder text.
         if let MessageContent::Blocks(blocks) = &out[2].content {
             match &blocks[0] {
-                ContentBlock::ToolResult { content, is_error, .. } => {
+                ContentBlock::ToolResult {
+                    content, is_error, ..
+                } => {
                     assert_eq!(*is_error, Some(true));
                     match content {
                         ToolResultContent::Text(t) => assert_eq!(t, UNAVAILABLE_RESULT_MSG),
@@ -408,7 +429,10 @@ mod tests {
         let out = sanitize_history(messages);
 
         assert_eq!(out.len(), 3, "no extra turn inserted");
-        assert_eq!(pairing(&out), (vec!["t1".to_string()], vec!["t1".to_string()]));
+        assert_eq!(
+            pairing(&out),
+            (vec!["t1".to_string()], vec!["t1".to_string()])
+        );
         assert_balanced(&out);
         // The injected text is preserved alongside the synthesized result.
         if let MessageContent::Blocks(blocks) = &out[2].content {
@@ -442,9 +466,11 @@ mod tests {
         // t1 keeps its real result; t2 gets the placeholder.
         if let MessageContent::Blocks(blocks) = &out[2].content {
             let t1 = blocks.iter().find_map(|b| match b {
-                ContentBlock::ToolResult { tool_use_id, content, .. } if tool_use_id == "t1" => {
-                    Some(content)
-                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } if tool_use_id == "t1" => Some(content),
                 _ => None,
             });
             match t1 {
@@ -472,7 +498,10 @@ mod tests {
 
         let out = sanitize_history(messages);
 
-        assert_eq!(pairing(&out), (vec!["t1".to_string()], vec!["t1".to_string()]));
+        assert_eq!(
+            pairing(&out),
+            (vec!["t1".to_string()], vec!["t1".to_string()])
+        );
         assert_balanced(&out);
     }
 

@@ -13,8 +13,12 @@ pub struct ColorSetCommand;
 
 #[async_trait]
 impl SlashCommand for AdvisorCommand {
-    fn name(&self) -> &str { "advisor" }
-    fn description(&self) -> &str { "Set or unset the server-side advisor model" }
+    fn name(&self) -> &str {
+        "advisor"
+    }
+    fn description(&self) -> &str {
+        "Set or unset the server-side advisor model"
+    }
     fn help(&self) -> &str {
         "Usage: /advisor [<model>|off|unset]\n\n\
          Sets the advisor model used for server-side suggestions.\n\
@@ -77,9 +81,15 @@ impl SlashCommand for AdvisorCommand {
 
 #[async_trait]
 impl SlashCommand for FastCommand {
-    fn name(&self) -> &str { "fast" }
-    fn aliases(&self) -> Vec<&str> { vec!["speed"] }
-    fn description(&self) -> &str { "Toggle fast mode (uses a faster/cheaper model)" }
+    fn name(&self) -> &str {
+        "fast"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["speed"]
+    }
+    fn description(&self) -> &str {
+        "Toggle fast mode (uses a faster/cheaper model)"
+    }
     fn help(&self) -> &str {
         "Usage: /fast [on|off]\n\n\
          Fast mode switches to the active provider's smaller, faster model\n\
@@ -109,11 +119,8 @@ impl SlashCommand for FastCommand {
 
         let provider_id = ctx.config.selected_provider_id();
         let fast_model = resolve_fast_model_id(&ctx.config);
-        let normal_model = stripped_model_for_provider(
-            provider_id,
-            ctx.config.effective_model(),
-        )
-        .to_string();
+        let normal_model =
+            stripped_model_for_provider(provider_id, ctx.config.effective_model()).to_string();
 
         if enable {
             let mut new_config = ctx.config.clone();
@@ -130,11 +137,8 @@ impl SlashCommand for FastCommand {
             let mut new_config = ctx.config.clone();
             // Restore default / saved model
             new_config.model = None;
-            let restored_model = stripped_model_for_provider(
-                provider_id,
-                new_config.effective_model(),
-            )
-            .to_string();
+            let restored_model =
+                stripped_model_for_provider(provider_id, new_config.effective_model()).to_string();
             CommandResult::ConfigChangeMessage(
                 new_config,
                 format!(
@@ -150,9 +154,15 @@ impl SlashCommand for FastCommand {
 
 #[async_trait]
 impl SlashCommand for ColorSetCommand {
-    fn name(&self) -> &str { "color-set" }
-    fn hidden(&self) -> bool { true }
-    fn description(&self) -> &str { "Internal: set prompt color — use /color instead" }
+    fn name(&self) -> &str {
+        "color-set"
+    }
+    fn hidden(&self) -> bool {
+        true
+    }
+    fn description(&self) -> &str {
+        "Internal: set prompt color — use /color instead"
+    }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
         let color = args.trim();
@@ -171,10 +181,11 @@ impl SlashCommand for ColorSetCommand {
         } else {
             // Validate hex or named color
             let known_colors = [
-                "red", "green", "blue", "yellow", "cyan", "magenta",
-                "white", "orange", "purple", "pink", "gray", "grey",
+                "red", "green", "blue", "yellow", "cyan", "magenta", "white", "orange", "purple",
+                "pink", "gray", "grey",
             ];
-            let is_hex = color.starts_with('#') && (color.len() == 4 || color.len() == 7)
+            let is_hex = color.starts_with('#')
+                && (color.len() == 4 || color.len() == 7)
                 && color[1..].chars().all(|c| c.is_ascii_hexdigit());
             if !is_hex && !known_colors.contains(&color.to_lowercase().as_str()) {
                 return CommandResult::Error(format!(

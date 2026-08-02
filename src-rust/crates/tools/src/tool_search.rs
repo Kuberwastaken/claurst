@@ -128,7 +128,10 @@ fn score_entry(entry: &CatalogEntry, terms: &[&str]) -> usize {
             }
         }
 
-        if desc_lower.split_whitespace().any(|w| w.trim_matches(|c: char| !c.is_alphanumeric()) == *term) {
+        if desc_lower
+            .split_whitespace()
+            .any(|w| w.trim_matches(|c: char| !c.is_alphanumeric()) == *term)
+        {
             score += 5; // whole-word description hit
         } else if desc_lower.contains(term) {
             score += 2; // substring description hit
@@ -193,10 +196,7 @@ impl Tool for ToolSearchTool {
             let mut missing = Vec::new();
 
             for name in requested {
-                if let Some(entry) = catalog
-                    .iter()
-                    .find(|e| e.name.eq_ignore_ascii_case(name))
-                {
+                if let Some(entry) = catalog.iter().find(|e| e.name.eq_ignore_ascii_case(name)) {
                     found.push(format!("{}: {}", entry.name, entry.description));
                 } else {
                     missing.push(name.to_string());
@@ -282,9 +282,7 @@ mod tests {
 
     async fn run(query: &str) -> String {
         let tool = ToolSearchTool;
-        let out = tool
-            .execute(json!({ "query": query }), &ctx())
-            .await;
+        let out = tool.execute(json!({ "query": query }), &ctx()).await;
         out.content
     }
 
@@ -306,10 +304,7 @@ mod tests {
     #[tokio::test]
     async fn exact_name_ranks_first() {
         let out = run("grep").await;
-        let first_line = out
-            .lines()
-            .find(|l| l.contains(": "))
-            .unwrap_or_default();
+        let first_line = out.lines().find(|l| l.contains(": ")).unwrap_or_default();
         assert!(
             first_line.starts_with("Grep:"),
             "exact name match should rank first, got first result line: {first_line:?}\n{out}"

@@ -1,5 +1,5 @@
 use crate::config::{HookEntry, HookEvent, McpServerConfig, Settings, Theme};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -189,16 +189,28 @@ pub fn summarize_import_result(result: &ImportExecutionResult, paths: &ImportPat
     let mut lines = vec!["Config import completed.".to_string()];
 
     if result.wrote_claude_md {
-        lines.push(format!("- Wrote CLAUDE.md: {}", paths.target_claude_md.display()));
+        lines.push(format!(
+            "- Wrote CLAUDE.md: {}",
+            paths.target_claude_md.display()
+        ));
     }
     if result.wrote_settings {
-        lines.push(format!("- Wrote settings.json: {}", paths.target_settings_json.display()));
+        lines.push(format!(
+            "- Wrote settings.json: {}",
+            paths.target_settings_json.display()
+        ));
     }
     if !result.imported_fields.is_empty() {
-        lines.push(format!("- Imported fields: {}", result.imported_fields.join(", ")));
+        lines.push(format!(
+            "- Imported fields: {}",
+            result.imported_fields.join(", ")
+        ));
     }
     if !result.skipped_fields.is_empty() {
-        lines.push(format!("- Skipped fields: {}", result.skipped_fields.join(", ")));
+        lines.push(format!(
+            "- Skipped fields: {}",
+            result.skipped_fields.join(", ")
+        ));
     }
     lines.push("Reopen settings to review changes. If mcpServers were imported, wait for this session to reconnect MCP automatically. Review CLAUDE.md changes in a new session.".to_string());
     lines.join("\n")
@@ -224,7 +236,10 @@ fn prepare_import_with_paths(
 
     if selection.include_claude_md() {
         let content = std::fs::read_to_string(&paths.source_claude_md).with_context(|| {
-            format!("Failed to read source CLAUDE.md: {}", paths.source_claude_md.display())
+            format!(
+                "Failed to read source CLAUDE.md: {}",
+                paths.source_claude_md.display()
+            )
         })?;
         let excerpt = build_excerpt(&content, 8, 500);
         preview.claude_md = Some(ClaudeMdPreview {
@@ -243,12 +258,13 @@ fn prepare_import_with_paths(
     }
 
     if selection.include_settings() {
-        let source_text = std::fs::read_to_string(&paths.source_settings_json).with_context(|| {
-            format!(
-                "Failed to read source settings.json: {}",
-                paths.source_settings_json.display()
-            )
-        })?;
+        let source_text =
+            std::fs::read_to_string(&paths.source_settings_json).with_context(|| {
+                format!(
+                    "Failed to read source settings.json: {}",
+                    paths.source_settings_json.display()
+                )
+            })?;
         let source_value: Value = serde_json::from_str(&source_text).with_context(|| {
             format!(
                 "Failed to parse source settings.json: {}",
@@ -258,7 +274,8 @@ fn prepare_import_with_paths(
 
         let mut current_settings = Settings::load_sync().unwrap_or_default();
         let current_value = serde_json::to_value(&current_settings).unwrap_or(Value::Null);
-        let settings_outcome = map_settings_preview(&source_value, &current_value, &mut current_settings)?;
+        let settings_outcome =
+            map_settings_preview(&source_value, &current_value, &mut current_settings)?;
         imported_fields.extend(settings_outcome.imported_fields.iter().cloned());
         skipped_fields.extend(settings_outcome.skipped_fields.iter().cloned());
         preview.settings = Some(SettingsPreview {
@@ -318,7 +335,10 @@ fn map_settings_preview(
         preview_fields.push(PreviewField {
             name: "model".to_string(),
             action: PreviewAction::Skip,
-            reason: Some("model is not imported to keep the current session and default model unchanged".to_string()),
+            reason: Some(
+                "model is not imported to keep the current session and default model unchanged"
+                    .to_string(),
+            ),
         });
         skipped_fields.push("model".to_string());
         skipped_count += 1;
@@ -330,7 +350,6 @@ fn map_settings_preview(
         });
         kept_count += 1;
     }
-
 
     map_theme_field(
         source_obj.get("theme"),
@@ -495,7 +514,9 @@ fn map_theme_field(
             };
             if let Some(theme) = parsed {
                 let action = match current_value.and_then(Value::as_str) {
-                    Some(current_text) if current_text.eq_ignore_ascii_case(raw) => PreviewAction::Import,
+                    Some(current_text) if current_text.eq_ignore_ascii_case(raw) => {
+                        PreviewAction::Import
+                    }
                     Some(_) => PreviewAction::Replace,
                     None => PreviewAction::Import,
                 };
@@ -555,7 +576,9 @@ fn map_mcp_servers_field(
             preview_fields.push(PreviewField {
                 name: "mcpServers".to_string(),
                 action: PreviewAction::Skip,
-                reason: Some("mcpServers structure is incompatible with the current program".to_string()),
+                reason: Some(
+                    "mcpServers structure is incompatible with the current program".to_string(),
+                ),
             });
             skipped_fields.push("mcpServers".to_string());
             *skipped_count += 1;
@@ -611,7 +634,9 @@ fn map_hooks_field(
             preview_fields.push(PreviewField {
                 name: "hooks".to_string(),
                 action: PreviewAction::Skip,
-                reason: Some("hooks structure is incompatible with the current program".to_string()),
+                reason: Some(
+                    "hooks structure is incompatible with the current program".to_string(),
+                ),
             });
             skipped_fields.push("hooks".to_string());
             *skipped_count += 1;
@@ -738,7 +763,11 @@ fn parse_hooks(value: &Value) -> Result<HashMap<HookEvent, Vec<HookEntry>>> {
                     .to_string();
                 hook_entries.push(HookEntry {
                     command,
-                    tool_filter: if matcher == "*" { None } else { Some(matcher.clone()) },
+                    tool_filter: if matcher == "*" {
+                        None
+                    } else {
+                        Some(matcher.clone())
+                    },
                     blocking: false,
                 });
             }
@@ -763,7 +792,9 @@ fn parse_hook_event(name: &str) -> Result<HookEvent> {
 fn skip_reason_for_key(key: &str) -> &'static str {
     match key {
         "env" => "contains sensitive environment variables and is not imported automatically",
-        "ANTHROPIC_AUTH_TOKEN" | "apiKey" | "providers" => "auth and provider credentials are not migrated automatically",
+        "ANTHROPIC_AUTH_TOKEN" | "apiKey" | "providers" => {
+            "auth and provider credentials are not migrated automatically"
+        }
         "enabledPlugins" => "plugin config structure differs from the current program",
         "disabledMcpServers" => "the current program has no matching field",
         "extraKnownMarketplaces" => "the current program has no matching field",
@@ -916,10 +947,19 @@ mod tests {
         let preview = build_import_preview_with_paths(ImportSelection::Both, paths).unwrap();
         assert!(preview.claude_md.is_some());
         let settings = preview.settings.unwrap();
-        assert!(settings.fields.iter().any(|f| f.name == "model" && f.action == PreviewAction::Skip));
+        assert!(settings
+            .fields
+            .iter()
+            .any(|f| f.name == "model" && f.action == PreviewAction::Skip));
         assert!(settings.fields.iter().any(|f| f.name == "theme"));
         assert!(settings.fields.iter().any(|f| f.name.starts_with("hooks")));
-        assert!(settings.fields.iter().any(|f| f.name.starts_with("mcpServers")));
-        assert!(settings.fields.iter().any(|f| f.name == "env" && f.action == PreviewAction::Skip));
+        assert!(settings
+            .fields
+            .iter()
+            .any(|f| f.name.starts_with("mcpServers")));
+        assert!(settings
+            .fields
+            .iter()
+            .any(|f| f.name == "env" && f.action == PreviewAction::Skip));
     }
 }

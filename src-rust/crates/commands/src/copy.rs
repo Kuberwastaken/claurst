@@ -11,8 +11,12 @@ pub struct CopyCommand;
 
 #[async_trait]
 impl SlashCommand for CopyCommand {
-    fn name(&self) -> &str { "copy" }
-    fn description(&self) -> &str { "Copy the last assistant response to the clipboard" }
+    fn name(&self) -> &str {
+        "copy"
+    }
+    fn description(&self) -> &str {
+        "Copy the last assistant response to the clipboard"
+    }
     fn help(&self) -> &str {
         "Usage: /copy [n]\n\n\
          Copies the most recent assistant response to the system clipboard.\n\

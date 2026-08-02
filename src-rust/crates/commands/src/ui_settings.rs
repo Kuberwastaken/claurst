@@ -11,7 +11,7 @@
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub(crate) struct UiSettings {
     #[serde(default)]
-    pub editor_mode: Option<String>,       // "vim" or "normal"
+    pub editor_mode: Option<String>, // "vim" or "normal"
     #[serde(default)]
     pub fast_mode: Option<bool>,
     #[serde(default)]
