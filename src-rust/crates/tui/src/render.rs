@@ -2085,6 +2085,59 @@ fn render_tool_block_lines(lines: &mut Vec<Line<'static>>, block: &crate::app::T
     }
 }
 
+/// Extract the confidence score used by the TodoWrite checklist.
+fn todo_confidence(todo: &serde_json::Value) -> Option<u8> {
+    let value = if todo.get("status").and_then(|status| status.as_str()) == Some("completed") {
+        todo.get("completion_confidence")
+            .filter(|value| !value.is_null())
+            .or_else(|| todo.get("confidence"))
+    } else {
+        todo.get("confidence")
+    }?;
+
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_f64()
+            .filter(|score| score.is_finite() && score.fract() == 0.0)
+            .filter(|score| (0.0..=100.0).contains(score))
+            .map(|score| score as u8),
+        serde_json::Value::String(raw) => raw
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|score| score.is_finite() && score.fract() == 0.0)
+            .filter(|score| (0.0..=100.0).contains(score))
+            .map(|score| score as u8),
+        _ => None,
+    }
+}
+
+fn aggregate_todo_confidence(todos: &[serde_json::Value]) -> Option<u8> {
+    let mut weighted_sum = 0u32;
+    let mut total_weight = 0u32;
+    for todo in todos {
+        let Some(score) = todo_confidence(todo) else {
+            continue;
+        };
+        let weight = match todo.get("priority").and_then(|priority| priority.as_str()) {
+            Some("high") => 3,
+            Some("medium") => 2,
+            _ => 1,
+        };
+        weighted_sum += u32::from(score) * weight;
+        total_weight += weight;
+    }
+    (total_weight > 0).then_some(((weighted_sum + total_weight / 2) / total_weight) as u8)
+}
+
+fn confidence_color(score: u8) -> Color {
+    match score {
+        80..=100 => Color::Rgb(120, 200, 120),
+        50..=79 => Color::Rgb(220, 190, 100),
+        _ => Color::Rgb(220, 120, 100),
+    }
+}
+
 /// Render a TodoWrite call as a checklist. Returns `false` (so the caller can
 /// fall back to the generic block) when the input carries no `todos` array.
 fn render_todo_block(
@@ -2121,6 +2174,12 @@ fn render_todo_block(
             format!("  {}/{} done", done, total),
             Style::default().fg(Color::DarkGray),
         ));
+        if let Some(confidence) = aggregate_todo_confidence(todos) {
+            header.push(Span::styled(
+                format!(" · confidence {}%", confidence),
+                Style::default().fg(confidence_color(confidence)),
+            ));
+        }
     }
     lines.push(Line::from(header));
 
@@ -2154,9 +2213,19 @@ fn render_todo_block(
                 Style::default().fg(Color::Rgb(170, 170, 170)),
             ),
         };
+        let confidence = todo_confidence(t);
         lines.push(Line::from(vec![
             Span::styled(format!("     {} ", glyph), Style::default().fg(glyph_color)),
             Span::styled(content.to_string(), text_style),
+            Span::styled(
+                confidence
+                    .map(|score| format!(" [{}%]", score))
+                    .unwrap_or_default(),
+                confidence
+                    .map(confidence_color)
+                    .map(|color| Style::default().fg(color))
+                    .unwrap_or_default(),
+            ),
         ]));
     }
     if total > MAX_ITEMS {
@@ -3481,9 +3550,9 @@ mod tool_block_tests {
             "TodoWrite",
             ToolStatus::Done,
             r#"{"todos":[
-                {"content":"Locate files","status":"completed"},
-                {"content":"Build importer","status":"in_progress"},
-                {"content":"Wire adapter","status":"pending"}
+                {"content":"Locate files","status":"completed","completion_confidence":90},
+                {"content":"Build importer","status":"in_progress","confidence":70},
+                {"content":"Wire adapter","status":"pending","confidence":50}
             ]}"#,
             Some("Todo list updated (3 total)"),
         );
@@ -3492,10 +3561,11 @@ mod tool_block_tests {
         // Header shows count, not the raw "Todo list updated (...)".
         assert!(joined.contains("Todos"), "{joined:?}");
         assert!(joined.contains("1/3 done"), "{joined:?}");
+        assert!(joined.contains("confidence 70%"), "{joined:?}");
         // Each status has its ASCII checkbox + content.
-        assert!(joined.contains("[x] Locate files"), "done marker: {joined:?}");
-        assert!(joined.contains("[>] Build importer"), "in-progress marker: {joined:?}");
-        assert!(joined.contains("[ ] Wire adapter"), "pending marker: {joined:?}");
+        assert!(joined.contains("[x] Locate files [90%]"), "done marker: {joined:?}");
+        assert!(joined.contains("[>] Build importer [70%]"), "in-progress marker: {joined:?}");
+        assert!(joined.contains("[ ] Wire adapter [50%]"), "pending marker: {joined:?}");
         // The raw result-preview string must NOT leak into the checklist view.
         assert!(!joined.contains("Todo list updated"), "preview suppressed: {joined:?}");
     }
