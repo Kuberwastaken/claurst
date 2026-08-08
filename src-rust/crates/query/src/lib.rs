@@ -2409,6 +2409,36 @@ mod tests {
     }
 
     #[test]
+    fn test_build_provider_options_for_cursor_acp() {
+        let options = build_provider_options(
+            "cursor-acp",
+            "gpt-5.6-luna[context=272k,reasoning=medium,fast=false]",
+            Some(claurst_core::effort::EffortLevel::Medium),
+            None,
+        );
+        assert_eq!(
+            options["cursor_acp"]["thought_level"],
+            serde_json::json!("medium")
+        );
+        assert!(options.get("reasoningEffort").is_none());
+
+        let no_effort =
+            build_provider_options("cursor-acp", "gpt-5.6-luna", None, Some(16_000));
+        assert_eq!(no_effort, serde_json::Value::Null);
+
+        let top_effort = build_provider_options(
+            "cursor-acp",
+            "gpt-5.6-luna",
+            Some(claurst_core::effort::EffortLevel::Ultracode),
+            None,
+        );
+        assert_eq!(
+            top_effort["cursor_acp"]["thought_level"],
+            serde_json::json!("ultracode")
+        );
+    }
+
+    #[test]
     fn test_alibaba_is_openaiish_provider() {
         // "alibaba" is an alias for "qwen" (Alibaba's DashScope backend);
         // both must be treated as OpenAI-compatible providers.

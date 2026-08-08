@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use claurst_core::provider_id::{ModelId, ProviderId};
 use claurst_core::types::{ContentBlock, MessageContent, Role, UsageInfo};
 use futures::{Stream, StreamExt};
+use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{Mutex, RwLock};
@@ -82,6 +83,50 @@ impl CursorAcpCommand {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(untagged)]
+enum AcpConfigValue {
+    String(String),
+    Boolean(bool),
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct AcpConfigOptionValue {
+    value: String,
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+struct AcpConfigOption {
+    id: String,
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    category: Option<String>,
+    #[serde(rename = "type")]
+    option_type: String,
+    #[serde(rename = "currentValue")]
+    current_value: AcpConfigValue,
+    #[serde(default)]
+    options: Vec<AcpConfigOptionValue>,
+}
+
+impl AcpConfigOption {
+    fn current_string(&self) -> Option<&str> {
+        match &self.current_value {
+            AcpConfigValue::String(value) => Some(value),
+            AcpConfigValue::Boolean(_) => None,
+        }
+    }
+
+    fn supports_value(&self, value: &str) -> bool {
+        self.options.iter().any(|option| option.value == value)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Model catalog
 // ---------------------------------------------------------------------------
@@ -92,6 +137,7 @@ pub struct ModelCatalog {
     pub models: Vec<String>,
     pub current: Option<String>,
     pub names: HashMap<String, String>,
+    config_options: Vec<AcpConfigOption>,
 }
 
 impl ModelCatalog {
@@ -133,6 +179,7 @@ impl ModelCatalog {
             models,
             current,
             names: HashMap::new(),
+            config_options: parse_config_options(params),
         }
     }
 
@@ -186,7 +233,8 @@ impl ModelCatalog {
                                     if !models.contains(&value.to_string()) {
                                         models.push(value.to_string());
                                     }
-                                    if let Some(name) = option.get("name").and_then(|v| v.as_str()) {
+                                    if let Some(name) = option.get("name").and_then(|v| v.as_str())
+                                    {
                                         names.insert(value.to_string(), name.to_string());
                                     }
                                 }
@@ -201,6 +249,24 @@ impl ModelCatalog {
             models,
             current,
             names,
+            config_options: parse_config_options(params),
+        }
+    }
+
+    fn config_option(&self, category: &str) -> Option<&AcpConfigOption> {
+        self.config_options
+            .iter()
+            .find(|option| option.category.as_deref() == Some(category))
+    }
+
+    fn config_option_by_id(&self, id: &str) -> Option<&AcpConfigOption> {
+        self.config_options.iter().find(|option| option.id == id)
+    }
+
+    fn replace_config_options(&mut self, params: &serde_json::Value) {
+        let options = parse_config_options(params);
+        if !options.is_empty() {
+            self.config_options = options;
         }
     }
     /// Resolve a model ID. Exact match wins; bare ID resolves when exactly
@@ -229,6 +295,25 @@ impl ModelCatalog {
         }
         None
     }
+}
+
+fn parse_config_options(params: &serde_json::Value) -> Vec<AcpConfigOption> {
+    params
+        .get("configOptions")
+        .and_then(serde_json::Value::as_array)
+        .map(|options| {
+            options
+                .iter()
+                .filter_map(|option| serde_json::from_value(option.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn session_update_text(update: &serde_json::Value) -> Option<(&str, &str)> {
+    let update_type = update.get("sessionUpdate")?.as_str()?;
+    let text = update.get("content")?.get("text")?.as_str()?;
+    Some((update_type, text))
 }
 
 // ---------------------------------------------------------------------------
@@ -467,6 +552,23 @@ impl CursorAcpProvider {
         Ok(())
     }
 
+    async fn set_config_option(
+        &self,
+        process: &mut AcpProcess,
+        option: &AcpConfigOption,
+        value: &str,
+    ) -> Result<(), ProviderError> {
+        let id = self.next_id(process);
+        let request = set_config_option_request(id, &process.session_id, option, value);
+
+        self.send_json(process, &request).await?;
+        let response = self.read_response(process, id).await?;
+        if let Some(result) = response.get("result") {
+            process.catalog.replace_config_options(result);
+        }
+        Ok(())
+    }
+
     /// Read a JSON-RPC response with the given id.
     async fn read_response(
         &self,
@@ -476,16 +578,17 @@ impl CursorAcpProvider {
         let mut line = String::new();
         loop {
             line.clear();
-            let n = process
-                .stdout
-                .read_line(&mut line)
-                .await
-                .map_err(|e| ProviderError::Other {
-                    provider: self.id.clone(),
-                    message: format!("stdout read error: {}", e),
-                    status: None,
-                    body: None,
-                })?;
+            let n =
+                process
+                    .stdout
+                    .read_line(&mut line)
+                    .await
+                    .map_err(|e| ProviderError::Other {
+                        provider: self.id.clone(),
+                        message: format!("stdout read error: {}", e),
+                        status: None,
+                        body: None,
+                    })?;
             if n == 0 {
                 let stderr = process.stderr_tail.read().await;
                 return Err(ProviderError::Other {
@@ -529,9 +632,63 @@ impl CursorAcpProvider {
     }
 }
 
+fn requested_cursor_effort(provider_options: &serde_json::Value) -> Option<&str> {
+    provider_options
+        .get("cursor_acp")
+        .and_then(|options| options.get("thought_level"))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn set_config_option_request(
+    id: u64,
+    session_id: &str,
+    option: &AcpConfigOption,
+    value: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id.to_string(),
+        "method": "session/set_config_option",
+        "params": {
+            "sessionId": session_id,
+            "configId": option.id,
+            "type": "id",
+            "value": value,
+        },
+    })
+}
+
+fn supported_config_value(option: &AcpConfigOption, requested: &str) -> Option<String> {
+    if option.supports_value(requested) {
+        return Some(requested.to_string());
+    }
+
+    match requested {
+        "none" | "minimal" | "low" => option.options.first().map(|value| value.value.clone()),
+        "high" | "xhigh" | "max" | "ultracode" => {
+            option.options.last().map(|value| value.value.clone())
+        }
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LlmProvider implementation
 // ---------------------------------------------------------------------------
+
+/// Map an ACP stop-reason string to the provider-neutral `StopReason`.
+///
+/// Unrecognised values default to `StopReason::EndTurn`, matching the
+/// behaviour of the inline match that previously lived inside
+/// `create_message_stream`.
+fn map_stop_reason(s: &str) -> StopReason {
+    match s {
+        "end_turn" => StopReason::EndTurn,
+        "max_tokens" => StopReason::MaxTokens,
+        "tool_use" => StopReason::ToolUse,
+        _ => StopReason::EndTurn,
+    }
+}
 
 #[async_trait]
 impl LlmProvider for CursorAcpProvider {
@@ -555,6 +712,7 @@ impl LlmProvider for CursorAcpProvider {
         let mut stop_reason = StopReason::EndTurn;
         let mut usage = UsageInfo::default();
         let mut text_parts = Vec::new();
+        let mut thinking_parts = Vec::new();
 
         while let Some(result) = stream.next().await {
             match result {
@@ -572,6 +730,13 @@ impl LlmProvider for CursorAcpProvider {
                     StreamEvent::TextDelta { text, .. } => {
                         text_parts.push(text);
                     }
+                    StreamEvent::ThinkingDelta { thinking, .. }
+                    | StreamEvent::ReasoningDelta {
+                        reasoning: thinking,
+                        ..
+                    } => {
+                        thinking_parts.push(thinking);
+                    }
                     StreamEvent::MessageDelta {
                         stop_reason: sr, ..
                     } => {
@@ -585,9 +750,18 @@ impl LlmProvider for CursorAcpProvider {
         }
 
         let text = text_parts.join("");
+        let thinking = thinking_parts.join("");
+        let mut content = Vec::new();
+        if !thinking.is_empty() {
+            content.push(ContentBlock::Thinking {
+                thinking,
+                signature: String::new(),
+            });
+        }
+        content.push(ContentBlock::Text { text });
         Ok(ProviderResponse {
             id,
-            content: vec![ContentBlock::Text { text }],
+            content,
             stop_reason,
             usage,
             model,
@@ -613,6 +787,31 @@ impl LlmProvider for CursorAcpProvider {
         // Build session/prompt request.
         let id = self.next_id(process);
         let resolved_model = process.catalog.resolve_model(&model).unwrap_or(model);
+
+        if let Some(option) = process.catalog.config_option("model").cloned() {
+            if option.supports_value(&resolved_model)
+                && option.current_string() != Some(resolved_model.as_str())
+            {
+                self.set_config_option(process, &option, &resolved_model)
+                    .await?;
+            }
+        }
+
+        if let Some(requested) = requested_cursor_effort(&request.provider_options) {
+            let option = process
+                .catalog
+                .config_option("thought_level")
+                .or_else(|| process.catalog.config_option_by_id("thought_level"))
+                .or_else(|| process.catalog.config_option_by_id("reasoning_effort"))
+                .cloned();
+            if let Some(option) = option {
+                if let Some(value) = supported_config_value(&option, requested) {
+                    if option.current_string() != Some(value.as_str()) {
+                        self.set_config_option(process, &option, &value).await?;
+                    }
+                }
+            }
+        }
 
         // ACP session/prompt: send only the latest user message as a flat
         // content-block array. The session maintains conversation history.
@@ -648,7 +847,6 @@ impl LlmProvider for CursorAcpProvider {
             "method": "session/prompt",
             "params": {
                 "sessionId": process.session_id,
-                "model": resolved_model,
                 "prompt": prompt_json,
             },
         });
@@ -657,6 +855,8 @@ impl LlmProvider for CursorAcpProvider {
 
         // Collect events into a vec and return as a stream.
         let mut events: Vec<Result<StreamEvent, ProviderError>> = Vec::new();
+        let mut started_text = false;
+        let mut started_thinking = false;
 
         events.push(Ok(StreamEvent::MessageStart {
             id: id.to_string(),
@@ -667,16 +867,17 @@ impl LlmProvider for CursorAcpProvider {
         let mut line = String::new();
         loop {
             line.clear();
-            let n = process
-                .stdout
-                .read_line(&mut line)
-                .await
-                .map_err(|e| ProviderError::Other {
-                    provider: self.id.clone(),
-                    message: format!("read error: {}", e),
-                    status: None,
-                    body: None,
-                })?;
+            let n =
+                process
+                    .stdout
+                    .read_line(&mut line)
+                    .await
+                    .map_err(|e| ProviderError::Other {
+                        provider: self.id.clone(),
+                        message: format!("read error: {}", e),
+                        status: None,
+                        body: None,
+                    })?;
             if n == 0 {
                 break;
             }
@@ -698,24 +899,49 @@ impl LlmProvider for CursorAcpProvider {
             // Check for notification (session/update).
             if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
                 if method == "session/update" {
-                    if let Some(update) =
-                        msg.get("params").and_then(|p| p.get("update"))
-                    {
+                    if let Some(update) = msg.get("params").and_then(|p| p.get("update")) {
+                        if let Some((update_type, text)) = session_update_text(update) {
+                            match update_type {
+                                "agent_message_chunk" => {
+                                    if !started_text {
+                                        events.push(Ok(StreamEvent::ContentBlockStart {
+                                            index: 0,
+                                            content_block: ContentBlock::Text {
+                                                text: String::new(),
+                                            },
+                                        }));
+                                        started_text = true;
+                                    }
+                                    events.push(Ok(StreamEvent::TextDelta {
+                                        index: 0,
+                                        text: text.to_string(),
+                                    }));
+                                }
+                                "agent_thought_chunk" => {
+                                    if !started_thinking {
+                                        events.push(Ok(StreamEvent::ContentBlockStart {
+                                            index: 1,
+                                            content_block: ContentBlock::Thinking {
+                                                thinking: String::new(),
+                                                signature: String::new(),
+                                            },
+                                        }));
+                                        started_thinking = true;
+                                    }
+                                    events.push(Ok(StreamEvent::ThinkingDelta {
+                                        index: 1,
+                                        thinking: text.to_string(),
+                                    }));
+                                }
+                                _ => {}
+                            }
+                        }
                         let update_type = update
                             .get("sessionUpdate")
                             .and_then(|u| u.as_str())
                             .unwrap_or("");
-                        if update_type == "agent_message_chunk" {
-                            if let Some(text) = update
-                                .get("content")
-                                .and_then(|c| c.get("text"))
-                                .and_then(|t| t.as_str())
-                            {
-                                events.push(Ok(StreamEvent::TextDelta {
-                                    index: 0,
-                                    text: text.to_string(),
-                                }));
-                            }
+                        if update_type == "config_option_update" {
+                            process.catalog.replace_config_options(update);
                         }
                     }
                 }
@@ -730,12 +956,7 @@ impl LlmProvider for CursorAcpProvider {
                         .and_then(|r| r.get("stopReason"))
                         .and_then(|s| s.as_str())
                         .unwrap_or("end_turn");
-                    let sr = match stop_reason {
-                        "end_turn" => StopReason::EndTurn,
-                        "max_tokens" => StopReason::MaxTokens,
-                        "tool_use" => StopReason::ToolUse,
-                        _ => StopReason::EndTurn,
-                    };
+                    let sr = map_stop_reason(stop_reason);
                     events.push(Ok(StreamEvent::MessageDelta {
                         stop_reason: Some(sr),
                         usage: None,
@@ -817,7 +1038,7 @@ impl LlmProvider for CursorAcpProvider {
         ProviderCapabilities {
             streaming: true,
             tool_calling: true,
-            thinking: false,
+            thinking: true,
             image_input: false,
             pdf_input: false,
             audio_input: false,
@@ -836,9 +1057,16 @@ impl LlmProvider for CursorAcpProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn cursor_acp_command_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        // Ensure no env var interferes with the default executable.
+        std::env::remove_var("CLAURST_CURSOR_ACP_PATH");
         let cmd = CursorAcpCommand::default();
         assert_eq!(cmd.executable, "agent");
         assert!(cmd.permission_args.contains(&"--force".to_string()));
@@ -848,6 +1076,9 @@ mod tests {
 
     #[test]
     fn cursor_acp_command_args() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        std::env::remove_var("CLAURST_CURSOR_ACP_PATH");
         let cmd = CursorAcpCommand::default();
         let args = cmd.args();
         assert!(args.contains(&"--force".to_string()));
@@ -890,11 +1121,9 @@ mod tests {
             models: vec!["model-a".to_string(), "model-b".to_string()],
             current: None,
             names: HashMap::new(),
+            config_options: Vec::new(),
         };
-        assert_eq!(
-            catalog.resolve_model("model-a").as_deref(),
-            Some("model-a")
-        );
+        assert_eq!(catalog.resolve_model("model-a").as_deref(), Some("model-a"));
     }
 
     #[test]
@@ -903,6 +1132,7 @@ mod tests {
             models: vec!["model-a [variant]".to_string()],
             current: None,
             names: HashMap::new(),
+            config_options: Vec::new(),
         };
         assert_eq!(
             catalog.resolve_model("model-a").as_deref(),
@@ -916,6 +1146,7 @@ mod tests {
             models: vec!["model-a [v1]".to_string(), "model-a [v2]".to_string()],
             current: None,
             names: HashMap::new(),
+            config_options: Vec::new(),
         };
         // Ambiguous — returns None.
         assert!(catalog.resolve_model("model-a").is_none());
@@ -951,8 +1182,12 @@ mod tests {
         });
         let catalog = ModelCatalog::from_session_new(&params);
         assert_eq!(catalog.models.len(), 4); // 3 from availableModels + 1 new from configOptions
-        assert!(catalog.models.contains(&"auto-smart[optimize_for=cost]".to_string()));
-        assert!(catalog.models.contains(&"gpt-5.5[context=272k]".to_string()));
+        assert!(catalog
+            .models
+            .contains(&"auto-smart[optimize_for=cost]".to_string()));
+        assert!(catalog
+            .models
+            .contains(&"gpt-5.5[context=272k]".to_string()));
         assert_eq!(catalog.current.as_deref(), Some("composer-2.5[fast=true]"));
         assert_eq!(
             catalog.names.get("composer-2.5[fast=true]"),
@@ -962,5 +1197,218 @@ mod tests {
             catalog.names.get("claude-opus-4-8[thinking=true]"),
             Some(&"Opus 4.8 (MAX mode)".to_string())
         );
+    }
+    #[test]
+    fn model_catalog_parses_model_and_thought_level_options() {
+        let params = serde_json::json!({
+            "configOptions": [
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "gpt-5.6-luna",
+                    "options": [
+                        {"value": "gpt-5.6-luna", "name": "GPT-5.6 Luna"}
+                    ]
+                },
+                {
+                    "id": "thought_level",
+                    "name": "Thought Level",
+                    "category": "thought_level",
+                    "type": "select",
+                    "currentValue": "medium",
+                    "options": [
+                        {"value": "low", "name": "Low"},
+                        {"value": "medium", "name": "Medium"},
+                        {"value": "high", "name": "High"}
+                    ]
+                }
+            ]
+        });
+
+        let catalog = ModelCatalog::from_session_new(&params);
+        let thought_level = catalog.config_option("thought_level").unwrap();
+        assert_eq!(thought_level.current_string(), Some("medium"));
+        assert!(thought_level.supports_value("high"));
+        assert_eq!(
+            supported_config_value(thought_level, "ultracode"),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            catalog
+                .config_option("model")
+                .and_then(|option| option.current_string()),
+            Some("gpt-5.6-luna")
+        );
+    }
+
+    #[test]
+    fn config_option_helpers_cover_exact_and_fallback_values() {
+        let option: AcpConfigOption = serde_json::from_value(serde_json::json!({
+            "id": "thought_level",
+            "name": "Thought Level",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": "medium",
+            "options": [
+                {"value": "low", "name": "Low"},
+                {"value": "medium", "name": "Medium"},
+                {"value": "high", "name": "High"}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(option.current_string(), Some("medium"));
+        assert!(option.supports_value("high"));
+        assert!(!option.supports_value("xhigh"));
+        assert_eq!(
+            supported_config_value(&option, "medium"),
+            Some("medium".to_string())
+        );
+        assert_eq!(
+            supported_config_value(&option, "minimal"),
+            Some("low".to_string())
+        );
+        assert_eq!(
+            supported_config_value(&option, "xhigh"),
+            Some("high".to_string())
+        );
+        assert_eq!(supported_config_value(&option, "unknown"), None);
+
+        let boolean: AcpConfigOption = serde_json::from_value(serde_json::json!({
+            "id": "fast_mode",
+            "name": "Fast Mode",
+            "category": "mode",
+            "type": "boolean",
+            "currentValue": true
+        }))
+        .unwrap();
+        assert_eq!(boolean.current_string(), None);
+        assert!(!boolean.supports_value("true"));
+        assert_eq!(supported_config_value(&boolean, "high"), None);
+    }
+
+    #[test]
+    fn set_config_option_request_matches_acp_wire_shape() {
+        let option: AcpConfigOption = serde_json::from_value(serde_json::json!({
+            "id": "thought_level",
+            "name": "Thought Level",
+            "type": "select",
+            "currentValue": "medium"
+        }))
+        .unwrap();
+        let request = set_config_option_request(7, "session-123", &option, "high");
+
+        assert_eq!(request["jsonrpc"], "2.0");
+        assert_eq!(request["id"], "7");
+        assert_eq!(request["method"], "session/set_config_option");
+        assert_eq!(request["params"]["sessionId"], "session-123");
+        assert_eq!(request["params"]["configId"], "thought_level");
+        assert_eq!(request["params"]["type"], "id");
+        assert_eq!(request["params"]["value"], "high");
+    }
+
+    #[test]
+    fn cursor_effort_is_read_from_provider_options() {
+        let options = serde_json::json!({
+            "cursor_acp": {"thought_level": "high"}
+        });
+        assert_eq!(requested_cursor_effort(&options), Some("high"));
+        assert_eq!(requested_cursor_effort(&serde_json::Value::Null), None);
+        assert_eq!(
+            requested_cursor_effort(&serde_json::json!({"cursor_acp": {}})),
+            None
+        );
+    }
+
+    #[test]
+    fn session_update_text_parses_message_and_thought_chunks() {
+        let message = serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"text": "answer"}
+        });
+        let thought = serde_json::json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": {"text": "reasoning"}
+        });
+        let missing_text = serde_json::json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": {}
+        });
+
+        assert_eq!(
+            session_update_text(&message),
+            Some(("agent_message_chunk", "answer"))
+        );
+        assert_eq!(
+            session_update_text(&thought),
+            Some(("agent_thought_chunk", "reasoning"))
+        );
+        assert_eq!(session_update_text(&missing_text), None);
+    }
+
+    #[test]
+    fn cursor_acp_provider_new() {
+        let provider = CursorAcpProvider::new("test-model".to_string());
+        assert_eq!(provider.id(), "cursor-acp");
+        assert_eq!(provider.name(), "Cursor ACP");
+    }
+
+    #[tokio::test]
+    async fn cursor_acp_provider_from_env() {
+        let provider = {
+            let _guard = ENV_LOCK.lock().unwrap();
+            std::env::set_var("CLAURST_CURSOR_ACP_MODEL", "env-model");
+            CursorAcpProvider::from_env()
+        };
+        let model = provider.model.read().await;
+        assert_eq!(*model, "env-model");
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CLAURST_CURSOR_ACP_MODEL");
+    }
+
+    #[test]
+    fn cursor_acp_provider_capabilities() {
+        let provider = CursorAcpProvider::new("test".to_string());
+        let caps = provider.capabilities();
+        assert!(caps.streaming);
+        assert!(caps.tool_calling);
+        assert!(caps.thinking);
+        assert!(!caps.image_input);
+        assert!(!caps.caching);
+        assert_eq!(caps.system_prompt_style, SystemPromptStyle::SystemMessage);
+    }
+
+    #[tokio::test]
+    async fn cursor_acp_provider_health_check_when_not_configured() {
+        let provider = {
+            let _guard = ENV_LOCK.lock().unwrap();
+            std::env::set_var("CLAURST_CURSOR_ACP_PATH", "nonexistent-binary-xyz");
+            CursorAcpProvider::new("test".to_string())
+        };
+        let status = provider.health_check().await.unwrap();
+        assert!(matches!(status, ProviderStatus::Unavailable { .. }));
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CLAURST_CURSOR_ACP_PATH");
+    }
+
+    #[test]
+    fn stop_reason_mapping() {
+        assert_eq!(map_stop_reason("end_turn"), StopReason::EndTurn);
+        assert_eq!(map_stop_reason("max_tokens"), StopReason::MaxTokens);
+        assert_eq!(map_stop_reason("tool_use"), StopReason::ToolUse);
+        assert_eq!(map_stop_reason("unknown"), StopReason::EndTurn);
+        assert_eq!(map_stop_reason(""), StopReason::EndTurn);
+    }
+
+    #[test]
+    fn cursor_acp_command_configured_with_nonexistent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        std::env::set_var("CLAURST_CURSOR_ACP_PATH", "nonexistent-binary-xyz");
+        let cmd = CursorAcpCommand::default();
+        assert!(!cmd.configured());
+        std::env::remove_var("CLAURST_CURSOR_ACP_PATH");
     }
 }

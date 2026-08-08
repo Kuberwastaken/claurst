@@ -106,6 +106,17 @@ pub(crate) fn build_provider_options(
     let mut options = serde_json::Map::new();
     let model_id = model_id.to_ascii_lowercase();
 
+    if provider_id == "cursor-acp" {
+        if let Some(level) = effort_level {
+            options.insert(
+                "cursor_acp".to_string(),
+                serde_json::json!({
+                    "thought_level": level.as_str(),
+                }),
+            );
+        }
+    }
+
     if provider_id == "github-copilot" {
         if model_id.contains("claude") {
             options.insert(

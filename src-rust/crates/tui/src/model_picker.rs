@@ -1262,6 +1262,18 @@ mod tests {
         assert!(!model_supports_effort("gpt-4o"));
     }
 
+    #[test]
+    fn cursor_gpt5_model_with_metadata_supports_effort() {
+        let id = "gpt-5.6-luna[context=272k,reasoning=medium,fast=false]";
+        let ladder = picker_variant_ladder(id);
+
+        assert!(
+            ladder.len() > 1,
+            "Cursor GPT-5.6 Luna should expose effort levels: {ladder:?}"
+        );
+        assert!(model_supports_effort(id));
+    }
+
     // 13. Haiku 4.5 IS a thinking model (opencode high/max), so confirming it
     //     carries an effort clamped onto its ladder.
     #[test]
