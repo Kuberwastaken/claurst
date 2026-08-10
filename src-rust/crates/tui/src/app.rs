@@ -1587,12 +1587,6 @@ pub struct App {
     /// Number of configured MCP servers for the status-bar indicator.
     pub mcp_server_count: usize,
 
-    /// Number of discovered skills (from `.claurst/skills/` etc.) for the
-    /// status-bar indicator.
-    pub skill_count: usize,
-    /// Number of configured MCP servers for the status-bar indicator.
-    pub mcp_server_count: usize,
-
     // ---- Thinking block expansion state ----------------------------------
     /// Set of thinking block content hashes that are expanded.
     pub thinking_expanded: std::collections::HashSet<u64>,
