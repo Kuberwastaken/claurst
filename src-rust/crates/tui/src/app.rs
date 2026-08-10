@@ -3233,7 +3233,7 @@ impl App {
             .or_else(|| {
                 self.current_dir
                     .as_ref()
-                    .map(|s| std::path::PathBuf::from(s))
+                    .map(std::path::PathBuf::from)
             })
             .unwrap_or_else(|| std::path::PathBuf::from("."));
 
@@ -7070,7 +7070,7 @@ impl App {
     /// continuation message via the existing `queued_messages` mechanism.
     fn check_auto_poke(&mut self) {
         // Don't poke if the turn was aborted/cancelled.
-        if !self.last_turn_elapsed.is_some() && self.tool_use_blocks.is_empty() {
+        if self.last_turn_elapsed.is_none() && self.tool_use_blocks.is_empty() {
             // Likely a fresh state — still allow poke.
         }
 

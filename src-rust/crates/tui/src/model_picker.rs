@@ -741,8 +741,8 @@ impl ModelPickerState {
             .unwrap_or("");
         // Find the first entry after the current position with a different
         // non-empty provider_id. Skip the default entry (empty provider_id).
-        for i in (self.selected_idx + 1)..grouped.len() {
-            let pid = grouped[i].0.provider_id.as_str();
+        for (i, (entry, _)) in grouped.iter().enumerate().skip(self.selected_idx + 1) {
+            let pid = entry.provider_id.as_str();
             if !pid.is_empty() && pid != current_provider {
                 self.selected_idx = i;
                 return;
@@ -750,8 +750,8 @@ impl ModelPickerState {
         }
         // Wrap around: find the first entry with a non-empty provider_id
         // from the beginning (skips default entry at index 0).
-        for i in 0..self.selected_idx {
-            let pid = grouped[i].0.provider_id.as_str();
+        for (i, (entry, _)) in grouped.iter().enumerate().take(self.selected_idx) {
+            let pid = entry.provider_id.as_str();
             if !pid.is_empty() && pid != current_provider {
                 self.selected_idx = i;
                 return;
@@ -782,8 +782,8 @@ impl ModelPickerState {
                 if !pid.is_empty() && pid != current_provider {
                     prev_provider = Some(pid);
                     // Now find the first entry of this provider group.
-                    for j in 0..=i {
-                        if grouped[j].0.provider_id == pid {
+                    for (j, (entry2, _)) in grouped.iter().enumerate().take(i + 1) {
+                        if entry2.provider_id == pid {
                             self.selected_idx = j;
                             return;
                         }
@@ -2309,8 +2309,7 @@ mod tests {
         // default entry (provider_id="") in the unfiltered list — the bug.
         assert_ne!(
             picker
-                .filtered_models_grouped()
-                .get(0)
+                .filtered_models_grouped().first()
                 .map(|(m, _)| m.provider_id.clone()),
             Some("together-ai-coding".to_string())
         );
