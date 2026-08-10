@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use crate::agents_view::render_agents_menu;
 use crate::context_viz::render_context_viz;
 use crate::export_dialog::render_export_dialog;
-use crate::app::{App, ContextMenuKind, SystemAnnotation, SystemMessageStyle, ToolStatus};
+use crate::app::{App, ContextMenuKind, DisplayMessage, SystemAnnotation, SystemMessageStyle, ToolStatus};
 use crate::rustle::rustle_lines;
 use crate::diff_viewer::render_diff_dialog;
 use crate::model_picker::render_model_picker;
@@ -862,6 +862,15 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_mcp_approval_dialog(&app.mcp_approval, size, frame.buffer_mut());
     }
 
+    // When error modal is showing, selectable area = full terminal
+    if app.notifications.current_is_error() {
+        app.last_selectable_area.set(size);
+    }
+
+    // ---- Text selection highlight (applied before modal overlay) ----------
+    apply_selection_highlight(frame, app);
+    cache_selectable_row_text(frame, app);
+
     // Always show error modals on top of everything (highest priority)
     if let Some(notif) = app.notifications.current() {
         if notif.kind == NotificationKind::Error {
@@ -870,6 +879,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
                 && app.streaming_thinking.is_empty()
                 && app.tool_use_blocks.is_empty();
             render_error_modal(frame, size, notif, app.error_modal_scroll_offset, app.footer_right_column_area.get(), is_welcome_screen);
+            render_context_menu(frame, app);
             return; // Don't render other overlays/notifications when error modal is showing
         }
     }
@@ -881,9 +891,6 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_notification_banner(frame, &app.notifications, size);
     }
 
-    // ---- Text selection highlight (topmost post-pass) ---------------------
-    apply_selection_highlight(frame, app);
-    cache_selectable_row_text(frame, app);
     render_context_menu(frame, app);
 }
 
@@ -1126,7 +1133,8 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     let transcript_empty = app.messages.is_empty()
         && app.streaming_text.is_empty()
         && app.streaming_thinking.is_empty()
-        && app.tool_use_blocks.is_empty();
+        && app.tool_use_blocks.is_empty()
+        && app.display_messages.is_empty();
 
     if transcript_empty {
         app.last_msg_area.set(Rect::default());
@@ -1528,7 +1536,62 @@ fn build_all_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         }
     }
 
+    // Append display-only bang command output (never sent to the model).
+    let bang_lines = render_bang_display_lines(app);
+    if !bang_lines.is_empty() {
+        push_rendered_items(&mut items, bang_lines, None, false);
+    }
+
     items
+}
+
+/// Render display-only `!` bang command entries (command, output, error).
+/// These are appended at the end of the transcript and never sent to the model.
+fn render_bang_display_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut found = false;
+    for msg in &app.display_messages {
+        match msg {
+            DisplayMessage::BangCommand { command } => {
+                found = true;
+                if !lines.is_empty() {
+                    lines.push(Line::from(""));
+                }
+                lines.push(Line::styled(
+                    format!("$ {}", command),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            DisplayMessage::BangOutput { text, exit_code } => {
+                found = true;
+                let color = if exit_code.unwrap_or(0) != 0 {
+                    Color::Red
+                } else {
+                    Color::Gray
+                };
+                for line in text.lines() {
+                    lines.push(Line::styled(
+                        line.to_string(),
+                        Style::default().fg(color),
+                    ));
+                }
+            }
+            DisplayMessage::BangError { text } => {
+                found = true;
+                lines.push(Line::styled(
+                    text.clone(),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            _ => {}
+        }
+    }
+    if found {
+        lines.push(Line::from(""));
+    }
+    lines
 }
 
 fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
@@ -1917,6 +1980,7 @@ fn render_system_annotation_lines(
         SystemMessageStyle::Info => (Color::DarkGray, Color::DarkGray),
         SystemMessageStyle::Warning => (Color::Yellow, Color::Yellow),
         SystemMessageStyle::Compact => unreachable!(),
+        SystemMessageStyle::TodoCard => (Color::Cyan, Color::Cyan),
     };
 
     // Centred, padded rule: "â”€â”€â”€ text â”€â”€â”€"
