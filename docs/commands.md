@@ -1255,3 +1255,29 @@ Some commands are available only under certain account or platform conditions:
 ### Feature-Flagged Commands
 
 Some commands check `isEnabled()` at runtime. For example, voice-related commands check for audio device availability; the desktop command checks for a display server.
+
+## `/turns` — Set Max Turn Limit
+
+Set or disable the maximum turn limit for the current session. When the limit
+is reached, the degradation summary (if enabled) runs one final tool-less turn.
+
+```
+/turns 25       — set max turns to 25
+/turns off      — disable the limit (no maximum)
+/turns          — show current setting
+```
+
+This overrides the `max_turns` config value for the current session only.
+
+## `/poke` — Toggle Auto-Poke
+
+Toggle or configure the auto-poke feature.
+
+```
+/poke          — toggle auto-poke on/off
+/poke on       — enable auto-poke
+/poke off      — disable auto-poke
+/poke status   — show status, budget, and incomplete count
+```
+
+See [Auto-Poke](./configuration.md#auto-poke) in the configuration reference.

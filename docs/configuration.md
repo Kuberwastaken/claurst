@@ -754,3 +754,40 @@ highlighted model. Favorited models appear with a ★ prefix at the top of the
 list and persist across sessions in `~/.claurst/settings.json`. Stale
 favorites (models no longer in the catalog) are hidden from the picker but
 kept in settings until you un-favorite them.
+
+---
+
+## Auto-Poke
+
+When the model stops with incomplete todos, Claurst can automatically send a
+continuation prompt asking the model to keep working.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `autoPokeEnabled` | boolean | true | When enabled, automatically sends a continuation prompt when the model stops with incomplete todos. Toggle at runtime with `/poke`. |
+
+Auto-poke has a safety budget of 48 pokes per session and stops after 3
+consecutive no-progress turns. Use `/poke status` to check the current
+budget and incomplete todo count.
+
+---
+
+## Degradation Summary
+
+When `max_turns` is reached, Claurst can run one final tool-less turn asking
+the model to summarize progress before returning.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `degradationSummaryEnabled` | boolean | true | When `true` (default), exceeding `max_turns` runs one final tool-less turn asking the model to summarize progress. When `false`, the loop returns the last assistant message immediately. |
+
+---
+
+## Hide Tool Content
+
+When enabled, the TUI transcript shows only the tool type (e.g. "Running
+command") without the command content or result summary.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `hideToolContent` | boolean | false | When `true`, the TUI log shows only the tool type without the command content or summary. Useful for reducing visual clutter in long sessions. |
