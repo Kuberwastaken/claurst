@@ -3134,19 +3134,6 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
-        // Git branch (if settings enabled)
-        if app.settings_screen.show_git_branch {
-            if let Some(ref branch) = app.git_branch {
-                if !parts.is_empty() {
-                    parts.push(Span::raw("  "));
-                }
-                parts.push(Span::styled(
-                    format!("⎇ {}", branch),
-                    Style::default().fg(Color::Cyan),
-                ));
-            }
-        }
-
         // Current directory (if settings enabled)
         if app.settings_screen.show_cwd {
             if let Some(ref dir) = app.current_dir {
