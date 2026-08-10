@@ -335,7 +335,15 @@ impl Tool for TodoWriteTool {
                 TodoStatus::InProgress => "[~]",
                 TodoStatus::Completed => "[x]",
             };
-            output.push_str(&format!("{} {} ({})\n", icon, item.content, item.id));
+            let mut line = format!("{} {} ({})", icon, item.content, item.id);
+            if let Some(c) = item.confidence {
+                line.push_str(&format!(" (confidence: {}%)", c));
+            }
+            if let Some(c) = item.completion_confidence {
+                line.push_str(&format!(" (completion confidence: {}%)", c));
+            }
+            output.push_str(&line);
+            output.push('\n');
         }
 
         // --- 6. Persist to disk ----------------------------------------------
