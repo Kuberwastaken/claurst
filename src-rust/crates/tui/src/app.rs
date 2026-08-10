@@ -101,11 +101,12 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("upgrade", "Check for updates and upgrade to the latest version"),
     ("vim", "Toggle vim keybindings"),
     ("voice", "Toggle voice input mode"),
+    ("turns", "Set or disable the max turn limit (e.g. /turns 25, /turns off)"),
 ];
 
 fn help_command_category(name: &str) -> &'static str {
     match name {
-        "connect" | "model" | "providers" | "refresh" | "fast" | "effort" | "voice" => "Model & Provider",
+        "connect" | "model" | "providers" | "refresh" | "fast" | "effort" | "voice" | "turns" => "Model & Provider",
         "changes" | "diff" | "review" | "rewind" | "export" | "copy" | "share" | "links" => "Review & History",
         "stats" | "cost" | "context" | "insights" | "heapdump" | "doctor" => "Diagnostics",
         "config" | "settings" | "theme" | "keybindings" | "hooks" | "mcp" | "import-config" => {
@@ -837,6 +838,8 @@ pub struct App {
     pub effort_level: EffortLevel,
     /// Whether fast mode is currently active (model locked to FAST_MODE_MODEL).
     pub fast_mode: bool,
+    /// Override for max turns (set via /turns command). None = use config/agent default.
+    pub max_turns_override: Option<u32>,
     /// Current agent mode name: "build", "plan".
     pub agent_mode: Option<String>,
     /// Accent color derived from the current agent mode.
@@ -1299,6 +1302,7 @@ impl App {
             has_credentials: true, // overridden by caller when no key is configured
             effort_level: EffortLevel::Medium,
             fast_mode: false,
+            max_turns_override: None,
             agent_mode: None,
             agent_mode_changed: false,
             accent_color: ACCENT_BUILD,
@@ -2004,6 +2008,33 @@ impl App {
     /// Handle slash commands that should open UI screens rather than execute
     /// as normal commands. Returns `true` if the command was intercepted.
     pub fn intercept_slash_command_with_args(&mut self, cmd: &str, args: &str) -> bool {
+        if cmd == "turns" {
+            let args = args.trim();
+            if args.is_empty() {
+                let current = self.max_turns_override;
+                let msg = match current {
+                    Some(n) if n == u32::MAX => "Max turns: disabled (no limit).".to_string(),
+                    Some(n) => format!("Max turns: {} (override active).", n),
+                    None => "Max turns: using config/agent default.".to_string(),
+                };
+                self.status_message = Some(msg);
+            } else if args == "off" || args == "disable" || args == "0" {
+                self.max_turns_override = Some(u32::MAX);
+                self.status_message = Some("Max turns disabled (no limit).".to_string());
+            } else if let Ok(n) = args.parse::<u32>() {
+                if n == 0 {
+                    self.max_turns_override = Some(u32::MAX);
+                    self.status_message = Some("Max turns disabled (no limit).".to_string());
+                } else {
+                    self.max_turns_override = Some(n);
+                    self.status_message = Some(format!("Max turns set to {}.", n));
+                }
+            } else {
+                self.status_message =
+                    Some("Usage: /turns <number> | off | (blank to show current).".to_string());
+            }
+            return true;
+        }
         if cmd == "mcp" && !args.trim().is_empty() {
             return false;
         }
