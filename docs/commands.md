@@ -1256,6 +1256,22 @@ Some commands are available only under certain account or platform conditions:
 
 Some commands check `isEnabled()` at runtime. For example, voice-related commands check for audio device availability; the desktop command checks for a display server.
 
+## Goal Badge in Transcript Header
+
+When a goal is active, a goal badge is displayed in the transcript header
+showing the current goal status. The `/goal` command has been simplified to
+`/goal set` for setting a new goal (the old `/goal <objective>` syntax still
+works as a shorthand).
+
+## Info Panel: TODOs and Git Branch
+
+The info panel now shows:
+- A **TODOs** label with the count of active todos when any are present
+- The current **git branch** name (when inside a git repository)
+
+These replace the previous duplicate display that was shown in the bottom
+status bar, reducing clutter while keeping the information accessible.
+
 ## Bang Commands (`!`)
 
 Execute shell commands directly from the input prompt without going through
