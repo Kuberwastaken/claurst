@@ -2429,6 +2429,7 @@ fn render_todo_block(
 
 /// Render queued prompts that will be sent after the current turn finishes.
 /// Each queued message gets one line: `>> {truncated text}`.
+#[allow(dead_code)] // Part of the queued-prompts feature; not yet wired into the render loop.
 fn render_queued_prompts(frame: &mut Frame, app: &App, area: Rect) {
     let max_lines = area.height as usize;
     let width = area.width as usize;
