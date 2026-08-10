@@ -830,6 +830,9 @@ pub struct App {
     pub is_streaming: bool,
     pub streaming_text: String,
     pub streaming_thinking: String,
+    /// Length of `streaming_text` captured at flush time, for TPS fallback
+    /// when `MessageStop` has already emptied `streaming_text`.
+    pub last_flushed_stream_len: usize,
     pub status_message: Option<String>,
     /// Randomly chosen thinking verb shown next to the spinner while streaming.
     pub spinner_verb: Option<String>,
@@ -1349,6 +1352,7 @@ impl App {
             is_streaming: false,
             streaming_text: String::new(),
             streaming_thinking: String::new(),
+            last_flushed_stream_len: 0,
             status_message: None,
             spinner_verb: None,
             should_exit: false,
@@ -1745,6 +1749,7 @@ impl App {
 
         let thinking = std::mem::take(&mut self.streaming_thinking);
         let text = std::mem::take(&mut self.streaming_text);
+        self.last_flushed_stream_len = text.len();
 
         let mut blocks = Vec::new();
         if !thinking.trim().is_empty() {
@@ -6952,11 +6957,13 @@ impl App {
                 // Track tokens per second for the status indicator (before take()).
                 // Prefer real usage; fall back to a rough char-based estimate
                 // (~4 chars/token) for providers that never report usage.
+                // fallback uses `last_flushed_stream_len` because `MessageStop`
+                // already flushed `streaming_text` via `mem::take`.
                 let reported_output = usage.as_ref().map(|u| u.output_tokens).unwrap_or(0);
                 let output_tokens = if reported_output > 0 {
                     reported_output
                 } else {
-                    (self.streaming_text.len() / 4).max(if self.streaming_text.is_empty() { 0 } else { 1 }) as u64
+                    (self.last_flushed_stream_len / 4).max(if self.last_flushed_stream_len == 0 { 0 } else { 1 }) as u64
                 };
                 // Active streaming throughput: time between first and last
                 // token arrival, excluding TTFT and post-stream idle.

@@ -2947,7 +2947,20 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             parts.push(Span::styled(clean, Style::default().fg(Color::DarkGray)));
         }
 
-        // 8. Bridge badge
+        // 8. Tokens per second average (from last 5 turns).
+        if !app.recent_token_rates.is_empty() {
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+            let avg_tps =
+                app.recent_token_rates.iter().sum::<f64>() / app.recent_token_rates.len() as f64;
+            parts.push(Span::styled(
+                format!("{:.0} tok/s", avg_tps),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
+        // 9. Bridge badge
         if let Some(badge) = app.bridge_state.status_badge(app.frame_count) {
             if !parts.is_empty() {
                 parts.push(Span::raw("  "));
