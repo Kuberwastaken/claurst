@@ -16,9 +16,22 @@ struct ConfigInput {
     value: Option<Value>,
 }
 
+// Provider ids this build actually knows how to construct a client for.
+// Mirrors the match arms in claurst_api::registry (create_provider_by_id /
+// build_provider) and claurst_core::config::Config::effective_model's
+// per-provider default-model table — kept as the primary id only (not every
+// alias accepted by those matches, e.g. "lm-studio"/"llama-cpp"). Update this
+// list alongside those when a new provider is added.
+static KNOWN_PROVIDER_IDS: &[&str] = &[
+    "anthropic", "openai", "google", "groq", "cerebras", "deepseek", "mistral",
+    "xai", "openrouter", "togetherai", "perplexity", "cohere", "qwen", "deepinfra",
+    "github-copilot", "ollama", "lmstudio", "llamacpp", "custom-openai", "azure",
+    "amazon-bedrock", "venice", "minimax", "codex", "free",
+];
+
 static SUPPORTED_SETTINGS: &[(&str, &str)] = &[
     ("model", "LLM model to use (e.g. 'claude-opus-4-6')"),
-    ("provider", "Active provider id (e.g. 'anthropic', 'openai', 'google')"),
+    ("provider", "Active provider id — one of the ids this build supports (use setting='provider' with a bad value to see the full list)"),
     ("effort", "Reasoning effort: none | minimal | low | medium | high | xhigh | max | ultracode"),
     ("max_tokens", "Maximum output tokens per response"),
     ("verbose", "Enable verbose logging (true/false)"),
@@ -99,6 +112,13 @@ impl Tool for ConfigTool {
                         Some(s) => s.to_string(),
                         None => return ToolResult::error("'provider' must be a string".to_string()),
                     };
+                    if !KNOWN_PROVIDER_IDS.contains(&s.as_str()) {
+                        return ToolResult::error(format!(
+                            "Unknown provider '{}'. Use one of: {}",
+                            s,
+                            KNOWN_PROVIDER_IDS.join(" | ")
+                        ));
+                    }
                     settings.config.provider = Some(s.clone());
                     if let Err(e) = settings.save().await {
                         return ToolResult::error(format!("Failed to save settings: {}", e));
