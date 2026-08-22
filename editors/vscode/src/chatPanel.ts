@@ -2,12 +2,6 @@ import * as os from 'os';
 import * as vscode from 'vscode';
 import { AcpClient, PermissionOption, ToolCallUpdate } from './acpClient';
 
-const EFFORT_LEVELS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultracode'];
-const COMMON_PROVIDERS = [
-  'anthropic', 'openai', 'google', 'groq', 'cerebras', 'deepseek', 'mistral',
-  'xai', 'openrouter', 'togetherai', 'cohere', 'ollama', 'azure', 'amazon-bedrock',
-];
-
 /** Owns one webview panel and its backing AcpClient/session. */
 export class ChatPanel {
   public static current: ChatPanel | undefined;
@@ -16,10 +10,6 @@ export class ChatPanel {
   private client: AcpClient | undefined;
   private readonly outputChannel: vscode.OutputChannel;
   private disposables: vscode.Disposable[] = [];
-
-  /** While true, streamed events update `status` instead of the visible transcript. */
-  private silent = false;
-  private status: { model?: string; provider?: string; effort?: string } = {};
 
   static createOrShow(extensionUri: vscode.Uri, outputChannel: vscode.OutputChannel): ChatPanel {
     if (ChatPanel.current) {
@@ -63,11 +53,6 @@ export class ChatPanel {
   <title>Claurst</title>
 </head>
 <body>
-  <div id="header">
-    <button class="pill" id="model-pill" title="Change model">model: …</button>
-    <button class="pill" id="provider-pill" title="Change provider">provider: …</button>
-    <button class="pill" id="effort-pill" title="Change reasoning effort">effort: …</button>
-  </div>
   <div id="messages"></div>
   <div id="input-row">
     <textarea id="input-box" rows="1" placeholder="Ask claurst..."></textarea>
@@ -87,23 +72,9 @@ export class ChatPanel {
     const executablePath = vscode.workspace.getConfiguration('claurst').get<string>('executablePath', 'claurst');
 
     this.client = new AcpClient(executablePath, cwd, {
-      onTextChunk: (text, isThought) => {
-        if (!this.silent) {
-          this.postToWebview({ type: 'textChunk', text, isThought });
-        }
-      },
-      onToolCall: (update) => {
-        this.captureStatusFromToolResult(update);
-        if (!this.silent) {
-          this.postToWebview({ type: 'toolCall', ...toolCallPayload(update) });
-        }
-      },
-      onToolCallUpdate: (update) => {
-        this.captureStatusFromToolResult(update);
-        if (!this.silent) {
-          this.postToWebview({ type: 'toolCallUpdate', ...toolCallPayload(update) });
-        }
-      },
+      onTextChunk: (text, isThought) => this.postToWebview({ type: 'textChunk', text, isThought }),
+      onToolCall: (update) => this.postToWebview({ type: 'toolCall', ...toolCallPayload(update) }),
+      onToolCallUpdate: (update) => this.postToWebview({ type: 'toolCallUpdate', ...toolCallPayload(update) }),
       onRequestPermission: (toolCall, options) => this.promptForPermission(toolCall, options),
       onStderr: (line) => this.outputChannel.appendLine(line),
       onExit: (code) => {
@@ -115,60 +86,23 @@ export class ChatPanel {
       await this.client.initialize();
       await this.client.newSession(cwd);
       this.postToWebview({ type: 'status', text: `Session started in ${cwd}` });
-      await this.refreshStatus();
     } catch (e) {
       this.reportError(e);
     }
   }
 
-  /** Silently asks the agent to report model/provider/effort via the Config
-   * tool and updates the header pills. Doesn't appear in the visible transcript. */
-  private async refreshStatus(): Promise<void> {
-    if (!this.client) {
-      return;
-    }
-    this.silent = true;
-    try {
-      await this.client.prompt(
-        'Call the Config tool three times, once each with setting="model", setting="provider", ' +
-        'and setting="effort" (omit "value" every time — these are reads, not writes). ' +
-        'After the three tool calls finish, reply with just the word "ok".',
-      );
-    } catch (e) {
-      this.outputChannel.appendLine(`[claurst-vscode] status refresh failed: ${e}`);
-    } finally {
-      this.silent = false;
-      this.pushStatus();
-    }
-  }
-
-  /** Parses `key = "value"` out of a Config tool result and updates the header. */
-  private captureStatusFromToolResult(update: ToolCallUpdate): void {
-    if (update.title !== 'Config' || !update.resultText) {
-      return;
-    }
-    const match = update.resultText.match(/^(model|provider|effort)\s*=\s*"?([^"\n]+)"?/);
-    if (!match) {
-      return;
-    }
-    const [, key, value] = match;
-    (this.status as any)[key] = value;
-    this.pushStatus();
-  }
-
-  private pushStatus(): void {
-    this.postToWebview({ type: 'headerUpdate', ...this.status });
-  }
-
-  private async promptForPermission(toolCall: ToolCallUpdate, options: PermissionOption[]): Promise<string> {
+  /**
+   * Returns the chosen option id, or `undefined` if the user dismissed the
+   * quick pick without choosing. `undefined` is sent back to the agent as a
+   * `Cancelled` outcome (not an implicit grant) — see acpClient's
+   * handleIncomingRequest.
+   */
+  private async promptForPermission(toolCall: ToolCallUpdate, options: PermissionOption[]): Promise<string | undefined> {
     const picked = await vscode.window.showQuickPick(
       options.map((o) => ({ label: o.name, description: o.kind, optionId: o.optionId })),
       { placeHolder: toolCall.title ?? 'Claurst is requesting permission', ignoreFocusOut: true },
     );
-    // Falling through to the first (typically "allow once") option on dismissal
-    // matches the ACP spec's guidance to avoid hanging the agent indefinitely,
-    // while still defaulting to the least-privileged choice offered.
-    return picked?.optionId ?? options[0]?.optionId ?? 'reject_once';
+    return picked?.optionId;
   }
 
   private handleWebviewMessage(msg: any): void {
@@ -181,70 +115,13 @@ export class ChatPanel {
       case 'stop':
         this.cancelCurrentTurn();
         break;
-      case 'pickModel':
-        this.pickModel().catch((e) => this.reportError(e));
-        break;
-      case 'pickProvider':
-        this.pickProvider().catch((e) => this.reportError(e));
-        break;
-      case 'pickEffort':
-        this.pickEffort().catch((e) => this.reportError(e));
-        break;
       default:
         break;
     }
   }
 
-  private async pickModel(): Promise<void> {
-    const value = await vscode.window.showInputBox({
-      prompt: 'Model to use for new turns',
-      value: this.status.model,
-      placeHolder: 'e.g. claude-opus-5, claude-sonnet-4-6, gpt-5',
-      ignoreFocusOut: true,
-    });
-    if (value) {
-      this.sendConfigChange('model', value);
-    }
-  }
-
-  private async pickProvider(): Promise<void> {
-    const CUSTOM = '$(edit) Custom…';
-    const picked = await vscode.window.showQuickPick([...COMMON_PROVIDERS, CUSTOM], {
-      placeHolder: `Active provider (current: ${this.status.provider ?? 'unknown'})`,
-      ignoreFocusOut: true,
-    });
-    if (!picked) {
-      return;
-    }
-    if (picked === CUSTOM) {
-      const custom = await vscode.window.showInputBox({ prompt: 'Provider id', ignoreFocusOut: true });
-      if (custom) {
-        this.sendConfigChange('provider', custom);
-      }
-      return;
-    }
-    this.sendConfigChange('provider', picked);
-  }
-
-  private async pickEffort(): Promise<void> {
-    const picked = await vscode.window.showQuickPick(EFFORT_LEVELS, {
-      placeHolder: `Reasoning effort (current: ${this.status.effort ?? 'unknown'})`,
-      ignoreFocusOut: true,
-    });
-    if (picked) {
-      this.sendConfigChange('effort', picked);
-    }
-  }
-
-  /** Sends a real, visible prompt engineered to reliably trigger a single
-   * Config tool call rather than a conversational reply. */
-  private sendConfigChange(setting: 'model' | 'provider' | 'effort', value: string): void {
-    this.postToWebview({ type: 'userEcho', text: `Set ${setting} to ${value}` });
-    this.runPrompt(`Use the Config tool to set "${setting}" to "${value}".`);
-  }
-
-  /** Runs a visible prompt to completion, signalling turnEnded either way
-   * so the webview can re-enable input. */
+  /** Runs a prompt to completion, signalling turnEnded either way so the
+   * webview can re-enable Send / hide Stop. */
   private async runPrompt(text: string): Promise<void> {
     try {
       await this.client?.prompt(text);

@@ -13,29 +13,6 @@ body {
   height: 100vh;
 }
 
-#header {
-  display: flex;
-  gap: 6px;
-  padding: 6px 8px;
-  border-bottom: 1px solid var(--vscode-panel-border);
-  flex-shrink: 0;
-}
-
-.pill {
-  background: var(--vscode-badge-background);
-  color: var(--vscode-badge-foreground);
-  border: none;
-  border-radius: 999px;
-  padding: 2px 10px;
-  font-size: 0.85em;
-  cursor: pointer;
-  font-family: var(--vscode-editor-font-family, monospace);
-}
-
-.pill:hover {
-  background: var(--vscode-button-hoverBackground);
-}
-
 #messages {
   flex: 1;
   overflow-y: auto;
