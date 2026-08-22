@@ -1022,7 +1022,10 @@ pub mod config {
         #[serde(default)]
         pub output_style: Option<String>,
         /// Reasoning effort level for new turns (see [`crate::effort::EffortLevel`]).
-        /// `None` means the query loop's own default (`Medium`) applies.
+        /// `None` means no effort override is applied at all — the query loop
+        /// sends no thinking-budget or temperature override, so the model and
+        /// provider's own defaults take effect. This is *not* the same as
+        /// `EffortLevel::Medium`, which has its own explicit budget/temperature.
         #[serde(default)]
         pub effort: Option<String>,
         pub auto_compact: bool,
@@ -1461,8 +1464,9 @@ pub mod config {
 
 
         /// Resolve the configured reasoning effort level, if any and valid.
-        /// An unset or unparseable value falls back to the query loop's own
-        /// default (`EffortLevel::Medium`) rather than erroring here.
+        /// Returns `None` when unset or unparseable — the caller (the query
+        /// loop) then applies no thinking-budget/temperature override at all,
+        /// not `EffortLevel::Medium`'s specific values.
         pub fn effective_effort_level(&self) -> Option<crate::effort::EffortLevel> {
             self.effort.as_deref().and_then(crate::effort::EffortLevel::from_str)
         }
