@@ -197,14 +197,14 @@ impl Tool for ConfigTool {
                     "provider = \"{}\"",
                     settings.config.selected_provider_id()
                 )),
-                "effort" => ToolResult::success(format!(
-                    "effort = \"{}\"",
-                    settings
-                        .config
-                        .effective_effort_level()
-                        .unwrap_or_default()
-                        .as_str()
-                )),
+                "effort" => match settings.config.effective_effort_level() {
+                    Some(level) => ToolResult::success(format!("effort = \"{}\"", level.as_str())),
+                    None => ToolResult::success(
+                        "effort = unset (no thinking-budget/temperature override applied; \
+                         model/provider defaults are used, not equivalent to any specific level)"
+                            .to_string(),
+                    ),
+                },
                 "max_tokens" => ToolResult::success(format!(
                     "max_tokens = {}",
                     settings.config.effective_max_tokens()
