@@ -6,9 +6,6 @@
   const inputEl = document.getElementById('input-box');
   const sendBtn = document.getElementById('send-btn');
   const stopBtn = document.getElementById('stop-btn');
-  const modelPill = document.getElementById('model-pill');
-  const providerPill = document.getElementById('provider-pill');
-  const effortPill = document.getElementById('effort-pill');
 
   let currentAgentBubble = null;
   const toolCallEls = new Map();
@@ -32,6 +29,9 @@
     return '•';
   }
 
+  // The initial tool_call event carries a title; the tool_call_update sent
+  // on completion never does (the agent only sends status + content there).
+  // Remember the title on the element itself so completion doesn't blank it.
   function upsertToolCall(id, title, status) {
     let el = id ? toolCallEls.get(id) : null;
     if (!el) {
@@ -42,8 +42,11 @@
         toolCallEls.set(id, el);
       }
     }
+    if (title) {
+      el.dataset.title = title;
+    }
     el.className = 'tool-call ' + (status || '');
-    el.textContent = `${statusIcon(status)} ${title || '(tool call)'}`;
+    el.textContent = `${statusIcon(status)} ${el.dataset.title || '(tool call)'}`;
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
@@ -79,9 +82,6 @@
       send();
     }
   });
-  modelPill.addEventListener('click', () => vscode.postMessage({ type: 'pickModel' }));
-  providerPill.addEventListener('click', () => vscode.postMessage({ type: 'pickProvider' }));
-  effortPill.addEventListener('click', () => vscode.postMessage({ type: 'pickEffort' }));
 
   setBusy(false);
 
@@ -104,21 +104,9 @@
         upsertToolCall(msg.toolCallId, msg.title, msg.status);
         break;
       }
-      case 'userEcho': {
-        currentAgentBubble = null;
-        appendRow(msg.text, 'user');
-        setBusy(true);
-        break;
-      }
       case 'status': {
         currentAgentBubble = null;
         appendRow(msg.text, 'system');
-        break;
-      }
-      case 'headerUpdate': {
-        if (msg.model) modelPill.textContent = 'model: ' + msg.model;
-        if (msg.provider) providerPill.textContent = 'provider: ' + msg.provider;
-        if (msg.effort) effortPill.textContent = 'effort: ' + msg.effort;
         break;
       }
       case 'turnEnded': {
