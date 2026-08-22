@@ -62,3 +62,48 @@ impl SessionRegistry {
         self.inner.remove(id).map(|(_, v)| v)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_session_starts_empty_with_a_fresh_cancel_token() {
+        let id = acp::SessionId::new("session-1");
+        let cwd = PathBuf::from("/tmp/claurst-test");
+        let state = SessionState::new(id.clone(), cwd.clone());
+
+        assert_eq!(state.session_id, id);
+        assert_eq!(state.cwd, cwd);
+        assert!(state.messages.lock().is_empty());
+        assert_eq!(
+            state.current_turn.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(!state.cancel_token.is_cancelled());
+    }
+
+    #[test]
+    fn registry_insert_get_remove_round_trip() {
+        let registry = SessionRegistry::new();
+        let id = acp::SessionId::new("session-2");
+        let state = SessionState::new(id.clone(), PathBuf::from("/tmp"));
+
+        assert!(registry.get(&id).is_none());
+
+        registry.insert(Arc::clone(&state));
+        let fetched = registry.get(&id).expect("session should be present after insert");
+        assert!(Arc::ptr_eq(&fetched, &state));
+
+        let removed = registry.remove(&id).expect("session should be present to remove");
+        assert!(Arc::ptr_eq(&removed, &state));
+        assert!(registry.get(&id).is_none());
+    }
+
+    #[test]
+    fn registry_remove_unknown_id_returns_none() {
+        let registry = SessionRegistry::new();
+        let id = acp::SessionId::new("missing");
+        assert!(registry.remove(&id).is_none());
+    }
+}

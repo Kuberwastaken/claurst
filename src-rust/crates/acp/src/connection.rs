@@ -277,6 +277,22 @@ mod tests {
     use super::*;
     use tokio::io::{duplex, AsyncReadExt};
 
+    #[test]
+    fn id_to_key_distinguishes_number_and_string_ids_with_the_same_text() {
+        // A numeric id and a string id that render the same digits must not
+        // collide in the pending-request map.
+        let number_key = id_to_key(&acp::RequestId::Number(7));
+        let string_key = id_to_key(&acp::RequestId::Str("7".into()));
+        assert_ne!(number_key, string_key);
+        assert_eq!(number_key, id_to_key(&acp::RequestId::Number(7)));
+        assert_eq!(string_key, id_to_key(&acp::RequestId::Str("7".into())));
+    }
+
+    #[test]
+    fn id_to_key_null_is_stable() {
+        assert_eq!(id_to_key(&acp::RequestId::Null), id_to_key(&acp::RequestId::Null));
+    }
+
     /// `send_response` must emit a newline-delimited JSON object containing
     /// `jsonrpc: "2.0"`, the request id, and the result payload.
     #[tokio::test]
