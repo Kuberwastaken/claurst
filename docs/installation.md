@@ -2,8 +2,9 @@
 
 Claurst is a Rust reimplementation of the Claude Code CLI. The fastest way
 to install it is via the one-liner installers below. They drop the binary
-into `~/.claurst/bin` (or `%USERPROFILE%\.claurst\bin` on Windows) and add
-that directory to your `PATH` automatically.
+into `~/.local/bin` (or `%LOCALAPPDATA%\Programs\claurst` on Windows; Git Bash
+uses that same Windows default) and add that directory to your `PATH`
+automatically.
 
 ---
 
@@ -36,13 +37,26 @@ curl -fsSL https://github.com/Kuberwastaken/claurst/releases/latest/download/ins
 irm https://github.com/Kuberwastaken/claurst/releases/latest/download/install.ps1 | iex
 ```
 
+### Windows (Git Bash / MSYS / Cygwin)
+
+`install.sh` also works under Git Bash. It downloads the Windows zip
+(`claurst-windows-x86_64.zip`), installs `claurst.exe` into the **same**
+default directory as `install.ps1` (`%LOCALAPPDATA%\Programs\claurst`), and
+updates the Windows user `PATH` (not only bashrc):
+
+```bash
+curl -fsSL https://github.com/Kuberwastaken/claurst/releases/latest/download/install.sh | bash
+```
+
 Both installers:
 
 1. Detect your platform and architecture.
 2. Download the matching archive from the latest GitHub release.
-3. Extract `claurst` into `~/.claurst/bin/` (Windows: `%USERPROFILE%\.claurst\bin\`).
+3. Extract `claurst` into `~/.local/bin/` on Linux/macOS, or
+   `%LOCALAPPDATA%\Programs\claurst` on Windows (`install.sh` under Git Bash
+   uses this same Windows default).
 4. Append that directory to your shell config (`.bashrc`, `.zshrc`,
-   `.config/fish/config.fish`) or to your Windows user `PATH`.
+   `.config/fish/config.fish`) on Unix, or to your Windows user `PATH`.
 5. On macOS, strip the quarantine attribute so Gatekeeper does not block the
    unsigned binary.
 
@@ -58,10 +72,40 @@ Both scripts accept the same flags:
 | `--version 0.1.0` | `-Version 0.1.0` | Install a specific version |
 | `--binary <path>` | `-Binary <path>` | Install from a local file (skip download) |
 | `--install-dir <path>` | `-InstallDir <path>` | Override the install directory |
+| `--token <token>` | `-Token <token>` | GitHub token for API/downloads |
 | `--no-modify-path` | `-NoModifyPath` | Don't touch shell config / user PATH |
 | `--help` | `-Help` | Show usage |
 
 Example: `curl -fsSL https://.../install.sh | bash -s -- --version 0.1.0`
+
+### GitHub authentication
+
+If GitHub rate-limits unauthenticated requests, or you install from a private
+fork/release, set a token via env or flag. The installer also accepts
+`GH_TOKEN` (GitHub CLI convention):
+
+```bash
+# Linux / macOS
+export GITHUB_TOKEN=ghp_...   # or GH_TOKEN
+curl -fsSL https://github.com/Kuberwastaken/claurst/releases/latest/download/install.sh | bash
+
+# Or pass the token as a flag when running the script locally:
+./install.sh --token ghp_...
+```
+
+```powershell
+# Windows
+$env:GITHUB_TOKEN = 'ghp_...'   # or $env:GH_TOKEN
+irm https://github.com/Kuberwastaken/claurst/releases/latest/download/install.ps1 | iex
+
+# Or:
+.\install.ps1 -Token ghp_...
+```
+
+The token is sent as `Authorization: Bearer …` on the GitHub API call that
+resolves the latest version and on asset/checksum downloads. A fine-grained
+or classic PAT with `contents: read` (public repos need no scopes beyond
+rate-limit relief) is enough.
 
 ---
 
@@ -300,12 +344,14 @@ the [Upgrading](#upgrading) section above.
 
 ## Uninstalling
 
-If you used the install script, remove the install directory:
+If you used the install script, remove the binary (or install directory):
 
 ```bash
-rm -rf ~/.claurst/bin                    # Linux / macOS
-# Windows (PowerShell):
-Remove-Item -Recurse -Force "$env:USERPROFILE\.claurst\bin"
+rm -f ~/.local/bin/claurst               # Linux / macOS
+# Windows (PowerShell / default install.ps1 path):
+Remove-Item -Force "$env:LOCALAPPDATA\Programs\claurst\claurst.exe"
+# Optional: remove the empty install dir
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Programs\claurst" -ErrorAction SilentlyContinue
 ```
 
 For manual installs:
@@ -322,4 +368,5 @@ rm -rf ~/.claurst
 ```
 
 You may also want to remove the `# claurst` PATH line that the installer
-appended to your shell config (`.bashrc`, `.zshrc`, etc.).
+appended to your shell config (`.bashrc`, `.zshrc`, etc.), or the Windows
+user PATH entry for `%LOCALAPPDATA%\Programs\claurst`.

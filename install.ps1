@@ -12,6 +12,7 @@ param(
     [string]$Version = "",
     [string]$Binary = "",
     [string]$InstallDir = "",
+    [string]$Token = "",
     [switch]$NoModifyPath,
     [switch]$Help
 )
@@ -38,16 +39,38 @@ Options:
     -Version <version>      Install a specific version (e.g., 0.1.0)
     -Binary <path>          Install from a local binary instead of downloading
     -InstallDir <path>      Override install location (default: %LOCALAPPDATA%\Programs\claurst)
+    -Token <token>          GitHub token for API/downloads (or set GITHUB_TOKEN / GH_TOKEN)
     -NoModifyPath           Don't add the install dir to user PATH
 
 Examples:
     irm https://github.com/Kuberwastaken/claurst/releases/latest/download/install.ps1 | iex
     .\install.ps1 -Version 0.1.0
     .\install.ps1 -Binary C:\path\to\claurst.exe
+    `$env:GITHUB_TOKEN = 'ghp_...'; .\install.ps1
 "@
 }
 
 if ($Help) { Show-Usage; exit 0 }
+
+# Prefer -Token; otherwise GITHUB_TOKEN, then GH_TOKEN (gh CLI convention).
+if ([string]::IsNullOrEmpty($Token)) {
+    if (-not [string]::IsNullOrEmpty($env:GITHUB_TOKEN)) {
+        $Token = $env:GITHUB_TOKEN
+    } elseif (-not [string]::IsNullOrEmpty($env:GH_TOKEN)) {
+        $Token = $env:GH_TOKEN
+    }
+}
+
+function Get-GitHubHeaders {
+    $headers = @{
+        'User-Agent' = 'claurst-installer'
+        'Accept'     = 'application/vnd.github+json'
+    }
+    if (-not [string]::IsNullOrEmpty($script:Token)) {
+        $headers['Authorization'] = "Bearer $($script:Token)"
+    }
+    return $headers
+}
 
 # ----- Detect architecture -----
 function Get-Arch {
@@ -88,12 +111,17 @@ function Resolve-Version {
         return ($script:Version -replace '^v', '')
     }
     try {
-        $resp = Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ 'User-Agent' = 'claurst-installer' }
+        $resp = Invoke-RestMethod -UseBasicParsing `
+            -Uri "https://api.github.com/repos/$Repo/releases/latest" `
+            -Headers (Get-GitHubHeaders)
         $tag = $resp.tag_name
         if ([string]::IsNullOrEmpty($tag)) { throw "no tag_name in response" }
         return ($tag -replace '^v', '')
     } catch {
         Write-Err "Failed to fetch latest version from GitHub API: $_"
+        if ([string]::IsNullOrEmpty($script:Token)) {
+            Write-Info "If you hit rate limits or need a private release, set GITHUB_TOKEN or pass -Token."
+        }
         exit 1
     }
 }
@@ -129,16 +157,23 @@ function Download-And-Install($desiredVersion, $arch) {
 
     Write-Info "Installing claurst v$desiredVersion (windows-$arch)"
     Write-Muted "Downloading $url"
+    if (-not [string]::IsNullOrEmpty($script:Token)) {
+        Write-Muted "Using GitHub authentication."
+    }
+    $ghHeaders = Get-GitHubHeaders
     try {
         # Disable progress UI for a faster, less noisy download.
         $oldPref = $ProgressPreference
         $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $zipPath
+        Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $zipPath -Headers $ghHeaders
         $ProgressPreference = $oldPref
     } catch {
         Write-Err "Download failed: $_"
         Write-Info ("Check that release v$desiredVersion exists for windows-" + $arch + ":")
         Write-Info "  https://github.com/$Repo/releases/tag/v$desiredVersion"
+        if ([string]::IsNullOrEmpty($script:Token)) {
+            Write-Info "Private releases require GITHUB_TOKEN / GH_TOKEN or -Token."
+        }
         Remove-Item -Recurse -Force $tmpRoot -ErrorAction SilentlyContinue
         exit 1
     }
@@ -154,7 +189,7 @@ function Download-And-Install($desiredVersion, $arch) {
     try {
         $oldPref2 = $ProgressPreference
         $ProgressPreference = 'SilentlyContinue'
-        Invoke-WebRequest -UseBasicParsing -Uri $sumsUrl -OutFile $sumsPath
+        Invoke-WebRequest -UseBasicParsing -Uri $sumsUrl -OutFile $sumsPath -Headers $ghHeaders
         $ProgressPreference = $oldPref2
         $haveSums = $true
     } catch {
@@ -223,16 +258,20 @@ function Install-FromBinary {
 
 function Install-Binary($source) {
     $target = Join-Path $InstallDir 'claurst.exe'
+    $stale = "$target.old"
 
     # The currently running claurst.exe (if any) holds an exclusive file lock on
-    # Windows.  Try to swap by renaming the old one first.
+    # Windows.  Swap by renaming the old one aside, then remove it after the
+    # new binary is in place (the lock is on the path that was open).
     if (Test-Path $target) {
-        $stale = "$target.old"
         if (Test-Path $stale) { Remove-Item -Force $stale -ErrorAction SilentlyContinue }
         try { Move-Item -Force $target $stale } catch { }
     }
 
     Copy-Item -Force $source $target
+    if (Test-Path $stale) {
+        Remove-Item -Force $stale -ErrorAction SilentlyContinue
+    }
     Write-Success "Installed: $target"
 }
 
