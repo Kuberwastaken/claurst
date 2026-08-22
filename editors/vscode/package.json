@@ -58,7 +58,8 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -w -p ./",
-    "vscode:prepublish": "npm run compile"
+    "vscode:prepublish": "npm run compile",
+    "test": "npm run compile && node --test out/acpProtocol.test.js"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
