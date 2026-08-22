@@ -2320,10 +2320,12 @@ async fn run_interactive(
                     if plain_enter && !app.is_streaming && !any_dialog_open {
                         // If a file-ref suggestion is active, accept it instead of submitting.
                         if !app.prompt_input.suggestions.is_empty()
-                            && app.prompt_input.suggestion_index.is_some()
-                            && app.prompt_input.suggestions.get(app.prompt_input.suggestion_index.unwrap())
-                                .map(|s| s.source == claurst_tui::prompt_input::TypeaheadSource::FileRef)
-                                .unwrap_or(false)
+                            && app.prompt_input.suggestion_index.is_some_and(|index| {
+                                app.prompt_input
+                                    .suggestions
+                                    .get(index)
+                                    .is_some_and(|s| s.source == claurst_tui::prompt_input::TypeaheadSource::FileRef)
+                            })
                         {
                             app.prompt_input.accept_suggestion();
                             app.prompt_input.insert_char(' ');
