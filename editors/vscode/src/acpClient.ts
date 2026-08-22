@@ -1,15 +1,10 @@
 import * as cp from 'child_process';
 import * as readline from 'readline';
+import { extractText, parseLine } from './acpProtocol';
 
-/** Minimal newline-delimited JSON-RPC 2.0 client for the Agent Client Protocol,
- * matching the wire format implemented in src-rust/crates/acp/src/connection.rs:
- * one UTF-8 line per message, no Content-Length framing. */
-
-export interface JsonRpcError {
-  code: number;
-  message: string;
-  data?: unknown;
-}
+/** Speaks ACP to a `claurst acp` child process over stdio. Wire parsing
+ * itself lives in acpProtocol.ts; this class owns the process, the
+ * pending-request map, and dispatch to caller-supplied event callbacks. */
 
 export type PermissionOption = {
   optionId: string;
@@ -22,21 +17,19 @@ export type ToolCallUpdate = {
   title?: string;
   status?: string;
   kind?: string;
-  /** First text content block from the tool's result, if any. */
-  resultText?: string;
 };
 
 export interface AcpClientEvents {
   onTextChunk?: (text: string, isThought: boolean) => void;
   onToolCall?: (update: ToolCallUpdate) => void;
   onToolCallUpdate?: (update: ToolCallUpdate) => void;
-  /** Must resolve to one of the option ids offered in `options`. */
-  onRequestPermission?: (toolCall: ToolCallUpdate, options: PermissionOption[]) => Promise<string>;
+  /** Return the chosen option id, or `undefined` to cancel the request
+   * (e.g. the user dismissed the picker without choosing). */
+  onRequestPermission?: (toolCall: ToolCallUpdate, options: PermissionOption[]) => Promise<string | undefined>;
   onStderr?: (line: string) => void;
   onExit?: (code: number | null) => void;
 }
 
-/** Speaks ACP to a `claurst acp` child process over stdio. */
 export class AcpClient {
   private child: cp.ChildProcessWithoutNullStreams;
   private rl: readline.Interface;
@@ -66,47 +59,37 @@ export class AcpClient {
   }
 
   private handleLine(line: string): void {
-    const trimmed = line.trim();
-    if (trimmed.length === 0) {
-      return;
-    }
-    let msg: any;
-    try {
-      msg = JSON.parse(trimmed);
-    } catch {
-      this.events.onStderr?.(`[claurst-vscode] malformed line from agent: ${trimmed}`);
+    const parsed = parseLine(line);
+    if (!parsed) {
+      if (line.trim().length > 0) {
+        this.events.onStderr?.(`[claurst-vscode] malformed line from agent: ${line.trim()}`);
+      }
       return;
     }
 
-    const hasId = msg.id !== undefined && msg.id !== null;
-    const hasResult = 'result' in msg;
-    const hasError = 'error' in msg;
-    const hasMethod = typeof msg.method === 'string';
-
-    if (hasId && (hasResult || hasError) && !hasMethod) {
-      const pending = this.pending.get(msg.id);
-      if (!pending) {
+    switch (parsed.kind) {
+      case 'response': {
+        const pending = this.pending.get(parsed.id);
+        if (!pending) {
+          return;
+        }
+        this.pending.delete(parsed.id);
+        if (parsed.error) {
+          pending.reject(Object.assign(new Error(parsed.error.message ?? 'ACP error'), { data: parsed.error }));
+        } else {
+          pending.resolve(parsed.result);
+        }
         return;
       }
-      this.pending.delete(msg.id);
-      if (hasError) {
-        pending.reject(Object.assign(new Error(msg.error?.message ?? 'ACP error'), { data: msg.error }));
-      } else {
-        pending.resolve(msg.result);
-      }
-      return;
-    }
-
-    if (hasId && hasMethod) {
-      // Agent → client request. Only session/request_permission is expected in v1.
-      this.handleIncomingRequest(msg.id, msg.method, msg.params).catch((e) => {
-        this.events.onStderr?.(`[claurst-vscode] failed to handle ${msg.method}: ${e}`);
-      });
-      return;
-    }
-
-    if (hasMethod) {
-      this.handleNotification(msg.method, msg.params);
+      case 'request':
+        // Agent → client request. Only session/request_permission is expected in v1.
+        this.handleIncomingRequest(parsed.id, parsed.method, parsed.params).catch((e) => {
+          this.events.onStderr?.(`[claurst-vscode] failed to handle ${parsed.method}: ${e}`);
+        });
+        return;
+      case 'notification':
+        this.handleNotification(parsed.method, parsed.params);
+        return;
     }
   }
 
@@ -123,12 +106,14 @@ export class AcpClient {
         name: o.name,
         kind: o.kind,
       }));
-      const chosen = (await this.events.onRequestPermission?.(toolCall, options)) ?? options[0]?.optionId;
-      this.writeMessage({
-        jsonrpc: '2.0',
-        id,
-        result: { outcome: { outcome: 'selected', optionId: chosen } },
-      });
+      const chosen = await this.events.onRequestPermission?.(toolCall, options);
+      // No selection (dismissed picker, or no handler wired up) must NOT
+      // grant an option — respond Cancelled, matching the ACP spec's
+      // Cancelled outcome rather than guessing an option to grant.
+      const result = chosen
+        ? { outcome: { outcome: 'selected', optionId: chosen } }
+        : { outcome: { outcome: 'cancelled' } };
+      this.writeMessage({ jsonrpc: '2.0', id, result });
       return;
     }
 
@@ -160,7 +145,6 @@ export class AcpClient {
             title: update.title,
             status: update.status,
             kind: update.kind,
-            resultText: extractToolResultText(update.content),
           });
           break;
         case 'tool_call_update':
@@ -169,7 +153,6 @@ export class AcpClient {
             title: update.title,
             status: update.status,
             kind: update.kind,
-            resultText: extractToolResultText(update.content),
           });
           break;
         default:
@@ -231,27 +214,4 @@ export class AcpClient {
     this.rl.close();
     this.child.kill();
   }
-}
-
-function extractText(content: any): string {
-  if (!content) {
-    return '';
-  }
-  if (content.type === 'text') {
-    return content.text ?? '';
-  }
-  return '';
-}
-
-/** Pull the first text block out of a ToolCall(Update)'s `content` array. */
-function extractToolResultText(content: any): string | undefined {
-  if (!Array.isArray(content)) {
-    return undefined;
-  }
-  for (const item of content) {
-    if (item?.type === 'content' && item.content?.type === 'text') {
-      return item.content.text ?? undefined;
-    }
-  }
-  return undefined;
 }
