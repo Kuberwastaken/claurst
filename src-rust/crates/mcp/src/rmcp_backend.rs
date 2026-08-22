@@ -22,6 +22,16 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
+/// Lock a `std::sync::Mutex`, recovering from poisoning instead of panicking.
+///
+/// A poisoned mutex only means some other thread panicked while holding the
+/// lock; the guarded state is still valid to read/write here, so panicking
+/// again on every subsequent lock would just cascade one earlier failure
+/// into a permanently unusable client.
+fn lock_recover<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub struct RmcpNotificationClient {
     notifications_tx: mpsc::UnboundedSender<Value>,
     client_info: rmcp_model::ClientInfo,
@@ -281,12 +291,8 @@ impl LegacySseRmcpTransport {
             let result = transport::process_sse_response(response, |event, data| {
                 if matches!(event, Some("endpoint")) {
                     let endpoint = transport::resolve_legacy_endpoint(&sse_url, data)?;
-                    *post_endpoint.lock().expect("endpoint mutex poisoned") = Some(endpoint.clone());
-                    if let Some(tx) = endpoint_tx_for_task
-                        .lock()
-                        .expect("endpoint sender mutex poisoned")
-                        .take()
-                    {
+                    *lock_recover(&post_endpoint) = Some(endpoint.clone());
+                    if let Some(tx) = lock_recover(&endpoint_tx_for_task).take() {
                         let _ = tx.send(Ok(endpoint));
                     }
                     return Ok(());
@@ -304,24 +310,16 @@ impl LegacySseRmcpTransport {
 
             if let Err(e) = result {
                 tracing::warn!(server = %server_name, error = %e, "Legacy SSE stream closed with error");
-                if let Some(tx) = endpoint_tx_for_task
-                    .lock()
-                    .expect("endpoint sender mutex poisoned")
-                    .take()
-                {
+                if let Some(tx) = lock_recover(&endpoint_tx_for_task).take() {
                     let _ = tx.send(Err(anyhow::anyhow!(e.to_string())));
                 }
-            } else if let Some(tx) = endpoint_tx_for_task
-                .lock()
-                .expect("endpoint sender mutex poisoned")
-                .take()
-            {
+            } else if let Some(tx) = lock_recover(&endpoint_tx_for_task).take() {
                 let _ = tx.send(Err(anyhow::anyhow!(
                     "legacy SSE stream closed before announcing endpoint"
                 )));
             }
         });
-        self.background_tasks.lock().expect("task mutex poisoned").push(task);
+        lock_recover(&self.background_tasks).push(task);
 
         let endpoint = tokio::time::timeout(std::time::Duration::from_secs(10), endpoint_rx)
             .await
@@ -337,7 +335,7 @@ impl LegacySseRmcpTransport {
                     self.server_name
                 )
             })??;
-        *self.post_endpoint.lock().expect("endpoint mutex poisoned") = Some(endpoint);
+        *lock_recover(&self.post_endpoint) = Some(endpoint);
         Ok(())
     }
 }
@@ -347,7 +345,7 @@ impl Drop for LegacySseRmcpTransport {
         // Some upper-layer paths drop the backend instead of calling close()
         // explicitly. Abort the listener tasks again here so legacy SSE does
         // not outlive the connection teardown.
-        let mut tasks = self.background_tasks.lock().expect("task mutex poisoned");
+        let mut tasks = lock_recover(&self.background_tasks);
         for handle in tasks.drain(..) {
             handle.abort();
         }
@@ -361,11 +359,7 @@ impl rmcp::transport::Transport<RoleClient> for LegacySseRmcpTransport {
         &mut self,
         item: rmcp::service::TxJsonRpcMessage<RoleClient>,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
-        let endpoint = self
-            .post_endpoint
-            .lock()
-            .expect("endpoint mutex poisoned")
-            .clone();
+        let endpoint = lock_recover(&self.post_endpoint).clone();
         let client = self.client.clone();
         let auth_token = self.auth_token.clone();
         let server_name = self.server_name.clone();
@@ -417,7 +411,7 @@ impl rmcp::transport::Transport<RoleClient> for LegacySseRmcpTransport {
     fn close(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         let background_tasks = Arc::clone(&self.background_tasks);
         async move {
-            let mut tasks = background_tasks.lock().expect("task mutex poisoned");
+            let mut tasks = lock_recover(&background_tasks);
             for handle in tasks.drain(..) {
                 handle.abort();
             }
@@ -476,7 +470,7 @@ async fn handle_legacy_sse_http_response(
                 tracing::warn!(server = %server_name_for_task, error = %e, "legacy SSE POST stream closed with error");
             }
         });
-        background_tasks.lock().expect("task mutex poisoned").push(task);
+        lock_recover(&background_tasks).push(task);
         return Ok(());
     }
 
@@ -897,6 +891,21 @@ mod tests {
             .send()
             .await
             .expect("fetch test response")
+    }
+
+    #[test]
+    fn lock_recover_returns_guard_after_poisoning() {
+        let mutex = Arc::new(StdMutex::new(0));
+        let poisoned = Arc::clone(&mutex);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().expect("lock for poisoning");
+            panic!("poison the mutex");
+        })
+        .join();
+
+        assert!(mutex.is_poisoned());
+        let guard = lock_recover(&mutex);
+        assert_eq!(*guard, 0);
     }
 
     #[test]
