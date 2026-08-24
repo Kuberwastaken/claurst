@@ -52,6 +52,12 @@ pub(crate) fn is_openai_reasoning_model(model_id: &str) -> bool {
 }
 
 pub(crate) fn is_openaiish_provider(provider_id: &str) -> bool {
+    // Custom providers from Settings are always OpenAI-compatible.
+    if let Ok(settings) = claurst_core::Settings::load_sync() {
+        if settings.custom_providers.contains_key(provider_id) {
+            return true;
+        }
+    }
     matches!(
         provider_id,
         "openai"
@@ -105,6 +111,17 @@ pub(crate) fn build_provider_options(
 ) -> Value {
     let mut options = serde_json::Map::new();
     let model_id = model_id.to_ascii_lowercase();
+
+    if provider_id == "cursor-acp" {
+        if let Some(level) = effort_level {
+            options.insert(
+                "cursor_acp".to_string(),
+                serde_json::json!({
+                    "thought_level": level.as_str(),
+                }),
+            );
+        }
+    }
 
     if provider_id == "github-copilot" {
         if model_id.contains("claude") {
@@ -262,6 +279,26 @@ pub(crate) fn build_provider_options(
                         options.insert(
                             "thinking".to_string(),
                             serde_json::json!({"type": "disabled"}),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback for custom (user-defined) providers: when the model is not a
+    // GPT reasoning model (so the block above did not insert `reasoningEffort`),
+    // check the model definition in Settings for a `reasoningEffort` override
+    // and apply it. This lets non-GPT models on custom providers (e.g. GLM-5.2)
+    // still send `reasoningEffort` to the API.
+    if !options.contains_key("reasoningEffort") {
+        if let Ok(settings) = claurst_core::Settings::load_sync() {
+            if let Some(cp) = settings.custom_providers.get(provider_id) {
+                if let Some(model_def) = cp.models.get(&model_id) {
+                    if let Some(ref effort) = model_def.reasoning_effort {
+                        options.insert(
+                            "reasoningEffort".to_string(),
+                            serde_json::json!(effort),
                         );
                     }
                 }

@@ -41,3 +41,6 @@ pub use copilot::CopilotProvider;
 
 pub mod codex;
 pub use codex::CodexProvider;
+
+pub mod cursor_acp;
+pub use cursor_acp::CursorAcpProvider;

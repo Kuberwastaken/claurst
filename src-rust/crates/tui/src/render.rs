@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use crate::agents_view::render_agents_menu;
 use crate::context_viz::render_context_viz;
 use crate::export_dialog::render_export_dialog;
-use crate::app::{App, ContextMenuKind, SystemAnnotation, SystemMessageStyle, ToolStatus};
+use crate::app::{App, ContextMenuKind, DisplayMessage, SystemAnnotation, SystemMessageStyle, ToolStatus};
 use crate::rustle::rustle_lines;
 use crate::diff_viewer::render_diff_dialog;
 use crate::model_picker::render_model_picker;
@@ -862,6 +862,15 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_mcp_approval_dialog(&app.mcp_approval, size, frame.buffer_mut());
     }
 
+    // When error modal is showing, selectable area = full terminal
+    if app.notifications.current_is_error() {
+        app.last_selectable_area.set(size);
+    }
+
+    // ---- Text selection highlight (applied before modal overlay) ----------
+    apply_selection_highlight(frame, app);
+    cache_selectable_row_text(frame, app);
+
     // Always show error modals on top of everything (highest priority)
     if let Some(notif) = app.notifications.current() {
         if notif.kind == NotificationKind::Error {
@@ -870,6 +879,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
                 && app.streaming_thinking.is_empty()
                 && app.tool_use_blocks.is_empty();
             render_error_modal(frame, size, notif, app.error_modal_scroll_offset, app.footer_right_column_area.get(), is_welcome_screen);
+            render_context_menu(frame, app);
             return; // Don't render other overlays/notifications when error modal is showing
         }
     }
@@ -881,9 +891,6 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_notification_banner(frame, &app.notifications, size);
     }
 
-    // ---- Text selection highlight (topmost post-pass) ---------------------
-    apply_selection_highlight(frame, app);
-    cache_selectable_row_text(frame, app);
     render_context_menu(frame, app);
 }
 
@@ -1126,7 +1133,8 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     let transcript_empty = app.messages.is_empty()
         && app.streaming_text.is_empty()
         && app.streaming_thinking.is_empty()
-        && app.tool_use_blocks.is_empty();
+        && app.tool_use_blocks.is_empty()
+        && app.display_messages.is_empty();
 
     if transcript_empty {
         app.last_msg_area.set(Rect::default());
@@ -1528,7 +1536,62 @@ fn build_all_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         }
     }
 
+    // Append display-only bang command output (never sent to the model).
+    let bang_lines = render_bang_display_lines(app);
+    if !bang_lines.is_empty() {
+        push_rendered_items(&mut items, bang_lines, None, false);
+    }
+
     items
+}
+
+/// Render display-only `!` bang command entries (command, output, error).
+/// These are appended at the end of the transcript and never sent to the model.
+fn render_bang_display_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut found = false;
+    for msg in &app.display_messages {
+        match msg {
+            DisplayMessage::BangCommand { command } => {
+                found = true;
+                if !lines.is_empty() {
+                    lines.push(Line::from(""));
+                }
+                lines.push(Line::styled(
+                    format!("$ {}", command),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            DisplayMessage::BangOutput { text, exit_code } => {
+                found = true;
+                let color = if exit_code.unwrap_or(0) != 0 {
+                    Color::Red
+                } else {
+                    Color::Gray
+                };
+                for line in text.lines() {
+                    lines.push(Line::styled(
+                        line.to_string(),
+                        Style::default().fg(color),
+                    ));
+                }
+            }
+            DisplayMessage::BangError { text } => {
+                found = true;
+                lines.push(Line::styled(
+                    text.clone(),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            _ => {}
+        }
+    }
+    if found {
+        lines.push(Line::from(""));
+    }
+    lines
 }
 
 fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
@@ -1917,6 +1980,7 @@ fn render_system_annotation_lines(
         SystemMessageStyle::Info => (Color::DarkGray, Color::DarkGray),
         SystemMessageStyle::Warning => (Color::Yellow, Color::Yellow),
         SystemMessageStyle::Compact => unreachable!(),
+        SystemMessageStyle::TodoCard => (Color::Cyan, Color::Cyan),
     };
 
     // Centred, padded rule: "â”€â”€â”€ text â”€â”€â”€"
@@ -2085,6 +2149,59 @@ fn render_tool_block_lines(lines: &mut Vec<Line<'static>>, block: &crate::app::T
     }
 }
 
+/// Extract the confidence score used by the TodoWrite checklist.
+fn todo_confidence(todo: &serde_json::Value) -> Option<u8> {
+    let value = if todo.get("status").and_then(|status| status.as_str()) == Some("completed") {
+        todo.get("completion_confidence")
+            .filter(|value| !value.is_null())
+            .or_else(|| todo.get("confidence"))
+    } else {
+        todo.get("confidence")
+    }?;
+
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_f64()
+            .filter(|score| score.is_finite() && score.fract() == 0.0)
+            .filter(|score| (0.0..=100.0).contains(score))
+            .map(|score| score as u8),
+        serde_json::Value::String(raw) => raw
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|score| score.is_finite() && score.fract() == 0.0)
+            .filter(|score| (0.0..=100.0).contains(score))
+            .map(|score| score as u8),
+        _ => None,
+    }
+}
+
+fn aggregate_todo_confidence(todos: &[serde_json::Value]) -> Option<u8> {
+    let mut weighted_sum = 0u32;
+    let mut total_weight = 0u32;
+    for todo in todos {
+        let Some(score) = todo_confidence(todo) else {
+            continue;
+        };
+        let weight = match todo.get("priority").and_then(|priority| priority.as_str()) {
+            Some("high") => 3,
+            Some("medium") => 2,
+            _ => 1,
+        };
+        weighted_sum += u32::from(score) * weight;
+        total_weight += weight;
+    }
+    (total_weight > 0).then_some(((weighted_sum + total_weight / 2) / total_weight) as u8)
+}
+
+fn confidence_color(score: u8) -> Color {
+    match score {
+        80..=100 => Color::Rgb(120, 200, 120),
+        50..=79 => Color::Rgb(220, 190, 100),
+        _ => Color::Rgb(220, 120, 100),
+    }
+}
+
 /// Render a TodoWrite call as a checklist. Returns `false` (so the caller can
 /// fall back to the generic block) when the input carries no `todos` array.
 fn render_todo_block(
@@ -2121,6 +2238,12 @@ fn render_todo_block(
             format!("  {}/{} done", done, total),
             Style::default().fg(Color::DarkGray),
         ));
+        if let Some(confidence) = aggregate_todo_confidence(todos) {
+            header.push(Span::styled(
+                format!(" · confidence {}%", confidence),
+                Style::default().fg(confidence_color(confidence)),
+            ));
+        }
     }
     lines.push(Line::from(header));
 
@@ -2154,9 +2277,19 @@ fn render_todo_block(
                 Style::default().fg(Color::Rgb(170, 170, 170)),
             ),
         };
+        let confidence = todo_confidence(t);
         lines.push(Line::from(vec![
             Span::styled(format!("     {} ", glyph), Style::default().fg(glyph_color)),
             Span::styled(content.to_string(), text_style),
+            Span::styled(
+                confidence
+                    .map(|score| format!(" [{}%]", score))
+                    .unwrap_or_default(),
+                confidence
+                    .map(confidence_color)
+                    .map(|color| Style::default().fg(color))
+                    .unwrap_or_default(),
+            ),
         ]));
     }
     if total > MAX_ITEMS {
@@ -2674,6 +2807,39 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             parts.push(Span::styled(
                 format!("Tokens: {}/{} ({}%)", used, max, pct),
                 Style::default().fg(color),
+            ));
+        }
+
+        // Tokens per second average (from last 5 turns).
+        if !app.recent_token_rates.is_empty() {
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+            let avg_tps = app.recent_token_rates.iter().sum::<f64>()
+                / app.recent_token_rates.len() as f64;
+            parts.push(Span::styled(
+                format!("{:.0} tok/s", avg_tps),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
+        // Todo progress (done/total).
+        let todos = claurst_tools::todo_write::load_todos(&app.session_id);
+        if !todos.is_empty() {
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+            let total = todos.len();
+            let completed = todos.iter()
+                .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("completed"))
+                .count();
+            parts.push(Span::styled(
+                format!("\u{2713}{}/{}", completed, total),
+                Style::default().fg(if completed == total {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                }),
             ));
         }
 
@@ -3481,9 +3647,9 @@ mod tool_block_tests {
             "TodoWrite",
             ToolStatus::Done,
             r#"{"todos":[
-                {"content":"Locate files","status":"completed"},
-                {"content":"Build importer","status":"in_progress"},
-                {"content":"Wire adapter","status":"pending"}
+                {"content":"Locate files","status":"completed","completion_confidence":90},
+                {"content":"Build importer","status":"in_progress","confidence":70},
+                {"content":"Wire adapter","status":"pending","confidence":50}
             ]}"#,
             Some("Todo list updated (3 total)"),
         );
@@ -3492,10 +3658,11 @@ mod tool_block_tests {
         // Header shows count, not the raw "Todo list updated (...)".
         assert!(joined.contains("Todos"), "{joined:?}");
         assert!(joined.contains("1/3 done"), "{joined:?}");
+        assert!(joined.contains("confidence 70%"), "{joined:?}");
         // Each status has its ASCII checkbox + content.
-        assert!(joined.contains("[x] Locate files"), "done marker: {joined:?}");
-        assert!(joined.contains("[>] Build importer"), "in-progress marker: {joined:?}");
-        assert!(joined.contains("[ ] Wire adapter"), "pending marker: {joined:?}");
+        assert!(joined.contains("[x] Locate files [90%]"), "done marker: {joined:?}");
+        assert!(joined.contains("[>] Build importer [70%]"), "in-progress marker: {joined:?}");
+        assert!(joined.contains("[ ] Wire adapter [50%]"), "pending marker: {joined:?}");
         // The raw result-preview string must NOT leak into the checklist view.
         assert!(!joined.contains("Todo list updated"), "preview suppressed: {joined:?}");
     }
