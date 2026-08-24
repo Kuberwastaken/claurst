@@ -70,10 +70,19 @@ pub fn parse_skill_file(content: &str, path: &Path) -> Option<DiscoveredSkill> {
     };
 
     let name = name.unwrap_or_else(|| {
-        path.file_stem()
+        let stem = path
+            .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("unnamed")
-            .to_string()
+            .unwrap_or("unnamed");
+        if stem.eq_ignore_ascii_case("skill") {
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+                .unwrap_or(stem)
+                .to_string()
+        } else {
+            stem.to_string()
+        }
     });
     let description = description.unwrap_or_else(|| "Custom skill".to_string());
 
@@ -93,11 +102,27 @@ pub fn parse_skill_file(content: &str, path: &Path) -> Option<DiscoveredSkill> {
 // Directory scanning
 // ---------------------------------------------------------------------------
 
-/// Scan a single directory for `*.md` skill files.
+/// Scan a single directory for skill files:
+/// - Flat `*.md` files directly in `dir`
+/// - Subdirectories containing `SKILL.md` or `skill.md` (e.g. `dir/<skill-name>/SKILL.md`)
+/// - `dir` itself if it directly contains `SKILL.md` or `skill.md`
 fn scan_dir(dir: &Path) -> Vec<DiscoveredSkill> {
     let mut skills = Vec::new();
     if !dir.is_dir() {
         return skills;
+    }
+
+    // If `dir` directly contains a SKILL.md/skill.md file, parse it as a single skill.
+    for skill_file in ["SKILL.md", "skill.md", "SKILL.MD", "Skill.md"] {
+        let candidate = dir.join(skill_file);
+        if candidate.is_file() {
+            if let Ok(content) = std::fs::read_to_string(&candidate) {
+                if let Some(skill) = parse_skill_file(&content, &candidate) {
+                    skills.push(skill);
+                    return skills;
+                }
+            }
+        }
     }
 
     let entries = match std::fs::read_dir(dir) {
@@ -110,15 +135,43 @@ fn scan_dir(dir: &Path) -> Vec<DiscoveredSkill> {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("md") {
-            match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    if let Some(skill) = parse_skill_file(&content, &path) {
-                        skills.push(skill);
+        let file_name = entry.file_name();
+        let file_name_str = file_name.to_string_lossy();
+
+        // Skip hidden files/directories (e.g. .git, .DS_Store).
+        if file_name_str.starts_with('.') {
+            continue;
+        }
+
+        if path.is_file() {
+            if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                match std::fs::read_to_string(&path) {
+                    Ok(content) => {
+                        if let Some(skill) = parse_skill_file(&content, &path) {
+                            skills.push(skill);
+                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!(path = %path.display(), error = %err, "skill_discovery: read failed");
                     }
                 }
-                Err(err) => {
-                    tracing::debug!(path = %path.display(), error = %err, "skill_discovery: read failed");
+            }
+        } else if path.is_dir() {
+            // Check subdirectories for SKILL.md / skill.md
+            for skill_file in ["SKILL.md", "skill.md", "SKILL.MD", "Skill.md"] {
+                let candidate = path.join(skill_file);
+                if candidate.is_file() {
+                    match std::fs::read_to_string(&candidate) {
+                        Ok(content) => {
+                            if let Some(skill) = parse_skill_file(&content, &candidate) {
+                                skills.push(skill);
+                            }
+                        }
+                        Err(err) => {
+                            tracing::debug!(path = %candidate.display(), error = %err, "skill_discovery: read failed");
+                        }
+                    }
+                    break;
                 }
             }
         }
@@ -127,11 +180,49 @@ fn scan_dir(dir: &Path) -> Vec<DiscoveredSkill> {
     skills
 }
 
+/// Resolve a configured path string, expanding `~` to the user's home directory.
+fn resolve_path(path_str: &str, cwd: &Path) -> PathBuf {
+    let trimmed = path_str.trim();
+    if trimmed == "~" {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+    } else if let Some(stripped) = trimmed.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            home.join(stripped)
+        } else {
+            PathBuf::from(trimmed)
+        }
+    } else if trimmed.starts_with('~') {
+        if let Some(home) = dirs::home_dir() {
+            if let Some(pos) = trimmed.find('/') {
+                home.join(&trimmed[pos + 1..])
+            } else {
+                home
+            }
+        } else {
+            PathBuf::from(trimmed)
+        }
+    } else {
+        let p = Path::new(trimmed);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cwd.join(p)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Top-level discovery
 // ---------------------------------------------------------------------------
 
 /// Discover all skills from all configured sources.
+///
+/// Search priority (first match wins for a given skill name):
+///   1. Project `.claurst/skills/` and `.agents/skills/` — walk up from `cwd`
+///   2. Global `~/.claurst/skills/`
+///   3. Global `~/.agents/skills/`
+///   4. Configured extra paths from `SkillsConfig.paths`
+///   5. Git-URL repos from `SkillsConfig.urls` (cloned once, then cached)
 ///
 /// Returns a `HashMap` of `skill_name → DiscoveredSkill` (first match wins;
 /// duplicates from lower-priority sources are warned via `tracing::warn`).
@@ -176,18 +267,18 @@ pub fn discover_skills(
         &crate::config::Settings::config_dir().join("skills"),
     ));
 
-    // ---- 3. Configured extra paths ------------------------------------------
+    // ---- 3. Global .agents skills: ~/.agents/skills/ -------------------------
+    if let Some(home) = dirs::home_dir() {
+        add(scan_dir(&home.join(".agents").join("skills")));
+    }
+
+    // ---- 4. Configured extra paths ------------------------------------------
     for path_str in &config_skills.paths {
-        let path = Path::new(path_str);
-        let path = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            cwd.join(path)
-        };
+        let path = resolve_path(path_str, cwd);
         add(scan_dir(&path));
     }
 
-    // ---- 4. Git URL skills (cached) -----------------------------------------
+    // ---- 5. Git URL skills (cached) -----------------------------------------
     for url in &config_skills.urls {
         if let Some(git_skills) = fetch_git_skills(url) {
             add(git_skills);
@@ -215,10 +306,7 @@ fn fetch_git_skills(url: &str) -> Option<Vec<DiscoveredSkill>> {
     let cache_dir = dirs::cache_dir()?.join("claurst").join("skills");
 
     // Use the last path segment of the URL as the local directory name.
-    let repo_name = url
-        .split('/')
-        .next_back()?
-        .trim_end_matches(".git");
+    let repo_name = url.split('/').next_back()?.trim_end_matches(".git");
 
     if repo_name.is_empty() {
         tracing::warn!(url, "skill_discovery: cannot derive repo name from git URL");
@@ -292,7 +380,8 @@ mod tests {
 
     #[test]
     fn test_parse_with_frontmatter() {
-        let content = "---\nname: review\ndescription: Review code changes\n---\n\nPlease review $ARGUMENTS";
+        let content =
+            "---\nname: review\ndescription: Review code changes\n---\n\nPlease review $ARGUMENTS";
         let path = PathBuf::from("review.md");
         let skill = parse_skill_file(content, &path).unwrap();
         assert_eq!(skill.name, "review");
@@ -338,7 +427,11 @@ mod tests {
     #[test]
     fn test_scan_dir_finds_skills() {
         let tmp = make_temp_dir();
-        write_file(tmp.path(), "review.md", "---\nname: review\n---\nReview $ARGUMENTS");
+        write_file(
+            tmp.path(),
+            "review.md",
+            "---\nname: review\n---\nReview $ARGUMENTS",
+        );
         write_file(tmp.path(), "debug.md", "Debug help.");
         write_file(tmp.path(), "not-md.txt", "ignored");
 
@@ -355,6 +448,87 @@ mod tests {
         assert!(skills.is_empty());
     }
 
+    #[test]
+    fn test_parse_skill_md_in_subdir_uses_parent_dir_name() {
+        let content = "Use clean code principles.";
+        let path = PathBuf::from("/home/user/.agents/skills/clean-code/SKILL.md");
+        let skill = parse_skill_file(content, &path).unwrap();
+        assert_eq!(skill.name, "clean-code");
+        assert_eq!(skill.description, "Custom skill");
+        assert_eq!(skill.template, "Use clean code principles.");
+    }
+
+    #[test]
+    fn test_scan_dir_finds_subdirectories_with_skill_md() {
+        let tmp = make_temp_dir();
+        // Flat file
+        write_file(
+            tmp.path(),
+            "flat.md",
+            "---\nname: flat\n---\nFlat template.",
+        );
+        // Subdirectory with SKILL.md
+        write_file(
+            tmp.path(),
+            "brainstorming/SKILL.md",
+            "---\ndescription: Brainstorm ideas\n---\nBrainstorm $ARGUMENTS",
+        );
+        // Subdirectory with lowercase skill.md
+        write_file(
+            tmp.path(),
+            "git-master/skill.md",
+            "---\nname: git-guru\ndescription: Git helpers\n---\nGit commands",
+        );
+        // Ignored non-skill dir
+        write_file(tmp.path(), "other_folder/readme.txt", "not a skill");
+
+        let skills = scan_dir(tmp.path());
+        assert_eq!(skills.len(), 3);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"flat"));
+        assert!(names.contains(&"brainstorming"));
+        assert!(names.contains(&"git-guru"));
+    }
+
+    #[test]
+    fn test_scan_dir_direct_skill_folder() {
+        let tmp = make_temp_dir();
+        let skill_dir = tmp.path().join("my-custom-skill");
+        write_file(
+            &skill_dir,
+            "SKILL.md",
+            "---\ndescription: Direct folder\n---\nDo work",
+        );
+
+        let skills = scan_dir(&skill_dir);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "my-custom-skill");
+        assert_eq!(skills[0].description, "Direct folder");
+    }
+
+    #[test]
+    fn test_resolve_path() {
+        let cwd = PathBuf::from("/workspace/project");
+        // Absolute path
+        assert_eq!(
+            resolve_path("/Users/test/.agents/skills", &cwd),
+            PathBuf::from("/Users/test/.agents/skills")
+        );
+        // Relative path
+        assert_eq!(
+            resolve_path("custom/skills", &cwd),
+            PathBuf::from("/workspace/project/custom/skills")
+        );
+        // Tilde path
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(
+                resolve_path("~/.agents/skills", &cwd),
+                home.join(".agents/skills")
+            );
+            assert_eq!(resolve_path("~", &cwd), home);
+        }
+    }
+
     // ---- discover_skills ----------------------------------------------------
 
     #[test]
@@ -362,7 +536,11 @@ mod tests {
         let tmp = make_temp_dir();
         let skills_dir = tmp.path().join(".claurst").join("skills");
         std::fs::create_dir_all(&skills_dir).unwrap();
-        write_file(&skills_dir, "myskill.md", "---\nname: myskill\ndescription: Test\n---\nDo it.");
+        write_file(
+            &skills_dir,
+            "myskill.md",
+            "---\nname: myskill\ndescription: Test\n---\nDo it.",
+        );
 
         let config = crate::config::SkillsConfig::default();
         let discovered = discover_skills(tmp.path(), &config);
@@ -371,10 +549,31 @@ mod tests {
     }
 
     #[test]
+    fn test_discover_from_project_agents_skills_subdir() {
+        let tmp = make_temp_dir();
+        let skills_dir = tmp.path().join(".agents").join("skills").join("sub-skill");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        write_file(
+            &skills_dir,
+            "SKILL.md",
+            "---\ndescription: Sub agent skill\n---\nSub agent prompt.",
+        );
+
+        let config = crate::config::SkillsConfig::default();
+        let discovered = discover_skills(tmp.path(), &config);
+        assert!(discovered.contains_key("sub-skill"));
+        assert_eq!(discovered["sub-skill"].description, "Sub agent skill");
+    }
+
+    #[test]
     fn test_discover_extra_paths() {
         let tmp = make_temp_dir();
         let extra = make_temp_dir();
-        write_file(extra.path(), "extra.md", "---\nname: extra\n---\nExtra skill.");
+        write_file(
+            extra.path(),
+            "extra.md",
+            "---\nname: extra\n---\nExtra skill.",
+        );
 
         let config = crate::config::SkillsConfig {
             paths: vec![extra.path().to_str().unwrap().to_string()],
@@ -389,10 +588,18 @@ mod tests {
         let tmp = make_temp_dir();
         let proj_skills = tmp.path().join(".claurst").join("skills");
         std::fs::create_dir_all(&proj_skills).unwrap();
-        write_file(&proj_skills, "dup.md", "---\nname: dup\ndescription: project\n---\nProject.");
+        write_file(
+            &proj_skills,
+            "dup.md",
+            "---\nname: dup\ndescription: project\n---\nProject.",
+        );
 
         let extra = make_temp_dir();
-        write_file(extra.path(), "dup.md", "---\nname: dup\ndescription: extra\n---\nExtra.");
+        write_file(
+            extra.path(),
+            "dup.md",
+            "---\nname: dup\ndescription: extra\n---\nExtra.",
+        );
 
         let config = crate::config::SkillsConfig {
             paths: vec![extra.path().to_str().unwrap().to_string()],
