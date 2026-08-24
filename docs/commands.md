@@ -1255,3 +1255,75 @@ Some commands are available only under certain account or platform conditions:
 ### Feature-Flagged Commands
 
 Some commands check `isEnabled()` at runtime. For example, voice-related commands check for audio device availability; the desktop command checks for a display server.
+
+## Bang Commands (`!`)
+
+Execute shell commands directly from the input prompt without going through
+the model. Zero token consumption. Output is display-only — the model never
+sees it.
+
+### Usage
+
+```
+! ls -la
+! git status
+! echo "hello"
+```
+
+Type `!` followed by a shell command. The command runs via `bash -c` in the
+project working directory and the result is shown inline in the transcript.
+
+### Configuration (`settings.json`)
+
+```json
+"bangCommands": {
+  "enabled": true,
+  "addToHistory": true,
+  "showInTranscript": true
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `enabled` | `false` (opt-in) | Toggle the feature |
+| `addToHistory` | `false` | Store `!` commands in a separate shell-command history |
+| `showInTranscript` | `true` | Display command + output in the chat transcript |
+
+### Notes
+
+- Output is display-only — the model never sees it (zero token consumption).
+- Blocked in plan mode (read-only restriction).
+- Uses `bash -c` for execution (not the PTY-based Bash tool).
+- `!!` (double bang) is NOT treated as a bang command.
+- A single `!` with no command is ignored.
+
+## `/yolo` — Toggle YOLO Mode
+
+Toggle YOLO mode, which skips all permission prompts and auto-approves every
+tool call. When enabled, the effective permission mode is set to
+`bypassPermissions`. The setting persists in `settings.json` under
+`"yoloMode"` and is restored on the next session.
+
+```
+/yolo          — toggle YOLO mode on/off
+```
+
+YOLO mode propagates to sub-agents: they inherit the parent's permission mode
+via the cloned tool context. You can also enable YOLO for a single session via
+the CLI flag `--dangerously-skip-permissions` (alias `--yolo`).
+
+## `/poke` — Toggle Auto-Poke
+
+Toggle or configure the auto-poke feature, which automatically sends a
+continuation prompt when the model stops with incomplete todos.
+
+```
+/poke          — toggle auto-poke on/off
+/poke on       — enable auto-poke
+/poke off      — disable auto-poke
+/poke status   — show current status, budget, and incomplete todo count
+```
+
+Auto-poke has a safety budget of 48 pokes per session and stops after 3
+consecutive no-progress turns. The setting persists in `settings.json` under
+`"autoPokeEnabled"` (default: `true`).

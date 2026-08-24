@@ -547,6 +547,10 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         config.permission_mode = PermissionMode::BypassPermissions;
+    } else if settings.config.yolo_mode {
+        // Persistent YOLO mode from settings.json — same effect as the CLI
+        // flag but without the root/sudo guard (settings are user-controlled).
+        config.permission_mode = PermissionMode::BypassPermissions;
     } else {
         config.permission_mode = cli.permission_mode.into();
     }

@@ -80,6 +80,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("new", "Start a fresh session (keeps model, provider & directory)"),
     ("output-style", "Show or switch the output style / persona"),
     ("plugin", "Manage plugins (list/info/enable/disable/reload)"),
+    ("poke", "Toggle or configure auto-poke (on/off/status)"),
     ("providers", "List available AI providers and their status"),
     ("caveman", "Caveman persona output style — save big token"),
     ("rocky", "Rocky persona output style — amaze amaze amaze"),
@@ -101,6 +102,7 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("upgrade", "Check for updates and upgrade to the latest version"),
     ("vim", "Toggle vim keybindings"),
     ("voice", "Toggle voice input mode"),
+    ("yolo", "Toggle YOLO mode (skip all permission prompts)"),
 ];
 
 fn help_command_category(name: &str) -> &'static str {
@@ -2175,6 +2177,95 @@ impl App {
     pub fn intercept_slash_command_with_args(&mut self, cmd: &str, args: &str) -> bool {
         if cmd == "mcp" && !args.trim().is_empty() {
             return false;
+        }
+        if cmd == "poke" {
+            let sub = args.trim();
+            let mut s = claurst_core::Settings::load_sync().unwrap_or_default();
+            match sub {
+                "on" | "enable" => {
+                    s.auto_poke_enabled = true;
+                    let _ = s.save_sync();
+                    self.status_message = Some("Auto-poke enabled.".to_string());
+                }
+                "off" | "disable" => {
+                    s.auto_poke_enabled = false;
+                    let _ = s.save_sync();
+                    self.status_message = Some("Auto-poke disabled.".to_string());
+                }
+                "status" => {
+                    let budget_left = claurst_tools::todo_write::MAX_AUTO_POKES
+                        .saturating_sub(self.auto_poke_count);
+                    let incomplete =
+                        claurst_tools::todo_write::count_incomplete_todos(&self.session_id);
+                    self.status_message = Some(format!(
+                        "Auto-poke: {} | Pokes: {}/{} | Budget left: {} | Incomplete: {}",
+                        if s.auto_poke_enabled { "ON" } else { "OFF" },
+                        self.auto_poke_count,
+                        claurst_tools::todo_write::MAX_AUTO_POKES,
+                        budget_left,
+                        incomplete,
+                    ));
+                }
+                "" => {
+                    // Toggle
+                    s.auto_poke_enabled = !s.auto_poke_enabled;
+                    let _ = s.save_sync();
+                    self.status_message = Some(format!(
+                        "Auto-poke {}.",
+                        if s.auto_poke_enabled { "enabled" } else { "disabled" }
+                    ));
+                }
+                _ => {
+                    self.status_message =
+                        Some("Usage: /poke [on|off|status] (no arg toggles).".to_string());
+                }
+            }
+            return true;
+        }
+        if cmd == "yolo" {
+            let mut s = claurst_core::Settings::load_sync().unwrap_or_default();
+            let sub = args.trim();
+            match sub {
+                "on" | "enable" => {
+                    s.config.yolo_mode = true;
+                    let _ = s.save_sync();
+                    self.config.permission_mode =
+                        claurst_core::config::PermissionMode::BypassPermissions;
+                    self.status_message =
+                        Some("YOLO mode enabled. All tool calls auto-approved.".to_string());
+                }
+                "off" | "disable" => {
+                    s.config.yolo_mode = false;
+                    let _ = s.save_sync();
+                    self.config.permission_mode =
+                        claurst_core::config::PermissionMode::Default;
+                    self.status_message = Some("YOLO mode disabled.".to_string());
+                }
+                "status" => {
+                    self.status_message = Some(format!(
+                        "YOLO mode: {}",
+                        if s.config.yolo_mode { "ON" } else { "OFF" },
+                    ));
+                }
+                "" => {
+                    s.config.yolo_mode = !s.config.yolo_mode;
+                    let _ = s.save_sync();
+                    self.config.permission_mode = if s.config.yolo_mode {
+                        claurst_core::config::PermissionMode::BypassPermissions
+                    } else {
+                        claurst_core::config::PermissionMode::Default
+                    };
+                    self.status_message = Some(format!(
+                        "YOLO mode {}.",
+                        if s.config.yolo_mode { "enabled" } else { "disabled" }
+                    ));
+                }
+                _ => {
+                    self.status_message =
+                        Some("Usage: /yolo [on|off|status] (no arg toggles).".to_string());
+                }
+            }
+            return true;
         }
         self.intercept_slash_command(cmd)
     }
@@ -5629,7 +5720,7 @@ impl App {
                 self.history_search_overlay.select_next();
                 false
             }
-            // ========== NEW KEYBINDING ACTIONS (Phase 1) ==========
+            // === NEW KEYBINDING ACTIONS (Phase 1) ==========
             "clearLine" => {
                 // Ctrl+L: Clear the current input line (like bash Ctrl+L)
                 if !self.is_streaming {
@@ -7356,7 +7447,7 @@ impl App {
         }
     }
 
-    // ========== NEW KEYBINDING HELPER FUNCTIONS (Phase 1) ==========
+    // === NEW KEYBINDING HELPER FUNCTIONS (Phase 1) ==========
 
     /// Jump to the next error/issue in messages.
     /// Searches for common error indicators: "Error:", "ERROR:", "error", "failed", "FAIL".
@@ -8410,6 +8501,7 @@ mod tests {
         assert!(app.should_exit);
     }
 
+
     #[test]
     fn kb_select_mode_starts_and_cancels() {
         let mut app = make_app();
@@ -8422,5 +8514,39 @@ mod tests {
         assert!(!app.kb_select_mode);
         assert!(app.selection_anchor.is_none());
         assert!(app.selection_focus.is_none());
+    }
+
+    #[test]
+    fn yolo_command_toggles_permission_mode() {
+        let mut app = make_app();
+        // Default permission mode.
+        assert_eq!(
+            app.config.permission_mode,
+            claurst_core::config::PermissionMode::Default
+        );
+        // /yolo on sets bypass mode.
+        assert!(app.intercept_slash_command_with_args("yolo", "on"));
+        assert_eq!(
+            app.config.permission_mode,
+            claurst_core::config::PermissionMode::BypassPermissions
+        );
+        assert!(app.status_message.as_deref().unwrap().contains("enabled"));
+        // /yolo off resets to default.
+        assert!(app.intercept_slash_command_with_args("yolo", "off"));
+        assert_eq!(
+            app.config.permission_mode,
+            claurst_core::config::PermissionMode::Default
+        );
+        assert!(app.status_message.as_deref().unwrap().contains("disabled"));
+        // /yolo on again.
+        assert!(app.intercept_slash_command_with_args("yolo", "on"));
+        assert_eq!(
+            app.config.permission_mode,
+            claurst_core::config::PermissionMode::BypassPermissions
+        );
+        assert!(app.status_message.as_deref().unwrap().contains("enabled"));
+        // /yolo status shows current state.
+        assert!(app.intercept_slash_command_with_args("yolo", "status"));
+        assert!(app.status_message.as_deref().unwrap().contains("ON"));
     }
 }

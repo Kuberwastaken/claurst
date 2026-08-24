@@ -1223,6 +1223,15 @@ pub mod config {
         /// Keyboard scrolling (PageUp/PageDown, etc.) is unaffected either way.
         #[serde(default, rename = "mouseCapture", skip_serializing_if = "Option::is_none")]
         pub mouse_capture: Option<bool>,
+        /// YOLO mode: skip all permission prompts and auto-approve every tool
+        /// call. Persisted in `settings.json` under `"yoloMode"`. When enabled,
+        /// the effective permission mode is
+        /// [`PermissionMode::BypassPermissions`]. The CLI `--yolo` /
+        /// `--dangerously-skip-permissions` flag overrides this for a single
+        /// session. Sub-agents inherit the parent's permission mode via the
+        /// cloned [`ToolContext`], so YOLO mode propagates to them.
+        #[serde(default, rename = "yoloMode")]
+        pub yolo_mode: bool,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -2150,6 +2159,7 @@ pub mod config {
                 file_injection_enabled: over.config.file_injection_enabled || base.config.file_injection_enabled,
                 file_injection_max_size: if over.config.file_injection_max_size != 0 { over.config.file_injection_max_size } else { base.config.file_injection_max_size },
                 request_timeout_secs: over.config.request_timeout_secs.or(base.config.request_timeout_secs),
+                yolo_mode: over.config.yolo_mode || base.config.yolo_mode,
             };
             Self {
                 config: merged_config,
