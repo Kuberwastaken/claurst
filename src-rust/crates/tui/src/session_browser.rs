@@ -35,6 +35,8 @@ pub struct SessionEntry {
     pub message_count: usize,
     /// Estimated USD cost for the session.
     pub cost_usd: f64,
+    /// Working directory where the session was started, if known.
+    pub working_dir: Option<String>,
 }
 
 /// State for the session browser overlay.
@@ -45,6 +47,10 @@ pub struct SessionBrowserState {
     pub mode: SessionBrowserMode,
     /// Input buffer used while in `Rename` mode.
     pub rename_input: String,
+    /// When true, each session row also shows its working-directory path.
+    pub show_all: bool,
+    /// When true, a preview panel with the selected session's details is shown.
+    pub show_preview: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -60,6 +66,8 @@ impl SessionBrowserState {
             sessions: Vec::new(),
             mode: SessionBrowserMode::Browse,
             rename_input: String::new(),
+            show_all: false,
+            show_preview: false,
         }
     }
 
@@ -77,6 +85,8 @@ impl SessionBrowserState {
         self.visible = false;
         self.mode = SessionBrowserMode::Browse;
         self.rename_input.clear();
+        self.show_all = false;
+        self.show_preview = false;
     }
 
     /// Move selection up one row, wrapping to the end.
@@ -99,6 +109,16 @@ impl SessionBrowserState {
             return;
         }
         self.selected_idx = (self.selected_idx + 1) % count;
+    }
+
+    /// Toggle the show-all-paths display.
+    pub fn toggle_show_all(&mut self) {
+        self.show_all = !self.show_all;
+    }
+
+    /// Toggle the preview panel.
+    pub fn toggle_show_preview(&mut self) {
+        self.show_preview = !self.show_preview;
     }
 
     /// Return a reference to the currently selected session, if any.
@@ -205,8 +225,10 @@ fn truncate_display(s: &str, max_width: usize) -> String {
 
 /// Render the session browser overlay directly into `buf`.
 ///
-/// Draws a centred modal (≈70 wide × ≈20 tall) with:
-/// - A scrollable list of sessions (id, title, date, messages, cost)
+/// Draws a centred modal with:
+/// - A scrollable list of sessions (title, date, messages, cost)
+/// - Optional path display per session when `show_all` is on
+/// - An optional preview panel with the selected session's details
 /// - Selection highlight on the focused row
 /// - Mode-sensitive hint bar at the bottom
 /// - A rename input field shown when in `Rename` mode
@@ -215,12 +237,14 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
         return;
     }
 
+    // Grow the modal vertically when the preview panel is visible so the list
+    // and the preview both fit without truncation.
+    let modal_h: u16 = if state.show_preview { 28 } else { 20 };
     const MODAL_W: u16 = 70;
-    const MODAL_H: u16 = 20;
 
     let dialog_area = centered_rect(
         MODAL_W.min(area.width.saturating_sub(2)),
-        MODAL_H.min(area.height.saturating_sub(2)),
+        modal_h.min(area.height.saturating_sub(2)),
         area,
     );
 
@@ -253,17 +277,22 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
         let title_w = inner_w.saturating_sub(fixed).max(10);
 
         // Header row
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {:<title_w$}  {:<date_w$}  {:>msgs_w$}  {:>cost_w$}",
-                    "Title", "Last Updated", "Msgs", "Cost",
-                    title_w = title_w, date_w = date_w,
-                    msgs_w = msgs_w, cost_w = cost_w),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::UNDERLINED),
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                "  {:<title_w$}  {:<date_w$}  {:>msgs_w$}  {:>cost_w$}",
+                "Title",
+                "Last Updated",
+                "Msgs",
+                "Cost",
+                title_w = title_w,
+                date_w = date_w,
+                msgs_w = msgs_w,
+                cost_w = cost_w
             ),
-        ]));
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::UNDERLINED),
+        )]));
         lines.push(Line::from(""));
 
         for (i, session) in state.sessions.iter().enumerate() {
@@ -300,42 +329,171 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
 
             lines.push(Line::from(vec![
                 Span::styled("  ", prefix_style),
-                Span::styled(format!("{:<title_w$}", title_cell, title_w = title_w), title_style),
+                Span::styled(
+                    format!("{:<title_w$}", title_cell, title_w = title_w),
+                    title_style,
+                ),
                 Span::styled("  ", meta_style),
-                Span::styled(format!("{:<date_w$}", date_cell, date_w = date_w), meta_style),
+                Span::styled(
+                    format!("{:<date_w$}", date_cell, date_w = date_w),
+                    meta_style,
+                ),
                 Span::styled("  ", meta_style),
                 Span::styled(msgs_cell, meta_style),
                 Span::styled("  ", meta_style),
                 Span::styled(cost_cell, meta_style),
             ]));
+
+            // When show_all is on, render the working-dir path as a second
+            // indented line under each session row.
+            if state.show_all {
+                let path_text = session.working_dir.as_deref().unwrap_or("(no path)");
+                let path_w = inner_w.saturating_sub(4).max(10);
+                let path_cell = truncate_display(path_text, path_w);
+                let path_style = if is_selected {
+                    Style::default().fg(Color::Rgb(140, 160, 180)).bg(row_bg)
+                } else {
+                    Style::default().fg(Color::Rgb(80, 80, 80))
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("    ", prefix_style),
+                    Span::styled(path_cell, path_style),
+                ]));
+            }
         }
     }
 
     lines.push(Line::from(""));
 
+    // --- Preview panel ----------------------------------------------------
+    if state.show_preview {
+        if let Some(session) = state.selected_session() {
+            let label_style = Style::default().fg(Color::DarkGray);
+            let value_style = Style::default().fg(Color::White);
+
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  Preview ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "\u{2500}".repeat(inner_w.saturating_sub(10)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+
+            let preview_w = inner_w.saturating_sub(12).max(10);
+
+            let title_str = truncate_display(&session.title, preview_w);
+            lines.push(Line::from(vec![
+                Span::styled("  ID       ", label_style),
+                Span::styled(&session.id, value_style),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  Title    ", label_style),
+                Span::styled(title_str, value_style),
+            ]));
+            let path_str = session.working_dir.as_deref().unwrap_or("(no path)");
+            let path_disp = truncate_display(path_str, preview_w);
+            lines.push(Line::from(vec![
+                Span::styled("  Path     ", label_style),
+                Span::styled(path_disp, value_style),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("  Updated  ", label_style),
+                Span::styled(&session.last_updated, value_style),
+                Span::styled("    ", label_style),
+                Span::styled("Msgs ", label_style),
+                Span::styled(format!("{}", session.message_count), value_style),
+                Span::styled("    ", label_style),
+                Span::styled("Cost ", label_style),
+                Span::styled(fmt_cost(session.cost_usd), value_style),
+            ]));
+            lines.push(Line::from(""));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  Preview ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "\u{2500}".repeat(inner_w.saturating_sub(10)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "  (no session selected)",
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(""));
+        }
+    }
+
     // --- Mode-sensitive bottom section -----------------------------------
     match &state.mode {
         SessionBrowserMode::Browse => {
+            let all_indicator = if state.show_all { "on" } else { "off" };
+            let preview_indicator = if state.show_preview { "on" } else { "off" };
             lines.push(Line::from(vec![
                 Span::styled("  ", Style::default()),
                 Span::styled(
                     "\u{2191}\u{2193}",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(" navigate  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "Enter",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=resume  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "r",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=rename  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
+                    "a",
+                    Style::default()
+                        .fg(if state.show_all {
+                            Color::Green
+                        } else {
+                            Color::Cyan
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("=paths:{}  ", all_indicator),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    "p",
+                    Style::default()
+                        .fg(if state.show_preview {
+                            Color::Green
+                        } else {
+                            Color::Cyan
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("=preview:{}  ", preview_indicator),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
                     "Esc",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=close", Style::default().fg(Color::DarkGray)),
             ]));
@@ -346,7 +504,12 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
             let cursor = "\u{2588}"; // block cursor
             let input_display = format!("{}{}", state.rename_input, cursor);
             lines.push(Line::from(vec![
-                Span::styled(label, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    label,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(
                     input_display,
                     Style::default()
@@ -358,12 +521,16 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
                 Span::styled("  ", Style::default()),
                 Span::styled(
                     "Enter",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=confirm  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "Esc",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=cancel", Style::default().fg(Color::DarkGray)),
             ]));
@@ -378,7 +545,9 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
                 ),
                 Span::styled(
                     "Enter",
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=yes  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
@@ -421,6 +590,7 @@ mod tests {
                 last_updated: "2 hours ago".to_string(),
                 message_count: 34,
                 cost_usd: 0.0124,
+                working_dir: Some("/home/user/project".to_string()),
             },
             SessionEntry {
                 id: "sess-002".to_string(),
@@ -428,6 +598,7 @@ mod tests {
                 last_updated: "yesterday".to_string(),
                 message_count: 12,
                 cost_usd: 0.0045,
+                working_dir: Some("/home/user/project".to_string()),
             },
             SessionEntry {
                 id: "sess-003".to_string(),
@@ -435,6 +606,7 @@ mod tests {
                 last_updated: "3 days ago".to_string(),
                 message_count: 57,
                 cost_usd: 0.0289,
+                working_dir: None,
             },
         ]
     }
@@ -525,7 +697,10 @@ mod tests {
         s.start_rename();
         s.rename_input = "  New Title  ".to_string(); // intentional whitespace
         let result = s.confirm_rename();
-        assert_eq!(result, Some(("sess-001".to_string(), "New Title".to_string())));
+        assert_eq!(
+            result,
+            Some(("sess-001".to_string(), "New Title".to_string()))
+        );
         assert_eq!(s.mode, SessionBrowserMode::Browse);
         assert!(s.rename_input.is_empty());
         // Also check local title was updated
@@ -551,7 +726,10 @@ mod tests {
         s.start_rename();
         s.cancel();
         assert_eq!(s.mode, SessionBrowserMode::Browse);
-        assert!(s.visible, "overlay should remain visible after cancel-from-rename");
+        assert!(
+            s.visible,
+            "overlay should remain visible after cancel-from-rename"
+        );
     }
 
     // 11. cancel() in Browse mode closes the overlay.
@@ -582,7 +760,11 @@ mod tests {
         let mut buf = Buffer::empty(area);
         render_session_browser(&s, area, &mut buf);
         for cell in buf.content() {
-            assert_eq!(cell.symbol(), " ", "buffer should be empty when browser is hidden");
+            assert_eq!(
+                cell.symbol(),
+                " ",
+                "buffer should be empty when browser is hidden"
+            );
         }
     }
 
@@ -599,7 +781,58 @@ mod tests {
     fn truncate_display_trims() {
         let long = "abcdefghij"; // 10 chars
         let result = truncate_display(long, 5);
-        assert!(result.width() <= 6, "truncated string should fit within budget");
+        assert!(
+            result.width() <= 6,
+            "truncated string should fit within budget"
+        );
         assert!(result.ends_with('…'));
+    }
+
+    // 16. toggle_show_all flips the flag.
+    #[test]
+    fn toggle_show_all_flips() {
+        let mut s = SessionBrowserState::new();
+        assert!(!s.show_all);
+        s.toggle_show_all();
+        assert!(s.show_all);
+        s.toggle_show_all();
+        assert!(!s.show_all);
+    }
+
+    // 17. toggle_show_preview flips the flag.
+    #[test]
+    fn toggle_show_preview_flips() {
+        let mut s = SessionBrowserState::new();
+        assert!(!s.show_preview);
+        s.toggle_show_preview();
+        assert!(s.show_preview);
+        s.toggle_show_preview();
+        assert!(!s.show_preview);
+    }
+
+    // 18. close() resets toggles to false.
+    #[test]
+    fn close_resets_toggles() {
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        s.toggle_show_all();
+        s.toggle_show_preview();
+        assert!(s.show_all);
+        assert!(s.show_preview);
+        s.close();
+        assert!(!s.show_all);
+        assert!(!s.show_preview);
+    }
+
+    // 19. render with show_all and show_preview does not panic.
+    #[test]
+    fn render_with_toggles_does_not_panic() {
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        s.toggle_show_all();
+        s.toggle_show_preview();
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(area);
+        render_session_browser(&s, area, &mut buf);
     }
 }

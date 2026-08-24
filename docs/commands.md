@@ -1255,3 +1255,28 @@ Some commands are available only under certain account or platform conditions:
 ### Feature-Flagged Commands
 
 Some commands check `isEnabled()` at runtime. For example, voice-related commands check for audio device availability; the desktop command checks for a display server.
+
+## Keyboard Text Selection and Copy
+
+Use keyboard shortcuts to select text in the transcript and copy it to the
+clipboard. This works alongside the existing mouse-based click-drag selection.
+
+- **Arrow keys / hjkl**: Move the selection cursor in the transcript
+- **Shift+Arrow / Shift+hjkl**: Extend the selection
+- **Enter** or **`y`**: Yank (copy) the selected text to the system clipboard
+- **Esc**: Cancel the selection
+
+When mouse capture is enabled (default), click-drag selection also works.
+Set `"mouseCapture": false` in settings to release the mouse to the terminal
+for native selection instead.
+
+## Session Browser Improvements
+
+The session browser (`/session`) has been enhanced with:
+
+- **Show-all paths**: Toggle to reveal sessions from all projects, not just
+  the current one
+- **Preview toggles**: Quick toggle to show/hide session previews inline
+
+Use `/session` to open the browser, then follow the on-screen key hints to
+toggle these options.

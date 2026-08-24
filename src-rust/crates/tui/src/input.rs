@@ -11,6 +11,7 @@ pub fn is_bang_command(input: &str) -> bool {
     input.starts_with('!') && !input.starts_with("!!") && input.len() > 1
 }
 
+
 /// Parse a slash command into `(command_name, args)`.
 /// Returns `("", "")` if the input is not a slash command.
 pub fn parse_slash_command(input: &str) -> (&str, &str) {
