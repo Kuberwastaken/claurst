@@ -1,7 +1,7 @@
 // ConfigTool: get or set Claurst configuration settings at runtime.
 //
 // Reads from and persists to ~/.claurst/settings.json.
-// Supported settings: model, max_tokens, verbose, permission_mode.
+// Supported settings: model, provider, effort, max_tokens, verbose, permission_mode.
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
@@ -16,8 +16,23 @@ struct ConfigInput {
     value: Option<Value>,
 }
 
+// Provider ids this build actually knows how to construct a client for.
+// Mirrors the match arms in claurst_api::registry (create_provider_by_id /
+// build_provider) and claurst_core::config::Config::effective_model's
+// per-provider default-model table — kept as the primary id only (not every
+// alias accepted by those matches, e.g. "lm-studio"/"llama-cpp"). Update this
+// list alongside those when a new provider is added.
+static KNOWN_PROVIDER_IDS: &[&str] = &[
+    "anthropic", "openai", "google", "groq", "cerebras", "deepseek", "mistral",
+    "xai", "openrouter", "togetherai", "perplexity", "cohere", "qwen", "deepinfra",
+    "github-copilot", "ollama", "lmstudio", "llamacpp", "custom-openai", "azure",
+    "amazon-bedrock", "venice", "minimax", "codex", "free",
+];
+
 static SUPPORTED_SETTINGS: &[(&str, &str)] = &[
     ("model", "LLM model to use (e.g. 'claude-opus-4-6')"),
+    ("provider", "Active provider id — one of the ids this build supports (use setting='provider' with a bad value to see the full list)"),
+    ("effort", "Reasoning effort: none | minimal | low | medium | high | xhigh | max | ultracode"),
     ("max_tokens", "Maximum output tokens per response"),
     ("verbose", "Enable verbose logging (true/false)"),
     ("permission_mode", "Permission mode: default | accept_edits | bypass_permissions | plan"),
@@ -30,8 +45,8 @@ impl Tool for ConfigTool {
 
     fn description(&self) -> &str {
         "Get or set Claurst configuration settings. Omit 'value' to read the current value. \
-         Supported settings: model, max_tokens, verbose, permission_mode, auto_compact. \
-         Changes persist to ~/.claurst/settings.json."
+         Supported settings: model, provider, effort, max_tokens, verbose, permission_mode, \
+         auto_compact. Changes persist to ~/.claurst/settings.json."
     }
 
     fn permission_level(&self) -> PermissionLevel { PermissionLevel::Write }
@@ -91,6 +106,41 @@ impl Tool for ConfigTool {
                         return ToolResult::error(format!("Failed to save settings: {}", e));
                     }
                     ToolResult::success(format!("model = \"{}\"", s))
+                }
+                "provider" => {
+                    let s = match new_value.as_str() {
+                        Some(s) => s.to_string(),
+                        None => return ToolResult::error("'provider' must be a string".to_string()),
+                    };
+                    if !KNOWN_PROVIDER_IDS.contains(&s.as_str()) {
+                        return ToolResult::error(format!(
+                            "Unknown provider '{}'. Use one of: {}",
+                            s,
+                            KNOWN_PROVIDER_IDS.join(" | ")
+                        ));
+                    }
+                    settings.config.provider = Some(s.clone());
+                    if let Err(e) = settings.save().await {
+                        return ToolResult::error(format!("Failed to save settings: {}", e));
+                    }
+                    ToolResult::success(format!("provider = \"{}\"", s))
+                }
+                "effort" => {
+                    let s = match new_value.as_str() {
+                        Some(s) => s,
+                        None => return ToolResult::error("'effort' must be a string".to_string()),
+                    };
+                    if claurst_core::effort::EffortLevel::from_str(s).is_none() {
+                        return ToolResult::error(format!(
+                            "Unknown effort level '{}'. Use: none | minimal | low | medium | high | xhigh | max | ultracode",
+                            s
+                        ));
+                    }
+                    settings.config.effort = Some(s.to_string());
+                    if let Err(e) = settings.save().await {
+                        return ToolResult::error(format!("Failed to save settings: {}", e));
+                    }
+                    ToolResult::success(format!("effort = \"{}\"", s))
                 }
                 "max_tokens" => {
                     let n = match new_value.as_u64() {
@@ -163,6 +213,18 @@ impl Tool for ConfigTool {
                     "model = \"{}\"",
                     settings.config.effective_model()
                 )),
+                "provider" => ToolResult::success(format!(
+                    "provider = \"{}\"",
+                    settings.config.selected_provider_id()
+                )),
+                "effort" => match settings.config.effective_effort_level() {
+                    Some(level) => ToolResult::success(format!("effort = \"{}\"", level.as_str())),
+                    None => ToolResult::success(
+                        "effort = unset (no thinking-budget/temperature override applied; \
+                         model/provider defaults are used, not equivalent to any specific level)"
+                            .to_string(),
+                    ),
+                },
                 "max_tokens" => ToolResult::success(format!(
                     "max_tokens = {}",
                     settings.config.effective_max_tokens()
