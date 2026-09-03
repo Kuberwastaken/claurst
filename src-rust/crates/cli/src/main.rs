@@ -1874,6 +1874,13 @@ async fn run_interactive(
     // Set up terminal
     let mut terminal = setup_terminal(live_config.mouse_capture_enabled())?;
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
+    // Status-bar indicator tracks *connected* servers, not the configured
+    // list (a server that fails to handshake is configured but not connected).
+    app.mcp_server_count = tool_ctx
+        .mcp_manager
+        .as_ref()
+        .map(|manager| manager.server_count())
+        .unwrap_or(0);
     if let Some(error) = settings_load_error {
         app.invalid_config_dialog =
             claurst_tui::InvalidConfigDialogState::show_settings_error(&error);
@@ -4194,6 +4201,11 @@ async fn run_interactive(
             let new_mcp_manager = connect_mcp_manager_arc(&decision.allowed).await;
             tool_ctx.mcp_manager = new_mcp_manager.clone();
             app.mcp_manager = new_mcp_manager.clone();
+            // Keep the status-bar indicator in sync with the live count.
+            app.mcp_server_count = new_mcp_manager
+                .as_ref()
+                .map(|manager| manager.server_count())
+                .unwrap_or(0);
             tools_arc = build_tools_with_mcp(new_mcp_manager.clone());
             if app.mcp_view.visible {
                 app.refresh_mcp_view();

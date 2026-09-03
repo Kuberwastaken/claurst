@@ -246,6 +246,19 @@ pub struct App {
     pub remote_session_url: Option<String>,
     /// Live MCP manager snapshot source when available.
     pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
+    /// Number of connected MCP servers for the status-bar indicator. Updated
+    /// by the caller (CLI) at startup and on every MCP reconnect so it tracks
+    /// `McpManager::server_count()`, not just the configured list.
+    pub mcp_server_count: usize,
+    /// Number of discovered skills for the status-bar indicator. Populated
+    /// once in the background from the skill loader (discovery can shell out
+    /// to `git clone`, so it must not run inside `App::new`).
+    pub skill_count: usize,
+    /// When `true`, the main event loop should spawn a one-shot background
+    /// task to discover skills and report the count.
+    pub skill_count_pending: bool,
+    /// Receiver for the background skill-count discovery.
+    pub skill_count_rx: Option<tokio::sync::mpsc::Receiver<usize>>,
     /// Queued request for a real MCP reconnect from the interactive loop.
     pub pending_mcp_reconnect: bool,
     /// Set after an in-session provider connection (e.g. a Claude Pro/Max OAuth
@@ -647,6 +660,12 @@ impl App {
             session_title: None,
             remote_session_url: None,
             mcp_manager: None,
+            mcp_server_count: 0,
+            skill_count: 0,
+            // Discover skills once, lazily, on the first run-loop iteration
+            // (never inside the constructor — see the field docs).
+            skill_count_pending: true,
+            skill_count_rx: None,
             pending_mcp_reconnect: false,
             pending_provider_reload: false,
             pending_mcp_panel_auth: None,

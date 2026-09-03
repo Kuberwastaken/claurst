@@ -393,6 +393,39 @@ impl App {
                 });
             }
 
+            // Drain the one-shot skill-count discovery into the status-bar
+            // indicator. Discovery runs on a background task because it can
+            // shell out to `git clone` for `skills.urls` entries.
+            if let Some(ref mut rx) = self.skill_count_rx {
+                match rx.try_recv() {
+                    Ok(count) => {
+                        self.skill_count = count;
+                        self.skill_count_rx = None;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        self.skill_count_rx = None;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                }
+            }
+
+            // Spawn the one-shot skill discovery when requested (startup).
+            if self.skill_count_pending {
+                self.skill_count_pending = false;
+                let root = self.project_root();
+                let skills_config = self.config.skills.clone();
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                self.skill_count_rx = Some(rx);
+                tokio::spawn(async move {
+                    let count = tokio::task::spawn_blocking(move || {
+                        claurst_core::discover_skills(&root, &skills_config).len()
+                    })
+                    .await
+                    .unwrap_or(0);
+                    let _ = tx.send(count).await;
+                });
+            }
+
             // Drain voice transcription events (non-blocking).
             // When the background recording/transcription task emits a
             // TranscriptReady event we insert the text directly into the
