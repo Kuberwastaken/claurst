@@ -35,6 +35,10 @@ pub struct SessionEntry {
     pub message_count: usize,
     /// Estimated USD cost for the session.
     pub cost_usd: f64,
+    /// Working directory recorded for the session, shown when path display
+    /// is toggled on (`a`). `None` for sessions saved before the field
+    /// existed.
+    pub working_dir: Option<String>,
 }
 
 /// State for the session browser overlay.
@@ -45,6 +49,12 @@ pub struct SessionBrowserState {
     pub mode: SessionBrowserMode,
     /// Input buffer used while in `Rename` mode.
     pub rename_input: String,
+    /// Whether each session's working-directory path is shown in the list
+    /// (toggled with `a`). Off by default to keep rows compact.
+    pub show_paths: bool,
+    /// Whether a preview of the selected session is shown below the list
+    /// (toggled with `p`). On by default.
+    pub show_preview: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -60,6 +70,8 @@ impl SessionBrowserState {
             sessions: Vec::new(),
             mode: SessionBrowserMode::Browse,
             rename_input: String::new(),
+            show_paths: false,
+            show_preview: true,
         }
     }
 
@@ -99,6 +111,16 @@ impl SessionBrowserState {
             return;
         }
         self.selected_idx = (self.selected_idx + 1) % count;
+    }
+
+    /// Toggle whether each session's working-directory path is shown.
+    pub fn toggle_show_paths(&mut self) {
+        self.show_paths = !self.show_paths;
+    }
+
+    /// Toggle whether the selected session's preview is shown.
+    pub fn toggle_show_preview(&mut self) {
+        self.show_preview = !self.show_preview;
     }
 
     /// Return a reference to the currently selected session, if any.
@@ -205,18 +227,18 @@ fn truncate_display(s: &str, max_width: usize) -> String {
 
 /// Render the session browser overlay directly into `buf`.
 ///
-/// Draws a centred modal (≈70 wide × ≈20 tall) with:
-/// - A scrollable list of sessions (id, title, date, messages, cost)
-/// - Selection highlight on the focused row
-/// - Mode-sensitive hint bar at the bottom
-/// - A rename input field shown when in `Rename` mode
+/// Layout is fixed so every region stays reachable regardless of session
+/// count: list (windowed around the selection), preview panel (when enabled),
+/// and a mode-sensitive hint bar at the bottom. Windowing keeps the selection
+/// visible past ~14 sessions instead of letting the list push the preview and
+/// hints off the modal.
 pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut Buffer) {
     if !state.visible {
         return;
     }
 
     const MODAL_W: u16 = 70;
-    const MODAL_H: u16 = 20;
+    const MODAL_H: u16 = 24;
 
     let dialog_area = centered_rect(
         MODAL_W.min(area.width.saturating_sub(2)),
@@ -233,19 +255,42 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
         }
     }
 
-    let inner_w = dialog_area.width.saturating_sub(2) as usize;
-    let mut lines: Vec<Line> = Vec::new();
+    // --- Layout: list area, preview area, hint area ------------------------
+    // Borders consume 2 rows; the hint bar gets 2 lines (hint + spacer).
+    let inner = Rect {
+        x: dialog_area.x + 1,
+        y: dialog_area.y + 1,
+        width: dialog_area.width.saturating_sub(2),
+        height: dialog_area.height.saturating_sub(2),
+    };
+    let hint_h: u16 = 2;
+    let preview_h: u16 = if state.show_preview { 6 } else { 0 };
+    let list_h = inner.height.saturating_sub(hint_h + preview_h);
+    let list_area = Rect { height: list_h, ..inner };
+    let preview_area = Rect {
+        y: inner.y + list_h,
+        height: preview_h,
+        ..inner
+    };
+    let hint_area = Rect {
+        y: inner.y + list_h + preview_h,
+        height: hint_h,
+        ..inner
+    };
 
-    // --- Session list -----------------------------------------------------
+    let inner_w = inner.width as usize;
+
+    // --- Session list (windowed around the selection) -----------------------
+    let mut list_lines: Vec<Line> = Vec::new();
     if state.sessions.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::styled(
+        list_lines.push(Line::from(""));
+        list_lines.push(Line::from(vec![Span::styled(
             "  No sessions found.",
             Style::default().fg(Color::DarkGray),
         )]));
     } else {
         // Column widths (approximate):
-        //   title: ~40 chars  |  date: ~14 chars  |  msgs: 5  |  cost: 9
+        //   title: flexible  |  date: ~14 chars  |  msgs: 5  |  cost: 9
         let date_w: usize = 14;
         let msgs_w: usize = 5;
         let cost_w: usize = 9;
@@ -253,20 +298,31 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
         let title_w = inner_w.saturating_sub(fixed).max(10);
 
         // Header row
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {:<title_w$}  {:<date_w$}  {:>msgs_w$}  {:>cost_w$}",
-                    "Title", "Last Updated", "Msgs", "Cost",
-                    title_w = title_w, date_w = date_w,
-                    msgs_w = msgs_w, cost_w = cost_w),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::UNDERLINED),
+        list_lines.push(Line::from(vec![Span::styled(
+            format!(
+                "  {:<title_w$}  {:<date_w$}  {:>msgs_w$}  {:>cost_w$}",
+                "Title",
+                "Last Updated",
+                "Msgs",
+                "Cost",
+                title_w = title_w,
+                date_w = date_w,
+                msgs_w = msgs_w,
+                cost_w = cost_w
             ),
-        ]));
-        lines.push(Line::from(""));
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::UNDERLINED),
+        )]));
+        list_lines.push(Line::from(""));
 
-        for (i, session) in state.sessions.iter().enumerate() {
+        // Visible-row window: show at most list_h-2 rows (header + blank),
+        // keeping the selection inside the window.
+        let list_rows = list_h.saturating_sub(2) as usize;
+        let (window_start, window_end) = list_window(state.selected_idx, state.sessions.len(), list_rows);
+
+        for i in window_start..window_end {
+            let session = &state.sessions[i];
             let is_selected = i == state.selected_idx;
 
             let title_cell = truncate_display(&session.title, title_w);
@@ -298,25 +354,91 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
 
             let prefix_style = Style::default().bg(row_bg);
 
-            lines.push(Line::from(vec![
+            list_lines.push(Line::from(vec![
                 Span::styled("  ", prefix_style),
-                Span::styled(format!("{:<title_w$}", title_cell, title_w = title_w), title_style),
+                Span::styled(
+                    format!("{:<title_w$}", title_cell, title_w = title_w),
+                    title_style,
+                ),
                 Span::styled("  ", meta_style),
-                Span::styled(format!("{:<date_w$}", date_cell, date_w = date_w), meta_style),
+                Span::styled(
+                    format!("{:<date_w$}", date_cell, date_w = date_w),
+                    meta_style,
+                ),
                 Span::styled("  ", meta_style),
                 Span::styled(msgs_cell, meta_style),
                 Span::styled("  ", meta_style),
                 Span::styled(cost_cell, meta_style),
             ]));
+
+            // Optional working-directory row under each entry (toggle: `a`).
+            if state.show_paths {
+                let path_display = session
+                    .working_dir
+                    .as_deref()
+                    .unwrap_or("(no working dir)");
+                let path_cell = truncate_display(path_display, inner_w.saturating_sub(4));
+                let path_style = if is_selected {
+                    Style::default()
+                        .fg(Color::Rgb(140, 160, 180))
+                        .bg(row_bg)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                list_lines.push(Line::from(vec![
+                    Span::styled("      ", prefix_style),
+                    Span::styled(path_cell, path_style),
+                ]));
+            }
         }
     }
 
-    lines.push(Line::from(""));
+    // --- Preview panel (toggle: `p`) ---------------------------------------
+    let mut preview_lines: Vec<Line> = Vec::new();
+    if state.show_preview {
+        preview_lines.push(Line::from(vec![Span::styled(
+            " Preview",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        match state.selected_session() {
+            Some(session) => {
+                preview_lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(&session.title, Style::default().fg(Color::White)),
+                ]));
+                preview_lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        format!(
+                            "{} messages · {} · {}",
+                            session.message_count,
+                            session.last_updated,
+                            fmt_cost(session.cost_usd)
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+                if let Some(dir) = session.working_dir.as_deref() {
+                    preview_lines.push(Line::from(vec![
+                        Span::styled("  ", Style::default()),
+                        Span::styled(dir, Style::default().fg(Color::DarkGray)),
+                    ]));
+                }
+            }
+            None => preview_lines.push(Line::from(vec![Span::styled(
+                "  (no session selected)",
+                Style::default().fg(Color::DarkGray),
+            )])),
+        }
+    }
 
-    // --- Mode-sensitive bottom section -----------------------------------
-    match &state.mode {
-        SessionBrowserMode::Browse => {
-            lines.push(Line::from(vec![
+    // --- Mode-sensitive hint bar -------------------------------------------
+    let hint_lines: Vec<Line> = match &state.mode {
+        SessionBrowserMode::Browse => vec![
+            Line::from(""),
+            Line::from(vec![
                 Span::styled("  ", Style::default()),
                 Span::styled(
                     "\u{2191}\u{2193}",
@@ -334,27 +456,36 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
                 ),
                 Span::styled("=rename  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
+                    "a",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("=paths  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "p",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("=preview  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
                     "Esc",
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=close", Style::default().fg(Color::DarkGray)),
-            ]));
-        }
-        SessionBrowserMode::Rename => {
-            // Show rename input field.
-            let label = "  Rename: ";
-            let cursor = "\u{2588}"; // block cursor
-            let input_display = format!("{}{}", state.rename_input, cursor);
-            lines.push(Line::from(vec![
-                Span::styled(label, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            ]),
+        ],
+        SessionBrowserMode::Rename => vec![
+            Line::from(vec![
                 Span::styled(
-                    input_display,
+                    "  Rename: ",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{}\u{2588}", state.rename_input),
                     Style::default()
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
                 ),
-            ]));
-            lines.push(Line::from(vec![
+            ]),
+            Line::from(vec![
                 Span::styled("  ", Style::default()),
                 Span::styled(
                     "Enter",
@@ -366,10 +497,10 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=cancel", Style::default().fg(Color::DarkGray)),
-            ]));
-        }
-        SessionBrowserMode::Confirm => {
-            lines.push(Line::from(vec![
+            ]),
+        ],
+        SessionBrowserMode::Confirm => vec![
+            Line::from(vec![
                 Span::styled(
                     "  Confirm? ",
                     Style::default()
@@ -378,7 +509,9 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
                 ),
                 Span::styled(
                     "Enter",
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=yes  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
@@ -386,9 +519,10 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=no", Style::default().fg(Color::DarkGray)),
-            ]));
-        }
-    }
+            ]),
+            Line::from(""),
+        ],
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -396,13 +530,46 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
         .title_alignment(Alignment::Center)
         .border_style(Style::default().fg(Color::Cyan));
 
-    let para = Paragraph::new(lines)
-        .block(block)
-        .alignment(Alignment::Left)
-        .wrap(Wrap { trim: false });
-
     use ratatui::widgets::Widget;
-    para.render(dialog_area, buf);
+    let inner_block = Block::default().borders(Borders::ALL);
+    let _ = inner_block; // layout already accounts for the outer borders
+
+    Paragraph::new(list_lines)
+        .block(block.clone())
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: false })
+        .render(list_area, buf);
+
+    if state.show_preview {
+        Paragraph::new(preview_lines)
+            .block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            )
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: false })
+            .render(preview_area, buf);
+    }
+
+    Paragraph::new(hint_lines)
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: false })
+        .render(hint_area, buf);
+}
+
+/// Compute the `[start, end)` window of rows to render so the selection stays
+/// visible. Scrolls the window only when the selection would leave it.
+fn list_window(selected: usize, total: usize, rows: usize) -> (usize, usize) {
+    if total == 0 || rows == 0 {
+        return (0, 0);
+    }
+    let rows = rows.min(total);
+    if selected < rows {
+        return (0, rows);
+    }
+    let start = (selected + 1).saturating_sub(rows);
+    (start, start + rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -421,6 +588,7 @@ mod tests {
                 last_updated: "2 hours ago".to_string(),
                 message_count: 34,
                 cost_usd: 0.0124,
+                working_dir: Some("/home/user/project-a".to_string()),
             },
             SessionEntry {
                 id: "sess-002".to_string(),
@@ -428,6 +596,7 @@ mod tests {
                 last_updated: "yesterday".to_string(),
                 message_count: 12,
                 cost_usd: 0.0045,
+                working_dir: Some("/home/user/project-b".to_string()),
             },
             SessionEntry {
                 id: "sess-003".to_string(),
@@ -435,6 +604,7 @@ mod tests {
                 last_updated: "3 days ago".to_string(),
                 message_count: 57,
                 cost_usd: 0.0289,
+                working_dir: None,
             },
         ]
     }
@@ -595,6 +765,75 @@ mod tests {
     }
 
     // 15. truncate_display trims long strings.
+    // Toggle defaults: paths off, preview on.
+    #[test]
+    fn toggle_defaults() {
+        let s = SessionBrowserState::new();
+        assert!(!s.show_paths);
+        assert!(s.show_preview);
+    }
+
+    // Toggling flips the flags.
+    #[test]
+    fn toggles_flip_flags() {
+        let mut s = SessionBrowserState::new();
+        s.toggle_show_paths();
+        assert!(s.show_paths);
+        s.toggle_show_preview();
+        assert!(!s.show_preview);
+    }
+
+    // Windowing: selection visible even far down a long list.
+    #[test]
+    fn list_window_keeps_selection_visible() {
+        // Early selection: window starts at 0.
+        assert_eq!(list_window(2, 50, 10), (0, 10));
+        // Selection past the first page: window scrolls to keep it.
+        assert_eq!(list_window(15, 50, 10), (6, 16));
+        // Selection at the end.
+        assert_eq!(list_window(49, 50, 10), (40, 50));
+        // Degenerate inputs.
+        assert_eq!(list_window(0, 0, 10), (0, 0));
+        assert_eq!(list_window(0, 5, 0), (0, 0));
+        // Rows larger than total: everything fits.
+        assert_eq!(list_window(3, 5, 10), (0, 5));
+    }
+
+    // Rendering with paths and preview shown must not panic.
+    #[test]
+    fn render_with_paths_and_preview_does_not_panic() {
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        s.toggle_show_paths();
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        render_session_browser(&s, area, &mut buf);
+    }
+
+    // Rendering a long list keeps the selection row on screen.
+    #[test]
+    fn render_long_list_does_not_panic() {
+        let mut s = SessionBrowserState::new();
+        let sessions: Vec<SessionEntry> = (0..40)
+            .map(|i| SessionEntry {
+                id: format!("sess-{:03}", i),
+                title: format!("Session number {}", i),
+                last_updated: "1h ago".to_string(),
+                message_count: i,
+                cost_usd: 0.001 * (i as f64),
+                working_dir: Some(format!("/home/user/proj-{}", i % 3)),
+            })
+            .collect();
+        s.open(sessions);
+        // Walk the selection through the whole list.
+        for _ in 0..40 {
+            s.select_next();
+            let area = Rect::new(0, 0, 80, 24);
+            let mut buf = Buffer::empty(area);
+            render_session_browser(&s, area, &mut buf);
+        }
+    }
+
     #[test]
     fn truncate_display_trims() {
         let long = "abcdefghij"; // 10 chars

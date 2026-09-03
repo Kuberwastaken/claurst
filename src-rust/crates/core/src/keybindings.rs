@@ -27,6 +27,7 @@ pub enum KeyContext {
     ModelPicker,
     Select,
     Plugin,
+    SessionBrowser,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -337,6 +338,17 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("space", "toggle", KeyContext::Attachments),
         ("a", "addAttachment", KeyContext::Attachments),
         ("r", "removeAttachment", KeyContext::Attachments),
+
+        // ========== SESSION BROWSER ==========
+        ("up", "prevSession", KeyContext::SessionBrowser),
+        ("down", "nextSession", KeyContext::SessionBrowser),
+        ("pageup", "prevSessionPage", KeyContext::SessionBrowser),
+        ("pagedown", "nextSessionPage", KeyContext::SessionBrowser),
+        ("enter", "resumeSession", KeyContext::SessionBrowser),
+        ("escape", "closeSessionBrowser", KeyContext::SessionBrowser),
+        ("r", "renameSession", KeyContext::SessionBrowser),
+        ("a", "toggleSessionPaths", KeyContext::SessionBrowser),
+        ("p", "toggleSessionPreview", KeyContext::SessionBrowser),
     ];
 
     defaults

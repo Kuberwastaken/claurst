@@ -9,6 +9,7 @@ use super::keys::{
     normalize_layout_shortcut_key,
 };
 use super::types::{ContextMenuItem, ContextMenuState};
+use crate::session_browser::SessionBrowserMode;
 
     
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
@@ -463,6 +464,51 @@ use super::types::{ContextMenuItem, ContextMenuState};
         }
         assert_eq!(app.prompt_input.text, "line1\nline2");
         assert!(app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn test_session_browser_toggles_route_through_keybindings() {
+        let mut app = make_app();
+        app.session_browser.open(vec![]);
+        assert!(app.session_browser.visible);
+
+        // 'a' toggles paths (KeyContext::SessionBrowser action).
+        assert!(!app.session_browser.show_paths);
+        app.handle_key_event(press_key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(app.session_browser.show_paths);
+
+        // 'p' toggles preview.
+        assert!(app.session_browser.show_preview);
+        app.handle_key_event(press_key(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert!(!app.session_browser.show_preview);
+
+        // Esc closes via the resolver.
+        app.handle_key_event(press_key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.session_browser.visible);
+    }
+
+    #[test]
+    fn test_session_browser_rename_still_inline() {
+        let mut app = make_app();
+        let entries = vec![crate::session_browser::SessionEntry {
+            id: "s1".to_string(),
+            title: "hello".to_string(),
+            last_updated: "now".to_string(),
+            message_count: 1,
+            cost_usd: 0.0,
+            working_dir: None,
+        }];
+        app.session_browser.open(entries);
+        // 'r' enters rename mode via the resolver action.
+        app.handle_key_event(press_key(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(app.session_browser.mode, SessionBrowserMode::Rename);
+        // Typing goes to the rename buffer (inline handling).
+        app.handle_key_event(press_key(KeyCode::Char('!'), KeyModifiers::NONE));
+        assert_eq!(app.session_browser.rename_input, "hello!");
+        // Esc cancels rename back to Browse; the browser stays open.
+        app.handle_key_event(press_key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.session_browser.mode, SessionBrowserMode::Browse);
+        assert!(app.session_browser.visible);
     }
 
     #[test]
