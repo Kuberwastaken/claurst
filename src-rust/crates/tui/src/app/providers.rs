@@ -286,12 +286,113 @@ impl App {
                 .to_string()
         };
 
+        self.model_picker
+            .load_favorites(self.config.favorite_models.clone());
         self.model_picker.open_with_title(
             title.unwrap_or_else(|| "Select model".to_string()),
             &current_model,
             self.effort_level,
             self.fast_mode,
         );
+    }
+
+    /// Check if a provider is connected: it has a resolvable API key, it is
+    /// a keyless local provider, or it is a configured custom provider with
+    /// a non-empty apiBase (internal gateways may not need auth).
+    pub(super) fn is_provider_connected(&self, provider_id: &str) -> bool {
+        match provider_id {
+            "ollama" | "lmstudio" | "lm-studio"
+            | "llamacpp" | "llama-cpp" | "llama-server" | "free" => true,
+            _ => {
+                if self.config.resolve_provider_api_key(provider_id).is_some() {
+                    return true;
+                }
+                if let Some(def) = self.config.custom_providers.get(provider_id) {
+                    return !def.api_base.trim().is_empty();
+                }
+                false
+            }
+        }
+    }
+
+    /// Open the model picker showing models from all connected providers,
+    /// grouped by provider name. Unconfigured providers are hidden by
+    /// default; press `a` in the picker to show them.
+    pub(super) fn open_model_picker_all_providers(&mut self) {
+        self.dismiss_error_notifications();
+
+        // Get ALL provider IDs from the registry (for the full model list).
+        let mut provider_ids: Vec<String> = self
+            .provider_registry
+            .as_ref()
+            .map(|registry| {
+                registry
+                    .provider_ids()
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Custom providers are not in the provider registry's connected map
+        // until first use — include them from the config.
+        for pid in self.config.custom_providers.keys() {
+            if !provider_ids.contains(pid) {
+                provider_ids.push(pid.clone());
+            }
+        }
+        // Also include the current provider if not already listed.
+        if let Some(current) = &self.config.provider {
+            if !provider_ids.contains(current) {
+                provider_ids.push(current.clone());
+            }
+        }
+
+        // Determine which providers are connected.
+        let connected_ids: std::collections::HashSet<String> = provider_ids
+            .iter()
+            .filter(|pid| self.is_provider_connected(pid))
+            .cloned()
+            .collect();
+        self.model_picker.connected_provider_ids = connected_ids;
+
+        // Collect models from ALL providers (filtering happens at display time).
+        let mut all_models: Vec<crate::model_picker::ModelEntry> = Vec::new();
+        let mut provider_names = std::collections::HashMap::new();
+        for pid in &provider_ids {
+            // Look up the provider display name from the model registry.
+            if let Some(entry) = self
+                .model_registry
+                .list_providers()
+                .iter()
+                .find(|p| &*p.id == pid)
+            {
+                provider_names.insert(pid.clone(), entry.name.clone());
+            }
+            // Custom providers: use the user-configured display name.
+            if let Some(def) = self.config.custom_providers.get(pid) {
+                provider_names.insert(pid.clone(), def.name.clone());
+            }
+            let models = crate::model_picker::models_for_provider_from_registry(
+                pid,
+                &self.model_registry,
+            );
+            for mut m in models {
+                m.provider_id = pid.clone();
+                all_models.push(m);
+            }
+        }
+
+        self.model_picker.provider_names = provider_names;
+        self.model_picker.set_models(all_models);
+        self.model_picker_provider_id = None; // all-providers mode
+        self.model_picker.all_providers_mode = true;
+        self.model_picker.loading_models = false;
+        self.model_picker_fetch_pending = false;
+        self.model_picker.load_favorites(self.config.favorite_models.clone());
+
+        self.model_picker
+            .open_all_providers(&self.model_name, self.effort_level, self.fast_mode);
     }
 
     pub(super) fn activate_provider(&mut self, provider_id: String, provider_name: String, status_prefix: &str) {
@@ -415,8 +516,10 @@ impl App {
         self.config = config;
         self.provider_registry = provider_registry;
         self.model_registry = claurst_api::ModelRegistry::new();
-        // Re-layer user metadata overrides (issue #309) onto the fresh registry.
+        // Re-layer user metadata overrides (issue #309) and custom provider
+        // model catalogs onto the fresh registry.
         self.model_registry.apply_model_overrides(&self.config.model_overrides);
+        self.model_registry.apply_custom_providers(&self.config.custom_providers);
         self.auth_store = auth_store;
         self.connect_dialog = DialogSelectState::new("Connect a provider", provider_picker_items());
         self.import_config_picker = DialogSelectState::new("Import config", import_config_picker_items());

@@ -736,47 +736,31 @@ impl App {
             return false;
         }
 
-        // Model picker intercepts navigation and Esc
+        // Model picker: configurable bindings (ModelPicker context) with a
+        // filter-editing fallback for unbound keys.
         if self.model_picker.visible {
-            match key.code {
-                KeyCode::Esc => self.model_picker.close(),
-                KeyCode::Home => self.model_picker.select_first(),
-                KeyCode::End => self.model_picker.select_last(),
-                KeyCode::Up => self.model_picker.select_prev(),
-                KeyCode::Down => self.model_picker.select_next(),
-                KeyCode::Left => self.model_picker.effort_prev(),
-                KeyCode::Right => self.model_picker.effort_next(),
-                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => self.model_picker.select_prev(),
-                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => self.model_picker.select_next(),
-                KeyCode::Enter => {
-                    if let Some((model_id, effort)) = self.model_picker.confirm() {
-                        // If user picked a model other than the fast-mode model
-                        // while fast mode was active, turn fast mode off.
-                        if self.fast_mode && !self.model_picker.is_selected_fast_mode_model(&model_id) {
-                            self.fast_mode = false;
-                        }
-                        if let Some(e) = effort {
-                            self.effort_level = e;
-                        }
-                        // Store explicit selections in the canonical
-                        // "provider/model" form for non-Anthropic providers.
-                        // The "free" composite's picker entries already carry
-                        // a routing prefix (`free/…`, `zen/…`, `openrouter/…`)
-                        // so re-prefixing would produce nonsense like
-                        // `free/free/auto`.
-                        let provider = self.config.provider.as_deref().unwrap_or("anthropic");
-                        let full_model = if provider == "anthropic" || provider == "free" {
-                            model_id.clone()
-                        } else {
-                            format!("{}/{}", provider, model_id)
-                        };
-                        self.set_model(full_model.clone());
-                        self.persist_provider_and_model();
-                        let effort_hint = effort.map(|e| format!(" [{}]", e.label())).unwrap_or_default();
-                        self.status_message = Some(format!("Model: {}{}", full_model, effort_hint));
+            if let Some(keystroke) = key_event_to_keystroke(&key) {
+                match self.keybindings.process(keystroke, &KeyContext::ModelPicker) {
+                    KeybindingResult::Action(action) => {
+                        self.handle_model_picker_action(&action);
+                        return false;
+                    }
+                    KeybindingResult::Pending => return false,
+                    KeybindingResult::NoMatch | KeybindingResult::Unbound => {
+                        // Fall through to filter editing below.
                     }
                 }
+            } else {
+                self.keybindings.cancel_chord();
+            }
+            match key.code {
                 KeyCode::Backspace => self.model_picker.pop_filter_char(),
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.model_picker.select_prev()
+                }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.model_picker.select_next()
+                }
                 KeyCode::Char(c) => self.model_picker.push_filter_char(c),
                 _ => {}
             }
@@ -1702,6 +1686,135 @@ impl App {
         false
     }
 
+    /// Execute a ModelPicker-context keybinding action. Mirrors the
+    /// hardcoded dialog handlers but consults the configurable binding map,
+    /// so users can remap picker keys via settings.json.
+    pub(super) fn handle_model_picker_action(&mut self, action: &str) {
+        match action {
+            "prevModel" => self.model_picker.select_prev(),
+            "nextModel" => self.model_picker.select_next(),
+            "pageUp" => {
+                for _ in 0..10 {
+                    self.model_picker.select_prev();
+                }
+            }
+            "pageDown" => {
+                for _ in 0..10 {
+                    self.model_picker.select_next();
+                }
+            }
+            "firstModel" => self.model_picker.select_first(),
+            "lastModel" => self.model_picker.select_last(),
+            "effortDown" => self.model_picker.effort_prev(),
+            "effortUp" => self.model_picker.effort_next(),
+            "nextProvider" => self.model_picker.select_next_provider(),
+            "prevProvider" => self.model_picker.select_prev_provider(),
+            "toggleShowAllProviders" => {
+                if self.model_picker.all_providers_mode {
+                    self.model_picker.toggle_show_all_providers();
+                }
+            }
+            "cancelModelPicker" => self.model_picker.close(),
+            "toggleFavorite" => {
+                let grouped = self.model_picker.filtered_models_grouped();
+                if let Some((m, _)) = grouped.get(self.model_picker.selected_idx) {
+                    // In all-providers mode the entry carries its own
+                    // provider; otherwise use the active config provider.
+                    let provider = if m.provider_id.is_empty() {
+                        self.config
+                            .provider
+                            .as_deref()
+                            .unwrap_or("anthropic")
+                            .to_string()
+                    } else {
+                        m.provider_id.clone()
+                    };
+                    let model_key = if provider == "anthropic" || provider == "free" {
+                        m.id.clone()
+                    } else {
+                        format!("{}/{}", provider, m.id)
+                    };
+                    self.model_picker.toggle_favorite(&model_key);
+                }
+            }
+            "selectModel" => {
+                // Capture all-providers mode AND the selected entry's
+                // provider_id BEFORE confirm() — confirm() calls close()
+                // which resets all_providers_mode and clears the filter,
+                // changing the grouped list and invalidating selected_idx.
+                let was_all_providers = self.model_picker.all_providers_mode;
+                let selected_provider_id = if was_all_providers {
+                    self.model_picker
+                        .filtered_models_grouped()
+                        .get(self.model_picker.selected_idx)
+                        .map(|(m, _)| m.provider_id.clone())
+                } else {
+                    None
+                };
+                if let Some((model_id, effort)) = self.model_picker.confirm() {
+                    // Default sentinel — clear the explicit model override
+                    // so the provider's best model is auto-selected.
+                    if model_id == crate::model_picker::DEFAULT_MODEL_SENTINEL {
+                        self.config.model = None;
+                        let provider = self.config.provider.as_deref().unwrap_or("anthropic");
+                        let best = self.display_default_model_for_provider(provider);
+                        self.model_name = best.clone();
+                        self.cost_tracker.set_model(&best);
+                        self.refresh_context_window_size();
+                        self.context_used_tokens = 0;
+                        self.persist_provider_and_model();
+                        self.status_message = Some(format!("Model: {} (default)", best));
+                        return;
+                    }
+                    // If user picked a model other than the fast-mode model
+                    // while fast mode was active, turn fast mode off.
+                    if self.fast_mode
+                        && !self.model_picker.is_selected_fast_mode_model(&model_id)
+                    {
+                        self.fast_mode = false;
+                    }
+                    if let Some(e) = effort {
+                        self.effort_level = e;
+                    }
+                    // Store explicit selections in the canonical
+                    // "provider/model" form for non-Anthropic providers.
+                    // The "free" composite's picker entries already carry
+                    // a routing prefix (`free/…`, `zen/…`, `openrouter/…`)
+                    // so re-prefixing would produce nonsense like
+                    // `free/free/auto`.
+                    //
+                    // In all-providers mode the provider comes from the
+                    // selected entry's provider_id, not config.provider.
+                    let full_model = if was_all_providers {
+                        if let Some(provider) = selected_provider_id {
+                            if provider == "anthropic" || provider == "free" {
+                                model_id.clone()
+                            } else {
+                                format!("{}/{}", provider, model_id)
+                            }
+                        } else {
+                            model_id.clone()
+                        }
+                    } else {
+                        let provider = self.config.provider.as_deref().unwrap_or("anthropic");
+                        if provider == "anthropic" || provider == "free" {
+                            model_id.clone()
+                        } else {
+                            format!("{}/{}", provider, model_id)
+                        }
+                    };
+                    self.set_model(full_model.clone());
+                    self.persist_provider_and_model();
+                    let effort_hint = effort
+                        .map(|e| format!(" [{}]", e.label()))
+                        .unwrap_or_default();
+                    self.status_message = Some(format!("Model: {}{}", full_model, effort_hint));
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub(super) fn current_key_context(&self) -> KeyContext {
         if self.diff_viewer.visible {
             KeyContext::DiffDialog
@@ -2338,7 +2451,14 @@ impl App {
             }
             "openModelPicker" => {
                 if !self.is_streaming {
-                    self.intercept_slash_command("model");
+                    // When custom providers are configured, open the picker in
+                    // all-providers mode (grouped by provider, with favorites).
+                    // Otherwise fall back to the current provider's picker.
+                    if !self.config.custom_providers.is_empty() {
+                        self.open_model_picker_all_providers();
+                    } else {
+                        self.intercept_slash_command("model");
+                    }
                 }
                 false
             }

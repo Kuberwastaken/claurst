@@ -776,6 +776,10 @@ pub struct ModelRegistry {
     /// after every catalog merge so they stay authoritative across cache reloads
     /// and network refreshes (issue #309).
     overrides: HashMap<String, claurst_core::config::ModelOverride>,
+    /// User-defined custom providers (`customProviders` in settings.json),
+    /// keyed by provider id. Re-registered after every catalog merge so
+    /// custom models survive cache reloads and network refreshes.
+    custom_providers: HashMap<String, claurst_core::config::CustomProviderDef>,
 }
 
 impl ModelRegistry {
@@ -787,6 +791,7 @@ impl ModelRegistry {
             cache_path: None,
             refresh_interval: Duration::from_secs(5 * 60),
             overrides: HashMap::new(),
+            custom_providers: HashMap::new(),
         };
         registry.load_bundled_snapshot();
         registry
@@ -1115,8 +1120,10 @@ impl ModelRegistry {
                 if let Some(parsed) = parse_snapshot_str(&text) {
                     self.merge_entries(parsed.models);
                     self.providers.extend(parsed.providers);
-                    // Re-assert user overrides over the freshly fetched catalog.
+                    // Re-assert user overrides and custom providers over
+                    // the freshly fetched catalog.
                     self.reapply_overrides();
+                    register_custom_providers(&mut self.entries, &mut self.providers, &std::collections::HashMap::new(), &self.custom_providers);
                     if let Some(ref path) = self.cache_path.clone() {
                         // Write the raw response so future loads can re-parse
                         // it identically.  Best-effort; ignore I/O errors.
@@ -1161,8 +1168,10 @@ impl ModelRegistry {
             if !parsed.models.is_empty() {
                 self.merge_entries(parsed.models);
                 self.providers.extend(parsed.providers);
-                // Re-assert user overrides over the freshly merged catalog.
+                // Re-assert user overrides and custom providers over the
+                // freshly merged catalog.
                 self.reapply_overrides();
+                register_custom_providers(&mut self.entries, &mut self.providers, &std::collections::HashMap::new(), &self.custom_providers);
                 return;
             }
         }
@@ -1171,6 +1180,7 @@ impl ModelRegistry {
         if let Ok(entries) = serde_json::from_str::<HashMap<String, ModelEntry>>(&data) {
             self.merge_entries(entries);
             self.reapply_overrides();
+            register_custom_providers(&mut self.entries, &mut self.providers, &std::collections::HashMap::new(), &self.custom_providers);
         }
     }
 
@@ -1234,6 +1244,19 @@ impl ModelRegistry {
         apply_overrides_to_entries(&mut self.entries, &self.overrides);
     }
 
+    /// Register user-defined custom providers and their models into the
+    /// registry. Each model is keyed as `<provider_id>/<model_id>` and a
+    /// synthetic `ModelEntry` is created from the `CustomModelDef` metadata.
+    /// The definitions are retained and re-registered after every catalog
+    /// merge (cache reload, network refresh) so custom models survive.
+    pub fn apply_custom_providers(
+        &mut self,
+        custom_providers: &HashMap<String, claurst_core::config::CustomProviderDef>,
+    ) {
+        let old = std::mem::replace(&mut self.custom_providers, custom_providers.clone());
+        register_custom_providers(&mut self.entries, &mut self.providers, &old, &self.custom_providers);
+    }
+
     /// Re-apply the retained overrides after a catalog merge, so a cache reload
     /// or refresh never wipes out user-corrected metadata. No-op when no
     /// overrides are registered.
@@ -1242,6 +1265,102 @@ impl ModelRegistry {
             return;
         }
         apply_overrides_to_entries(&mut self.entries, &self.overrides);
+    }
+}
+
+/// Register user-defined custom providers and their models into the registry
+/// maps. Each model is keyed as `<provider_id>/<model_id>` and a synthetic
+/// `ModelEntry` is created from the `CustomModelDef` metadata. A
+/// `ProviderEntry` is also created per provider so it shows in `/providers`.
+/// Custom models are re-registered after every catalog merge so they survive
+/// cache reloads and network refreshes. Entries and provider rows for custom
+/// providers that are no longer declared are dropped, so re-applying a
+/// smaller set leaves no stale rows.
+fn register_custom_providers(
+    entries: &mut HashMap<String, ModelEntry>,
+    providers: &mut HashMap<String, ProviderEntry>,
+    old_custom: &HashMap<String, claurst_core::config::CustomProviderDef>,
+    new_custom: &HashMap<String, claurst_core::config::CustomProviderDef>,
+) {
+    // Only drop rows for providers that were PREVIOUSLY registered as custom
+    // but are no longer declared. Never touch catalog-loaded providers.
+    let stale_provider_keys: Vec<String> = old_custom
+        .keys()
+        .filter(|pid| !new_custom.contains_key(*pid))
+        .cloned()
+        .collect();
+    for pid in &stale_provider_keys {
+        providers.remove(pid);
+        let prefix = format!("{}/", pid);
+        entries.retain(|key, _| !key.starts_with(&prefix));
+    }
+
+    for (provider_id, def) in new_custom {
+        providers
+            .entry(provider_id.clone())
+            .or_insert_with(|| ProviderEntry {
+                id: ProviderId::new(provider_id),
+                name: def.name.clone(),
+                env: Vec::new(),
+                api: Some(def.api_base.clone()),
+                npm: None,
+                doc: None,
+            });
+        for (model_id, model_def) in &def.models {
+            let key = format!("{}/{}", provider_id, model_id);
+            // An unset contextWindow would fall through the registry lookup
+            // as "unknown" and the compact heuristic would assume 100k.
+            // Default explicitly instead (128k mirrors the generic fallback)
+            // and warn so the user knows to set a real value.
+            let context_window = match model_def.context_window {
+                Some(w) => w,
+                None => {
+                    tracing::warn!(
+                        provider = %provider_id,
+                        model = %model_id,
+                        "customProvider model has no contextWindow; defaulting to 128k"
+                    );
+                    128_000
+                }
+            };
+            entries.insert(
+                key,
+                ModelEntry {
+                    info: ModelInfo {
+                        id: ModelId::new(model_id),
+                        provider_id: ProviderId::new(provider_id),
+                        name: model_def.name.clone().unwrap_or_else(|| model_id.to_string()),
+                        context_window,
+                        max_output_tokens: model_def.max_output_tokens.unwrap_or(0),
+                        release_date: None,
+                        status: None,
+                    },
+                    family: None,
+                    status: Default::default(),
+                    release_date: None,
+                    last_updated: None,
+                    knowledge: None,
+                    open_weights: false,
+                    tool_calling: true,
+                    reasoning: model_def.reasoning_effort.is_some(),
+                    structured_output: false,
+                    temperature: true,
+                    attachment: false,
+                    interleaved: None,
+                    modalities_input: vec![Modality::Text],
+                    modalities_output: vec![Modality::Text],
+                    cost_input: None,
+                    cost_output: None,
+                    cost_cache_read: None,
+                    cost_cache_write: None,
+                    cost: Default::default(),
+                    provider_override: None,
+                    experimental_modes: Default::default(),
+                    options: Default::default(),
+                    headers: Default::default(),
+                },
+            );
+        }
     }
 }
 
@@ -1567,6 +1686,109 @@ pub fn effective_model_for_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- custom providers (settings `customProviders`) -----------------
+
+    fn sample_custom_providers() -> std::collections::HashMap<
+        String,
+        claurst_core::config::CustomProviderDef,
+    > {
+        use claurst_core::config::{CustomModelDef, CustomProviderDef};
+        let mut models = std::collections::HashMap::new();
+        models.insert(
+            "My-Model-X".to_string(),
+            CustomModelDef {
+                name: Some("My Model X".to_string()),
+                context_window: Some(64_000),
+                max_output_tokens: Some(8_192),
+                reasoning_effort: Some("high".to_string()),
+            },
+        );
+        models.insert(
+            "plain-model".to_string(),
+            CustomModelDef::default(),
+        );
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "acme-gateway".to_string(),
+            CustomProviderDef {
+                name: "Acme Gateway".to_string(),
+                api_base: "https://gateway.internal.example/v1".to_string(),
+                api_key: Some("{env:ACME_GATEWAY_KEY}".to_string()),
+                headers: Default::default(),
+                models,
+                request_timeout_secs: Some(120),
+                include_usage_in_stream: Some(false),
+                reasoning_field: Some("reasoning_content".to_string()),
+            },
+        );
+        providers
+    }
+
+    #[test]
+    fn custom_providers_register_models_and_provider_entry() {
+        let mut reg = ModelRegistry::new();
+        reg.apply_custom_providers(&sample_custom_providers());
+
+        // Provider entry shows in /providers with the user's display name.
+        let provider = reg
+            .provider("acme-gateway")
+            .expect("custom provider registered");
+        assert_eq!(provider.name, "Acme Gateway");
+
+        // Mixed-case model keys register under the exact id.
+        let entry = reg
+            .get("acme-gateway", "My-Model-X")
+            .expect("exact-case key");
+        assert_eq!(entry.info.context_window, 64_000);
+        assert_eq!(entry.info.max_output_tokens, 8_192);
+        assert!(
+            entry.reasoning,
+            "reasoning_effort set means reasoning-capable"
+        );
+        assert_eq!(entry.info.name, "My Model X");
+
+        // Bare model with unset contextWindow defaults to 128k, not 0
+        // (0 would be rejected by MIN_PLAUSIBLE_REGISTRY_WINDOW).
+        let plain = reg
+            .get("acme-gateway", "plain-model")
+            .expect("plain model");
+        assert_eq!(plain.info.context_window, 128_000);
+        assert!(!plain.reasoning);
+
+        // list_by_provider surfaces both.
+        assert_eq!(reg.list_by_provider("acme-gateway").len(), 2);
+    }
+
+    #[test]
+    fn custom_providers_survive_cache_reload() {
+        // A cache load merges the cached catalog over the registry; the
+        // custom providers must be re-registered afterwards, not wiped.
+        let mut reg = ModelRegistry::new();
+        reg.apply_custom_providers(&sample_custom_providers());
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("models.json");
+        std::fs::write(&cache, "{}").unwrap();
+        reg.load_cache(&cache);
+
+        assert!(
+            reg.get("acme-gateway", "My-Model-X").is_some(),
+            "custom model must survive a cache reload"
+        );
+        assert!(reg.provider("acme-gateway").is_some());
+    }
+
+    #[test]
+    fn apply_custom_providers_replaces_previous_set() {
+        // Re-applying with an empty map drops the old entries: the call
+        // replaces the retained set rather than merging into it.
+        let mut reg = ModelRegistry::new();
+        reg.apply_custom_providers(&sample_custom_providers());
+        reg.apply_custom_providers(&Default::default());
+        assert!(reg.get("acme-gateway", "My-Model-X").is_none());
+        assert!(reg.provider("acme-gateway").is_none());
+    }
 
     #[test]
     fn bundled_snapshot_loads() {

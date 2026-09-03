@@ -329,6 +329,22 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("escape", "cancel", KeyContext::Select),
         ("/", "search", KeyContext::Select),
 
+        // ========== MODEL PICKER ==========
+        ("up", "prevModel", KeyContext::ModelPicker),
+        ("down", "nextModel", KeyContext::ModelPicker),
+        ("pageup", "pageUp", KeyContext::ModelPicker),
+        ("pagedown", "pageDown", KeyContext::ModelPicker),
+        ("home", "firstModel", KeyContext::ModelPicker),
+        ("end", "lastModel", KeyContext::ModelPicker),
+        ("enter", "selectModel", KeyContext::ModelPicker),
+        ("escape", "cancelModelPicker", KeyContext::ModelPicker),
+        ("left", "effortDown", KeyContext::ModelPicker),
+        ("right", "effortUp", KeyContext::ModelPicker),
+        ("tab", "nextProvider", KeyContext::ModelPicker),
+        ("shift+tab", "prevProvider", KeyContext::ModelPicker),
+        ("f", "toggleFavorite", KeyContext::ModelPicker),
+        ("a", "toggleShowAllProviders", KeyContext::ModelPicker),
+
         // ========== PLUGIN & ATTACHMENTS ==========
         ("up", "prev", KeyContext::Plugin),
         ("down", "next", KeyContext::Plugin),

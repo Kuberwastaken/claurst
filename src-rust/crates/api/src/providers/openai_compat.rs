@@ -210,6 +210,16 @@ impl OpenAiCompatProvider {
         self
     }
 
+    /// Override the HTTP client's request timeout. Used by custom providers
+    /// that declare `requestTimeoutSecs` in settings.json. Rebuilding the
+    /// reqwest client is the only way to change a `Client`'s timeout.
+    pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        if let Ok(client) = reqwest::Client::builder().timeout(timeout).build() {
+            self.http_client = client;
+        }
+        self
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------

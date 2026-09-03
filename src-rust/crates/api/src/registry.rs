@@ -266,6 +266,57 @@ pub fn provider_from_config(
         "codex" | "openai-codex" => {
             CodexProvider::from_stored().map(|provider| Arc::new(provider) as Arc<dyn LlmProvider>)
         }
+        // User-defined OpenAI-compatible providers (`customProviders` in
+        // settings.json): merged into `provider_configs` by
+        // `Settings::effective_config`. Recognized by a `provider_configs`
+        // entry with an api_base under a non-builtin id. Built as a generic
+        // OpenAI-compat provider with headers, reasoning-field quirk, and
+        // per-provider timeout from the definition.
+        id if provider_cfg.is_some()
+            && api_base.is_some()
+            && !claurst_core::provider_id::ProviderId::builtin_provider_ids()
+                .contains(&id) =>
+        {
+            let provider_cfg = provider_cfg.expect("checked by guard");
+            let api_base = api_base.expect("checked by guard");
+            let display_name = provider_cfg
+                .options
+                .get("display_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(provider_id);
+            let mut provider = crate::providers::openai_compat::OpenAiCompatProvider::new(
+                provider_id,
+                display_name,
+                api_base,
+            );
+            if let Some(key) = api_key {
+                provider = provider.with_api_key(key);
+            }
+            for (name, value) in &provider_cfg.headers {
+                provider = provider.with_header(name.clone(), value.clone());
+            }
+            let reasoning_field = provider_cfg
+                .options
+                .get("reasoning_field")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let include_usage = provider_cfg
+                .options
+                .get("include_usage_in_stream")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            if reasoning_field.is_some() || !include_usage {
+                provider = provider.with_quirks(crate::providers::openai_compat::ProviderQuirks {
+                    reasoning_field,
+                    include_usage_in_stream: include_usage,
+                    ..Default::default()
+                });
+            }
+            if let Some(secs) = provider_cfg.request_timeout_secs {
+                provider = provider.with_request_timeout(std::time::Duration::from_secs(secs));
+            }
+            Some(Arc::new(provider))
+        }
         _ => api_key.and_then(|key| provider_from_key(provider_id, key)),
     }
 }

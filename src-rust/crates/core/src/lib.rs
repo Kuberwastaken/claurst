@@ -89,7 +89,7 @@ pub use types::{
     ContentBlock, ImageSource, DocumentSource, CitationsConfig, Message, MessageContent,
     MessageCost, Role, ToolDefinition, ToolResultContent, UsageInfo,
 };
-pub use config::{AgentDefinition, BudgetSplitPolicy, Config, CommandTemplate, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
+pub use config::{AgentDefinition, BudgetSplitPolicy, Config, CommandTemplate, CustomModelDef, CustomProviderDef, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
 pub use import_config::{ClaudeMdPreview, ImportExecutionResult, ImportPaths, ImportPreview, ImportSelection, PreviewAction, PreviewField, SettingsPreview, build_import_preview, execute_import, summarize_import_result};
 
 // Skill discovery: filesystem and git URL skill loading.
@@ -921,6 +921,11 @@ pub mod config {
         /// Provider-specific options (passed through to provider implementation)
         #[serde(default)]
         pub options: HashMap<String, serde_json::Value>,
+        /// Extra HTTP headers sent on every request to this provider.
+        /// Populated for user-defined custom providers from their
+        /// `headers` map; ignored by built-in providers that don't read it.
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        pub headers: HashMap<String, String>,
         /// Total request timeout in seconds for this provider's HTTP client.
         /// Overrides the global [`Config::request_timeout_secs`] when set.
         /// Useful for slow local models (CPU inference, large MoE) that can take
@@ -943,8 +948,160 @@ pub mod config {
                 models_whitelist: Vec::new(),
                 models_blacklist: Vec::new(),
                 options: HashMap::new(),
+                headers: HashMap::new(),
                 request_timeout_secs: None,
             }
+        }
+    }
+
+    impl ProviderConfig {
+        /// Build the `provider_configs` entry for a user-defined custom
+        /// provider: base URL + API key (raw, still `{env:VAR}`-substituted at
+        /// resolution time) + headers + per-provider timeout, plus the
+        /// OpenAI-compat options the custom-provider definition carries.
+        pub fn from_custom_provider(def: &CustomProviderDef) -> Self {
+            let mut options: HashMap<String, serde_json::Value> = HashMap::new();
+            options.insert(
+                "display_name".to_string(),
+                serde_json::Value::String(def.name.clone()),
+            );
+            if let Some(reasoning_field) = &def.reasoning_field {
+                options.insert(
+                    "reasoning_field".to_string(),
+                    serde_json::Value::String(reasoning_field.clone()),
+                );
+            }
+            if let Some(include_usage) = def.include_usage_in_stream {
+                options.insert(
+                    "include_usage_in_stream".to_string(),
+                    serde_json::Value::Bool(include_usage),
+                );
+            }
+            Self {
+                api_key: def.api_key.clone(),
+                api_base: Some(def.api_base.clone()),
+                enabled: true,
+                models_whitelist: Vec::new(),
+                models_blacklist: Vec::new(),
+                options,
+                headers: def.headers.clone(),
+                request_timeout_secs: def.request_timeout_secs,
+            }
+        }
+    }
+
+    // ---- CustomModelDef --------------------------------------------------
+
+    /// A model definition within a custom OpenAI-compatible provider.
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    pub struct CustomModelDef {
+        /// Total context window size in tokens.
+        #[serde(
+            default,
+            rename = "contextWindow",
+            alias = "context_window",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub context_window: Option<u32>,
+        /// Maximum tokens the model can emit in a single response.
+        #[serde(
+            default,
+            rename = "maxOutputTokens",
+            alias = "max_output_tokens",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub max_output_tokens: Option<u32>,
+        /// Human-readable display name shown in the model picker.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        /// Reasoning effort level (e.g. "high", "max", "none").
+        #[serde(
+            default,
+            rename = "reasoningEffort",
+            alias = "reasoning_effort",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub reasoning_effort: Option<String>,
+    }
+
+    // ---- CustomProviderDef -----------------------------------------------
+
+    /// A user-defined OpenAI-compatible provider, stored in
+    /// [`Settings::custom_providers`] keyed by its unique id.
+    ///
+    /// Unlike [`ProviderConfig`] (which tweaks built-in providers), this is a
+    /// fully self-contained provider definition with its own base URL, API key,
+    /// custom headers, and model catalog. The id (map key) becomes the provider
+    /// id used in `provider/model` routing.
+    ///
+    /// Kept deliberately small: only knobs the request path actually consumes
+    /// (base URL, key, headers, timeout, reasoning field, usage-in-stream,
+    /// model catalog). Streaming is always on — the workspace has no
+    /// non-streaming fallback today, so a `streaming: false` knob would be dead
+    /// configuration.
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    pub struct CustomProviderDef {
+        /// Human-readable display name shown in the provider picker.
+        #[serde(default)]
+        pub name: String,
+        /// OpenAI-compatible base URL (claurst appends `/chat/completions`).
+        #[serde(rename = "apiBase", alias = "api_base")]
+        pub api_base: String,
+        /// API key. Supports `{env:VAR_NAME}` substitution at resolution time.
+        /// `None` means no key — provider is registered but health_check
+        /// returns `Unavailable`.
+        #[serde(
+            rename = "apiKey",
+            alias = "api_key",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub api_key: Option<String>,
+        /// Custom HTTP headers sent on every request to this provider.
+        #[serde(default)]
+        pub headers: HashMap<String, String>,
+        /// Model catalog local to this provider, keyed by model id.
+        #[serde(default)]
+        pub models: HashMap<String, CustomModelDef>,
+        /// Per-provider request timeout override in seconds.
+        #[serde(
+            default,
+            rename = "requestTimeoutSecs",
+            alias = "request_timeout_secs",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub request_timeout_secs: Option<u64>,
+        /// Whether to send `stream_options.include_usage` when streaming.
+        /// Default: true. Set to false for providers that don't support it.
+        #[serde(
+            default,
+            rename = "includeUsageInStream",
+            alias = "include_usage_in_stream",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub include_usage_in_stream: Option<bool>,
+        /// JSON field name for reasoning/thinking content (e.g.
+        /// "reasoning_content" for DeepSeek). None means no reasoning field.
+        #[serde(
+            default,
+            rename = "reasoningField",
+            alias = "reasoning_field",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub reasoning_field: Option<String>,
+    }
+
+    impl CustomProviderDef {
+        /// Resolve the API key, substituting `{env:VAR_NAME}` patterns with
+        /// the corresponding environment variable value. Uses the same
+        /// [`substitute_env_vars`] helper as the rest of the config system,
+        /// so embedded patterns like `Bearer {env:FOO}` work too. Returns
+        /// `None` if the key is absent or resolves to an empty string.
+        pub fn resolve_api_key(&self) -> Option<String> {
+            self.api_key
+                .as_ref()
+                .map(|raw| substitute_env_vars(raw))
+                .filter(|key| !key.is_empty())
         }
     }
 
@@ -1050,6 +1207,16 @@ pub mod config {
         /// Per-provider configurations
         #[serde(default)]
         pub provider_configs: HashMap<String, ProviderConfig>,
+        /// User-favorited model keys (`"provider/model"`), copied from
+        /// Settings on load. The picker reads this, not the settings file.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub favorite_models: Vec<String>,
+        /// User-defined OpenAI-compatible providers (`customProviders` in
+        /// settings.json), copied from Settings on load. The model registry
+        /// registers their model catalogs; request paths consume the merged
+        /// `provider_configs` entries instead.
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        pub custom_providers: HashMap<String, CustomProviderDef>,
         /// User-supplied model metadata overrides, keyed by `"provider/model"`.
         /// Take precedence over the models.dev catalog (copied from Settings on
         /// load; see [`ModelOverride`]).
@@ -1252,6 +1419,29 @@ pub mod config {
         /// Per-provider configurations stored in settings.json.
         #[serde(default)]
         pub providers: HashMap<String, ProviderConfig>,
+        /// User-defined OpenAI-compatible providers, keyed by unique id.
+        /// Each entry is a self-contained provider with its own base URL,
+        /// API key, headers, and model catalog. The id becomes the provider
+        /// id used in `provider/model` routing. Merged into
+        /// `Config::provider_configs` once at load time (see
+        /// [`Settings::effective_config`]) so request paths never re-read
+        /// the settings file.
+        #[serde(
+            default,
+            rename = "customProviders",
+            alias = "custom_providers"
+        )]
+        pub custom_providers: HashMap<String, CustomProviderDef>,
+        /// User-favorited model keys (`"provider/model"` format). Shown in a
+        /// dedicated section at the top of the /model picker. Matching uses
+        /// the full provider-prefixed key so `free/auto` and
+        /// `openai/gpt-4o` are distinguishable.
+        #[serde(
+            default,
+            rename = "favoriteModels",
+            alias = "favorite_models"
+        )]
+        pub favorite_models: Vec<String>,
         /// User-supplied model metadata overrides stored in settings.json,
         /// keyed by `"provider/model"`. Merged into
         /// [`Config::model_overrides`] by [`Settings::effective_config`] and
@@ -1514,8 +1704,12 @@ pub mod config {
                         .find_map(|var| std::env::var(var).ok().filter(|v| !v.is_empty()))
                 })
                 .or_else(|| crate::AuthStore::load().api_key_for(provider_id))
-                // Support {env:VAR_NAME} patterns in the resolved value
+                // Support {env:VAR_NAME} patterns in the resolved value.
+                // Filter AFTER substitution so an unset env var inside the
+                // pattern yields None instead of a blank key — otherwise
+                // the picker marks the provider connected and requests 401.
                 .map(|key| substitute_env_vars(&key))
+                .filter(|key| !key.is_empty())
         }
 
         pub fn resolve_anthropic_api_key(&self) -> Option<String> {
@@ -1533,8 +1727,11 @@ pub mod config {
                         .iter()
                         .find_map(|var| std::env::var(var).ok().filter(|v| !v.is_empty()))
                 })
-                // Support {env:VAR_NAME} patterns in the resolved value
+                // Support {env:VAR_NAME} patterns in the resolved value.
+                // Filter after substitution: an unset env var inside the
+                // pattern must yield None, not a blank key.
                 .map(|key| substitute_env_vars(&key))
+                .filter(|key| !key.is_empty())
         }
 
         /// Resolve the API key for the active provider.
@@ -1820,6 +2017,39 @@ pub mod config {
             for (id, pc) in &self.providers {
                 config.provider_configs.entry(id.clone()).or_insert_with(|| pc.clone());
             }
+            // Merge custom providers into provider_configs once, here, so
+            // request paths resolve keys/base URLs through the normal
+            // provider_configs lookup instead of re-reading settings.json.
+            // A custom provider whose id collides with a built-in provider
+            // would silently shadow the real one; skip those with a warning.
+            // An explicit `providers.<id>` entry also wins over a custom
+            // provider with the same id.
+            let builtin_ids = crate::provider_id::ProviderId::builtin_provider_ids();
+            for (id, cp) in &self.custom_providers {
+                if builtin_ids.contains(&id.as_str()) {
+                    tracing::warn!(
+                        provider = %id,
+                        "customProviders entry shadows a built-in provider id; ignoring it"
+                    );
+                    continue;
+                }
+                config
+                    .provider_configs
+                    .entry(id.clone())
+                    .or_insert_with(|| ProviderConfig::from_custom_provider(cp));
+            }
+            // Copy favorite model keys and custom provider defs onto Config
+            // so the picker and model registry do not read Settings per frame.
+            // Builtin-id collisions are excluded here too, so consumers of
+            // Config.custom_providers (model registry, picker, provider
+            // options) never see a shadowing entry.
+            config.favorite_models = self.favorite_models.clone();
+            config.custom_providers = self
+                .custom_providers
+                .iter()
+                .filter(|(id, _)| !builtin_ids.contains(&id.as_str()))
+                .map(|(id, def)| (id.clone(), def.clone()))
+                .collect();
             // Merge top-level `modelOverrides` into config.model_overrides
             // (nested `config` block wins for keys present in both).
             for (id, ov) in &self.model_overrides {
@@ -1962,6 +2192,16 @@ pub mod config {
                 hooks: merge_map(base.config.hooks, over.config.hooks),
                 provider: over.config.provider.or(base.config.provider),
                 provider_configs: merge_map(base.config.provider_configs, over.config.provider_configs),
+                custom_providers: merge_map(base.config.custom_providers, over.config.custom_providers),
+                favorite_models: {
+                    let mut v = base.config.favorite_models;
+                    for f in over.config.favorite_models {
+                        if !v.contains(&f) {
+                            v.push(f);
+                        }
+                    }
+                    v
+                },
                 model_overrides: merge_map(base.config.model_overrides, over.config.model_overrides),
                 formatter: merge_map(base.config.formatter, over.config.formatter),
                 commands: merge_map(base.config.commands, over.config.commands),
@@ -2007,6 +2247,8 @@ pub mod config {
                 last_seen_version: over.last_seen_version.or(base.last_seen_version),
                 provider: over.provider.or(base.provider),
                 providers: merge_map(base.providers, over.providers),
+                custom_providers: merge_map(base.custom_providers, over.custom_providers),
+                favorite_models: { let mut v = base.favorite_models; for f in over.favorite_models { if !v.contains(&f) { v.push(f); } } v },
                 model_overrides: merge_map(base.model_overrides, over.model_overrides),
                 commands: merge_map(base.commands, over.commands),
                 formatter: merge_map(base.formatter, over.formatter),
@@ -4596,6 +4838,131 @@ pub mod tasks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- customProviders (Settings -> effective Config) -----------------
+
+    fn sample_custom_provider() -> crate::config::CustomProviderDef {
+        let mut models = std::collections::HashMap::new();
+        models.insert(
+            "my-model".to_string(),
+            crate::config::CustomModelDef {
+                context_window: Some(64_000),
+                max_output_tokens: Some(8_192),
+                name: Some("My Model".to_string()),
+                reasoning_effort: None,
+            },
+        );
+        crate::config::CustomProviderDef {
+            name: "Acme Gateway".to_string(),
+            api_base: "https://gateway.internal.example/v1".to_string(),
+            api_key: Some("{env:ACME_GATEWAY_KEY}".to_string()),
+            headers: Default::default(),
+            models,
+            request_timeout_secs: Some(120),
+            include_usage_in_stream: Some(false),
+            reasoning_field: Some("reasoning_content".to_string()),
+        }
+    }
+
+    #[test]
+    fn custom_providers_merge_into_effective_config() {
+        let mut settings = crate::config::Settings::default();
+        settings
+            .custom_providers
+            .insert("acme-gateway".to_string(), sample_custom_provider());
+        settings.favorite_models = vec!["acme-gateway/my-model".to_string()];
+
+        let config = settings.effective_config();
+
+        // Merged into provider_configs for the request path...
+        let pc = config
+            .provider_configs
+            .get("acme-gateway")
+            .expect("custom provider merged into provider_configs");
+        assert_eq!(
+            pc.api_base.as_deref(),
+            Some("https://gateway.internal.example/v1")
+        );
+        assert_eq!(pc.request_timeout_secs, Some(120));
+        // ...and the defs are copied onto Config for the picker/registry.
+        assert!(config.custom_providers.contains_key("acme-gateway"));
+        assert_eq!(config.favorite_models, vec!["acme-gateway/my-model"]);
+    }
+
+    #[test]
+    fn custom_provider_cannot_shadow_builtin_provider() {
+        let mut settings = crate::config::Settings::default();
+        settings
+            .custom_providers
+            .insert("openai".to_string(), sample_custom_provider());
+
+        let config = settings.effective_config();
+
+        // The builtin id is skipped with a warning rather than merged over
+        // the real OpenAI provider config.
+        if let Some(pc) = config.provider_configs.get("openai") {
+            assert_ne!(
+                pc.api_base.as_deref(),
+                Some("https://gateway.internal.example/v1"),
+                "customProviders.openai must not shadow the builtin provider"
+            );
+        }
+        assert!(
+            !config.custom_providers.contains_key("openai"),
+            "colliding custom provider id must be dropped from Config.custom_providers"
+        );
+    }
+
+    #[test]
+    fn explicit_providers_entry_wins_over_custom_provider() {
+        let mut settings = crate::config::Settings::default();
+        settings.providers.insert(
+            "acme-gateway".to_string(),
+            crate::config::ProviderConfig {
+                api_base: Some("https://explicit.example/v1".to_string()),
+                ..Default::default()
+            },
+        );
+        settings
+            .custom_providers
+            .insert("acme-gateway".to_string(), sample_custom_provider());
+
+        let config = settings.effective_config();
+        let pc = config
+            .provider_configs
+            .get("acme-gateway")
+            .expect("merged provider config");
+        assert_eq!(
+            pc.api_base.as_deref(),
+            Some("https://explicit.example/v1"),
+            "providers.<id> entry wins over customProviders.<id>"
+        );
+    }
+
+    #[test]
+    fn custom_provider_settings_serde_roundtrip() {
+        // camelCase keys round-trip: apiBase, apiKey, contextWindow, etc.
+        let mut settings = crate::config::Settings::default();
+        settings
+            .custom_providers
+            .insert("acme-gateway".to_string(), sample_custom_provider());
+        settings.favorite_models = vec!["acme-gateway/my-model".to_string()];
+
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("\"customProviders\""), "{json}");
+        assert!(json.contains("\"apiBase\""), "{json}");
+        assert!(json.contains("\"favoriteModels\""), "{json}");
+
+        let back: crate::config::Settings = serde_json::from_str(&json).unwrap();
+        let def = back
+            .custom_providers
+            .get("acme-gateway")
+            .expect("roundtripped");
+        assert_eq!(def.api_base, "https://gateway.internal.example/v1");
+        assert!(back
+            .favorite_models
+            .contains(&"acme-gateway/my-model".to_string()));
+    }
 
     #[test]
     fn test_message_user() {
