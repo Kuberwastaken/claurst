@@ -67,11 +67,13 @@ pub(super) const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("upgrade", "Check for updates and upgrade to the latest version"),
     ("vim", "Toggle vim keybindings"),
     ("voice", "Toggle voice input mode"),
+    ("yolo", "Toggle YOLO mode (bypass all permission prompts)"),
 ];
 
 pub(super) fn help_command_category(name: &str) -> &'static str {
     match name {
         "connect" | "model" | "providers" | "refresh" | "fast" | "effort" | "voice" => "Model & Provider",
+        "yolo" => "Permissions",
         "changes" | "diff" | "review" | "rewind" | "export" | "copy" | "share" | "links" => "Review & History",
         "stats" | "cost" | "context" | "insights" | "heapdump" | "doctor" => "Diagnostics",
         "config" | "settings" | "theme" | "keybindings" | "hooks" | "mcp" | "import-config" => {
@@ -99,7 +101,51 @@ pub(super) fn help_overlay_entries() -> Vec<HelpEntry> {
 impl App {
     /// Handle slash commands that should open UI screens rather than execute
     /// as normal commands. Returns `true` if the command was intercepted.
+    /// Handle `/yolo [on|off]`. Toggles YOLO mode (bypass all permission
+    /// prompts). When turning on, shows the BypassPermissionsModeDialog
+    /// (security gate) before activating. When turning off, restores
+    /// the Default permission mode (not Plan/AcceptEdits).
+    pub fn handle_yolo_command(&mut self, args: &str) {
+        let turning_on = match args.trim() {
+            "" => {
+                self.config.permission_mode != claurst_core::PermissionMode::BypassPermissions
+            }
+            "on" | "true" | "1" => true,
+            "off" | "false" | "0" => false,
+            _ => {
+                self.status_message = Some("Usage: /yolo [on|off]".to_string());
+                return;
+            }
+        };
+
+        if turning_on {
+            // Show the security dialog before activating. Mark it as a
+            // runtime toggle so key handling knows acceptance should switch
+            // the permission mode (and decline cancels instead of exiting).
+            // Remember the current mode so `/yolo off` restores it instead
+            // of hard-setting `Default`.
+            self.yolo_previous_mode = Some(self.config.permission_mode.clone());
+            self.bypass_permissions_dialog.show();
+            self.yolo_pending = true;
+        } else if self.config.permission_mode == claurst_core::PermissionMode::BypassPermissions {
+            // Restore the mode that was active before YOLO was enabled —
+            // or `Default` if YOLO came from settings/CLI rather than `/yolo`.
+            self.config.permission_mode = self
+                .yolo_previous_mode
+                .take()
+                .unwrap_or(claurst_core::PermissionMode::Default);
+            self.status_message =
+                Some("YOLO mode off. Permission prompts restored.".to_string());
+        } else {
+            self.status_message = Some("YOLO mode is not active.".to_string());
+        }
+    }
+
     pub fn intercept_slash_command_with_args(&mut self, cmd: &str, args: &str) -> bool {
+        if cmd == "yolo" {
+            self.handle_yolo_command(args.trim());
+            return true;
+        }
         if cmd == "mcp" && !args.trim().is_empty() {
             return false;
         }

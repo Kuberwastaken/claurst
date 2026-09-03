@@ -547,6 +547,15 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         config.permission_mode = PermissionMode::BypassPermissions;
+    } else if config.yolo_mode {
+        // YOLO mode from global settings.json: same root/sudo guard.
+        #[cfg(unix)]
+        if nix::unistd::Uid::effective().is_root() {
+            anyhow::bail!(
+                "yoloMode cannot be used with root/sudo privileges for security reasons"
+            );
+        }
+        config.permission_mode = PermissionMode::BypassPermissions;
     } else {
         config.permission_mode = cli.permission_mode.into();
     }

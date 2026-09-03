@@ -244,15 +244,33 @@ impl App {
         // Accepting is remembered in settings.json (skipDangerousModePermissionPrompt)
         // so the warning is shown once, not on every launch.
         if self.bypass_permissions_dialog.visible {
+            // When the dialog was opened by `/yolo` at runtime, acceptance
+            // activates YOLO mode and declining cancels the toggle (no exit).
+            let yolo_runtime = self.yolo_pending;
             match key.code {
                 KeyCode::Char('1') | KeyCode::Esc => {
-                    // "No, exit" — quit immediately
-                    self.should_exit = true;
+                    // "No, exit" — for the startup gate, quit immediately.
+                    // For `/yolo`, just cancel the toggle (and hide the dialog).
+                    self.yolo_pending = false;
+                    if yolo_runtime {
+                        self.bypass_permissions_dialog.dismiss();
+                        self.status_message = Some("YOLO mode cancelled.".to_string());
+                    } else {
+                        self.should_exit = true;
+                    }
                 }
                 KeyCode::Char('2') => {
                     // "Yes, I accept" — dismiss and continue
                     self.bypass_permissions_dialog.dismiss();
                     let _ = Self::persist_bypass_permissions_accepted();
+                    if yolo_runtime {
+                        self.yolo_pending = false;
+                        self.config.permission_mode =
+                            claurst_core::PermissionMode::BypassPermissions;
+                        self.status_message = Some(
+                            "YOLO mode on. All permission prompts bypassed.".to_string(),
+                        );
+                    }
                 }
                 KeyCode::Up | KeyCode::Char('k') => self.bypass_permissions_dialog.select_prev(),
                 KeyCode::Down | KeyCode::Char('j') => self.bypass_permissions_dialog.select_next(),
@@ -260,6 +278,18 @@ impl App {
                     if self.bypass_permissions_dialog.is_accept_selected() {
                         self.bypass_permissions_dialog.dismiss();
                         let _ = Self::persist_bypass_permissions_accepted();
+                        if yolo_runtime {
+                            self.yolo_pending = false;
+                            self.config.permission_mode =
+                                claurst_core::PermissionMode::BypassPermissions;
+                            self.status_message = Some(
+                                "YOLO mode on. All permission prompts bypassed.".to_string(),
+                            );
+                        }
+                    } else if yolo_runtime {
+                        self.yolo_pending = false;
+                        self.bypass_permissions_dialog.dismiss();
+                        self.status_message = Some("YOLO mode cancelled.".to_string());
                     } else {
                         self.should_exit = true;
                     }

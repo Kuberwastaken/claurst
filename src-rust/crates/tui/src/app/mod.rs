@@ -336,6 +336,15 @@ pub struct App {
     pub bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState,
     /// Whether the bypass-permissions dialog has been shown this session.
     pub bypass_permissions_dialog_shown: bool,
+    /// When true, the bypass-permissions dialog was opened by `/yolo` at
+    /// runtime (not by the --dangerously-skip-permissions startup gate).
+    /// Accepting it switches the permission mode to BypassPermissions;
+    /// declining cancels the toggle without exiting.
+    pub yolo_pending: bool,
+    /// Permission mode active before `/yolo` was turned on, so `/yolo off`
+    /// can restore it instead of hard-setting `Default` (which would kick
+    /// the user out of `plan` or `acceptEdits`).
+    pub yolo_previous_mode: Option<claurst_core::PermissionMode>,
     /// File injection warning dialog.
     /// Shown when oversized or binary files are detected in @refs.
     pub file_injection_dialog: crate::file_injection_dialog::FileInjectionDialogState,
@@ -685,6 +694,8 @@ impl App {
             go_to_line_dialog: GoToLineDialog::new(),
             bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState::new(),
             bypass_permissions_dialog_shown: false,
+            yolo_pending: false,
+            yolo_previous_mode: None,
             file_injection_dialog: crate::file_injection_dialog::FileInjectionDialogState::new(),
             file_injection_force: false,
             onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState::new(),

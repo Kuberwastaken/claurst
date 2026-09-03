@@ -4,6 +4,7 @@ use super::*;
 
 use claurst_core::config::Config;
 use claurst_core::types::Role;
+use claurst_core::PermissionMode;
 use super::keys::{
     key_event_to_keystroke, layout_to_latin, normalize_char_with_shift,
     normalize_layout_shortcut_key,
@@ -463,6 +464,67 @@ use super::types::{ContextMenuItem, ContextMenuState};
         }
         assert_eq!(app.prompt_input.text, "line1\nline2");
         assert!(app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn test_yolo_on_shows_dialog_and_accept_activates() {
+        let mut app = make_app();
+        assert!(app.intercept_slash_command_with_args("yolo", "on"));
+        // Dialog visible, mode not yet switched.
+        assert!(app.bypass_permissions_dialog.visible);
+        assert!(app.yolo_pending);
+        assert_eq!(app.config.permission_mode, PermissionMode::Default);
+
+        // Accept via '2'.
+        app.handle_key_event(press_key(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert!(!app.bypass_permissions_dialog.visible);
+        assert!(!app.yolo_pending);
+        assert_eq!(app.config.permission_mode, PermissionMode::BypassPermissions);
+    }
+
+    #[test]
+    fn test_yolo_on_decline_cancels_without_exit() {
+        let mut app = make_app();
+        assert!(app.intercept_slash_command_with_args("yolo", "on"));
+        // Decline via '1'.
+        app.handle_key_event(press_key(KeyCode::Char('1'), KeyModifiers::NONE));
+        assert!(!app.bypass_permissions_dialog.visible);
+        assert!(!app.yolo_pending);
+        // No exit: decline only cancels the runtime toggle.
+        assert!(!app.should_exit);
+        assert_eq!(app.config.permission_mode, PermissionMode::Default);
+    }
+
+    #[test]
+    fn test_yolo_off_restores_previous_mode_not_default() {
+        // /yolo off must not kick the user out of plan/acceptEdits.
+        let mut app = make_app();
+        app.config.permission_mode = PermissionMode::Plan;
+        assert!(app.intercept_slash_command_with_args("yolo", "on"));
+        app.handle_key_event(press_key(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(app.config.permission_mode, PermissionMode::BypassPermissions);
+
+        assert!(app.intercept_slash_command_with_args("yolo", "off"));
+        // Plan mode restored, not Default.
+        assert_eq!(app.config.permission_mode, PermissionMode::Plan);
+    }
+
+    #[test]
+    fn test_yolo_off_restores_default_mode() {
+        let mut app = make_app();
+        app.config.permission_mode = PermissionMode::BypassPermissions;
+        assert!(app.intercept_slash_command_with_args("yolo", "off"));
+        assert_eq!(app.config.permission_mode, PermissionMode::Default);
+        assert!(!app.bypass_permissions_dialog.visible);
+    }
+
+    #[test]
+    fn test_yolo_toggle_when_not_bypass_shows_dialog() {
+        let mut app = make_app();
+        // Bare /yolo with Default mode: toggle on → dialog.
+        assert!(app.intercept_slash_command_with_args("yolo", ""));
+        assert!(app.bypass_permissions_dialog.visible);
+        assert!(app.yolo_pending);
     }
 
     #[test]

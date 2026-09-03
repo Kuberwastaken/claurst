@@ -290,6 +290,27 @@ Setting persists to `~/.claurst/ui-settings.json`.
 
 ---
 
+### /yolo
+**Aliases:** `danger`
+
+Toggle YOLO mode. In YOLO mode the effective permission mode is
+`bypassPermissions`: all tool-permission prompts are bypassed. The first
+`/yolo on` shows the bypass-permissions security dialog before activating;
+acceptance activates it for the session, declining cancels the toggle.
+
+```
+/yolo          — toggle (shows dialog when turning on)
+/yolo on       — show the security dialog, then activate
+/yolo off      — restore default permission mode
+```
+
+YOLO mode can also be enabled persistently via `"yoloMode": true` in the
+`config` block of the global settings file. That field is global-only: a
+project settings file cannot enable it. Same root/sudo guard as
+`--dangerously-skip-permissions` applies.
+
+---
+
 ## Configuration & Settings
 
 ### /config
