@@ -31,6 +31,8 @@ pub enum DisplayMessage {
     Conversation(Message),
     /// An injected system notice (e.g. compact boundary).
     System { text: String, style: SystemMessageStyle },
+    /// A `!` bang command and its output (shown in the transcript).
+    BangCommand { command: String, output: String },
 }
 
 /// Context menu state: position and currently selected item index.

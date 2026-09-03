@@ -393,6 +393,32 @@ impl App {
                 });
             }
 
+            // Drain bang command result from spawned task.
+            if let Some(ref mut rx) = self.bang_command_pending {
+                match rx.try_recv() {
+                    Ok((command, output)) => {
+                        if self.config.bang_commands.show_in_transcript {
+                            // Show the command and output as a notification.
+                            let formatted = if output.is_empty() {
+                                format!("$ ! {} (no output)", command)
+                            } else {
+                                format!("$ ! {}\n{}", command, output)
+                            };
+                            self.push_notification(
+                                crate::notifications::NotificationKind::Info,
+                                formatted,
+                                None,
+                            );
+                        }
+                        self.bang_command_pending = None;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        self.bang_command_pending = None;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                }
+            }
+
             // Drain voice transcription events (non-blocking).
             // When the background recording/transcription task emits a
             // TranscriptReady event we insert the text directly into the
@@ -547,6 +573,16 @@ impl App {
                             }
                             let input = self.take_input();
                             if !input.is_empty() {
+                                // Bang command: `! <command>` runs a shell
+                                // command directly, bypassing the model.
+                                if input.starts_with('!') && self.config.bang_commands.enabled {
+                                    let command = input[1..].trim().to_string();
+                                    if !command.is_empty() {
+                                        self.execute_bang_command(command);
+                                        self.clear_prompt();
+                                        continue;
+                                    }
+                                }
                                 return Ok(Some(input));
                             }
                         }
