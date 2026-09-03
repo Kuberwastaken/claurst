@@ -1073,6 +1073,24 @@ pub mod config {
         }
     }
 
+    // ---- BangCommands -----------------------------------------------------
+
+    /// Configuration for `!` bang commands — execute shell commands
+    /// directly from the prompt without going through the model.
+    ///
+    /// Disabled by default (opt-in). When enabled, typing `! <command>`
+    /// at the prompt runs the command in a spawned subprocess with a
+    /// timeout and output cap, and displays the result in the transcript.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct BangCommandsConfig {
+        /// Whether the feature is enabled. Default: false (opt-in).
+        #[serde(default)]
+        pub enabled: bool,
+        /// Whether to display command + output in the chat transcript.
+        #[serde(default = "default_true", rename = "showInTranscript")]
+        pub show_in_transcript: bool,
+    }
+
     // ---- ModelOverride ---------------------------------------------------
 
     /// User-supplied metadata override for a single model, keyed by the
@@ -1196,6 +1214,9 @@ pub mod config {
         /// (project settings cannot enable it) — see `Settings::merge`.
         #[serde(default, rename = "yoloMode")]
         pub yolo_mode: bool,
+        /// Configuration for `!` bang commands.
+        #[serde(default)]
+        pub bang_commands: BangCommandsConfig,
         /// Formatter configurations (copied from Settings on load).
         #[serde(default)]
         pub formatter: HashMap<String, FormatterConfig>,
@@ -2376,6 +2397,10 @@ pub mod config {
                 // only the user's global settings may enable it. A project
                 // settings file must not be able to flip this on.
                 yolo_mode: base.config.yolo_mode,
+                // SECURITY: bang commands bypass the permission system, so
+                // only the user's global settings may enable them. A project
+                // settings file must not be able to flip this on.
+                bang_commands: base.config.bang_commands.clone(),
                 cursor_blink_enabled: over.config.cursor_blink_enabled || base.config.cursor_blink_enabled,
                 file_autocomplete_limit: if over.config.file_autocomplete_limit != 0 { over.config.file_autocomplete_limit } else { base.config.file_autocomplete_limit },
                 file_autocomplete_show_hidden_files: over.config.file_autocomplete_show_hidden_files || base.config.file_autocomplete_show_hidden_files,
