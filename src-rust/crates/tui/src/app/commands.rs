@@ -106,6 +106,60 @@ impl App {
         self.intercept_slash_command(cmd)
     }
 
+    /// Execute a `!` bang command in a spawned subprocess with a timeout
+    /// and output cap. The command runs through the system shell (sh on
+    /// Unix, cmd on Windows) — not hardcoded to bash — and the result
+    /// is displayed in the transcript. The spawned task sends the
+    /// (command, output) pair back over a channel so the TUI never blocks.
+    pub fn execute_bang_command(&mut self, command: String) {
+        // Block in plan mode.
+        if self.config.permission_mode == claurst_core::PermissionMode::Plan {
+            self.push_notification(
+                crate::notifications::NotificationKind::Warning,
+                "Bang commands disabled in plan mode.".to_string(),
+                None,
+            );
+            return;
+        }
+
+        let working_dir = self.project_root();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        self.bang_command_pending = Some(rx);
+
+        tokio::spawn(async move {
+            // Run the command in a blocking task with a timeout.
+            let cmd_str = command.clone();
+            let working_dir = working_dir.clone();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                tokio::task::spawn_blocking(move || {
+                    run_shell_command(&cmd_str, &working_dir)
+                }),
+            )
+            .await;
+
+            let output = match result {
+                Ok(Ok(Ok(output))) => output,
+                Ok(Ok(Err(e))) => format!("Error: {e}"),
+                Ok(Err(e)) => format!("Task panicked: {e}"),
+                Err(_) => "Command timed out after 60 seconds.".to_string(),
+            };
+
+            // Cap output to 100KB to prevent OOM in the TUI.
+            const MAX_OUTPUT: usize = 100_000;
+            let output = if output.len() > MAX_OUTPUT {
+                format!("{}\n... (output truncated at {} bytes)", &output[..MAX_OUTPUT], MAX_OUTPUT)
+            } else {
+                output
+            };
+
+            let _ = tx.send((command, output)).await;
+        });
+
+        // Result will be displayed when the spawned task completes.
+    }
+
     pub fn intercept_slash_command(&mut self, cmd: &str) -> bool {
         self.close_secondary_views();
         self.dismiss_error_notifications();
@@ -388,4 +442,58 @@ impl App {
         }
     }
 
+}
+
+
+/// Run a shell command with a 60-second timeout. Uses `sh` on Unix and
+/// `cmd` on Windows — never hardcoded to `bash`. Returns the combined
+/// stdout+stderr output.
+fn run_shell_command(command: &str, working_dir: &std::path::Path) -> Result<String, String> {
+    #[cfg(unix)]
+    {
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(working_dir)
+            .output()
+            .map_err(|e| format!("Failed to spawn: {e}"))?;
+        let mut combined = String::new();
+        if !output.stdout.is_empty() {
+            combined.push_str(&String::from_utf8_lossy(&output.stdout));
+        }
+        if !output.stderr.is_empty() {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        }
+        if !output.status.success() {
+            combined = format!("Exit code: {}\n{}", output.status.code().unwrap_or(-1), combined);
+        }
+        Ok(combined)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let output = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg(command)
+            .current_dir(working_dir)
+            .output()
+            .map_err(|e| format!("Failed to spawn: {e}"))?;
+        let mut combined = String::new();
+        if !output.stdout.is_empty() {
+            combined.push_str(&String::from_utf8_lossy(&output.stdout));
+        }
+        if !output.stderr.is_empty() {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        }
+        if !output.status.success() {
+            combined = format!("Exit code: {}\n{}", output.status.code().unwrap_or(-1), combined);
+        }
+        Ok(combined)
+    }
 }

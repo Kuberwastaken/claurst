@@ -246,6 +246,8 @@ pub struct App {
     pub remote_session_url: Option<String>,
     /// Live MCP manager snapshot source when available.
     pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
+    /// Pending bang command result to display (from a spawned task).
+    pub bang_command_pending: Option<tokio::sync::mpsc::Receiver<(String, String)>>,
     /// Queued request for a real MCP reconnect from the interactive loop.
     pub pending_mcp_reconnect: bool,
     /// Set after an in-session provider connection (e.g. a Claude Pro/Max OAuth
@@ -647,6 +649,7 @@ impl App {
             session_title: None,
             remote_session_url: None,
             mcp_manager: None,
+            bang_command_pending: None,
             pending_mcp_reconnect: false,
             pending_provider_reload: false,
             pending_mcp_panel_auth: None,
