@@ -246,6 +246,11 @@ pub struct App {
     pub remote_session_url: Option<String>,
     /// Live MCP manager snapshot source when available.
     pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
+    /// Cached list of discovered skill slash commands (name, description),
+    /// built once at startup and refreshed when the config changes. Used to
+    /// augment the autocomplete and command palette without re-running
+    /// discovery on every keystroke.
+    pub discovered_slash_commands: Vec<(String, String)>,
     /// Queued request for a real MCP reconnect from the interactive loop.
     pub pending_mcp_reconnect: bool,
     /// Set after an in-session provider connection (e.g. a Claude Pro/Max OAuth
@@ -647,6 +652,7 @@ impl App {
             session_title: None,
             remote_session_url: None,
             mcp_manager: None,
+            discovered_slash_commands: Vec::new(),
             pending_mcp_reconnect: false,
             pending_provider_reload: false,
             pending_mcp_panel_auth: None,

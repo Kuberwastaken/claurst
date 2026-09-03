@@ -1874,6 +1874,12 @@ async fn run_interactive(
     // Set up terminal
     let mut terminal = setup_terminal(live_config.mouse_capture_enabled())?;
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
+    // Discover skill slash commands once at startup so they appear in
+    // autocomplete without re-running discovery per keystroke.
+    app.discovered_slash_commands = claurst_commands::all_slash_command_names(
+        &tool_ctx.working_dir,
+        &live_config.skills,
+    );
     if let Some(error) = settings_load_error {
         app.invalid_config_dialog =
             claurst_tui::InvalidConfigDialogState::show_settings_error(&error);
