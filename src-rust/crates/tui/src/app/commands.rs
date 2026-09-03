@@ -62,6 +62,7 @@ pub(super) const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("stats", "Open token and cost stats"),
     ("survey", "Open session feedback survey"),
     ("theme", "Open the theme picker"),
+    ("turns", "Show, set, or disable the session max-turn limit (/turns 25, /turns off). Session-only, not persisted"),
     ("ultrareview", "Run an exhaustive multi-dimensional code review"),
     ("update", "Check for updates and upgrade to the latest version"),
     ("upgrade", "Check for updates and upgrade to the latest version"),
@@ -79,7 +80,7 @@ pub(super) fn help_command_category(name: &str) -> &'static str {
         }
         "agent" | "agents" | "memory" | "plugin" | "survey" => "Tools",
         "session" | "resume" | "rename" | "fork" | "clear" | "new" | "move" | "compact"
-        | "quit" | "exit" => "Session",
+        | "quit" | "exit" | "turns" => "Session",
         _ => "Commands",
     }
 }
@@ -97,9 +98,56 @@ pub(super) fn help_overlay_entries() -> Vec<HelpEntry> {
 }
 
 impl App {
+    /// Handle `/turns [N|off|disable]`. With no argument, show the current
+    /// session max-turn limit. Sets a session-local override (never persisted);
+    /// `off` raises the limit to a large finite ceiling rather than removing
+    /// it entirely, so runaway loops still terminate.
+    pub fn handle_turns_command(&mut self, args: &str) {
+        const MAX_TURNS_CEILING: u32 = 1_000;
+        if args.is_empty() {
+            let msg = match self.max_turns_override {
+                Some(n) if n >= MAX_TURNS_CEILING => format!(
+                    "Max turns: disabled (ceiling {}), session-only.",
+                    MAX_TURNS_CEILING
+                ),
+                Some(n) => format!("Max turns: {} (override active), session-only.", n),
+                None => "Max turns: using config/agent default.".to_string(),
+            };
+            self.status_message = Some(msg);
+        } else if args == "off" || args == "disable" || args == "0" {
+            self.max_turns_override = Some(MAX_TURNS_CEILING);
+            self.status_message = Some(format!(
+                "Max turns disabled (ceiling {}), session-only.",
+                MAX_TURNS_CEILING
+            ));
+        } else if let Ok(n) = args.parse::<u32>() {
+            if n == 0 {
+                self.max_turns_override = Some(MAX_TURNS_CEILING);
+                self.status_message = Some(format!(
+                    "Max turns disabled (ceiling {}), session-only.",
+                    MAX_TURNS_CEILING
+                ));
+            } else {
+                self.max_turns_override = Some(n);
+                self.status_message = Some(format!("Max turns set to {}, session-only.", n));
+            }
+        } else {
+            self.status_message = Some(
+                "Usage: /turns <number> | off | (blank to show current). Session-only, not persisted."
+                    .to_string(),
+            );
+        }
+    }
+
     /// Handle slash commands that should open UI screens rather than execute
     /// as normal commands. Returns `true` if the command was intercepted.
     pub fn intercept_slash_command_with_args(&mut self, cmd: &str, args: &str) -> bool {
+        // `/turns` is session-local: show / set / disable the max-turn limit.
+        // Not persisted — resets to the config/agent default on restart.
+        if cmd == "turns" {
+            self.handle_turns_command(args.trim());
+            return true;
+        }
         if cmd == "mcp" && !args.trim().is_empty() {
             return false;
         }
