@@ -1055,6 +1055,13 @@ pub mod config {
         /// load; see [`ModelOverride`]).
         #[serde(default, rename = "modelOverrides", alias = "model_overrides")]
         pub model_overrides: HashMap<String, ModelOverride>,
+        /// Persistent YOLO mode (bypass all permission prompts). When true,
+        /// the effective permission mode is BypassPermissions. The CLI
+        /// `--dangerously-skip-permissions` flag overrides this for a single
+        /// session. SECURITY: this field is global-only in the Settings merge
+        /// (project settings cannot enable it) — see `Settings::merge`.
+        #[serde(default, rename = "yoloMode")]
+        pub yolo_mode: bool,
         /// Formatter configurations (copied from Settings on load).
         #[serde(default)]
         pub formatter: HashMap<String, FormatterConfig>,
@@ -1976,6 +1983,10 @@ pub mod config {
                 managed_agents: over.config.managed_agents.or(base.config.managed_agents),
                 auto_commits: over.config.auto_commits.or(base.config.auto_commits),
                 mouse_capture: over.config.mouse_capture.or(base.config.mouse_capture),
+                // SECURITY: yolo_mode bypasses all permission prompts, so
+                // only the user's global settings may enable it. A project
+                // settings file must not be able to flip this on.
+                yolo_mode: base.config.yolo_mode,
                 cursor_blink_enabled: over.config.cursor_blink_enabled || base.config.cursor_blink_enabled,
                 file_autocomplete_limit: if over.config.file_autocomplete_limit != 0 { over.config.file_autocomplete_limit } else { base.config.file_autocomplete_limit },
                 file_autocomplete_show_hidden_files: over.config.file_autocomplete_show_hidden_files || base.config.file_autocomplete_show_hidden_files,
@@ -2256,6 +2267,72 @@ pub mod config {
             let config = settings.effective_config();
             assert_eq!(config.model_overrides["custom-openai/a"].context_window, Some(111));
             assert_eq!(config.model_overrides["custom-openai/b"].context_window, Some(222));
+        }
+
+        #[test]
+        fn yolo_mode_is_global_only_in_merge() {
+            // Project settings must not be able to enable YOLO mode.
+            let base = Settings::default();
+            let mut over = Settings::default();
+            over.config.yolo_mode = true;
+            let merged = Settings::merge(base.clone(), over);
+            assert!(!merged.config.yolo_mode);
+
+            // Global settings CAN enable it, and a project cannot disable it.
+            let mut base2 = Settings::default();
+            base2.config.yolo_mode = true;
+            let mut over2 = Settings::default();
+            over2.config.yolo_mode = false;
+            let merged2 = Settings::merge(base2, over2);
+            assert!(merged2.config.yolo_mode);
+        }
+
+        #[tokio::test]
+        async fn project_settings_cannot_enable_yolo_mode() {
+            // Isolate the global settings dir so the test cannot pick up the
+            // real user settings.
+            let home = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let project_claurst = project.path().join(".claurst");
+            tokio::fs::create_dir_all(&project_claurst).await.unwrap();
+
+            // Global: yolo off. Project: yolo on.
+            let global = Settings::default();
+            tokio::fs::write(
+                home.path().join("settings.json"),
+                serde_json::to_string(&global).unwrap(),
+            )
+            .await
+            .unwrap();
+            // Project settings JSON enabling yoloMode.
+            let project_json = serde_json::to_string(&Settings::default()).unwrap();
+            let project_json = project_json.replace(
+                "\"yoloMode\":false",
+                "\"yoloMode\":true",
+            );
+            tokio::fs::write(project_claurst.join("settings.json"), project_json)
+                .await
+                .unwrap();
+
+            // Point CLAURST_HOME at the isolated home and load hierarchically.
+            std::env::set_var("CLAURST_HOME", home.path());
+            let merged = Settings::load_hierarchical(project.path()).await.unwrap();
+            std::env::remove_var("CLAURST_HOME");
+            assert!(
+                !merged.config.yolo_mode,
+                "project settings must not be able to enable yoloMode"
+            );
+        }
+
+        #[test]
+        fn yolo_mode_json_roundtrip() {
+            // Serializes as camelCase `yoloMode` and deserializes back.
+            let mut settings = Settings::default();
+            settings.config.yolo_mode = true;
+            let json = serde_json::to_string(&settings).unwrap();
+            assert!(json.contains("\"yoloMode\":true"), "got: {json}");
+            let back: Settings = serde_json::from_str(&json).unwrap();
+            assert!(back.config.yolo_mode);
         }
 
         #[test]

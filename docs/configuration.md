@@ -79,6 +79,7 @@ The `config` object holds runtime behaviour options.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `permission_mode` | string | `"default"` | Controls how tool permissions are enforced. One of `"default"`, `"acceptEdits"`, `"bypassPermissions"`, `"plan"`. |
+| `yolo_mode` | boolean | `false` | Persistent YOLO mode: the effective permission mode is `bypassPermissions`. Global-only in the settings merge: a project settings file cannot enable it. |
 
 See [Permission Modes](#permission-modes) for a full description of each value.
 
