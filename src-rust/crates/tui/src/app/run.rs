@@ -348,6 +348,7 @@ impl App {
                                 last_updated,
                                 message_count: s.messages.len(),
                                 cost_usd: s.total_cost,
+                                working_dir: s.working_dir,
                             }
                         })
                         .collect();

@@ -370,6 +370,10 @@ pub struct App {
     /// When `true`, the main event loop should spawn an async task to load
     /// the session list from disk and populate the session browser.
     pub session_list_pending: bool,
+    /// Session id selected for resume in the session browser. Set by the
+    /// `resumeSession` keybinding action; drained by the main loop, which
+    /// performs the same session swap as the /resume command.
+    pub session_resume_pending: Option<String>,
     /// Receiver for background session-list results.
     pub session_list_rx:
         Option<tokio::sync::mpsc::Receiver<Vec<crate::session_browser::SessionEntry>>>,
@@ -699,6 +703,7 @@ impl App {
             model_picker_fetch_pending: false,
             model_picker_provider_id: None,
             session_list_pending: false,
+            session_resume_pending: None,
             session_list_rx: None,
             recent_sessions: Vec::new(),
             // Load recent activity once, lazily, on the first run-loop iteration.

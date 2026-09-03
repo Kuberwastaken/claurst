@@ -832,18 +832,15 @@ impl App {
             return false;
         }
 
-        // Session browser intercepts navigation and Esc
+        // Session browser: Rename and Confirm modes intercept raw character
+        // input here. Browse mode falls through to the keybinding resolver,
+        // which handles its actions via KeyContext::SessionBrowser (see
+        // handle_keybinding_action) so all keys stay configurable.
         if self.session_browser.visible {
             use crate::session_browser::SessionBrowserMode;
             match self.session_browser.mode {
                 SessionBrowserMode::Browse => {
-                    match key.code {
-                        KeyCode::Esc => self.session_browser.close(),
-                        KeyCode::Up => self.session_browser.select_prev(),
-                        KeyCode::Down => self.session_browser.select_next(),
-                        KeyCode::Char('r') => self.session_browser.start_rename(),
-                        _ => {}
-                    }
+                    // Handled by the keybinding resolver below; keep flowing.
                 }
                 SessionBrowserMode::Rename => {
                     match key.code {
@@ -858,6 +855,7 @@ impl App {
                         KeyCode::Char(c) => self.session_browser.push_rename_char(c),
                         _ => {}
                     }
+                    return false;
                 }
                 SessionBrowserMode::Confirm => {
                     match key.code {
@@ -867,9 +865,9 @@ impl App {
                         }
                         _ => {}
                     }
+                    return false;
                 }
             }
-            return false;
         }
 
         // Tasks overlay intercepts navigation and Esc
@@ -1705,6 +1703,8 @@ impl App {
     pub(super) fn current_key_context(&self) -> KeyContext {
         if self.diff_viewer.visible {
             KeyContext::DiffDialog
+        } else if self.session_browser.visible {
+            KeyContext::SessionBrowser
         } else if self.agents_menu.visible || self.mcp_view.visible || self.stats_dialog.visible {
             KeyContext::Select
         } else if self.import_config_dialog.visible {
@@ -2087,6 +2087,58 @@ impl App {
                 false
             }
             "redraw" => false,
+            // ---- Session browser (KeyContext::SessionBrowser) ----
+            "prevSession" => {
+                self.session_browser.select_prev();
+                false
+            }
+            "nextSession" => {
+                self.session_browser.select_next();
+                false
+            }
+            "prevSessionPage" => {
+                for _ in 0..8 {
+                    self.session_browser.select_prev();
+                }
+                false
+            }
+            "nextSessionPage" => {
+                for _ in 0..8 {
+                    self.session_browser.select_next();
+                }
+                false
+            }
+            "closeSessionBrowser" => {
+                self.session_browser.close();
+                false
+            }
+            "renameSession" => {
+                self.session_browser.start_rename();
+                false
+            }
+            "resumeSession" => {
+                // Signal the main loop to swap in the selected session. The
+                // loop drains `session_resume_pending` and performs the same
+                // swap as the /resume command (load, replace messages, reset
+                // file history and turn bookkeeping).
+                if let Some(session) = self.session_browser.selected_session() {
+                    self.session_resume_pending = Some(session.id.clone());
+                    self.session_browser.close();
+                }
+                false
+            }
+            "toggleSessionPaths" => {
+                self.session_browser.toggle_show_paths();
+                self.status_message = Some(format!(
+                    "Session paths {}.",
+                    if self.session_browser.show_paths { "shown" } else { "hidden" }
+                ));
+                false
+            }
+            "toggleSessionPreview" => {
+                self.session_browser.toggle_show_preview();
+                false
+            }
             "historySearch" => {
                 let overlay = HistorySearchOverlay::open(&self.prompt_input.history);
                 self.history_search_overlay = overlay;
