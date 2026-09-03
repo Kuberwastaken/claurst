@@ -246,6 +246,10 @@ impl App {
                 self.complete_current_turn_snapshot(stop_reason.contains("abort") || stop_reason.contains("cancel"));
                 self.invalidate_transcript();
                 self.refresh_turn_diff_from_history();
+
+                // Auto-poke: queue a continuation prompt when the model
+                // stopped cleanly with incomplete todos.
+                self.check_auto_poke(&stop_reason);
             }
 
             QueryEvent::Status(msg) => {
@@ -295,6 +299,80 @@ impl App {
 
         // Update token count from tracker.
         self.token_count = self.cost_tracker.total_tokens() as u32;
+    }
+
+    // -------------------------------------------------------------------
+    // Auto-poke
+    // -------------------------------------------------------------------
+
+    /// Check whether auto-poke should fire after a model turn ended with
+    /// `stop_reason`. When the model stopped cleanly with incomplete todos,
+    /// queue a synthetic continuation message via the existing
+    /// `queued_messages` mechanism (submitted by the main loop).
+    ///
+    /// Opt-in: auto-poke must be enabled in settings (default OFF) — see
+    /// `/poke`. Safety rails:
+    /// - Only fires on a clean `end_turn` stop. Aborts/cancels (Esc),
+    ///   `max_tokens` truncation, `content_filtered` refusals, and unknown
+    ///   stop reasons never poke — the user must stay in control after any
+    ///   abnormal stop.
+    /// - Budget: at most `MAX_AUTO_POKES` pokes per session.
+    /// - No-progress: after `NO_PROGRESS_THRESHOLD` consecutive turns with an
+    ///   unchanged todo-state hash, poking stops.
+    pub(super) fn check_auto_poke(&mut self, stop_reason: &str) {
+        // Opt-in only — default OFF. Read the live config so `/poke` toggles
+        // take effect immediately without a settings reload.
+        if !self.config.auto_poke_enabled {
+            return;
+        }
+
+        // Stop-reason gate: only continue after a clean end-of-turn. An
+        // aborted (Esc) or cancelled turn must never re-poke, and neither
+        // should truncation or provider-side refusals.
+        if stop_reason != "end_turn" {
+            return;
+        }
+
+        // Poke budget.
+        if self.auto_poke_count >= claurst_tools::todo_write::MAX_AUTO_POKES {
+            self.status_message = Some(format!(
+                "Auto-poke stopped: budget of {} reached.",
+                claurst_tools::todo_write::MAX_AUTO_POKES
+            ));
+            return;
+        }
+
+        // Incomplete todos?
+        let incomplete = claurst_tools::todo_write::count_incomplete_todos(&self.session_id);
+        if incomplete == 0 {
+            return; // All done — no poke needed.
+        }
+
+        // No-progress detection: hash the todo state.
+        let current_hash = claurst_tools::todo_write::todo_state_hash(&self.session_id);
+        if current_hash == self.last_todo_hash {
+            self.no_progress_turns += 1;
+        } else {
+            self.no_progress_turns = 0;
+            self.last_todo_hash = current_hash;
+        }
+
+        if self.no_progress_turns >= claurst_tools::todo_write::NO_PROGRESS_THRESHOLD {
+            self.status_message =
+                Some("Auto-poke stopped: no progress for 3 turns.".to_string());
+            return;
+        }
+
+        // Queue the continuation via the existing queued_messages
+        // infrastructure so the main loop submits it on the next iteration.
+        let poke_msg = claurst_tools::todo_write::build_auto_poke_message(incomplete);
+        self.auto_poke_count += 1;
+        self.status_message = Some(format!(
+            "Auto-poking... ({} incomplete todos)",
+            incomplete
+        ));
+        self.queued_messages.push_back(poke_msg);
+        self.pending_auto_submit = true;
     }
 
     /// Run the TUI event loop. Returns `Some(input)` when the user submits

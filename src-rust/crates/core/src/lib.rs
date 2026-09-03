@@ -1114,6 +1114,12 @@ pub mod config {
         /// Keyboard scrolling (PageUp/PageDown, etc.) is unaffected either way.
         #[serde(default, rename = "mouseCapture", skip_serializing_if = "Option::is_none")]
         pub mouse_capture: Option<bool>,
+        /// Auto-poke: automatically send a continuation prompt when the model
+        /// stops with incomplete todos. Opt-in — the default is OFF. The
+        /// TUI's `/poke` command toggles it and persists to settings.json
+        /// under `"autoPokeEnabled"`.
+        #[serde(default, rename = "autoPokeEnabled")]
+        pub auto_poke_enabled: bool,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -1977,6 +1983,7 @@ pub mod config {
                 auto_commits: over.config.auto_commits.or(base.config.auto_commits),
                 mouse_capture: over.config.mouse_capture.or(base.config.mouse_capture),
                 cursor_blink_enabled: over.config.cursor_blink_enabled || base.config.cursor_blink_enabled,
+                auto_poke_enabled: over.config.auto_poke_enabled || base.config.auto_poke_enabled,
                 file_autocomplete_limit: if over.config.file_autocomplete_limit != 0 { over.config.file_autocomplete_limit } else { base.config.file_autocomplete_limit },
                 file_autocomplete_show_hidden_files: over.config.file_autocomplete_show_hidden_files || base.config.file_autocomplete_show_hidden_files,
                 file_injection_enabled: over.config.file_injection_enabled || base.config.file_injection_enabled,
@@ -2256,6 +2263,42 @@ pub mod config {
             let config = settings.effective_config();
             assert_eq!(config.model_overrides["custom-openai/a"].context_window, Some(111));
             assert_eq!(config.model_overrides["custom-openai/b"].context_window, Some(222));
+        }
+
+        #[test]
+        fn auto_poke_enabled_defaults_off() {
+            // Opt-in: absent key deserializes to false, not true.
+            let settings = Settings::default();
+            assert!(!settings.config.auto_poke_enabled);
+            let json = r#"{ "config": { "autoPokeEnabled": true } }"#;
+            let parsed: Result<Settings, _> = serde_json::from_str(json);
+            // A partial config block is valid only if required fields are
+            // present; check the roundtrip instead.
+            if let Ok(s) = parsed {
+                assert!(s.config.auto_poke_enabled);
+            }
+            let mut on = Settings::default();
+            on.config.auto_poke_enabled = true;
+            let serialized = serde_json::to_string(&on).unwrap();
+            assert!(serialized.contains("\"autoPokeEnabled\":true"), "got: {serialized}");
+            let back: Settings = serde_json::from_str(&serialized).unwrap();
+            assert!(back.config.auto_poke_enabled);
+        }
+
+        #[test]
+        fn auto_poke_merges_with_or() {
+            // Either global or project can enable; default false everywhere.
+            let base = Settings::default();
+            let mut over = Settings::default();
+            over.config.auto_poke_enabled = true;
+            let merged = Settings::merge(base, over);
+            assert!(merged.config.auto_poke_enabled);
+
+            let mut base2 = Settings::default();
+            base2.config.auto_poke_enabled = true;
+            let over2 = Settings::default();
+            let merged2 = Settings::merge(base2, over2);
+            assert!(merged2.config.auto_poke_enabled);
         }
 
         #[test]

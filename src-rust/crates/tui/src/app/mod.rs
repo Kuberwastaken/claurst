@@ -392,6 +392,17 @@ pub struct App {
     /// When `true`, the main loop will inject a synthetic Enter event on the
     /// next iteration to dequeue and submit the next queued message.
     pub pending_auto_submit: bool,
+    /// Current session id, kept in sync with `ToolContext::session_id` so
+    /// auto-poke can read the session's persisted todos.
+    pub session_id: String,
+    /// Auto-poke state: how many continuation prompts were sent this session.
+    pub auto_poke_count: u32,
+    /// Consecutive poked turns without any todo-state change. When this
+    /// reaches `NO_PROGRESS_THRESHOLD`, auto-poking stops.
+    pub no_progress_turns: u32,
+    /// Hash of the todo state at the last poke check, for no-progress
+    /// detection.
+    pub last_todo_hash: String,
     /// Connect-a-provider dialog (/connect command).
     pub connect_dialog: DialogSelectState,
     /// Import-config source picker (/import-config command).
@@ -707,6 +718,10 @@ impl App {
             auth_store: claurst_core::AuthStore::load(),
             queued_messages: std::collections::VecDeque::new(),
             pending_auto_submit: false,
+            session_id: String::new(),
+            auto_poke_count: 0,
+            no_progress_turns: 0,
+            last_todo_hash: String::new(),
             connect_dialog: DialogSelectState::new("Connect a provider", provider_picker_items()),
             import_config_picker: DialogSelectState::new("Import config", import_config_picker_items()),
             import_config_dialog: ImportConfigDialogState::new(),
