@@ -54,7 +54,13 @@ impl App {
         }
         let file_autocomplete_limit = self.config.file_autocomplete_limit;
         let file_autocomplete_show_hidden = self.config.file_autocomplete_show_hidden_files;
-        self.prompt_input.update_suggestions(PROMPT_SLASH_COMMANDS, file_autocomplete_limit, file_autocomplete_show_hidden);
+        // Merge built-in slash commands with discovered skill commands
+        // so skills appear in autocomplete and the command palette.
+        let mut all_cmds: Vec<(&str, &str)> = PROMPT_SLASH_COMMANDS.to_vec();
+        for (name, desc) in &self.discovered_slash_commands {
+            all_cmds.push((name.as_str(), desc.as_str()));
+        }
+        self.prompt_input.update_suggestions(&all_cmds, file_autocomplete_limit, file_autocomplete_show_hidden);
         self.sync_legacy_prompt_fields();
     }
 
