@@ -511,6 +511,13 @@ pub struct App {
     /// (issue #149 follow-up: prior word-boundary detection was a placeholder).
     pub last_row_text: RefCell<std::collections::HashMap<u16, String>>,
 
+    // ---- Keyboard text selection state ----------------------------------
+    /// Keyboard selection mode active (entered with `v` on empty prompt).
+    pub kb_select_mode: bool,
+    /// Cursor row for keyboard selection, as a screen row within
+    /// `last_msg_area`. Converted to absolute (col, row) on demand.
+    pub kb_cursor_row: u16,
+
     // ---- Advanced mouse interaction state --------------------------------
     /// Timestamp of the last left mouse click (for double/triple-click detection).
     pub last_click_time: Option<std::time::Instant>,
@@ -795,6 +802,8 @@ impl App {
             selection_focus: None,
             selection_text: RefCell::new(String::new()),
             last_row_text: RefCell::new(std::collections::HashMap::new()),
+            kb_select_mode: false,
+            kb_cursor_row: 0,
             last_click_time: None,
             last_click_position: None,
             click_count: 0,

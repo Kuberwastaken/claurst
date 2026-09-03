@@ -1198,6 +1198,24 @@ impl App {
             self.keybindings.cancel_chord();
         }
 
+        // ---- Keyboard selection mode: swallow unbound keys -----------------
+        // When kb_select_mode is active, the Transcript keybinding context
+        // handles movement (up/down/etc.), copy (Enter/Ctrl+C), and cancel
+        // (Esc).  Anything that falls through here was not bound in the
+        // Transcript context.  Swallow it to prevent the hardcoded handlers
+        // below from inserting characters or triggering actions, EXCEPT:
+        //   - Ctrl+C: copy selection and exit (hardcoded handler below).
+        //   - Ctrl+D: exit the app (hardcoded handler below).
+        if self.kb_select_mode {
+            let is_ctrl_c = key.code == KeyCode::Char('c')
+                && key.modifiers.contains(KeyModifiers::CONTROL);
+            let is_ctrl_d = key.code == KeyCode::Char('d')
+                && key.modifiers.contains(KeyModifiers::CONTROL);
+            if !is_ctrl_c && !is_ctrl_d {
+                return false;
+            }
+        }
+
         // Clear any active text selection on key press (except Ctrl+C which copies it).
         let is_copy = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
         if !is_copy && self.selection_anchor.is_some() {
@@ -1366,11 +1384,16 @@ impl App {
                 if self.selection_anchor.is_some() && !sel_text.is_empty() {
                     // Text is selected: copy to clipboard.
                     let copied = crate::image_paste::write_clipboard_text(&sel_text);
-                    self.selection_anchor = None;
-                    self.selection_focus = None;
-                    *self.selection_text.borrow_mut() = String::new();
                     if copied {
                         self.push_notification(NotificationKind::Info, "Copied to clipboard".to_string(), Some(2));
+                    }
+                    // Exit keyboard selection mode if active.
+                    if self.kb_select_mode {
+                        self.exit_kb_selection();
+                    } else {
+                        self.selection_anchor = None;
+                        self.selection_focus = None;
+                        *self.selection_text.borrow_mut() = String::new();
                     }
                 } else if self.is_streaming {
                     // Cancel streaming.
@@ -1451,6 +1474,28 @@ impl App {
             {
                 self.show_help = !self.show_help;
                 self.help_overlay.toggle();
+            }
+
+            // ---- Enter keyboard selection mode (v on empty prompt) ----
+            // Mirrors the `?` help toggle: a bare printable char on an empty
+            // prompt with no modifiers.  Gated on no voice recorder so it
+            // doesn't shadow voice PTT, and on not being in vim Normal/Visual
+            // mode so it doesn't shadow vim's `v` (visual mode).  Once active,
+            // all selection keys route through KeyContext::Transcript.
+            KeyCode::Char('v')
+                if !self.is_streaming
+                    && self.prompt_input.is_empty()
+                    && self.voice_recorder.is_none()
+                    && !matches!(
+                        self.prompt_input.vim_mode,
+                        VimMode::Normal | VimMode::Visual | VimMode::VisualBlock
+                    )
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && !key.modifiers.contains(KeyModifiers::SHIFT)
+                    && !key.modifiers.contains(KeyModifiers::SUPER) =>
+            {
+                self.enter_kb_selection();
             }
 
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1703,6 +1748,11 @@ impl App {
     }
 
     pub(super) fn current_key_context(&self) -> KeyContext {
+        // Keyboard selection mode takes priority — all movement/copy/cancel
+        // keys are routed through the Transcript context's keybinding table.
+        if self.kb_select_mode {
+            return KeyContext::Transcript;
+        }
         if self.diff_viewer.visible {
             KeyContext::DiffDialog
         } else if self.agents_menu.visible || self.mcp_view.visible || self.stats_dialog.visible {
@@ -2381,8 +2431,141 @@ impl App {
                 }
                 false
             }
+
+            // ========== KEYBOARD TEXT SELECTION (Transcript context) ==========
+            "selectionUp" => {
+                self.move_kb_cursor(-1);
+                false
+            }
+            "selectionDown" => {
+                self.move_kb_cursor(1);
+                false
+            }
+            "selectionPageUp" => {
+                let step = self.last_msg_area.get().height.max(1) as i32;
+                self.move_kb_cursor(-step);
+                false
+            }
+            "selectionPageDown" => {
+                let step = self.last_msg_area.get().height.max(1) as i32;
+                self.move_kb_cursor(step);
+                false
+            }
+            "selectionGoStart" => {
+                let area = self.last_selectable_area.get();
+                self.kb_cursor_row = area.y;
+                self.update_kb_selection();
+                false
+            }
+            "selectionGoEnd" => {
+                let area = self.last_selectable_area.get();
+                self.kb_cursor_row = area.y.saturating_add(area.height).saturating_sub(1);
+                self.update_kb_selection();
+                false
+            }
+            "selectionCopy" => {
+                let text = self.selection_text.borrow().clone();
+                if !text.is_empty() {
+                    let copied = crate::image_paste::write_clipboard_text(&text);
+                    if copied {
+                        self.push_notification(
+                            NotificationKind::Info,
+                            "Copied to clipboard".to_string(),
+                            Some(2),
+                        );
+                    }
+                }
+                self.exit_kb_selection();
+                false
+            }
+            "selectionCancel" => {
+                self.exit_kb_selection();
+                false
+            }
+
             _ => false,
         }
+    }
+
+    // ========== KEYBOARD TEXT SELECTION HELPERS ============================
+    //
+    // The selection cursor operates in screen-row coordinates within the
+    // transcript pane (last_selectable_area / last_msg_area).  Content-
+    // anchored means the cursor moves through actual rendered rows in the
+    // `last_row_text` cache, and scroll adjusts to keep it visible.
+
+    /// Enter keyboard selection mode.
+    /// Called from the hardcoded `v` handler (gated on empty prompt, not
+    /// streaming, no voice recorder, not in vim Normal/Visual).
+    pub(super) fn enter_kb_selection(&mut self) {
+        let area = self.last_selectable_area.get();
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        self.kb_select_mode = true;
+        // Start at the bottom of the transcript (most recent content).
+        self.kb_cursor_row = area.y.saturating_add(area.height).saturating_sub(1);
+        let col = area.x;
+        self.selection_anchor = Some((col, self.kb_cursor_row));
+        self.selection_focus = Some((col, self.kb_cursor_row));
+        self.status_message = Some("Selection mode: ↑↓ move · Enter copy · Esc cancel".to_string());
+    }
+
+    /// Exit keyboard selection mode and clear selection state.
+    pub(super) fn exit_kb_selection(&mut self) {
+        self.kb_select_mode = false;
+        self.clear_selection();
+    }
+
+    /// Move the keyboard selection cursor by `delta` rows (negative = up).
+    /// Clamps to the transcript pane bounds and scrolls the view to keep
+    /// the cursor visible (fixes review point #5: unreachable scroll branches).
+    pub(super) fn move_kb_cursor(&mut self, delta: i32) {
+        let area = self.last_selectable_area.get();
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let min_row = area.y;
+        let max_row = area.y.saturating_add(area.height).saturating_sub(1);
+        let new_row = if delta < 0 {
+            self.kb_cursor_row.saturating_sub(delta.unsigned_abs() as u16).max(min_row)
+        } else {
+            self.kb_cursor_row.saturating_add(delta as u16).min(max_row)
+        };
+        self.kb_cursor_row = new_row;
+        self.update_kb_selection();
+        // Scroll to keep the cursor visible. scroll_offset counts lines
+        // above the bottom; the cursor's offset from the bottom of the
+        // visible area = max_row - cursor_row.
+        let dist_from_bottom = max_row.saturating_sub(new_row);
+        let visible_height = area.height;
+        if dist_from_bottom >= visible_height {
+            // Cursor scrolled past the top — scroll up to show it.
+            let want = (dist_from_bottom as usize) + 1;
+            let max_scroll = self.last_max_scroll.get();
+            self.scroll_offset = want.min(max_scroll);
+            self.auto_scroll = false;
+        } else if (new_row as i32) > (max_row as i32 - visible_height as i32 / 4) {
+            // Cursor near the bottom — snap to bottom for context.
+            self.scroll_offset = 0;
+            self.auto_scroll = true;
+        }
+    }
+
+    /// Update selection_anchor/focus based on the current kb_cursor_row.
+    /// The anchor stays at the entry point; the focus follows the cursor.
+    pub(super) fn update_kb_selection(&mut self) {
+        let area = self.last_selectable_area.get();
+        if area.width == 0 {
+            return;
+        }
+        let col = area.x;
+        let row = self.kb_cursor_row.clamp(
+            area.y,
+            area.y.saturating_add(area.height).saturating_sub(1),
+        );
+        self.kb_cursor_row = row;
+        self.selection_focus = Some((col, row));
     }
 
     /// Handle a key event while in legacy history-search mode.

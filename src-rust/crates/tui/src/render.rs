@@ -882,6 +882,19 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     }
 
     // ---- Text selection highlight (topmost post-pass) ---------------------
+    // Restrict the selectable area to the transcript pane (last_msg_area)
+    // so keyboard and mouse selection can't roam over the prompt box,
+    // status bar, or other UI chrome. Falls back to the full frame when
+    // the transcript is empty (welcome screen).
+    let selectable = {
+        let msg = app.last_msg_area.get();
+        if msg.width > 0 && msg.height > 0 {
+            msg
+        } else {
+            size
+        }
+    };
+    app.last_selectable_area.set(selectable);
     apply_selection_highlight(frame, app);
     cache_selectable_row_text(frame, app);
     render_context_menu(frame, app);
@@ -930,9 +943,6 @@ fn apply_selection_highlight(frame: &mut Frame, app: &App) {
         (Some(a), Some(f)) => (a, f),
         _ => return,
     };
-    if anchor == focus {
-        return;
-    }
 
     let selectable_area = app.last_selectable_area.get();
     if selectable_area.width == 0 || selectable_area.height == 0 {
@@ -966,6 +976,20 @@ fn apply_selection_highlight(frame: &mut Frame, app: &App) {
         focus.0.clamp(selectable_area.x, max_col),
         focus.1.clamp(selectable_area.y, max_row),
     );
+
+    // When anchor == focus, show a cursor bar on the single cell so the
+    // user sees the selection entry point immediately (review point #10).
+    if anchor == focus {
+        if let Some(cell) = frame.buffer_mut().cell_mut((anchor.0, anchor.1)) {
+            cell.set_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(200, 200, 200)),
+            );
+        }
+        *app.selection_text.borrow_mut() = String::new();
+        return;
+    }
 
     // Normalise so start ≤ end (row-major order).
     let (start, end) = if (anchor.1, anchor.0) <= (focus.1, focus.0) {
@@ -1194,6 +1218,7 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     // at render time). Prevents unbounded inflation when scrolling past the top
     // (#223).
     app.last_max_scroll.set(max_scroll);
+    app.total_message_lines.set(content_height as usize);
     // scroll_offset counts lines above the bottom (0 = at bottom).
     // ratatui scroll() takes an absolute top-row index, so convert:
     //   top_row = max_scroll - scroll_offset  (clamped to [0, max_scroll])
