@@ -95,6 +95,10 @@ pub struct QueryConfig {
     pub model: String,
     pub max_tokens: u32,
     pub max_turns: u32,
+    /// Whether the max-steps graceful degradation summary turn is enabled.
+    /// When `false`, exceeding `max_turns` returns cold (last assistant
+    /// message) instead of running a final tool-less summary turn.
+    pub degradation_enabled: bool,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
     pub output_style: claurst_core::system_prompt::OutputStyle,
@@ -174,6 +178,7 @@ impl Default for QueryConfig {
             model: claurst_core::constants::DEFAULT_MODEL.to_string(),
             max_tokens: claurst_core::constants::DEFAULT_MAX_TOKENS,
             max_turns: claurst_core::constants::MAX_TURNS_DEFAULT,
+            degradation_enabled: true,
             system_prompt: None,
             append_system_prompt: None,
             output_style: claurst_core::system_prompt::OutputStyle::Default,
@@ -210,6 +215,7 @@ impl QueryConfig {
                 .as_ref()
                 .map(|p| p.display().to_string()),
             managed_agents: cfg.managed_agents.clone(),
+            degradation_enabled: cfg.degradation_summary_enabled.unwrap_or(true),
             ..Default::default()
         }
     }
@@ -231,6 +237,7 @@ impl QueryConfig {
                 .as_ref()
                 .map(|p| p.display().to_string()),
             managed_agents: cfg.managed_agents.clone(),
+            degradation_enabled: cfg.degradation_summary_enabled.unwrap_or(true),
             ..Default::default()
         }
     }
@@ -471,6 +478,21 @@ pub async fn run_query_loop(
         // dispatched exactly once, and re-exceeding the cap afterwards returns
         // cold. Applies to both goal and non-goal runs.
         let degradation_turn = if turn > effective_max_turns {
+            if !config.degradation_enabled {
+                info!(
+                    turns = turn,
+                    max = effective_max_turns,
+                    "Max turns reached — degradation disabled, returning cold"
+                );
+                let last_msg = messages
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| Message::assistant("Max turns reached."));
+                return QueryOutcome::EndTurn {
+                    message: last_msg,
+                    usage: UsageInfo::default(),
+                };
+            }
             if degradation_done {
                 info!(
                     turns = turn,
@@ -2127,6 +2149,7 @@ mod tests {
             model: "claude-sonnet-4-6".to_string(),
             max_tokens: 4096,
             max_turns: 10,
+            degradation_enabled: true,
             system_prompt: sys.map(String::from),
             append_system_prompt: append.map(String::from),
             output_style: claurst_core::system_prompt::OutputStyle::Default,
@@ -2899,6 +2922,18 @@ mod tests {
         tools: Vec<Box<dyn Tool>>,
         continuation: crate::continuation::ContinuationMode,
     ) -> (QueryOutcome, Vec<bool>, Vec<Message>) {
+        drive_loop_with_degradation(always_end_turn, max_turns, tools, continuation, true).await
+    }
+
+    /// Same as `drive_loop_with_mock` but lets the caller control the
+    /// `degradation_enabled` flag.
+    async fn drive_loop_with_degradation(
+        always_end_turn: bool,
+        max_turns: u32,
+        tools: Vec<Box<dyn Tool>>,
+        continuation: crate::continuation::ContinuationMode,
+        degradation_enabled: bool,
+    ) -> (QueryOutcome, Vec<bool>, Vec<Message>) {
         let recorded = Arc::new(StdMutex::new(Vec::new()));
         let provider = Arc::new(RecordingProvider {
             id: claurst_core::provider_id::ProviderId::new("mockprov"),
@@ -2922,6 +2957,7 @@ mod tests {
         let mut config = make_config(None, None);
         config.model = "mock-model".to_string();
         config.max_turns = max_turns;
+        config.degradation_enabled = degradation_enabled;
         config.provider_registry = Some(registry);
         config.continuation = continuation;
 
@@ -3013,6 +3049,40 @@ mod tests {
             msgs.iter()
                 .any(|m| m.get_all_text().contains("maximum number of steps")),
             "the tool-less summary prompt must be injected into the history"
+        );
+    }
+
+    /// (c-bis) With `degradation_enabled = false`, exceeding `max_turns`
+    /// returns cold immediately: no extra request is dispatched, the last
+    /// assistant message is the outcome, and no summary prompt is injected.
+    #[tokio::test]
+    async fn max_steps_disabled_returns_cold_without_summary_turn() {
+        // max_turns = 2, model never ends the turn on its own: turns 1 & 2 run,
+        // turn 3 exceeds the cap and — with degradation off — the loop returns
+        // cold instead of dispatching a third (summary) request.
+        let (outcome, recorded, msgs) = drive_loop_with_degradation(
+            false,
+            2,
+            noop_tools(),
+            crate::continuation::ContinuationMode::Default,
+            false,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, QueryOutcome::EndTurn { .. }),
+            "the loop must end cold when degradation is disabled"
+        );
+        assert_eq!(
+            recorded.len(),
+            2,
+            "no summary turn may be dispatched when degradation is disabled, got {:?}",
+            recorded
+        );
+        assert!(
+            !msgs.iter()
+                .any(|m| m.get_all_text().contains("maximum number of steps")),
+            "the tool-less summary prompt must NOT be injected when degradation is disabled"
         );
     }
 

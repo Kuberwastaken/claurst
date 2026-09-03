@@ -73,6 +73,7 @@ The `config` object holds runtime behaviour options.
 | `model` | string \| null | provider default | Model ID to use. When absent, the provider's default is used (e.g. `claude-sonnet-4-6` for Anthropic, `gpt-4o` for OpenAI). |
 | `max_tokens` | integer \| null | 8192 | Maximum tokens per model response. |
 | `provider` | string \| null | `"anthropic"` | Active provider. See the [Providers](#providers) section. |
+| `degradationSummaryEnabled` | boolean \| null | true | Controls the max-steps graceful degradation turn. When `true` (or unset), exceeding `max_turns` runs one final tool-less turn asking the model to summarize progress. When `false`, the loop returns the last assistant message immediately. |
 
 ### Permission mode
 
