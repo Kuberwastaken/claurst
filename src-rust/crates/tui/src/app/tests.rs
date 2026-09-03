@@ -465,6 +465,114 @@ use super::types::{ContextMenuItem, ContextMenuState};
         assert!(app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE)));
     }
 
+    /// Build an `App` for auto-poke tests with `auto_poke_enabled` on and a
+    /// known session id. Uses `save_todos_in` against a tempdir-mounted
+    /// `todos` dir via `CLAURST_HOME` so nothing touches real user state.
+    fn make_poke_app(todos: &[serde_json::Value]) -> (App, tempfile::TempDir) {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAURST_HOME", home.path());
+        let app_dir = home.path().join("todos");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let mut app = make_app();
+        app.config.auto_poke_enabled = true;
+        app.session_id = "poke-test-session".to_string();
+        if !todos.is_empty() {
+            claurst_tools::todo_write::save_todos_in(
+                &app_dir,
+                &app.session_id,
+                todos,
+            );
+        }
+        (app, home)
+    }
+
+    fn todo(id: &str, status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "content": format!("task {}", id),
+            "status": status,
+            "priority": "medium",
+        })
+    }
+
+    #[test]
+    fn test_poke_command_toggles_setting() {
+        let mut app = make_app();
+        assert!(!app.config.auto_poke_enabled);
+        assert!(app.intercept_slash_command_with_args("poke", "on"));
+        assert!(app.config.auto_poke_enabled);
+        assert!(app.intercept_slash_command_with_args("poke", "off"));
+        assert!(!app.config.auto_poke_enabled);
+        // No-arg toggle flips.
+        assert!(app.intercept_slash_command_with_args("poke", ""));
+        assert!(app.config.auto_poke_enabled);
+    }
+
+    #[test]
+    fn test_check_auto_poke_disabled_does_not_queue() {
+        let (mut app, _home) = make_poke_app(&[todo("1", "pending")]);
+        app.config.auto_poke_enabled = false;
+        app.check_auto_poke("end_turn");
+        assert!(app.queued_messages.is_empty());
+        assert!(!app.pending_auto_submit);
+    }
+
+    #[test]
+    fn test_check_auto_poke_end_turn_with_incomplete_todos_queues() {
+        let (mut app, _home) = make_poke_app(&[todo("1", "pending")]);
+        app.check_auto_poke("end_turn");
+        assert_eq!(app.queued_messages.len(), 1);
+        assert!(app.pending_auto_submit);
+        assert_eq!(app.auto_poke_count, 1);
+    }
+
+    #[test]
+    fn test_check_auto_poke_ignores_abort_and_max_tokens() {
+        let (mut app, _home) = make_poke_app(&[todo("1", "pending")]);
+        // Esc abort, cancellation, truncation, refusal: never poke.
+        for reason in ["abort", "cancelled", "max_tokens", "content_filtered"] {
+            app.check_auto_poke(reason);
+            assert!(app.queued_messages.is_empty(), "poked on {}", reason);
+        }
+        assert_eq!(app.auto_poke_count, 0);
+    }
+
+    #[test]
+    fn test_check_auto_poke_all_complete_does_not_queue() {
+        let (mut app, _home) =
+            make_poke_app(&[todo("1", "completed"), todo("2", "completed")]);
+        app.check_auto_poke("end_turn");
+        assert!(app.queued_messages.is_empty());
+    }
+
+    #[test]
+    fn test_check_auto_poke_budget_exhausted_stops() {
+        let (mut app, _home) = make_poke_app(&[todo("1", "pending")]);
+        app.auto_poke_count = claurst_tools::todo_write::MAX_AUTO_POKES;
+        app.check_auto_poke("end_turn");
+        assert!(app.queued_messages.is_empty());
+        assert!(app.status_message.is_some());
+    }
+
+    #[test]
+    fn test_check_auto_poke_no_progress_stops() {
+        let (mut app, _home) = make_poke_app(&[todo("1", "pending")]);
+        // First poke records the hash.
+        app.check_auto_poke("end_turn");
+        assert_eq!(app.auto_poke_count, 1);
+        // Simulate two more no-progress turns (todo state unchanged).
+        // The first call records the hash; calls 2 and 3 increment the
+        // no-progress counter to 1 and 2 and still poke.
+        app.check_auto_poke("end_turn");
+        app.check_auto_poke("end_turn");
+        assert_eq!(app.auto_poke_count, 3);
+        assert_eq!(app.no_progress_turns, claurst_tools::todo_write::NO_PROGRESS_THRESHOLD - 1);
+        // Fourth check reaches the threshold and stops without queueing.
+        app.check_auto_poke("end_turn");
+        assert_eq!(app.auto_poke_count, 3);
+        assert!(app.status_message.is_some());
+    }
+
     #[test]
     fn test_mcp_subcommand_is_not_intercepted() {
         let mut app = make_app();

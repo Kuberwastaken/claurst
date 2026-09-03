@@ -2429,6 +2429,9 @@ async fn run_interactive(
                                     tool_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_title = None;
+                                    // Keep the TUI's session id in sync so
+                                    // auto-poke reads the new session's todos.
+                                    app.session_id = tool_ctx.session_id.clone();
                                     // Reset per-turn diff/turn bookkeeping, as
                                     // ResumeSession does when swapping sessions.
                                     tool_ctx.file_history = Arc::new(ParkingMutex::new(
@@ -2535,6 +2538,7 @@ async fn run_interactive(
                                     tool_ctx.current_turn = Arc::new(
                                         std::sync::atomic::AtomicUsize::new(0),
                                     );
+                                    app.session_id = tool_ctx.session_id.clone();
                                     cmd_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_title = session.title.clone();
                                     if let Some(saved_dir) = session.working_dir.as_ref() {

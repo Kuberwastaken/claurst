@@ -290,6 +290,31 @@ Setting persists to `~/.claurst/ui-settings.json`.
 
 ---
 
+### /poke
+**Aliases:** `autopoke`
+
+Toggle auto-poke. When enabled, Claurst sends a continuation prompt
+automatically when the model stops a turn with incomplete todos. Opt-in:
+auto-poke is OFF by default.
+
+```
+/poke          — toggle auto-poke on/off
+/poke on       — enable auto-poke
+/poke off      — disable auto-poke
+/poke status   — show enabled state, poke budget, and incomplete count
+```
+
+Safety rails:
+- Only fires after a clean `end_turn` stop. Esc-aborted turns, `max_tokens`
+  truncation, and provider refusals never auto-poke.
+- Budget of 48 pokes per session.
+- Stops after 3 consecutive turns with no todo-state change.
+
+Setting persists to `~/.claurst/settings.json` under `"autoPokeEnabled"`
+(default: `false`).
+
+---
+
 ## Configuration & Settings
 
 ### /config

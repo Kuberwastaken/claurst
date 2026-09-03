@@ -46,6 +46,7 @@ pub(super) const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("new", "Start a fresh session (keeps model, provider & directory)"),
     ("output-style", "Show or switch the output style / persona"),
     ("plugin", "Manage plugins (list/info/enable/disable/reload)"),
+    ("poke", "Toggle or configure auto-poke (on/off/status)"),
     ("providers", "List available AI providers and their status"),
     ("caveman", "Caveman persona output style — save big token"),
     ("rocky", "Rocky persona output style — amaze amaze amaze"),
@@ -77,7 +78,7 @@ pub(super) fn help_command_category(name: &str) -> &'static str {
         "config" | "settings" | "theme" | "keybindings" | "hooks" | "mcp" | "import-config" => {
             "Workspace"
         }
-        "agent" | "agents" | "memory" | "plugin" | "survey" => "Tools",
+        "agent" | "agents" | "memory" | "plugin" | "poke" | "survey" => "Tools",
         "session" | "resume" | "rename" | "fork" | "clear" | "new" | "move" | "compact"
         | "quit" | "exit" => "Session",
         _ => "Commands",
@@ -99,7 +100,59 @@ pub(super) fn help_overlay_entries() -> Vec<HelpEntry> {
 impl App {
     /// Handle slash commands that should open UI screens rather than execute
     /// as normal commands. Returns `true` if the command was intercepted.
+    /// Handle `/poke [on|off|status]`. Toggles auto-poke, which sends a
+    /// continuation prompt when the model stops with incomplete todos.
+    /// Opt-in only: the default is OFF. Persists to settings.json.
+    pub fn handle_poke_command(&mut self, args: &str) {
+        let mut settings = claurst_core::Settings::load_sync().unwrap_or_default();
+        match args.trim() {
+            "on" | "enable" => {
+                settings.config.auto_poke_enabled = true;
+                let _ = settings.save_sync();
+                self.config.auto_poke_enabled = true;
+                self.status_message = Some("Auto-poke enabled.".to_string());
+            }
+            "off" | "disable" => {
+                settings.config.auto_poke_enabled = false;
+                let _ = settings.save_sync();
+                self.config.auto_poke_enabled = false;
+                self.status_message = Some("Auto-poke disabled.".to_string());
+            }
+            "status" => {
+                let budget_left = claurst_tools::todo_write::MAX_AUTO_POKES
+                    .saturating_sub(self.auto_poke_count);
+                let incomplete =
+                    claurst_tools::todo_write::count_incomplete_todos(&self.session_id);
+                self.status_message = Some(format!(
+                    "Auto-poke: {} | Pokes: {}/{} | Budget left: {} | Incomplete: {}",
+                    if self.config.auto_poke_enabled { "ON" } else { "OFF" },
+                    self.auto_poke_count,
+                    claurst_tools::todo_write::MAX_AUTO_POKES,
+                    budget_left,
+                    incomplete,
+                ));
+            }
+            "" => {
+                settings.config.auto_poke_enabled = !settings.config.auto_poke_enabled;
+                let _ = settings.save_sync();
+                self.config.auto_poke_enabled = settings.config.auto_poke_enabled;
+                self.status_message = Some(format!(
+                    "Auto-poke {}.",
+                    if settings.config.auto_poke_enabled { "enabled" } else { "disabled" }
+                ));
+            }
+            _ => {
+                self.status_message =
+                    Some("Usage: /poke [on|off|status] (no arg toggles).".to_string());
+            }
+        }
+    }
+
     pub fn intercept_slash_command_with_args(&mut self, cmd: &str, args: &str) -> bool {
+        if cmd == "poke" {
+            self.handle_poke_command(args);
+            return true;
+        }
         if cmd == "mcp" && !args.trim().is_empty() {
             return false;
         }
