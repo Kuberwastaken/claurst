@@ -1271,6 +1271,12 @@ pub mod config {
         /// makes the loop return cold (last assistant message) immediately.
         #[serde(default, rename = "degradationSummaryEnabled", skip_serializing_if = "Option::is_none")]
         pub degradation_summary_enabled: Option<bool>,
+        /// Auto-poke: automatically send a continuation prompt when the model
+        /// stops with incomplete todos. Opt-in — the default is OFF. The
+        /// TUI's `/poke` command toggles it and persists to settings.json
+        /// under `"autoPokeEnabled"`.
+        #[serde(default, rename = "autoPokeEnabled")]
+        pub auto_poke_enabled: bool,
         /// External status line command configuration. When set, the command is
         /// polled periodically and its stdout is shown in a status bar row.
         #[serde(default, rename = "statusLine", alias = "status_line", skip_serializing_if = "Option::is_none")]
@@ -2377,6 +2383,7 @@ pub mod config {
                 // settings file must not be able to flip this on.
                 yolo_mode: base.config.yolo_mode,
                 cursor_blink_enabled: over.config.cursor_blink_enabled || base.config.cursor_blink_enabled,
+                auto_poke_enabled: over.config.auto_poke_enabled || base.config.auto_poke_enabled,
                 file_autocomplete_limit: if over.config.file_autocomplete_limit != 0 { over.config.file_autocomplete_limit } else { base.config.file_autocomplete_limit },
                 file_autocomplete_show_hidden_files: over.config.file_autocomplete_show_hidden_files || base.config.file_autocomplete_show_hidden_files,
                 file_injection_enabled: over.config.file_injection_enabled || base.config.file_injection_enabled,
@@ -2896,6 +2903,42 @@ pub mod config {
             assert!(json.contains("\"yoloMode\":true"), "got: {json}");
             let back: Settings = serde_json::from_str(&json).unwrap();
             assert!(back.config.yolo_mode);
+        }
+
+        #[test]
+        fn auto_poke_enabled_defaults_off() {
+            // Opt-in: absent key deserializes to false, not true.
+            let settings = Settings::default();
+            assert!(!settings.config.auto_poke_enabled);
+            let json = r#"{ "config": { "autoPokeEnabled": true } }"#;
+            let parsed: Result<Settings, _> = serde_json::from_str(json);
+            // A partial config block is valid only if required fields are
+            // present; check the roundtrip instead.
+            if let Ok(s) = parsed {
+                assert!(s.config.auto_poke_enabled);
+            }
+            let mut on = Settings::default();
+            on.config.auto_poke_enabled = true;
+            let serialized = serde_json::to_string(&on).unwrap();
+            assert!(serialized.contains("\"autoPokeEnabled\":true"), "got: {serialized}");
+            let back: Settings = serde_json::from_str(&serialized).unwrap();
+            assert!(back.config.auto_poke_enabled);
+        }
+
+        #[test]
+        fn auto_poke_merges_with_or() {
+            // Either global or project can enable; default false everywhere.
+            let base = Settings::default();
+            let mut over = Settings::default();
+            over.config.auto_poke_enabled = true;
+            let merged = Settings::merge(base, over);
+            assert!(merged.config.auto_poke_enabled);
+
+            let mut base2 = Settings::default();
+            base2.config.auto_poke_enabled = true;
+            let over2 = Settings::default();
+            let merged2 = Settings::merge(base2, over2);
+            assert!(merged2.config.auto_poke_enabled);
         }
 
         #[test]

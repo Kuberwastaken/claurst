@@ -172,6 +172,7 @@ The `config` object holds runtime behaviour options.
 |-----|------|---------|-------------|
 | `permission_mode` | string | `"default"` | Controls how tool permissions are enforced. One of `"default"`, `"acceptEdits"`, `"bypassPermissions"`, `"plan"`. Currently replaced at startup by `--permission-mode` (default `default`), so set the mode with the flag or `yoloMode`. |
 | `yoloMode` | boolean | `false` | Persistent YOLO mode: the effective permission mode is `bypassPermissions`. Global-only in the settings merge: a project settings file cannot enable it. |
+| `auto_poke_enabled` | boolean | `false` | Opt-in auto-poke: send a continuation prompt when the model stops a turn with incomplete todos. Only fires after a clean `end_turn` stop; budget of 48 pokes per session; stops after 3 consecutive no-progress turns. Toggle at runtime with `/poke`. |
 
 See [Permission Modes](#permission-modes) for a full description of each value.
 

@@ -370,6 +370,57 @@ impl Tool for TodoWriteTool {
 }
 
 // ---------------------------------------------------------------------------
+// Auto-poke helpers (used by the TUI's check_auto_poke)
+// ---------------------------------------------------------------------------
+
+/// Build the synthetic continuation message sent when the model stops with
+/// incomplete todos. The message instructs the model to continue working.
+pub fn build_auto_poke_message(incomplete_count: usize) -> String {
+    format!(
+        "You have {} incomplete todo{}. Continue working, or update the todo tool.",
+        incomplete_count,
+        if incomplete_count == 1 { "" } else { "s" },
+    )
+}
+
+/// Count incomplete (pending + in_progress) todos for a session.
+pub fn count_incomplete_todos(session_id: &str) -> usize {
+    let todos = load_todos(session_id);
+    todos
+        .iter()
+        .filter_map(|t| t.get("status").and_then(|s| s.as_str()))
+        .filter(|s| *s == "pending" || *s == "in_progress")
+        .count()
+}
+
+/// Compute a stable hash of the current todo state (sorted `(id, status)`
+/// pairs). Used for no-progress detection: if the hash is unchanged for
+/// [`NO_PROGRESS_THRESHOLD`] consecutive poked turns, auto-poking stops.
+pub fn todo_state_hash(session_id: &str) -> String {
+    let todos = load_todos(session_id);
+    let mut pairs: Vec<(String, String)> = todos
+        .iter()
+        .filter_map(|t| {
+            let id = t.get("id").and_then(|v| v.as_str())?.to_string();
+            let status = t.get("status").and_then(|v| v.as_str())?.to_string();
+            Some((id, status))
+        })
+        .collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    pairs
+        .iter()
+        .map(|(id, s)| format!("{}:{}", id, s))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// Maximum auto-pokes per session (safety budget).
+pub const MAX_AUTO_POKES: u32 = 48;
+
+/// No-progress threshold: stop after this many consecutive no-progress turns.
+pub const NO_PROGRESS_THRESHOLD: u32 = 3;
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
