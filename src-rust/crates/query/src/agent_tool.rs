@@ -372,6 +372,8 @@ impl Tool for AgentTool {
             // Sub-agents run to their own completion and never drive goal
             // continuation — stop after one turn like every non-goal run.
             continuation: crate::continuation::ContinuationMode::Default,
+            // Sub-agents inherit the degradation-summary behaviour.
+            degradation_enabled: true,
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.

@@ -1114,6 +1114,12 @@ pub mod config {
         /// Keyboard scrolling (PageUp/PageDown, etc.) is unaffected either way.
         #[serde(default, rename = "mouseCapture", skip_serializing_if = "Option::is_none")]
         pub mouse_capture: Option<bool>,
+        /// Whether the max-steps graceful degradation summary turn is enabled.
+        /// `None` (default) or `Some(true)` means exceeding `max_turns` runs one
+        /// final tool-less turn asking the model to summarize progress.
+        /// `Some(false)` returns cold (last assistant message) immediately.
+        #[serde(default, rename = "degradationSummaryEnabled", skip_serializing_if = "Option::is_none")]
+        pub degradation_summary_enabled: Option<bool>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -1976,6 +1982,10 @@ pub mod config {
                 managed_agents: over.config.managed_agents.or(base.config.managed_agents),
                 auto_commits: over.config.auto_commits.or(base.config.auto_commits),
                 mouse_capture: over.config.mouse_capture.or(base.config.mouse_capture),
+                degradation_summary_enabled: over
+                    .config
+                    .degradation_summary_enabled
+                    .or(base.config.degradation_summary_enabled),
                 cursor_blink_enabled: over.config.cursor_blink_enabled || base.config.cursor_blink_enabled,
                 file_autocomplete_limit: if over.config.file_autocomplete_limit != 0 { over.config.file_autocomplete_limit } else { base.config.file_autocomplete_limit },
                 file_autocomplete_show_hidden_files: over.config.file_autocomplete_show_hidden_files || base.config.file_autocomplete_show_hidden_files,
@@ -4727,6 +4737,73 @@ mod tests {
         assert!(!cfg.mouse_capture_enabled());
         cfg.mouse_capture = Some(true);
         assert!(cfg.mouse_capture_enabled());
+    }
+
+    #[test]
+    fn test_config_degradation_summary_defaults_on() {
+        // Fresh config: the flag is tri-state and `None` means "enabled" —
+        // fresh installs keep the #230 degradation summary.
+        let cfg = crate::config::Config::default();
+        assert_eq!(cfg.degradation_summary_enabled, None);
+        assert!(cfg.degradation_summary_enabled.unwrap_or(true));
+    }
+
+    #[tokio::test]
+    async fn test_config_degradation_summary_merge_precedence() {
+        // Project value wins (.or() merge); an unset project file falls back
+        // to the global value rather than latching off. Isolates CLAURST_HOME
+        // so no real ~/.claurst/settings.json is read.
+        struct EnvRestore(std::ffi::OsString);
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                if self.0.is_empty() {
+                    std::env::remove_var("CLAURST_HOME");
+                } else {
+                    std::env::set_var("CLAURST_HOME", &self.0);
+                }
+            }
+        }
+        let saved = std::env::var_os("CLAURST_HOME").unwrap_or_default();
+        let _restore = EnvRestore(saved);
+
+        use crate::config::Settings;
+
+        // Case 1: project sets true, global sets false → true (project wins).
+        let global_home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(global_home.path()).unwrap();
+        let mut global = Settings::default();
+        global.config.degradation_summary_enabled = Some(false);
+        std::fs::write(
+            global_home.path().join("settings.json"),
+            serde_json::to_string_pretty(&global).unwrap(),
+        )
+        .unwrap();
+        std::env::set_var("CLAURST_HOME", global_home.path());
+        let project_dir = tempfile::tempdir().unwrap();
+        let claurst = project_dir.path().join(".claurst");
+        std::fs::create_dir_all(&claurst).unwrap();
+        let mut project = Settings::default();
+        project.config.degradation_summary_enabled = Some(true);
+        std::fs::write(
+            claurst.join("settings.json"),
+            serde_json::to_string_pretty(&project).unwrap(),
+        )
+        .unwrap();
+        let merged = Settings::load_hierarchical(project_dir.path()).await.unwrap();
+        assert_eq!(merged.config.degradation_summary_enabled, Some(true));
+
+        // Case 2: no project file, global sets false → false (global applies).
+        let bare_dir = tempfile::tempdir().unwrap();
+        let merged = Settings::load_hierarchical(bare_dir.path()).await.unwrap();
+        assert_eq!(merged.config.degradation_summary_enabled, Some(false));
+
+        // Case 3: no project file, global unset → None (default enabled).
+        let empty_home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(empty_home.path()).unwrap();
+        std::env::set_var("CLAURST_HOME", empty_home.path());
+        let bare_dir2 = tempfile::tempdir().unwrap();
+        let merged = Settings::load_hierarchical(bare_dir2.path()).await.unwrap();
+        assert_eq!(merged.config.degradation_summary_enabled, None);
     }
 
     #[test]
