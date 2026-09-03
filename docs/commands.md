@@ -1123,6 +1123,18 @@ Copy the most recent assistant response to the system clipboard. Pass a number t
 /copy N       — copy the Nth most recent response
 ```
 
+### Keyboard text selection
+
+When the prompt is empty (no text typed), press `v` to enter keyboard
+selection mode. A cursor bar appears at the bottom of the transcript.
+Use the arrow keys to extend the selection up or down. `PageUp`/`PageDown`
+scroll by a page, `Home`/`End` jump to the top/bottom of the transcript.
+`Enter` or `Ctrl+C` copies the selected text to the clipboard and exits
+selection mode. `Esc` cancels without copying.
+
+All selection-mode keys are routed through the configurable keybinding
+system under `KeyContext::Transcript` (see `/keybindings`).
+
 ---
 
 ## Advanced & Internal

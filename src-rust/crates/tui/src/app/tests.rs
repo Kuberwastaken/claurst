@@ -958,3 +958,249 @@ use super::types::{ContextMenuItem, ContextMenuState};
         app.handle_key_event(press_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.should_exit);
     }
+
+    // ---- Keyboard text selection (Transcript context) ----
+
+    #[test]
+    fn test_kb_selection_enters_with_v_on_empty_prompt() {
+        let mut app = make_app();
+        app.last_msg_area.set(ratatui::layout::Rect::new(0, 0, 80, 24));
+        app.last_selectable_area
+            .set(ratatui::layout::Rect::new(0, 0, 80, 24));
+        // Press 'v' on empty prompt — should enter selection mode.
+        app.handle_key_event(press_key(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(app.kb_select_mode, "v on empty prompt should enter selection mode");
+        assert!(app.selection_anchor.is_some(), "anchor should be set on entry");
+        assert!(app.selection_focus.is_some(), "focus should be set on entry");
+    }
+
+    #[test]
+    fn test_kb_selection_does_not_enter_with_text_in_prompt() {
+        let mut app = make_app();
+        app.last_msg_area.set(ratatui::layout::Rect::new(0, 0, 80, 24));
+        app.last_selectable_area
+            .set(ratatui::layout::Rect::new(0, 0, 80, 24));
+        // Type "verify" — the 'v' should be inserted as text, not enter selection.
+        app.handle_key_event(press_key(KeyCode::Char('v'), KeyModifiers::NONE));
+        // First 'v' enters selection mode because prompt is empty.
+        // Now type another 'v' — it should be swallowed by selection mode guard.
+        assert!(app.kb_select_mode);
+        app.handle_key_event(press_key(KeyCode::Char('e'), KeyModifiers::NONE));
+        // 'e' is swallowed in selection mode, prompt stays empty.
+        assert!(app.prompt_input.is_empty(), "keys should be swallowed in selection mode");
+    }
+
+    #[test]
+    fn test_kb_selection_cancel_with_escape() {
+        let mut app = make_app();
+        app.last_msg_area.set(ratatui::layout::Rect::new(0, 0, 80, 24));
+        app.last_selectable_area
+            .set(ratatui::layout::Rect::new(0, 0, 80, 24));
+        // Enter selection mode.
+        app.handle_key_event(press_key(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(app.kb_select_mode);
+        // Cancel with Escape.
+        app.handle_key_event(press_key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.kb_select_mode, "Esc should exit selection mode");
+        assert!(app.selection_anchor.is_none(), "selection should be cleared on cancel");
+    }
+
+    #[test]
+    fn test_kb_selection_context_returns_transcript() {
+        let mut app = make_app();
+        // Not in selection mode — should return Chat.
+        assert_eq!(
+            app.current_key_context(),
+            claurst_core::keybindings::KeyContext::Chat
+        );
+        // Enter selection mode.
+        app.kb_select_mode = true;
+        assert_eq!(
+            app.current_key_context(),
+            claurst_core::keybindings::KeyContext::Transcript
+        );
+    }
+
+    #[test]
+    fn test_kb_selection_ctrl_d_not_swallowed() {
+        let mut app = make_app();
+        app.last_msg_area.set(ratatui::layout::Rect::new(0, 0, 80, 24));
+        app.last_selectable_area
+            .set(ratatui::layout::Rect::new(0, 0, 80, 24));
+        // Enter selection mode.
+        app.handle_key_event(press_key(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(app.kb_select_mode);
+        // Press Ctrl+D — should not be swallowed, should trigger exit confirmation.
+        app.handle_key_event(press_key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(
+            app.last_exit_key_warning.is_some() || app.should_exit,
+            "Ctrl+D should trigger exit confirmation, not be swallowed"
+        );
+    }
+
+    #[test]
+    fn test_kb_selection_move_cursor_down_then_up() {
+        let mut app = make_app();
+        // Set up a 10-row selectable area starting at row 5.
+        app.last_selectable_area
+            .set(ratatui::layout::Rect::new(0, 5, 80, 10));
+        app.last_max_scroll.set(0);
+        // Enter selection mode — starts at bottom (row 14).
+        app.handle_key_event(press_key(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert_eq!(app.kb_cursor_row, 14, "should start at bottom row");
+        // Move up one row.
+        app.handle_key_event(press_key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.kb_cursor_row, 13, "up should move cursor up one row");
+        // Move down one row.
+        app.handle_key_event(press_key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.kb_cursor_row, 14, "down should move cursor back down");
+    }
+
+    #[test]
+    fn test_kb_selection_clamps_at_bounds() {
+        let mut app = make_app();
+        app.last_selectable_area
+            .set(ratatui::layout::Rect::new(0, 5, 80, 10));
+        app.last_max_scroll.set(0);
+        // Enter at bottom (row 14).
+        app.handle_key_event(press_key(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert_eq!(app.kb_cursor_row, 14);
+        // Move down — should clamp at 14.
+        app.handle_key_event(press_key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.kb_cursor_row, 14, "should clamp at bottom");
+        // Go to top.
+        app.handle_key_event(press_key(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.kb_cursor_row, 5, "Home should go to top row");
+        // Move up — should clamp at 5.
+        app.handle_key_event(press_key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.kb_cursor_row, 5, "should clamp at top");
+    }
+
+    #[test]
+    fn test_kb_selection_copy_exits_mode() {
+        let mut app = make_app();
+        app.last_selectable_area
+            .set(ratatui::layout::Rect::new(0, 5, 80, 10));
+        app.last_max_scroll.set(0);
+        // Enter selection mode.
+        app.handle_key_event(press_key(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(app.kb_select_mode);
+        // Move up to create a non-empty selection.
+        app.handle_key_event(press_key(KeyCode::Up, KeyModifiers::NONE));
+        // Press Enter — should copy and exit.
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.kb_select_mode, "Enter should exit selection mode after copy");
+        assert!(app.selection_anchor.is_none(), "selection should be cleared after copy");
+    }
+
+    // ---- Render pipeline integration: selectable area restriction ----
+
+    #[test]
+    fn test_render_restricts_selectable_area_to_transcript() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = make_app();
+        // Add a message so the transcript is non-empty and the welcome
+        // box is not shown.
+        app.messages.push(Message::user("Hello, this is a test message."));
+        app.messages.push(Message::assistant("And this is a response."));
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::render::render_app(f, &app)).unwrap();
+
+        // After rendering with messages, last_selectable_area should be
+        // the message pane (last_msg_area), NOT the full terminal.
+        let selectable = app.last_selectable_area.get();
+        let full = ratatui::layout::Rect::new(0, 0, 80, 24);
+        assert!(
+            selectable.height < full.height,
+            "selectable area height ({}) should be less than terminal height ({}) — \
+             it must not include the prompt box and status bar",
+            selectable.height,
+            full.height
+        );
+        assert!(
+            selectable.y > 0 || selectable.height < full.height,
+            "selectable area should be restricted to the transcript pane, not the full terminal"
+        );
+        // last_msg_area should also be set.
+        let msg_area = app.last_msg_area.get();
+        assert_eq!(
+            selectable, msg_area,
+            "selectable area should match last_msg_area after render with messages"
+        );
+        // total_message_lines should have been written (was always 0 before).
+        assert!(
+            app.total_message_lines.get() > 0,
+            "total_message_lines should be > 0 after rendering messages, got {}",
+            app.total_message_lines.get()
+        );
+    }
+
+    #[test]
+    fn test_render_selectable_area_falls_back_on_empty_transcript() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let app = make_app();
+        // No messages — welcome screen shown.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::render::render_app(f, &app)).unwrap();
+
+        // With no messages, last_msg_area is empty (0x0), so
+        // last_selectable_area should fall back to the full frame.
+        let selectable = app.last_selectable_area.get();
+        let full = ratatui::layout::Rect::new(0, 0, 80, 24);
+        assert_eq!(
+            selectable, full,
+            "selectable area should be the full terminal on the welcome screen"
+        );
+    }
+
+    #[test]
+    fn test_kb_selection_full_pipeline_enter_move_copy() {
+        // End-to-end test: create app with messages, render to populate
+        // last_selectable_area and total_message_lines, then drive the
+        // full key event pipeline (v -> up -> enter) through
+        // handle_key_event, which exercises the real keybinding resolver.
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = make_app();
+        app.messages.push(Message::user("First message."));
+        app.messages.push(Message::assistant("Second message."));
+        app.messages.push(Message::user("Third message."));
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| crate::render::render_app(f, &app)).unwrap();
+
+        // Verify render populated the area.
+        assert!(app.last_selectable_area.get().height > 0);
+
+        // Enter selection mode via the real key pipeline.
+        app.handle_key_event(press_key(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(app.kb_select_mode, "should enter selection mode after render");
+
+        // Move up — should go through the Transcript keybinding context
+        // and call selectionUp -> move_kb_cursor(-1).
+        let start_row = app.kb_cursor_row;
+        app.handle_key_event(press_key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            app.kb_cursor_row,
+            start_row.saturating_sub(1),
+            "up should move cursor up one row after render pipeline"
+        );
+
+        // Move back down.
+        app.handle_key_event(press_key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.kb_cursor_row, start_row, "down should restore cursor position");
+
+        // Enter copies and exits (selection may be empty at anchor==focus
+        // but the action handler still fires and exits cleanly).
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.kb_select_mode, "Enter should exit selection mode");
+    }

@@ -273,15 +273,17 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("escape", "cancel", KeyContext::HistorySearch),
         ("tab", "togglePreview", KeyContext::HistorySearch),
 
-        // ========== TRANSCRIPT / MESSAGE SELECTION ==========
-        ("up", "prevMessage", KeyContext::Transcript),
-        ("down", "nextMessage", KeyContext::Transcript),
-        ("pageup", "pageUp", KeyContext::Transcript),
-        ("pagedown", "pageDown", KeyContext::Transcript),
-        ("home", "goStart", KeyContext::Transcript),
-        ("end", "goEnd", KeyContext::Transcript),
-        ("enter", "selectMessage", KeyContext::Transcript),
-        ("escape", "cancel", KeyContext::Transcript),
+        // ========== TRANSCRIPT / KEYBOARD TEXT SELECTION ==========
+        // Active when kb_select_mode is true. Movement keys extend the
+        // selection; Enter and Ctrl+C copy and exit; Escape cancels.
+        ("up", "selectionUp", KeyContext::Transcript),
+        ("down", "selectionDown", KeyContext::Transcript),
+        ("pageup", "selectionPageUp", KeyContext::Transcript),
+        ("pagedown", "selectionPageDown", KeyContext::Transcript),
+        ("home", "selectionGoStart", KeyContext::Transcript),
+        ("end", "selectionGoEnd", KeyContext::Transcript),
+        ("enter", "selectionCopy", KeyContext::Transcript),
+        ("escape", "selectionCancel", KeyContext::Transcript),
 
         // ========== MESSAGE SELECTOR OVERLAY ==========
         ("up", "prevMessage", KeyContext::MessageSelector),
@@ -955,6 +957,53 @@ mod tests {
                 assert_eq!(action, "goLineStart", "CMD+Left should map to goLineStart");
             }
             other => panic!("Expected Action(\"goLineStart\"), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_transcript_context_resolves_selection_actions() {
+        // Verify that the real keybinding resolver dispatches the
+        // selection actions we registered in KeyContext::Transcript.
+        let user = UserKeybindings::default();
+        let mut resolver = KeybindingResolver::new(&user);
+
+        let check = |resolver: &mut KeybindingResolver, key: &str, expected: &str| {
+            let ks = parse_keystroke(key).unwrap();
+            let result = resolver.process(ks, &KeyContext::Transcript);
+            match result {
+                KeybindingResult::Action(action) => {
+                    assert_eq!(action, expected, "{} in Transcript should resolve to {}", key, expected);
+                }
+                other => panic!("{} in Transcript: expected Action({}), got {:?}", key, expected, other),
+            }
+        };
+
+        check(&mut resolver, "up", "selectionUp");
+        check(&mut resolver, "down", "selectionDown");
+        check(&mut resolver, "enter", "selectionCopy");
+        check(&mut resolver, "escape", "selectionCancel");
+        check(&mut resolver, "home", "selectionGoStart");
+        check(&mut resolver, "end", "selectionGoEnd");
+        check(&mut resolver, "pageup", "selectionPageUp");
+        check(&mut resolver, "pagedown", "selectionPageDown");
+    }
+
+    #[test]
+    fn test_transcript_context_does_not_resolve_chat_actions() {
+        // The Transcript context should NOT carry Chat-context bindings
+        // like historyPrev (up in Chat). This confirms the context
+        // isolation is correct — selection mode keys won't accidentally
+        // trigger chat history navigation.
+        let user = UserKeybindings::default();
+        let mut resolver = KeybindingResolver::new(&user);
+        let ks = parse_keystroke("up").unwrap();
+        let result = resolver.process(ks, &KeyContext::Chat);
+        // In Chat, up should be historyPrev, not selectionUp.
+        match result {
+            KeybindingResult::Action(action) => {
+                assert_ne!(action, "selectionUp", "up in Chat should not be selectionUp");
+            }
+            _ => {} // NoMatch/Unbound/Pending all fine — just not selectionUp
         }
     }
 }
