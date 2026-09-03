@@ -79,6 +79,69 @@ impl ProviderId {
     pub const ROUTING: &'static str = "routing";
     pub const NEURALWATT: &'static str = "neuralwatt";
     pub const FREE: &'static str = "free";
+
+    /// All built-in provider ids. A `customProviders` entry with one of
+    /// these ids would silently shadow the real provider, so
+    /// `Settings::effective_config` skips those with a warning.
+    pub fn builtin_provider_ids() -> &'static [&'static str] {
+        &[
+            Self::ANTHROPIC,
+            Self::OPENAI,
+            Self::GOOGLE,
+            Self::GOOGLE_VERTEX,
+            Self::AMAZON_BEDROCK,
+            Self::AZURE,
+            Self::GITHUB_COPILOT,
+            Self::MISTRAL,
+            Self::XAI,
+            Self::GROQ,
+            Self::DEEPINFRA,
+            Self::CEREBRAS,
+            Self::COHERE,
+            Self::CROF,
+            Self::TOGETHER_AI,
+            Self::PERPLEXITY,
+            Self::OPENROUTER,
+            Self::OLLAMA,
+            Self::LM_STUDIO,
+            Self::LLAMA_CPP,
+            Self::DEEPSEEK,
+            Self::GITLAB,
+            Self::CLOUDFLARE,
+            Self::VENICE,
+            Self::SAP,
+            Self::SAMBANOVA,
+            Self::HUGGINGFACE,
+            Self::NVIDIA,
+            Self::SILICONFLOW,
+            Self::MOONSHOT,
+            Self::ZHIPU,
+            Self::ZAI,
+            Self::NEBIUS,
+            Self::OVHCLOUD,
+            Self::SCALEWAY,
+            Self::VULTR,
+            Self::BASETEN,
+            Self::FRIENDLI,
+            Self::UPSTAGE,
+            Self::STEPFUN,
+            Self::FIREWORKS,
+            Self::NOVITA,
+            Self::MINIMAX,
+            Self::CODEX,
+            Self::OPENCODE_GO,
+            Self::OPENCODE_ZEN,
+            Self::SYNTHETIC,
+            Self::ROUTING,
+            Self::NEURALWATT,
+            Self::FREE,
+            // OpenAI-compat aliases accepted by the registry.
+            "lmstudio",
+            "llamacpp",
+            "llama-server",
+            "openai-codex",
+        ]
+    }
 }
 
 impl fmt::Display for ProviderId {

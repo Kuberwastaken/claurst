@@ -51,7 +51,17 @@ pub(crate) fn is_openai_reasoning_model(model_id: &str) -> bool {
         || model_id.starts_with("o4")
 }
 
-pub(crate) fn is_openaiish_provider(provider_id: &str) -> bool {
+/// Whether `provider_id` routes through an OpenAI-compatible adapter.
+/// `custom_providers` are user-defined OpenAI-compatible providers from
+/// settings (`customProviders`); pass the effective Config's map so this
+/// stays an in-memory lookup, not a settings read per request.
+pub(crate) fn is_openaiish_provider(
+    provider_id: &str,
+    custom_providers: &std::collections::HashMap<String, claurst_core::config::CustomProviderDef>,
+) -> bool {
+    if custom_providers.contains_key(provider_id) {
+        return true;
+    }
     matches!(
         provider_id,
         "openai"
@@ -102,8 +112,13 @@ pub(crate) fn build_provider_options(
     model_id: &str,
     effort_level: Option<claurst_core::effort::EffortLevel>,
     thinking_budget: Option<u32>,
+    custom_providers: &std::collections::HashMap<String, claurst_core::config::CustomProviderDef>,
 ) -> Value {
     let mut options = serde_json::Map::new();
+    // The catalog contains mixed-case model ids; keep the original for
+    // exact map lookups in the custom-provider block below, and a
+    // lowercased copy for the substring heuristics.
+    let model_id_exact = model_id.to_string();
     let model_id = model_id.to_ascii_lowercase();
 
     if provider_id == "github-copilot" {
@@ -185,7 +200,7 @@ pub(crate) fn build_provider_options(
         }
     }
 
-    if is_openaiish_provider(provider_id) && is_openai_reasoning_model(&model_id) {
+    if is_openaiish_provider(provider_id, custom_providers) && is_openai_reasoning_model(&model_id) {
         let reasoning_effort = effort_level
             .map(reasoning_effort_for_level)
             .unwrap_or("medium");
@@ -264,6 +279,27 @@ pub(crate) fn build_provider_options(
                             serde_json::json!({"type": "disabled"}),
                         );
                     }
+                }
+            }
+        }
+    }
+
+    // Fallback for user-defined custom providers: when the model is not a
+    // GPT reasoning model (so no `reasoningEffort` was inserted above),
+    // consult the model definition's `reasoningEffort` override. Lookup is
+    // exact-case first, then lowercased, so mixed-case settings keys work.
+    if !options.contains_key("reasoningEffort") {
+        if let Some(cp) = custom_providers.get(provider_id) {
+            let model_def = cp
+                .models
+                .get(&model_id_exact)
+                .or_else(|| cp.models.get(&model_id));
+            if let Some(model_def) = model_def {
+                if let Some(ref effort) = model_def.reasoning_effort {
+                    options.insert(
+                        "reasoningEffort".to_string(),
+                        serde_json::json!(effort),
+                    );
                 }
             }
         }

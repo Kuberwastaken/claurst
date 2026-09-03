@@ -577,6 +577,9 @@ impl App {
                 .join("models.json");
             reg.load_cache(&cache_path);
             reg.apply_model_overrides(&config.model_overrides);
+            // Register user-defined custom providers so their models appear
+            // in the picker and resolve for provider/model routing.
+            reg.apply_custom_providers(&config.custom_providers);
             reg
         };
         Self {
