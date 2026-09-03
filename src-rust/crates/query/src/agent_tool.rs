@@ -348,6 +348,8 @@ impl Tool for AgentTool {
             model,
             max_tokens: claurst_core::constants::DEFAULT_MAX_TOKENS,
             max_turns: resolved_max_turns,
+            // Sub-agents never inherit the session /turns override.
+            max_turns_override: None,
             system_prompt: Some(system_prompt),
             append_system_prompt: None,
             output_style: ctx.config.effective_output_style(),
@@ -635,6 +637,7 @@ pub fn init_team_swarm_runner() {
                     model,
                     max_tokens: claurst_core::constants::DEFAULT_MAX_TOKENS,
                     max_turns: max_turns.unwrap_or(10),
+                    max_turns_override: None,
                     system_prompt: Some(system_prompt),
                     working_directory: Some(ctx.working_dir.display().to_string()),
                     output_style: ctx.config.effective_output_style(),

@@ -95,6 +95,10 @@ pub struct QueryConfig {
     pub model: String,
     pub max_tokens: u32,
     pub max_turns: u32,
+    /// Session-level cap override (e.g. from the `/turns` command). When set
+    /// it takes precedence over both `agent_definition.max_turns` and
+    /// `max_turns` (override → agent → config).
+    pub max_turns_override: Option<u32>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
     pub output_style: claurst_core::system_prompt::OutputStyle,
@@ -174,6 +178,7 @@ impl Default for QueryConfig {
             model: claurst_core::constants::DEFAULT_MODEL.to_string(),
             max_tokens: claurst_core::constants::DEFAULT_MAX_TOKENS,
             max_turns: claurst_core::constants::MAX_TURNS_DEFAULT,
+            max_turns_override: None,
             system_prompt: None,
             append_system_prompt: None,
             output_style: claurst_core::system_prompt::OutputStyle::Default,
@@ -426,11 +431,16 @@ pub async fn run_query_loop(
     // (anti-recursion guard).
     let mut degradation_done = false;
 
-    // If an agent defines a max_turns override, respect it (agent wins over config).
-    let effective_max_turns = config.agent_definition
-        .as_ref()
-        .and_then(|a| a.max_turns)
-        .unwrap_or(config.max_turns);
+    // If an agent defines a max_turns override, respect it (agent wins over
+    // config) — unless the user set an explicit session override (e.g. the
+    // `/turns` command), which wins over everything: override → agent → config.
+    let effective_max_turns = config.max_turns_override.or_else(|| {
+        config
+            .agent_definition
+            .as_ref()
+            .and_then(|a| a.max_turns)
+    })
+    .unwrap_or(config.max_turns);
 
     // In-loop continuation policy (issue #230 / MI-3). Consulted at the end of
     // every turn that finishes with `end_turn`. The default policy stops after
@@ -2127,6 +2137,7 @@ mod tests {
             model: "claude-sonnet-4-6".to_string(),
             max_tokens: 4096,
             max_turns: 10,
+            max_turns_override: None,
             system_prompt: sys.map(String::from),
             append_system_prompt: append.map(String::from),
             output_style: claurst_core::system_prompt::OutputStyle::Default,
@@ -2899,6 +2910,19 @@ mod tests {
         tools: Vec<Box<dyn Tool>>,
         continuation: crate::continuation::ContinuationMode,
     ) -> (QueryOutcome, Vec<bool>, Vec<Message>) {
+        drive_loop_with_options(always_end_turn, max_turns, tools, continuation, None, None).await
+    }
+
+    /// Same as `drive_loop_with_mock` but lets the caller set the session
+    /// `max_turns_override` and the `agent_definition`.
+    async fn drive_loop_with_options(
+        always_end_turn: bool,
+        max_turns: u32,
+        tools: Vec<Box<dyn Tool>>,
+        continuation: crate::continuation::ContinuationMode,
+        max_turns_override: Option<u32>,
+        agent_definition: Option<claurst_core::AgentDefinition>,
+    ) -> (QueryOutcome, Vec<bool>, Vec<Message>) {
         let recorded = Arc::new(StdMutex::new(Vec::new()));
         let provider = Arc::new(RecordingProvider {
             id: claurst_core::provider_id::ProviderId::new("mockprov"),
@@ -2922,6 +2946,8 @@ mod tests {
         let mut config = make_config(None, None);
         config.model = "mock-model".to_string();
         config.max_turns = max_turns;
+        config.max_turns_override = max_turns_override;
+        config.agent_definition = agent_definition;
         config.provider_registry = Some(registry);
         config.continuation = continuation;
 
@@ -3013,6 +3039,47 @@ mod tests {
             msgs.iter()
                 .any(|m| m.get_all_text().contains("maximum number of steps")),
             "the tool-less summary prompt must be injected into the history"
+        );
+    }
+
+    /// (c-ter) The session `max_turns_override` wins over the agent
+    /// definition's `max_turns` (override -> agent -> config), so `/turns`
+    /// works even in agent modes like plan that pin their own limit.
+    #[tokio::test]
+    async fn max_turns_override_wins_over_agent_definition() {
+        // Agent pins max_turns = 20; config says 2; the session override (5)
+        // must win: the loop must run past 2 turns and stop after the cap
+        // rides the override to 5 (+ the degradation summary turn).
+        let agent = claurst_core::AgentDefinition {
+            description: None,
+            model: None,
+            temperature: None,
+            prompt: None,
+            access: "full".to_string(),
+            visible: true,
+            max_turns: Some(20),
+            color: None,
+        };
+        let (outcome, recorded, _msgs) = drive_loop_with_options(
+            false,
+            2, // config max_turns — must be ignored while the override is set
+            noop_tools(),
+            crate::continuation::ContinuationMode::Default,
+            Some(5), // /turns 5 override — must win over agent (20) & config (2)
+            Some(agent),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, QueryOutcome::EndTurn { .. }),
+            "the loop must end after the cap"
+        );
+        assert_eq!(
+            recorded.len(),
+            6,
+            "override (5) must win over agent (20) and config (2): expected 5 \
+             tool turns + 1 degradation summary turn, got {:?}",
+            recorded
         );
     }
 

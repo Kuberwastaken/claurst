@@ -7,7 +7,7 @@ This document is the complete reference for every slash command available in Cla
 ## Table of Contents
 
 1. [Command System Overview](#command-system-overview)
-2. [Session & Navigation](#session--navigation)
+2. [Session & Navigation](#session--navigation) — `/help`, `/clear`, `/new`, `/move`, `/exit`, `/resume`, `/session`, `/fork`, `/rename`, `/rewind`, `/compact`, `/turns`
 3. [Model & Provider](#model--provider) — `/model`, `/providers`, `/connect`, `/thinking`, `/effort`, `/advisor`, `/fast`
 4. [Configuration & Settings](#configuration--settings) — `/config`, `/keybindings`, `/permissions`, `/hooks`, `/privacy-settings`, `/mcp`, `/output-style`, `/theme`, `/statusline`, `/vim`, `/voice`, `/terminal-setup`
 5. [Code & Git](#code--git) — `/commit`, `/diff`, `/undo`, `/review`, `/security-review`, `/init`, `/search`
@@ -186,6 +186,24 @@ Summarize and compress the conversation history to reduce context window usage. 
 ```
 /compact
 ```
+
+### /turns
+
+Show, set, or disable the session max-turn limit.
+
+```
+/turns          # show the current limit
+/turns 25       # cap this session at 25 turns
+/turns off      # raise the limit to a large finite ceiling (1000)
+```
+
+The override is **session-local**: it is not persisted to `settings.json` and
+resets to the config/agent default on restart. Precedence is override ->
+agent (`max_turns` in an agent definition) -> config (`max_turns`).
+`/turns off` does not remove the limit entirely -- it raises it to a finite
+ceiling of 1000 turns so runaway loops still terminate. When the cap is
+exceeded, the usual graceful degradation applies (see
+`degradationSummaryEnabled`).
 
 ---
 
