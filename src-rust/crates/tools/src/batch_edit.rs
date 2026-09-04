@@ -60,7 +60,7 @@ impl Tool for BatchEditTool {
                         "properties": {
                             "file_path": {
                                 "type": "string",
-                                "description": "Absolute path to the file to modify"
+                                "description": "File to modify. Accepts absolute paths, main-relative paths, or &root-name/relative paths."
                             },
                             "old_string": {
                                 "type": "string",

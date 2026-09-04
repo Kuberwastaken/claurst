@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::{Mutex, OnceLock};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 // ---------------------------------------------------------------------------
 // Dynamic boundary marker
@@ -207,6 +207,8 @@ pub struct SystemPromptOptions {
     pub custom_output_style_prompt: Option<String>,
     /// Absolute path to the working directory (injected as dynamic section).
     pub working_directory: Option<String>,
+    /// Named workspace roots visible to the model. `main` is the primary root.
+    pub workspace_roots: BTreeMap<String, String>,
     /// Pre-built memory content from memdir (injected as dynamic section).
     pub memory_content: String,
     /// Custom system prompt (--system-prompt flag or settings).
@@ -318,7 +320,12 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         parts.push(format!("\n<working_directory>{}</working_directory>", cwd));
     }
 
-    // 12. Memory injection (from memdir)
+    // 12. Workspace roots (dynamic — can vary per session/worktree)
+    if !opts.workspace_roots.is_empty() {
+        parts.push(build_workspace_roots_section(&opts.workspace_roots));
+    }
+
+    // 13. Memory injection (from memdir)
     if !opts.memory_content.is_empty() {
         parts.push(format!(
             "\n<memory>\n{}\n</memory>",
@@ -326,12 +333,12 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         ));
     }
 
-    // 13. Active goal addendum (dynamic — changes each session)
+    // 14. Active goal addendum (dynamic — changes each session)
     if let Some(goal_text) = &opts.active_goal_addendum {
         parts.push(goal_text.clone());
     }
 
-    // 14. Appended system prompt (--append-system-prompt)
+    // 15. Appended system prompt (--append-system-prompt)
     if let Some(append) = &opts.append_system_prompt {
         parts.push(format!("\n{}", append));
     }
@@ -463,6 +470,21 @@ fn build_env_info_section(working_dir: Option<&str>) -> String {
         shell_line,
         os_note,
     )
+}
+
+fn build_workspace_roots_section(roots: &BTreeMap<String, String>) -> String {
+    let mut out = String::from("\n<workspace_roots>");
+    for (name, path) in roots {
+        out.push_str(&format!("\n<root name=\"{}\">{}</root>", name, path));
+    }
+    out.push_str(
+        "\n</workspace_roots>\nPaths may use workspace root syntax: &<root-name>/<relative-path>. \
+         Use &<root-name> to refer to a root directory itself. Relative paths without & resolve against main. \
+         For Glob and Grep, omitted path searches only main. To search all workspace roots, \
+         call the tool once per root with path=&<root-name>; these independent calls can run in parallel. \
+         When the user asks to find or search something without naming a specific root, search all workspace roots.",
+    );
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -676,6 +698,25 @@ mod tests {
             mem_pos > boundary_pos,
             "Memory content must appear after the dynamic boundary"
         );
+    }
+
+    #[test]
+    fn test_workspace_roots_in_dynamic_section() {
+        let opts = SystemPromptOptions {
+            workspace_roots: BTreeMap::from([
+                ("main".to_string(), "/repo".to_string()),
+                ("docs".to_string(), "/repo/docs".to_string()),
+            ]),
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+        let boundary_pos = prompt.find(SYSTEM_PROMPT_DYNAMIC_BOUNDARY).unwrap();
+        let roots_pos = prompt.find("<workspace_roots>").unwrap();
+        assert!(roots_pos > boundary_pos);
+        assert!(prompt.contains("<root name=\"main\">/repo</root>"));
+        assert!(prompt.contains("<root name=\"docs\">/repo/docs</root>"));
+        assert!(prompt.contains("&<root-name>/<relative-path>"));
+        assert!(prompt.contains("without naming a specific root, search all workspace roots"));
     }
 
     #[test]

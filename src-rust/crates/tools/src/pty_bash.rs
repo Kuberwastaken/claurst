@@ -744,7 +744,7 @@ impl Tool for PtyBashTool {
         if params.run_in_background {
             let cwd = {
                 let state = shell_state_arc.lock();
-                state.cwd.clone().unwrap_or_else(|| ctx.working_dir.clone())
+                state.cwd.clone().unwrap_or_else(|| ctx.main_root().clone())
             };
             return run_in_background(params.command, cwd, timeout_ms).await;
         }
@@ -756,7 +756,7 @@ impl Tool for PtyBashTool {
         {
             let effective_cwd = {
                 let state = shell_state_arc.lock();
-                state.cwd.clone().unwrap_or_else(|| ctx.working_dir.clone())
+                state.cwd.clone().unwrap_or_else(|| ctx.main_root().clone())
             };
             return run_windows_fallback(&params.command, &effective_cwd, timeout_dur, timeout_ms)
                 .await;
@@ -770,9 +770,9 @@ impl Tool for PtyBashTool {
             // environment (never its argv) — see `apply_restored_env` (#211).
             let (script, restored_env, working_dir_str) = {
                 let state = shell_state_arc.lock();
-                let script = build_wrapper_script(&params.command, &state, &ctx.working_dir);
+                let script = build_wrapper_script(&params.command, &state, &ctx.main_root());
                 let restored_env = state.env_vars.clone();
-                let wd = ctx.working_dir.to_string_lossy().into_owned();
+                let wd = ctx.main_root().to_string_lossy().into_owned();
                 (script, restored_env, wd)
             };
 
@@ -934,8 +934,9 @@ mod tests {
     }
 
     fn allow_all_context() -> ToolContext {
+        use std::collections::BTreeMap;
         ToolContext {
-            working_dir: std::env::temp_dir(),
+            workspace_roots: BTreeMap::from([("main".to_string(), std::env::temp_dir())]),
             permission_mode: claurst_core::config::PermissionMode::Default,
             permission_handler: std::sync::Arc::new(AllowAllHandler),
             cost_tracker: claurst_core::cost::CostTracker::new(),

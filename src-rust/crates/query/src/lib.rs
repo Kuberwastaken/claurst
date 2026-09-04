@@ -66,6 +66,7 @@ use claurst_core::error::ClaudeError;
 use claurst_core::types::{ContentBlock, Message, Role, ToolResultContent, UsageInfo};
 use claurst_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -100,6 +101,7 @@ pub struct QueryConfig {
     pub output_style: claurst_core::system_prompt::OutputStyle,
     pub output_style_prompt: Option<String>,
     pub working_directory: Option<String>,
+    pub workspace_roots: BTreeMap<String, String>,
     pub thinking_budget: Option<u32>,
     pub temperature: Option<f32>,
     /// Maximum cumulative character count of all tool results in the message
@@ -179,6 +181,7 @@ impl Default for QueryConfig {
             output_style: claurst_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             working_directory: None,
+            workspace_roots: BTreeMap::new(),
             thinking_budget: None,
             temperature: None,
             tool_result_budget: 50_000,
@@ -447,7 +450,7 @@ pub async fn run_query_loop(
     // can produce a per-turn file-change patch when the turn ends.
     let shadow_snap: Option<std::sync::Arc<claurst_core::snapshot::ShadowSnapshot>> =
         if tool_ctx.config.auto_commits == Some(true) {
-            claurst_core::snapshot::get_or_create(&tool_ctx.working_dir)
+            claurst_core::snapshot::get_or_create(&tool_ctx.main_root())
         } else {
             None
         };
@@ -1673,7 +1676,7 @@ pub async fn run_query_loop(
                     &tool_ctx.config.hooks,
                     claurst_core::config::HookEvent::Stop,
                     &stop_ctx,
-                    &tool_ctx.working_dir,
+                    &tool_ctx.main_root(),
                 )
                 .await;
             }};
@@ -1689,7 +1692,7 @@ pub async fn run_query_loop(
                 let _bg = stop_hooks_with_full_behavior(
                     &assistant_msg,
                     &tool_ctx.config,
-                    tool_ctx.working_dir.clone(),
+                    tool_ctx.main_root().clone(),
                 );
 
                 // Asynchronously extract and persist session memories if warranted.
@@ -1697,7 +1700,7 @@ pub async fn run_query_loop(
                 if session_memory::SessionMemoryExtractor::should_extract(messages) {
                     let model_clone = config.model.clone();
                     let messages_clone = messages.clone();
-                    let working_dir_clone = tool_ctx.working_dir.clone();
+                    let working_dir_clone = tool_ctx.main_root().clone();
 
                     // Build a fresh client using the same API key.  This avoids
                     // requiring an Arc in the existing run_query_loop signature.
@@ -1896,7 +1899,7 @@ pub async fn run_query_loop(
                             hooks,
                             claurst_core::config::HookEvent::PreToolUse,
                             &hook_ctx,
-                            &tool_ctx.working_dir,
+                            &tool_ctx.main_root(),
                         )
                         .await;
 
@@ -1980,7 +1983,7 @@ pub async fn run_query_loop(
                             hooks,
                             claurst_core::config::HookEvent::PostToolUse,
                             &post_ctx,
-                            &tool_ctx.working_dir,
+                            &tool_ctx.main_root(),
                         )
                         .await;
 
@@ -2026,7 +2029,7 @@ pub async fn run_query_loop(
                 let _bg = stop_hooks_with_full_behavior(
                     &assistant_msg,
                     &tool_ctx.config,
-                    tool_ctx.working_dir.clone(),
+                    tool_ctx.main_root().clone(),
                 );
                 if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &initial_snapshot) {
                     let patch = snap.patch(hash).await;
@@ -2042,7 +2045,7 @@ pub async fn run_query_loop(
                 let _bg = stop_hooks_with_full_behavior(
                     &assistant_msg,
                     &tool_ctx.config,
-                    tool_ctx.working_dir.clone(),
+                    tool_ctx.main_root().clone(),
                 );
                 if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &initial_snapshot) {
                     let patch = snap.patch(hash).await;
@@ -2132,6 +2135,7 @@ mod tests {
             output_style: claurst_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             working_directory: None,
+            workspace_roots: BTreeMap::new(),
             thinking_budget: None,
             temperature: None,
             tool_result_budget: 50_000,
@@ -2554,8 +2558,9 @@ mod tests {
     }
 
     fn deny_all_context() -> ToolContext {
+        use std::collections::BTreeMap;
         ToolContext {
-            working_dir: std::path::PathBuf::from("/workspace"),
+            workspace_roots: BTreeMap::from([("main".to_string(), std::path::PathBuf::from("/workspace"))]),
             permission_mode: claurst_core::config::PermissionMode::Default,
             permission_handler: Arc::new(DenyAllHandler),
             cost_tracker: claurst_core::cost::CostTracker::new(),

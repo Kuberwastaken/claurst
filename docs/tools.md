@@ -39,6 +39,12 @@ Every tool in Claurst implements a common `Tool` interface. This interface defin
 
 Tools are loaded eagerly at session start. The model receives tool descriptions and schemas and selects tools to call. Each tool call goes through permission resolution before `call()` is invoked.
 
+### Workspace-root paths
+
+Path-based tools accept absolute paths, paths relative to the main workspace root, and named workspace-root paths. The primary working directory is always available as `&main`; additional directories from `--add-dir` or `additional_dirs` are assigned sanitized names such as `&_ai-engine` or `&my-project-api`.
+
+Use `&root-name` for a root directory itself, or `&root-name/relative/path` for a file or subdirectory under that root. Relative paths without a root prefix resolve against `&main`.
+
 ### Tool Concurrency
 
 Tools marked `isConcurrencySafe` may run in parallel with other tool calls. Most write tools are not concurrency-safe. Read-only tools are generally safe to parallelize.
@@ -103,7 +109,7 @@ Read the contents of a file from the local filesystem. Returns file contents as 
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `file_path` | string | yes | Absolute path to the file |
+| `file_path` | string | yes | Absolute, `&main`-relative, or `&root-name/relative` path to the file |
 | `offset` | integer | no | First line to read (1-indexed) |
 | `limit` | integer | no | Maximum number of lines to read |
 
@@ -121,7 +127,7 @@ Write content to a file. Creates the file and any missing parent directories. Ov
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `file_path` | string | yes | Absolute path to write |
+| `file_path` | string | yes | Absolute, `&main`-relative, or `&root-name/relative` path to write |
 | `content` | string | yes | Full file content |
 
 Requires the file to have been read first (or the file to not exist). The previous content is stored for `/undo` support.
@@ -136,7 +142,7 @@ Perform an exact string replacement within an existing file. Fails if `old_strin
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `file_path` | string | yes | Absolute path to the file |
+| `file_path` | string | yes | Absolute, `&main`-relative, or `&root-name/relative` path to the file |
 | `old_string` | string | yes | Exact text to replace |
 | `new_string` | string | yes | Replacement text |
 | `replace_all` | boolean | no | Replace all occurrences (default: false) |
@@ -153,7 +159,7 @@ Apply multiple `FileEditTool`-style edits in a single tool call. More efficient 
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `edits` | array | yes | Array of `{file_path, old_string, new_string, replace_all}` objects |
+| `edits` | array | yes | Array of `{file_path, old_string, new_string, replace_all}` objects. `file_path` accepts absolute, `&main`-relative, or `&root-name/relative` paths. |
 
 Edits within the same file are applied in order. If any individual edit fails (string not found, not unique), the batch is aborted and no changes are written.
 
@@ -163,7 +169,7 @@ Edits within the same file are applied in order. If any individual edit fails (s
 
 **Permission level:** Write
 
-Apply a unified diff patch to one or more files. Accepts standard `diff -u` / `git diff` format patches.
+Apply a unified diff patch to one or more files. Accepts standard `diff -u` / `git diff` format patches. Patch file paths may be absolute, `&main`-relative, or `&root-name/relative` paths.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -269,12 +275,12 @@ Useful for iterative data exploration or multi-step computations where re-runnin
 
 **Permission level:** ReadOnly
 
-Find files matching a glob pattern. Searches from a specified directory (defaults to the current working directory). Returns matching file paths sorted by modification time.
+Find files matching a glob pattern. Searches from a specified directory; if `path` is omitted, searches only `&main`. Returns matching file paths sorted by modification time.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `pattern` | string | yes | Glob pattern (e.g., `**/*.rs`, `src/**/*.ts`) |
-| `path` | string | no | Directory to search from |
+| `path` | string | no | Directory to search from. Accepts absolute, `&main`-relative, or `&root-name/relative` paths. To search all workspace roots, call `GlobTool` once per root. |
 
 ---
 
@@ -287,7 +293,7 @@ Search file contents using regular expressions, powered by ripgrep. Supports mul
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `pattern` | string | yes | Regular expression pattern |
-| `path` | string | no | Directory or file to search |
+| `path` | string | no | Directory or file to search. Accepts absolute, `&main`-relative, or `&root-name/relative` paths. If omitted, searches only `&main`; to search all workspace roots, call `GrepTool` once per root. |
 | `glob` | string | no | File glob filter (e.g., `*.rs`) |
 | `type` | string | no | File type filter (e.g., `rust`, `py`, `js`) |
 | `output_mode` | string | no | `content`, `files_with_matches`, or `count` |
@@ -587,7 +593,7 @@ Edit a Jupyter notebook (`.ipynb`) by modifying, inserting, or deleting cells. O
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `notebook_path` | string | yes | Absolute path to the notebook |
+| `notebook_path` | string | yes | Absolute, `&main`-relative, or `&root-name/relative` path to the notebook |
 | `cell_index` | integer | no | Cell to edit (0-indexed) |
 | `new_source` | string | no | New cell source content |
 | `cell_type` | string | no | `code`, `markdown`, or `raw` |
@@ -757,7 +763,7 @@ Query a language server for code intelligence actions. Supports hover documentat
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `action` | string | yes | `hover`, `definition`, `references`, `symbols`, or `diagnostics` |
-| `file` | string | yes | Absolute or working-directory-relative path to the source file |
+| `file` | string | yes | Absolute, `&main`-relative, or `&root-name/relative` path to the source file |
 | `line` | integer | no | 1-based line number (required for `hover`, `definition`, `references`) |
 | `column` | integer | no | 1-based column number (required for `hover`, `definition`, `references`) |
 
@@ -790,7 +796,7 @@ Query a language server for code intelligence actions. Supports hover documentat
 }
 ```
 
-If no LSP server is configured for a file's language, the tool returns an informative error. The tool resolves relative paths against the current working directory.
+If no LSP server is configured for a file's language, the tool returns an informative error. Relative paths resolve against `&main`; `&root-name/relative` paths resolve against the named workspace root.
 
 ---
 

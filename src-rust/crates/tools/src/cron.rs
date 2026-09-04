@@ -557,8 +557,9 @@ mod tests {
     }
 
     fn deny_ctx() -> ToolContext {
+        use std::collections::BTreeMap;
         ToolContext {
-            working_dir: std::env::temp_dir(),
+            workspace_roots: BTreeMap::from([("main".to_string(), std::env::temp_dir())]),
             permission_mode: claurst_core::config::PermissionMode::Default,
             permission_handler: Arc::new(DenyHandler),
             cost_tracker: claurst_core::cost::CostTracker::new(),

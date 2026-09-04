@@ -43,7 +43,7 @@ impl Tool for FileReadTool {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "The absolute path to the file to read"
+                    "description": "The file to read. Accepts absolute paths, main-relative paths, or &root-name/relative paths."
                 },
                 "offset": {
                     "type": "number",

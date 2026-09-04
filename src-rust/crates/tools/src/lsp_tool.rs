@@ -39,7 +39,7 @@ impl Tool for LspTool {
                 },
                 "file": {
                     "type": "string",
-                    "description": "Absolute or working-directory-relative path to the source file."
+                    "description": "Path to the source file. Accepts absolute paths, main-relative paths, or &root-name/relative paths."
                 },
                 "line": {
                     "type": "integer",
@@ -67,14 +67,7 @@ impl Tool for LspTool {
         };
 
         // Resolve to absolute path
-        let file_path = if std::path::Path::new(&file_raw).is_absolute() {
-            file_raw.clone()
-        } else {
-            ctx.working_dir
-                .join(&file_raw)
-                .to_string_lossy()
-                .into_owned()
-        };
+        let file_path = ctx.resolve_path(&file_raw).to_string_lossy().into_owned();
 
         if let Err(e) = ctx.check_permission_for_path(
             self.name(),
@@ -119,7 +112,7 @@ impl Tool for LspTool {
         // --- Ensure the file is opened on its LSP server --------------------
         {
             let mut manager = lsp_manager_arc.lock().await;
-            if let Err(e) = manager.open_file(&file_path, &ctx.working_dir).await {
+            if let Err(e) = manager.open_file(&file_path, ctx.main_root()).await {
                 return ToolResult::error(format!("Failed to open file in LSP: {}", e));
             }
         }
@@ -130,7 +123,7 @@ impl Tool for LspTool {
                 let result = {
                     let mut manager = lsp_manager_arc.lock().await;
                     manager
-                        .hover(&file_path, &ctx.working_dir, line, column)
+                        .hover(&file_path, ctx.main_root(), line, column)
                         .await
                 };
                 match result {
@@ -147,7 +140,7 @@ impl Tool for LspTool {
                 let result = {
                     let mut manager = lsp_manager_arc.lock().await;
                     manager
-                        .definition(&file_path, &ctx.working_dir, line, column)
+                        .definition(&file_path, ctx.main_root(), line, column)
                         .await
                 };
                 match result {
@@ -164,7 +157,7 @@ impl Tool for LspTool {
                 let result = {
                     let mut manager = lsp_manager_arc.lock().await;
                     manager
-                        .references(&file_path, &ctx.working_dir, line, column)
+                        .references(&file_path, ctx.main_root(), line, column)
                         .await
                 };
                 match result {
@@ -185,7 +178,7 @@ impl Tool for LspTool {
                 let result = {
                     let mut manager = lsp_manager_arc.lock().await;
                     manager
-                        .document_symbols(&file_path, &ctx.working_dir)
+                        .document_symbols(&file_path, ctx.main_root())
                         .await
                 };
                 match result {

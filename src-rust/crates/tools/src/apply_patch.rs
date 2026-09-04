@@ -256,8 +256,9 @@ impl Tool for ApplyPatchTool {
 
     fn description(&self) -> &str {
         "Apply a unified diff patch to files. The patch must be in standard unified \
-         diff format (as produced by `git diff` or `diff -u`). Set dry_run=true to \
-         validate the patch without writing any changes."
+         diff format (as produced by `git diff` or `diff -u`). Patch file paths \
+         may be absolute, main-relative, or &root-name/relative paths. Set \
+         dry_run=true to validate the patch without writing any changes."
     }
 
     fn permission_level(&self) -> PermissionLevel {

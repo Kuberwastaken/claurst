@@ -132,7 +132,7 @@ impl Tool for SkillTool {
 
 fn skill_search_dirs(ctx: &ToolContext) -> Vec<PathBuf> {
     let mut dirs = vec![
-        ctx.working_dir.join(".claurst").join("commands"),
+        ctx.main_root().join(".claurst").join("commands"),
     ];
     dirs.push(claurst_core::config::Settings::config_dir().join("commands"));
     dirs

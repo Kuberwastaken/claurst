@@ -26,6 +26,7 @@ pub(crate) fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
         output_style: config.output_style,
         custom_output_style_prompt: config.output_style_prompt.clone(),
         working_directory: config.working_directory.clone(),
+        workspace_roots: config.workspace_roots.clone(),
         // Forward the session's enabled tool set so per-tool guideline blocks
         // are only emitted for tools that are actually loaded (issue #233).
         enabled_tools: config.enabled_tools.clone(),

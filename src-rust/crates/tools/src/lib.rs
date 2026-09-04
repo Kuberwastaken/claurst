@@ -13,8 +13,8 @@ use claurst_core::cost::CostTracker;
 use claurst_core::permissions::{PermissionDecision, PermissionHandler, PermissionRequest};
 use claurst_core::types::ToolDefinition;
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -282,7 +282,9 @@ impl CompletionNotifier {
 /// Shared context passed to every tool invocation.
 #[derive(Clone)]
 pub struct ToolContext {
-    pub working_dir: PathBuf,
+    /// Named workspace roots: "main" is the primary working directory,
+    /// additional entries come from --add-dir and workspace_paths.
+    pub workspace_roots: BTreeMap<String, PathBuf>,
     pub permission_mode: PermissionMode,
     pub permission_handler: Arc<dyn PermissionHandler>,
     pub cost_tracker: Arc<CostTracker>,
@@ -316,14 +318,113 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
-    /// Resolve a potentially relative path against the working directory.
+    /// Returns the primary (main) working directory.
+    ///
+    /// Invariant: every production and test `ToolContext` constructor must
+    /// populate the `main` root. This is the replacement for the previous
+    /// single `working_dir` field, so missing `main` indicates a programming
+    /// error at construction time rather than a user-provided path failure.
+    pub fn main_root(&self) -> &PathBuf {
+        self.workspace_roots.get("main")
+            .expect("ToolContext: 'main' root must always exist")
+    }
+
+    /// Returns all named workspace roots as a reference.
+    pub fn workspace_roots(&self) -> &BTreeMap<String, PathBuf> {
+        &self.workspace_roots
+    }
+
+    /// Look up a workspace root by name.
+    pub fn root(&self, name: &str) -> Option<&PathBuf> {
+        self.workspace_roots.get(name)
+    }
+
+    /// Resolve a path that may use `&root-name/relative-path` syntax.
+    ///
+    /// Delegates to `resolve_workspace_path` and returns just the absolute path
+    /// for backward compatibility.
     pub fn resolve_path(&self, path: &str) -> PathBuf {
-        let p = PathBuf::from(path);
-        if p.is_absolute() {
-            p
-        } else {
-            self.working_dir.join(p)
+        self.resolve_workspace_path(path).absolute_path
+    }
+
+    /// Resolve a path that may use `&root-name/relative-path` syntax.
+    ///
+    /// Three cases:
+    /// - Absolute path (`D:\...`, `/home/...`) → returned as-is.
+    /// - `&root-name/path` → resolved against the named root.
+    /// - `&root-name` alone → resolved to the root directory itself.
+    /// - Plain relative path → resolved against `main_root()`.
+    pub fn resolve_workspace_path(&self, path: &str) -> claurst_core::ResolvedWorkspacePath {
+        let input = path.to_string();
+
+        // 1. Absolute path
+        if Path::new(path).is_absolute() {
+            return claurst_core::ResolvedWorkspacePath {
+                input,
+                root_name: None,
+                root_path: None,
+                relative_path: None,
+                absolute_path: PathBuf::from(path),
+            };
         }
+
+        // 2. &root-name[/subpath] syntax
+        if let Some((root_name, remainder)) = claurst_core::workspace::parse_root_ref(path, &self.workspace_roots) {
+            if let Some(root_path) = self.workspace_roots.get(root_name).cloned() {
+                let absolute_path = if remainder.is_empty() {
+                    root_path.clone()
+                } else {
+                    root_path.join(remainder)
+                };
+                let relative = if remainder.is_empty() { None } else { Some(PathBuf::from(remainder)) };
+                return claurst_core::ResolvedWorkspacePath {
+                    input,
+                    root_name: Some(root_name.to_string()),
+                    root_path: Some(root_path),
+                    relative_path: relative,
+                    absolute_path,
+                };
+            }
+        }
+
+        // 3. Plain relative path — default to main
+        let absolute_path = self.main_root().join(path);
+        claurst_core::ResolvedWorkspacePath {
+            input,
+            root_name: None,
+            root_path: None,
+            relative_path: Some(PathBuf::from(path)),
+            absolute_path,
+        }
+    }
+
+    /// Format an absolute path as `&root-name/relative-path` if it falls under
+    /// any registered workspace root.
+    pub fn format_workspace_path(&self, path: &Path) -> Option<String> {
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        for (name, root_path) in &self.workspace_roots {
+            let canon_root = std::fs::canonicalize(root_path).unwrap_or_else(|_| root_path.clone());
+            if let Ok(relative) = canon.strip_prefix(&canon_root) {
+                let relative_str = relative.to_string_lossy();
+                if relative_str.is_empty() {
+                    return Some(format!("&{}", name));
+                }
+                return Some(format!("&{}/{}", name, relative_str));
+            }
+        }
+        None
+    }
+
+    /// Find which registered workspace root contains the given absolute path.
+    pub fn find_root_for_path(&self, path: &Path) -> Option<&str> {
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        for (name, root_path) in &self.workspace_roots {
+            let canon_root = std::fs::canonicalize(root_path).unwrap_or_else(|_| root_path.clone());
+            if canon.starts_with(&canon_root) {
+                return Some(name);
+            }
+        }
+        None
     }
 
     fn permission_allowed_roots(&self) -> Vec<PathBuf> {
@@ -346,7 +447,7 @@ impl ToolContext {
             details,
             is_read_only,
             path: path.map(|p| p.display().to_string()),
-            working_dir: Some(self.working_dir.clone()),
+            working_dir: Some(self.main_root().clone()),
             allowed_roots: self.permission_allowed_roots(),
             context_description: None,
         }
@@ -451,7 +552,7 @@ impl ToolContext {
     pub fn path_is_within_workspace(&self, path: &std::path::Path) -> bool {
         let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let mut roots = vec![
-            std::fs::canonicalize(&self.working_dir).unwrap_or_else(|_| self.working_dir.clone()),
+            std::fs::canonicalize(self.main_root()).unwrap_or_else(|_| self.main_root().clone()),
         ];
         roots.extend(
             self.permission_allowed_roots()
@@ -655,9 +756,10 @@ mod tests {
         handler: Arc<dyn claurst_core::permissions::PermissionHandler>,
     ) -> ToolContext {
         use claurst_core::config::Config;
+        use std::collections::BTreeMap;
 
         ToolContext {
-            working_dir: PathBuf::from("/workspace"),
+            workspace_roots: BTreeMap::from([("main".to_string(), PathBuf::from("/workspace"))]),
             permission_mode: claurst_core::config::PermissionMode::Default,
             permission_handler: handler,
             cost_tracker: claurst_core::cost::CostTracker::new(),

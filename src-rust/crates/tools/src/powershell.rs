@@ -221,7 +221,7 @@ impl Tool for PowerShellTool {
         let mut child = match Command::new(exe)
             .args(&args)
             .arg(&params.command)
-            .current_dir(&ctx.working_dir)
+            .current_dir(ctx.main_root())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())

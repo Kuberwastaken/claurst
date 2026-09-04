@@ -321,7 +321,7 @@ impl Tool for AgentTool {
 
         let (working_dir_str, worktree_path, git_root): (String, Option<PathBuf>, Option<PathBuf>) =
             if use_isolation {
-                let git_root = find_git_root(&ctx.working_dir);
+                let git_root = find_git_root(&ctx.main_root());
                 if let Some(ref root) = git_root {
                     if let Some(wt) = create_worktree(root, &agent_id).await {
                         let wd = wt.display().to_string();
@@ -331,17 +331,17 @@ impl Tool for AgentTool {
                             agent_id = %agent_id,
                             "Worktree creation failed; running agent in shared working directory"
                         );
-                        (ctx.working_dir.display().to_string(), None, None)
+                        (ctx.main_root().display().to_string(), None, None)
                     }
                 } else {
                     warn!(
                         agent_id = %agent_id,
                         "No git root found; isolation=worktree ignored"
                     );
-                    (ctx.working_dir.display().to_string(), None, None)
+                    (ctx.main_root().display().to_string(), None, None)
                 }
             } else {
-                (ctx.working_dir.display().to_string(), None, None)
+                (ctx.main_root().display().to_string(), None, None)
             };
 
         let query_config = QueryConfig {
@@ -353,6 +353,11 @@ impl Tool for AgentTool {
             output_style: ctx.config.effective_output_style(),
             output_style_prompt: ctx.config.resolve_output_style_prompt(),
             working_directory: Some(working_dir_str),
+            workspace_roots: ctx
+                .workspace_roots()
+                .iter()
+                .map(|(name, path)| (name.clone(), path.display().to_string()))
+                .collect(),
             thinking_budget: None,
             temperature: None,
             tool_result_budget: 50_000,
@@ -636,7 +641,12 @@ pub fn init_team_swarm_runner() {
                     max_tokens: claurst_core::constants::DEFAULT_MAX_TOKENS,
                     max_turns: max_turns.unwrap_or(10),
                     system_prompt: Some(system_prompt),
-                    working_directory: Some(ctx.working_dir.display().to_string()),
+                    working_directory: Some(ctx.main_root().display().to_string()),
+                    workspace_roots: ctx
+                        .workspace_roots()
+                        .iter()
+                        .map(|(name, path)| (name.clone(), path.display().to_string()))
+                        .collect(),
                     output_style: ctx.config.effective_output_style(),
                     output_style_prompt: ctx.config.resolve_output_style_prompt(),
                     provider_registry: Some(Arc::new(provider_registry)),

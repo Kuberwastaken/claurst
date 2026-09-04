@@ -39,7 +39,7 @@ impl Tool for FileWriteTool {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "The absolute path to the file to write"
+                    "description": "The file to write. Accepts absolute paths, main-relative paths, or &root-name/relative paths."
                 },
                 "content": {
                     "type": "string",

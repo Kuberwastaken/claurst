@@ -2,6 +2,7 @@
 //! `ToolContext` rooted at a caller-supplied (usually temp) directory.
 
 use crate::ToolContext;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -27,7 +28,7 @@ impl claurst_core::permissions::PermissionHandler for AllowAllHandler {
 /// Build a permissive, non-interactive `ToolContext` rooted at `working_dir`.
 pub(crate) fn allow_all_context(working_dir: PathBuf) -> ToolContext {
     ToolContext {
-        working_dir,
+        workspace_roots: BTreeMap::from([("main".to_string(), working_dir)]),
         permission_mode: claurst_core::config::PermissionMode::Default,
         permission_handler: Arc::new(AllowAllHandler),
         cost_tracker: claurst_core::cost::CostTracker::new(),

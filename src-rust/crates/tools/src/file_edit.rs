@@ -44,7 +44,7 @@ impl Tool for FileEditTool {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "The absolute path to the file to modify"
+                    "description": "The file to modify. Accepts absolute paths, main-relative paths, or &root-name/relative paths."
                 },
                 "old_string": {
                     "type": "string",

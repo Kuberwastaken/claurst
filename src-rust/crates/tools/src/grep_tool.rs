@@ -95,7 +95,7 @@ impl Tool for GrepTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "File or directory to search in. Defaults to working directory."
+                    "description": "File or directory to search in. Accepts absolute paths, main-relative paths, or &root-name/relative paths. If omitted, searches only main. To search all workspace roots, call Grep once per root with path=&root-name; these calls can run in parallel."
                 },
                 "type": {
                     "type": "string",
@@ -145,7 +145,7 @@ impl Tool for GrepTool {
             .path
             .as_ref()
             .map(|p| ctx.resolve_path(p))
-            .unwrap_or_else(|| ctx.working_dir.clone());
+            .unwrap_or_else(|| ctx.main_root().clone());
 
         if let Err(e) = ctx.check_permission_for_path(
             self.name(),

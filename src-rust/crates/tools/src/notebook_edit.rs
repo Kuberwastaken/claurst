@@ -63,7 +63,7 @@ impl Tool for NotebookEditTool {
             "properties": {
                 "notebook_path": {
                     "type": "string",
-                    "description": "Absolute path to the .ipynb notebook file"
+                    "description": "Path to the .ipynb notebook file. Accepts absolute paths, main-relative paths, or &root-name/relative paths."
                 },
                 "cell_id": {
                     "type": "string",
