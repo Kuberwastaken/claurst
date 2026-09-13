@@ -1,4 +1,4 @@
-// WebSearch tool that queries SearXNG, the Brave Search API, or DuckDuckGo depending on which backend is configured.
+// WebSearch tool that queries SearXNG, the Brave Search API, the Serply API, or DuckDuckGo depending on which backend is configured.
 //
 // Mirrors the TypeScript WebSearch tool behaviour:
 // - Accepts a query string
@@ -67,11 +67,13 @@ impl Tool for WebSearchTool {
         let num_results = params.num_results.clamp(1, 10);
         debug!(query = %params.query, num_results, "Web search");
 
-        // The tool tries SearXNG first, then Brave Search, then DuckDuckGo as a final fallback.
+        // The tool tries SearXNG first, then Brave Search, then Serply, then DuckDuckGo as a final fallback.
         if let Some(base) = std::env::var("SEARXNG_URL").ok().filter(|s| !s.is_empty()) {
             search_searxng(&params.query, num_results, &base).await
         } else if let Some(api_key) = std::env::var("BRAVE_SEARCH_API_KEY").ok().filter(|k| !k.is_empty()) {
             search_brave(&params.query, num_results, &api_key).await
+        } else if let Some(api_key) = std::env::var("SERPLY_API_KEY").ok().filter(|k| !k.is_empty()) {
+            search_serply(&params.query, num_results, &api_key).await
         } else {
             search_duckduckgo(&params.query, num_results).await
         }
@@ -190,6 +192,61 @@ fn format_brave_results(data: &Value, max: usize) -> String {
     }
 }
 
+/// Search using the Serply API.
+async fn search_serply(query: &str, num_results: usize, api_key: &str) -> ToolResult {
+    let client = reqwest::Client::new();
+    // Serply caps a page at 10 results, which is also the tool's own ceiling.
+    let url = format!(
+        "https://api.serply.io/v1/search/?q={}&num={}",
+        urlencoding_simple(query),
+        num_results
+    );
+
+    let resp = match client
+        .get(&url)
+        .header("Accept", "application/json")
+        .header("X-Api-Key", api_key)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return ToolResult::error(format!("Search request failed: {}", e)),
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        return ToolResult::error(format!("Serply API returned status {}", status));
+    }
+
+    let data: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => return ToolResult::error(format!("Failed to parse response: {}", e)),
+    };
+
+    let results = format_serply_results(&data, num_results);
+    ToolResult::success(results)
+}
+
+fn format_serply_results(data: &Value, max: usize) -> String {
+    let mut output = String::new();
+
+    if let Some(items) = data.get("results").and_then(|r| r.as_array()) {
+        for (i, item) in items.iter().take(max).enumerate() {
+            let title = item.get("title").and_then(|t| t.as_str()).unwrap_or("(No title)");
+            let url = item.get("link").and_then(|u| u.as_str()).unwrap_or("");
+            let snippet = item.get("description").and_then(|s| s.as_str()).unwrap_or("");
+
+            output.push_str(&format!("{}. **{}**\n   URL: {}\n   {}\n\n", i + 1, title, url, snippet));
+        }
+    }
+
+    if output.is_empty() {
+        "No results found.".to_string()
+    } else {
+        output
+    }
+}
+
 /// Fallback: DuckDuckGo Instant Answer API.
 /// Note: this doesn't return full search results, only instant answers.
 async fn search_duckduckgo(query: &str, num_results: usize) -> ToolResult {
@@ -279,4 +336,55 @@ fn urlencoding_simple(s: &str) -> String {
         }
     }
     encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Trimmed copy of a real Serply response body.
+    fn serply_body() -> Value {
+        json!({
+            "results": [
+                {
+                    "title": "Rust Programming Language",
+                    "link": "https://www.rust-lang.org/",
+                    "description": "A language empowering everyone to build reliable software.",
+                    "position": 1
+                },
+                {
+                    "title": "The Rust Programming Language - The Rust Book",
+                    "link": "https://doc.rust-lang.org/book/",
+                    "description": "An introductory book about Rust.",
+                    "position": 2
+                }
+            ],
+            "total": 2
+        })
+    }
+
+    #[test]
+    fn serply_results_match_the_other_backends_format() {
+        let output = format_serply_results(&serply_body(), 10);
+        assert_eq!(
+            output,
+            "1. **Rust Programming Language**\n   URL: https://www.rust-lang.org/\n   \
+             A language empowering everyone to build reliable software.\n\n\
+             2. **The Rust Programming Language - The Rust Book**\n   URL: https://doc.rust-lang.org/book/\n   \
+             An introductory book about Rust.\n\n"
+        );
+    }
+
+    #[test]
+    fn serply_results_stop_at_the_requested_count() {
+        let output = format_serply_results(&serply_body(), 1);
+        assert!(output.contains("https://www.rust-lang.org/"));
+        assert!(!output.contains("https://doc.rust-lang.org/book/"));
+    }
+
+    #[test]
+    fn serply_reports_no_results_when_the_array_is_empty_or_absent() {
+        assert_eq!(format_serply_results(&json!({"results": []}), 5), "No results found.");
+        assert_eq!(format_serply_results(&json!({}), 5), "No results found.");
+    }
 }
