@@ -50,6 +50,7 @@ pub fn provider_for_id(provider_id: &str) -> Option<OpenAiCompatProvider> {
         "synthetic" => Some(synthetic()),
         "routing" => Some(routing()),
         "neuralwatt" => Some(neuralwatt()),
+        "yolo-auto" => Some(yolo_auto()),
         _ => None,
     }
 }
@@ -608,6 +609,23 @@ pub fn neuralwatt() -> OpenAiCompatProvider {
         ProviderId::NEURALWATT,
         "NeuralWatt",
         "https://api.neuralwatt.com/v1",
+    )
+    .with_api_key(key)
+    .with_quirks(ProviderQuirks {
+        include_usage_in_stream: true,
+        ..Default::default()
+    })
+}
+
+/// Yolo-Auto — OpenAI-compatible endpoint with flat-rate plans.
+/// Reads `YOLO_AUTO_API_KEY` for authentication.  The model catalog is
+/// discoverable from the provider's `/v1/models` endpoint.
+pub fn yolo_auto() -> OpenAiCompatProvider {
+    let key = std::env::var("YOLO_AUTO_API_KEY").unwrap_or_default();
+    OpenAiCompatProvider::new(
+        ProviderId::YOLO_AUTO,
+        "Yolo-Auto",
+        "https://yolo-auto.com/v1",
     )
     .with_api_key(key)
     .with_quirks(ProviderQuirks {

@@ -131,6 +131,7 @@ pub(super) fn provider_picker_items() -> Vec<SelectItem> {
         SelectItem { id: "synthetic".into(), title: "Synthetic.dev".into(), description: "Hosted open weights".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "routing".into(), title: "routing.run".into(), description: "Hosted open weights · DeepSeek · Llama · Mixtral · Qwen".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "neuralwatt".into(), title: "NeuralWatt".into(), description: "Hosted open weights - energy-efficient".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "yolo-auto".into(), title: "Yolo-Auto".into(), description: "Flat-rate OpenAI-compatible - yolo / yolo-small".into(), category: "Popular".into(), badge: Some("FREE".into()) },
         SelectItem { id: "cerebras".into(), title: "Cerebras".into(), description: "Fast hosted inference".into(), category: "Other".into(), badge: Some("FREE".into()) },
         SelectItem { id: "sambanova".into(), title: "SambaNova".into(), description: "Fast hosted inference".into(), category: "Other".into(), badge: Some("FREE".into()) },
         SelectItem { id: "lmstudio".into(), title: "LM Studio".into(), description: "Local model server".into(), category: "Other".into(), badge: Some("LOCAL".into()) },
