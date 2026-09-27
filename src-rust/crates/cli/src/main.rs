@@ -2711,6 +2711,7 @@ async fn run_interactive(
                                     cmd_name.as_str(),
                                     "model" | "theme" | "resume" | "session"
                                         | "vim" | "vi" | "voice" | "fast" | "speed"
+                                        | "config" | "settings"
                                 );
                             let handled_by_tui = if skip_tui_for_args {
                                 false
