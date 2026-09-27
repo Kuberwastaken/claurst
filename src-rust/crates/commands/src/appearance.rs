@@ -75,24 +75,43 @@ impl SlashCommand for ThemeCommand {
     fn name(&self) -> &str { "theme" }
     fn description(&self) -> &str { "Show or change the current theme" }
     fn help(&self) -> &str {
-        "Usage: /theme [default|dark|light]\n\
-         Without arguments, shows the active theme. With an argument, updates the theme for this and future sessions."
+        "Usage: /theme [name]\n\n\
+         Without arguments, shows the active theme. With an argument, updates the
+         theme for this and future sessions.\n\n\
+         Built-in themes: default, dark, light, deuteranopia, solarized, nord, dracula,
+         monokai. Custom themes live in ~/.claurst/themes/<name>.toml."
     }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         let args = args.trim();
         if args.is_empty() {
             return CommandResult::Message(format!(
-                "Current theme: {:?}\nUse /theme <default|dark|light> to change it.",
+                "Current theme: {:?}\nUse /theme <name> to change it.",
                 ctx.config.theme
             ));
         }
 
         let Some(theme) = parse_theme(args) else {
-            return CommandResult::Error(
-                "Theme must be one of: default, dark, light".to_string(),
-            );
+            return CommandResult::Error("Theme name cannot be empty".to_string());
         };
+
+        // Validate the theme actually loads before persisting it, so a
+        // typo does not get written to settings and break startup.
+        let name = match &theme {
+            Theme::Default => "default".to_string(),
+            Theme::Dark => "dark".to_string(),
+            Theme::Light => "light".to_string(),
+            Theme::Deuteranopia => "deuteranopia".to_string(),
+            Theme::Custom(name) => name.clone(),
+        };
+        let themes_dir = Settings::config_dir().join("themes");
+        if let Err(err) = claurst_tui::theme::load_theme(&name, Some(&themes_dir)) {
+            let available = claurst_tui::theme::available_theme_names(Some(&themes_dir)).join(", ");
+            return CommandResult::Error(format!(
+                "Unknown theme '{}': {}. Available themes: {}",
+                name, err, available
+            ));
+        }
 
         let mut new_config = ctx.config.clone();
         new_config.theme = theme.clone();

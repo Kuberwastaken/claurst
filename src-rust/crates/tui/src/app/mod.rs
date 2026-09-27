@@ -1017,6 +1017,27 @@ impl App {
         );
     }
 
+    /// Apply the theme given as a `Theme` enum value: publish the matching
+    /// palette to the theme module and update `self.config.theme` so the next
+    /// frame renders with the new palette. Persistence is left to the caller
+    /// (the config command already saved settings).
+    pub fn apply_theme_name(&mut self, theme: &Theme) {
+        let name = match theme {
+            Theme::Default => "default",
+            Theme::Dark => "dark",
+            Theme::Light => "light",
+            Theme::Deuteranopia => "deuteranopia",
+            Theme::Custom(name) => name.as_str(),
+        };
+        let themes_dir = Settings::config_dir().join("themes");
+        if let Err(error) = crate::theme::set_theme(name, Some(&themes_dir)) {
+            self.status_message =
+                Some(format!("Theme '{}' failed to load: {}", name, error));
+            return;
+        }
+        self.config.theme = theme.clone();
+    }
+
     /// Apply a theme by name, persisting it to config.
     ///
     /// Also publishes the theme to the theme module so the next frame is

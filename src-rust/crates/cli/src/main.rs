@@ -3089,6 +3089,11 @@ async fn run_interactive(
                                 Some(CommandResult::ConfigChangeMessage(new_cfg, msg)) => {
                                     let mut applied_cfg = new_cfg;
                                     normalize_provider_from_model(&mut applied_cfg);
+                                    // If the command changed the theme, live-apply it so
+                                    // the next frame renders with the new palette.
+                                    if applied_cfg.theme != app.config.theme {
+                                        app.apply_theme_name(&applied_cfg.theme);
+                                    }
                                     cmd_ctx.config = applied_cfg.clone();
                                     tool_ctx.config = applied_cfg.clone();
                                     // Mode and tool allow/deny lists may have changed
@@ -3111,7 +3116,11 @@ async fn run_interactive(
                                         &cmd_ctx.config,
                                         &model_registry,
                                     );
-                                    app.status_message = Some(msg);
+                                    // The command's message, unless the live theme
+                                    // apply already surfaced a load error.
+                                    if app.status_message.is_none() {
+                                        app.status_message = Some(msg);
+                                    }
                                 }
                                 Some(CommandResult::UserMessage(msg)) => {
                                     // Queue a user-visible turn for the model.
