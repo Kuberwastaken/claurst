@@ -2791,15 +2791,23 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
-// Skills + MCP count indicator.
+        // Skills + MCP count indicator: render only the non-zero halves so a
+        // user with skills but no MCP servers doesn't see "0 mcp".
         if app.skill_count > 0 || app.mcp_server_count > 0 {
             if !parts.is_empty() {
                 parts.push(Span::raw("  "));
             }
-            parts.push(Span::styled(
-                format!("{} skills \u{00b7} {} mcp", app.skill_count, app.mcp_server_count),
-                Style::default().fg(Color::DarkGray),
-            ));
+            let mut label = String::new();
+            if app.skill_count > 0 {
+                label.push_str(&format!("{} skill{}", app.skill_count, if app.skill_count == 1 { "" } else { "s" }));
+            }
+            if app.mcp_server_count > 0 {
+                if !label.is_empty() {
+                    label.push_str(" \u{00b7} ");
+                }
+                label.push_str(&format!("{} mcp", app.mcp_server_count));
+            }
+            parts.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
         }
 
         // 4. Rate limits
