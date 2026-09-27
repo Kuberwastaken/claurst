@@ -1,7 +1,9 @@
 //! Slash-command catalog and dispatch.
 
 use claurst_core::config::Theme;
+use claurst_core::config::Settings;
 use claurst_core::types::Role;
+use crate::app::SystemMessageStyle;
 use crate::notifications::NotificationKind;
 use crate::overlays::HelpEntry;
 use super::App;
@@ -187,6 +189,31 @@ impl App {
         }
         if cmd == "mcp" && !args.trim().is_empty() {
             return false;
+        }
+        // `/theme <name>` applies a theme directly; bare `/theme` opens the picker.
+        if cmd == "theme" && !args.trim().is_empty() {
+            let themes_dir = Settings::config_dir().join("themes");
+            let name = args.trim();
+            match crate::theme::set_theme(name, Some(&themes_dir)) {
+                Ok(()) => {
+                    self.apply_theme(name);
+                    self.push_system_message(
+                        format!("Theme set to: {}", name),
+                        SystemMessageStyle::Info,
+                    );
+                }
+                Err(error) => {
+                    let available = crate::theme::available_theme_names(Some(&themes_dir)).join(", ");
+                    self.push_system_message(
+                        format!(
+                            "Unknown theme '{}': {}. Available themes: {}",
+                            name, error, available
+                        ),
+                        SystemMessageStyle::Warning,
+                    );
+                }
+            }
+            return true;
         }
         self.intercept_slash_command(cmd)
     }

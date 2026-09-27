@@ -630,7 +630,7 @@ impl App {
             reg.apply_model_overrides(&config.model_overrides);
             reg
         };
-        Self {
+        let app = Self {
             config,
             cost_tracker,
             messages: Vec::new(),
@@ -871,6 +871,25 @@ impl App {
             managed_agents_active: false,
             last_exit_key_warning: None,
             exit_key_sequence_start: None,
+        };
+        app.init_theme();
+        app
+    }
+
+    /// Publish the theme configured in `config.theme` to the theme module so
+    /// the render pass applies it. Unknown theme names fall back to the
+    /// native ("default") palette.
+    fn init_theme(&self) {
+        let name = match &self.config.theme {
+            Theme::Default => "default",
+            Theme::Dark => "dark",
+            Theme::Light => "light",
+            Theme::Deuteranopia => "deuteranopia",
+            Theme::Custom(name) => name.as_str(),
+        };
+        let themes_dir = Settings::config_dir().join("themes");
+        if let Err(error) = crate::theme::set_theme(name, Some(&themes_dir)) {
+            tracing::warn!("failed to load theme '{}': {}", name, error);
         }
     }
 
@@ -999,7 +1018,16 @@ impl App {
     }
 
     /// Apply a theme by name, persisting it to config.
+    ///
+    /// Also publishes the theme to the theme module so the next frame is
+    /// rendered with the new palette. Persistence errors are surfaced as a
+    /// status message but do not roll back the in-memory theme.
     pub fn apply_theme(&mut self, theme_name: &str) {
+        let themes_dir = Settings::config_dir().join("themes");
+        if let Err(error) = crate::theme::set_theme(theme_name, Some(&themes_dir)) {
+            self.status_message = Some(format!("Theme '{}' failed to load: {}", theme_name, error));
+            return;
+        }
         let theme = match theme_name {
             "dark" => Theme::Dark,
             "light" => Theme::Light,

@@ -3,6 +3,8 @@
 // Shows a list of available themes with colour swatches. Arrow keys navigate,
 // Enter selects, Esc cancels.
 
+use std::path::Path;
+
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -44,7 +46,15 @@ impl ThemeScreen {
     }
 
     pub fn open(&mut self, current_theme: &str) {
+        self.open_with_themes_dir(current_theme, crate::themes_dir().as_deref());
+    }
+
+    /// Open the picker, refreshing the theme list from `themes_dir` so
+    /// custom TOML themes created since launch show up too.
+    pub fn open_with_themes_dir(&mut self, current_theme: &str, themes_dir: Option<&Path>) {
         self.visible = true;
+        self.themes = builtin_themes();
+        self.themes.extend(custom_theme_options(themes_dir));
         // Select the current theme, if found
         if let Some(idx) = self.themes.iter().position(|t| t.name == current_theme) {
             self.selected_idx = idx;
@@ -181,6 +191,52 @@ fn builtin_themes() -> Vec<ThemeOption> {
     ]
 }
 
+/// Build picker entries for custom TOML themes in `themes_dir`. A theme that
+/// fails to parse is skipped; its file was validated when written, and a
+/// broken file must not break the picker.
+fn custom_theme_options(themes_dir: Option<&Path>) -> Vec<ThemeOption> {
+    let mut options = Vec::new();
+    let Some(dir) = themes_dir else {
+        return options;
+    };
+    for name in crate::theme::available_theme_names(themes_dir) {
+        if crate::theme::BUILTIN_THEMES.contains(&name.as_str()) {
+            continue;
+        }
+        let Ok(loaded) = crate::theme::load_theme(&name, themes_dir) else {
+            continue;
+        };
+        let file = dir.join(format!("{}.toml", name));
+        options.push(ThemeOption {
+            label: title_case(&name),
+            description: format!("Custom theme ({})", file.display()),
+            swatch: [
+                loaded.color(crate::theme::ThemeColor::Background),
+                loaded.color(crate::theme::ThemeColor::Accent),
+                loaded.color(crate::theme::ThemeColor::Success),
+                loaded.color(crate::theme::ThemeColor::Text),
+            ],
+            name,
+        });
+    }
+    options
+}
+
+/// "my-theme" -> "My Theme" for display in the picker.
+fn title_case(name: &str) -> String {
+    name.split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
@@ -197,7 +253,7 @@ pub fn render_theme_screen(frame: &mut Frame, screen: &ThemeScreen, area: Rect) 
     if let Some(subtitle_area) = modal_header_line_area(layout.header_area, 1) {
         frame.render_widget(
             Paragraph::new(Line::from(vec![Span::styled(
-                " Preview palettes before wiring up richer theme behavior.",
+                " Custom themes: drop a <name>.toml palette in ~/.claurst/themes/.",
                 Style::default().fg(CLAURST_MUTED),
             )])),
             subtitle_area,
@@ -299,7 +355,7 @@ mod tests {
     #[test]
     fn theme_screen_renders_current_theme() {
         let mut screen = ThemeScreen::new();
-        screen.open("dark");
+        screen.open_with_themes_dir("dark", None);
 
         let backend = TestBackend::new(90, 28);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -319,9 +375,25 @@ mod tests {
     }
 
     #[test]
+    fn custom_themes_listed_after_builtins() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mine.toml"),
+            "base = \"nord\"\n[colors]\naccent = \"#ff9900\"\n",
+        )
+        .unwrap();
+        let mut screen = ThemeScreen::new();
+        screen.open_with_themes_dir("default", Some(dir.path()));
+        assert_eq!(screen.themes.last().map(|t| t.name.as_str()), Some("mine"));
+        assert_eq!(screen.themes.last().unwrap().label, "Mine");
+        // The swatch carries the custom accent override.
+        assert_eq!(screen.themes.last().unwrap().swatch[1], Color::Rgb(255, 153, 0));
+    }
+
+    #[test]
     fn theme_navigation_wraps() {
         let mut screen = ThemeScreen::new();
-        screen.open("default");
+        screen.open_with_themes_dir("default", None);
 
         screen.select_prev();
         assert_eq!(screen.selected_name(), Some("deuteranopia"));

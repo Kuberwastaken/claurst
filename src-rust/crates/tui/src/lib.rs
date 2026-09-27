@@ -109,6 +109,7 @@ pub mod plugin_views;
 pub mod settings_screen;
 /// Theme picker overlay.
 pub mod theme_screen;
+pub mod theme;
 /// Color palette management for different themes and accessibility support.
 pub mod theme_colors;
 /// Diff viewer dialog (two-pane: file list + unified diff detail).
@@ -583,6 +584,12 @@ pub fn update_terminal_title(topic: Option<&str>) {
         Some(t) if !t.is_empty() => set_terminal_title(&format!("\u{1f980} | {}", t)),
         _ => set_terminal_title("\u{1f980} Claurst"),
     }
+}
+
+/// The per-user themes directory: `<config_dir>/themes`, where custom TOML
+/// palettes (`<name>.toml`) live.
+pub fn themes_dir() -> Option<std::path::PathBuf> {
+    Some(claurst_core::config::Settings::config_dir().join("themes"))
 }
 
 // ---------------------------------------------------------------------------
