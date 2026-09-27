@@ -25,6 +25,7 @@ pub mod coordinator;
 pub mod cron_scheduler;
 pub mod sanitize;
 pub mod session_memory;
+pub mod memory_extraction;
 
 mod runner;
 pub use runner::*;
@@ -51,6 +52,10 @@ pub use compact::{
 };
 pub use session_memory::{
     ExtractedMemory, MemoryCategory, SessionMemoryExtractor, SessionMemoryState,
+};
+pub use memory_extraction::{
+    build_transcript_for_extraction, extract_and_store, memory_extraction_available,
+    trigger_final_extraction,
 };
 
 use claurst_api::{
@@ -1988,6 +1993,19 @@ pub async fn run_query_loop(
                             }
                         }
                     }
+                }
+
+                // jcode-style memory extraction: fire-and-forget through the
+                // MemorySidecar into the project MemoryManager store. Works
+                // on any provider, not just Anthropic.
+                {
+                    let transcript =
+                        memory_extraction::build_transcript_for_extraction(messages);
+                    memory_extraction::trigger_final_extraction(
+                        transcript,
+                        tool_ctx.session_id.clone(),
+                        &tool_ctx.working_dir,
+                    );
                 }
 
                 // Trigger AutoDream consolidation check (non-blocking, best-effort).
