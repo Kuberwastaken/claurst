@@ -1021,7 +1021,10 @@ impl App {
     /// palette to the theme module and update `self.config.theme` so the next
     /// frame renders with the new palette. Persistence is left to the caller
     /// (the config command already saved settings).
-    pub fn apply_theme_name(&mut self, theme: &Theme) {
+    ///
+    /// Returns `false` and sets a status message when the theme fails to
+    /// load, so the caller can keep the error instead of a success message.
+    pub fn apply_theme_name(&mut self, theme: &Theme) -> bool {
         let name = match theme {
             Theme::Default => "default",
             Theme::Dark => "dark",
@@ -1033,9 +1036,10 @@ impl App {
         if let Err(error) = crate::theme::set_theme(name, Some(&themes_dir)) {
             self.status_message =
                 Some(format!("Theme '{}' failed to load: {}", name, error));
-            return;
+            return false;
         }
         self.config.theme = theme.clone();
+        true
     }
 
     /// Apply a theme by name, persisting it to config.

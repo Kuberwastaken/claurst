@@ -3092,8 +3092,9 @@ async fn run_interactive(
                                     normalize_provider_from_model(&mut applied_cfg);
                                     // If the command changed the theme, live-apply it so
                                     // the next frame renders with the new palette.
+                                    let mut theme_applied = true;
                                     if applied_cfg.theme != app.config.theme {
-                                        app.apply_theme_name(&applied_cfg.theme);
+                                        theme_applied = app.apply_theme_name(&applied_cfg.theme);
                                     }
                                     cmd_ctx.config = applied_cfg.clone();
                                     tool_ctx.config = applied_cfg.clone();
@@ -3119,7 +3120,7 @@ async fn run_interactive(
                                     );
                                     // The command's message, unless the live theme
                                     // apply already surfaced a load error.
-                                    if app.status_message.is_none() {
+                                    if theme_applied {
                                         app.status_message = Some(msg);
                                     }
                                 }
