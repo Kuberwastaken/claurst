@@ -135,7 +135,12 @@ pub async fn extract_and_store(
         return Ok(Vec::new());
     }
 
-    let sidecar = MemorySidecar::new(&settings, None);
+    // Session-level memory model (Alt+M picker mark) wins over the settings
+    // block, mirroring jcode's `sidecar_for_memory` resolution order.
+    let session_memory_model = claurst_core::memory_config::load_memory_model_store()
+        .model
+        .filter(|m| !m.trim().is_empty());
+    let sidecar = MemorySidecar::new(&settings, session_memory_model.as_deref());
     if sidecar.is_dormant() {
         tracing::debug!("Memory transcript extraction skipped: no usable sidecar backend");
         return Ok(Vec::new());

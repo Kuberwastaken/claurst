@@ -4283,6 +4283,7 @@ async fn run_interactive(
                                                                 ctx_for(&id, m.context_window),
                                                             ),
                                                         is_current: false,
+                                                        is_memory_model: false,
                                                     }
                                                 })
                                             })
@@ -4300,6 +4301,7 @@ async fn run_interactive(
                                                         ),
                                                     id,
                                                     is_current: false,
+                                                    is_memory_model: false,
                                                 }
                                             })
                                             .collect()

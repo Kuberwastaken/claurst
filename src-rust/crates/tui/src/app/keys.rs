@@ -773,6 +773,14 @@ impl App {
                 KeyCode::Down => self.model_picker.select_next(),
                 KeyCode::Left => self.model_picker.effort_prev(),
                 KeyCode::Right => self.model_picker.effort_next(),
+                // Alt+M marks the highlighted model as the memory sidecar
+                // model (jcode parity; not Ctrl+M: terminals deliver Ctrl+M
+                // as Enter without the kitty keyboard protocol).
+                KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    if let Some(notice) = self.model_picker.toggle_selected_memory_model() {
+                        self.status_message = Some(notice);
+                    }
+                }
                 KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => self.model_picker.select_prev(),
                 KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => self.model_picker.select_next(),
                 KeyCode::Enter => {
