@@ -150,22 +150,26 @@ impl App {
                         })
                         .collect();
 
-                    let (status, error_message) = match manager.server_status(&server.name) {
-                        claurst_mcp::McpServerStatus::Connected { .. } => {
-                            (McpViewStatus::Connected, None)
-                        }
-                        claurst_mcp::McpServerStatus::Connecting => {
-                            (McpViewStatus::Connecting, None)
-                        }
-                        claurst_mcp::McpServerStatus::Disconnected { last_error } => {
-                            if last_error.is_some() {
-                                (McpViewStatus::Error, last_error)
-                            } else {
-                                (McpViewStatus::Disconnected, None)
+                    let (status, error_message) = if self.disabled_mcp_servers.contains(&server.name) {
+                        (McpViewStatus::Disabled, None)
+                    } else {
+                        match manager.server_status(&server.name) {
+                            claurst_mcp::McpServerStatus::Connected { .. } => {
+                                (McpViewStatus::Connected, None)
                             }
-                        }
-                        claurst_mcp::McpServerStatus::Failed { error, .. } => {
-                            (McpViewStatus::Error, Some(error))
+                            claurst_mcp::McpServerStatus::Connecting => {
+                                (McpViewStatus::Connecting, None)
+                            }
+                            claurst_mcp::McpServerStatus::Disconnected { last_error } => {
+                                if last_error.is_some() {
+                                    (McpViewStatus::Error, last_error)
+                                } else {
+                                    (McpViewStatus::Disconnected, None)
+                                }
+                            }
+                            claurst_mcp::McpServerStatus::Failed { error, .. } => {
+                                (McpViewStatus::Error, Some(error))
+                            }
                         }
                     };
 

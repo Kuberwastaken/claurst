@@ -58,6 +58,10 @@ pub enum CommandResult {
         /// The local callback URL waiting for the OAuth redirect.
         redirect_uri: String,
     },
+    /// A server was enabled or disabled via `/mcp enable|disable`. The runtime
+    /// should reload settings and rebuild the MCP manager + tool list so the
+    /// change takes effect in the live session.
+    McpServersToggled { server_name: String, enabled: bool },
     /// Clear the conversation.
     ClearConversation,
     /// Replace the conversation with a specific message list (used by /rewind).

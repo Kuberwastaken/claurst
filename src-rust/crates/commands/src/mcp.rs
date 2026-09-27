@@ -21,8 +21,11 @@ impl SlashCommand for McpCommand {
            /mcp                        — list configured servers with live status\n\
            /mcp list                   — same as above\n\
            /mcp status                 — detailed connection status for all servers\n\
+           /mcp enable <server>       — re-enable a disabled server\n\
+           /mcp disable <server>      — disconnect a server and skip it at startup\n\
            /mcp auth <server>          — show OAuth auth instructions for a server\n\
            /mcp connect <server>       — reconnect a disconnected server\n\
+           /mcp tools [server]         — list tools (optionally for one server)\n\
            /mcp logs <server>          — show recent errors/logs for a server\n\
            /mcp resources [server]     — list resources from connected servers\n\
            /mcp prompts [server]       — list prompt templates from connected servers\n\
@@ -62,6 +65,18 @@ impl SlashCommand for McpCommand {
             let rest = sub["tools".len()..].trim();
             let server_filter = if rest.is_empty() { None } else { Some(rest) };
             return McpCommand::handle_tools(server_filter, ctx);
+        }
+
+        // /mcp enable <server-name> | /mcp disable <server-name>
+        if matches!(first_word, "enable" | "disable") {
+            let server_name = sub[first_word.len()..].trim();
+            if server_name.is_empty() {
+                return CommandResult::Error(format!(
+                    "Usage: /mcp {} <server-name>",
+                    first_word
+                ));
+            }
+            return McpCommand::handle_toggle(server_name, first_word == "enable");
         }
 
         // /mcp connect <server-name>
@@ -110,6 +125,9 @@ impl SlashCommand for McpCommand {
 
         // /mcp status — detailed status table
         if sub == "status" {
+            let disabled = Settings::load_sync()
+                .map(|s| s.disabled_mcp_servers)
+                .unwrap_or_default();
             let mut output = String::from("MCP Server Status\n─────────────────\n");
             for srv in &ctx.config.mcp_servers {
                 let kind = srv.server_type.as_str();
@@ -118,6 +136,16 @@ impl SlashCommand for McpCommand {
                     .as_deref()
                     .or(srv.command.as_deref())
                     .unwrap_or("(unknown)");
+
+                if disabled.contains(&srv.name) {
+                    output.push_str(&format!(
+                        "  {name:20} [{kind:10}] disabled by user\n    endpoint: {endpoint}\n",
+                        name = srv.name,
+                        kind = kind,
+                        endpoint = endpoint,
+                    ));
+                    continue;
+                }
 
                 // Fetch live status from the manager if available.
                 let live_status = ctx
@@ -357,6 +385,42 @@ impl McpCommand {
             ));
         }
         CommandResult::Message(out)
+    }
+
+    /// Handle `/mcp enable|disable <server>` — persist the toggle in global
+    /// settings (`disabledMcpServers`) and ask the runtime to rebuild the MCP
+    /// manager so the change applies live (tools registered/unregistered,
+    /// server connected/disconnected).
+    fn handle_toggle(server_name: &str, enable: bool) -> CommandResult {
+        // The server must exist in the current config (user or approved project).
+        let configured = Settings::load_sync()
+            .map(|s| s.config.mcp_servers.iter().any(|srv| srv.name == server_name))
+            .unwrap_or(false);
+        if !configured {
+            return CommandResult::Error(format!(
+                "No MCP server named '{}' is configured.\n\
+                 Check the 'mcpServers' list in ~/.claurst/settings.json.",
+                server_name
+            ));
+        }
+
+        let save = save_settings_mutation(|settings| {
+            if enable {
+                settings.disabled_mcp_servers.remove(server_name);
+            } else {
+                settings.disabled_mcp_servers.insert(server_name.to_string());
+            }
+        });
+        match save {
+            Ok(()) => CommandResult::McpServersToggled {
+                server_name: server_name.to_string(),
+                enabled: enable,
+            },
+            Err(e) => CommandResult::Error(format!(
+                "Failed to save settings while toggling MCP server '{}': {}",
+                server_name, e
+            )),
+        }
     }
 
     /// Handle `/mcp connect <server>` — attempt to reconnect a server.
