@@ -767,3 +767,47 @@ When the keyed model exists in the catalog, the override patches it in place.
 When it does not (a self-hosted alias), Claurst materialises a synthetic entry
 so the corrected values flow everywhere the metadata is read: the `/model`
 picker, the token-usage warnings, and the auto-compact thresholds.
+
+### Tsubasa example
+
+Use `custom-openai` for [Tsubasa](https://tsubasa.sh). Set the API key in
+`CUSTOM_OPENAI_API_KEY` and merge these fields into your settings:
+
+```json
+{
+  "provider": "custom-openai",
+  "providers": {
+    "custom-openai": {
+      "api_base": "https://api.tsubasa.sh/v1"
+    }
+  },
+  "modelOverrides": {
+    "custom-openai/tsubasa-fast": {
+      "contextWindow": 32768,
+      "maxOutputTokens": 8192
+    },
+    "custom-openai/tsubasa-pro": {
+      "contextWindow": 32768,
+      "maxOutputTokens": 16384
+    }
+  }
+}
+```
+
+Remove any saved `providers.custom-openai.api_key` when using the environment
+variable, because a configured key takes precedence. The selected provider sends
+your key and prompts to `api.tsubasa.sh`.
+
+Start with the built-in `explore` agent and a smaller output budget:
+
+```sh
+claurst --provider custom-openai --model tsubasa-fast --agent explore \
+  --max-tokens 4096 --print "Explain this function."
+```
+
+Use `tsubasa-pro` to select Pro. Both models have a 32,768-token total context
+budget, including instructions, tool definitions, history, and output. The
+default full tool list can exceed that budget before an answer starts. The
+`explore` agent sends a smaller read/search tool list and requires tool calls to
+be enabled for the selected endpoint and model. This setup does not enable
+image input or extended reasoning.
