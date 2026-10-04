@@ -51,6 +51,7 @@ fn get_env_var_for_provider(id: &str) -> &'static str {
         "upstage" => "UPSTAGE_API_KEY",
         "stepfun" => "STEPFUN_API_KEY",
         "fireworks" => "FIREWORKS_API_KEY",
+        "cheaperinference" => "CHEAPER_INFERENCE_API_KEY",
         _ => "API_KEY",
     }
 }
@@ -81,6 +82,7 @@ fn get_url_for_provider(id: &str) -> &'static str {
         "nvidia" => "build.nvidia.com",
         "venice" => "venice.ai/settings/api",
         "zai" => "z.ai/manage-apikey/apikey-list",
+        "cheaperinference" => "cheaperinference.com/signup",
         _ => "the provider's website",
     }
 }
@@ -168,6 +170,7 @@ pub(super) fn provider_picker_items() -> Vec<SelectItem> {
         SelectItem { id: "upstage".into(), title: "Upstage".into(), description: "Hosted Upstage models".into(), category: "Other".into(), badge: None },
         SelectItem { id: "stepfun".into(), title: "StepFun".into(), description: "Hosted reasoning models".into(), category: "Other".into(), badge: None },
         SelectItem { id: "fireworks".into(), title: "Fireworks AI".into(), description: "Fast inference".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "cheaperinference".into(), title: "Cheaper Inference".into(), description: "OpenAI-compatible gateway · GPT · Claude · Gemini · DeepSeek".into(), category: "Other".into(), badge: None },
     ]
 }
 

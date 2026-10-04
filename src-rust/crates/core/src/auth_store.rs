@@ -181,6 +181,7 @@ impl AuthStore {
             "synthetic" => "SYNTHETIC_API_KEY",
             "routing" => "ROUTING_API_KEY",
             "neuralwatt" => "NEURALWATT_API_KEY",
+            "cheaperinference" => "CHEAPER_INFERENCE_API_KEY",
             "custom-openai" => "CUSTOM_OPENAI_API_KEY",
             "ollama" | "lm-studio" | "llama-cpp" => "", // No API key required
             _ => return None,

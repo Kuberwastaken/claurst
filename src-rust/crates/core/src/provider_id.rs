@@ -78,6 +78,7 @@ impl ProviderId {
     pub const SYNTHETIC: &'static str = "synthetic";
     pub const ROUTING: &'static str = "routing";
     pub const NEURALWATT: &'static str = "neuralwatt";
+    pub const CHEAPER_INFERENCE: &'static str = "cheaperinference";
     pub const FREE: &'static str = "free";
 }
 

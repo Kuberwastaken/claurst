@@ -50,6 +50,7 @@ pub fn provider_for_id(provider_id: &str) -> Option<OpenAiCompatProvider> {
         "synthetic" => Some(synthetic()),
         "routing" => Some(routing()),
         "neuralwatt" => Some(neuralwatt()),
+        "cheaperinference" => Some(cheaper_inference()),
         _ => None,
     }
 }
@@ -616,6 +617,22 @@ pub fn neuralwatt() -> OpenAiCompatProvider {
     })
 }
 
+/// Cheaper Inference — OpenAI-compatible gateway to models from several labs.
+/// Reads `CHEAPER_INFERENCE_API_KEY` for authentication.
+pub fn cheaper_inference() -> OpenAiCompatProvider {
+    let key = std::env::var("CHEAPER_INFERENCE_API_KEY").unwrap_or_default();
+    OpenAiCompatProvider::new(
+        ProviderId::CHEAPER_INFERENCE,
+        "Cheaper Inference",
+        "https://api.cheaperinference.com/v1",
+    )
+    .with_api_key(key)
+    .with_quirks(ProviderQuirks {
+        include_usage_in_stream: true,
+        ..Default::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,5 +646,13 @@ mod tests {
         let qwen = provider_for_id("qwen").expect("qwen should resolve");
         assert_eq!(alibaba.id(), qwen.id());
         assert_eq!(alibaba.name(), qwen.name());
+    }
+
+    #[test]
+    fn cheaperinference_resolves_to_cheaper_inference_backend() {
+        let provider =
+            provider_for_id("cheaperinference").expect("cheaperinference should resolve");
+        assert_eq!(&**provider.id(), ProviderId::CHEAPER_INFERENCE);
+        assert_eq!(provider.name(), "Cheaper Inference");
     }
 }
