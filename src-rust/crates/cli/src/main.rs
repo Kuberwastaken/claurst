@@ -50,7 +50,7 @@ use clap::{ArgAction, Parser, ValueEnum};
 use parking_lot::Mutex as ParkingMutex;
 use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, info, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{fmt::writer::BoxMakeWriter, EnvFilter};
 
 // ---------------------------------------------------------------------------
 // MCP tool wrapper: makes MCP server tools look like native cc-tools.
@@ -471,12 +471,30 @@ async fn main() -> anyhow::Result<()> {
         .add_directive("rmcp::service::client=error".parse().expect("valid rmcp directive"))
         // Suppress error/warn logs from providers and query — errors are already shown as error modals
         .add_directive("claurst_api::providers::free=off".parse().expect("valid directive"))
-        .add_directive("claurst_query=off".parse().expect("valid directive"));
-    tracing_subscriber::fmt()
+        .add_directive("claurst_query=off".parse().expect("valid directive"))
+        // Unreadable system cert files are recoverable (other roots still load).
+        .add_directive("rustls_platform_verifier=error".parse().expect("valid directive"));
+
+    // Determine mode early (needed for log routing, settings error reporting,
+    // auth error handling, and permission handler selection).
+    let is_headless = cli.print || cli.prompt.is_some();
+
+    let log_builder = tracing_subscriber::fmt()
         .with_env_filter(log_filter)
-        .with_target(false)
-        .without_time()
-        .init();
+        .with_target(false);
+    if is_headless {
+        // Keep stdout clean for the response / JSON stream.
+        log_builder.without_time().with_writer(std::io::stderr).init();
+    } else {
+        // The TUI owns the terminal in raw mode; any log line written to
+        // stdout/stderr lands on top of the frame (#396). Log to a file instead,
+        // and drop output entirely if the file cannot be opened.
+        let writer = match claurst_core::paths::open_log_file(&claurst_core::paths::log_file_path()) {
+            Ok(file) => BoxMakeWriter::new(std::sync::Mutex::new(file)),
+            Err(_) => BoxMakeWriter::new(std::io::sink),
+        };
+        log_builder.with_ansi(false).with_writer(writer).init();
+    }
 
     // Determine working directory
     let cwd = cli
@@ -485,10 +503,6 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     debug!(cwd = %cwd.display(), "Starting Claurst");
-
-    // Determine mode early (needed for settings error reporting, auth error
-    // handling, and permission handler selection).
-    let is_headless = cli.print || cli.prompt.is_some();
 
     // Load settings from disk (hierarchical: global < project). A malformed
     // global file is kept intact; interactive mode displays the error in the

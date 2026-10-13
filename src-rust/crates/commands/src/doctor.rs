@@ -168,6 +168,10 @@ impl SlashCommand for DoctorCommand {
         } else {
             lines.push(format!("  ✗ Config dir missing: {}", config_dir.display()));
         }
+        lines.push(format!(
+            "  • Log file: {}",
+            claurst_core::paths::log_file_path_in(&config_dir).display()
+        ));
 
         // Settings validation — try loading ~/.claurst/settings.json
         let settings_path = config_dir.join("settings.json");

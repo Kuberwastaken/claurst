@@ -407,7 +407,7 @@ and `api_base` override the corresponding environment variables.
 | `NVIDIA_API_KEY` | API key for the `nvidia` provider. |
 | `CLAURST_BRIDGE_URL` | Enable the remote-control bridge by setting the server URL. |
 | `CLAURST_BRIDGE_TOKEN` | Bearer token for the remote-control bridge. |
-| `RUST_LOG` | Tracing filter (e.g. `debug`, `claurst_core=trace`). |
+| `RUST_LOG` | Tracing filter (e.g. `debug`, `claurst_core=trace`). In the interactive TUI, logs go to `<config dir>/logs/claurst.log` (rotated to `claurst.log.old` at 5 MB) so they never draw over the screen; in headless (`--print`) mode they go to stderr. `/doctor` shows the log file path. |
 
 ---
 

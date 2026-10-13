@@ -5,7 +5,8 @@
 //! through, so the home-dir precedence (see [`crate::config::Settings::config_dir`])
 //! is defined in exactly one place.
 
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
 
 /// The canonical claurst home directory — the single source of truth for where
 /// claurst keeps its data. Thin wrapper over
@@ -18,6 +19,88 @@ use std::path::PathBuf;
 /// 3. `$XDG_CONFIG_HOME/claurst` (when absolute) else `~/.config/claurst`.
 pub fn claurst_home() -> PathBuf {
     crate::config::Settings::config_dir()
+}
+
+/// Size at which the diagnostic log is rotated to `claurst.log.old` on open.
+pub const LOG_FILE_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Where the interactive TUI writes `tracing` output: `<claurst_home>/logs/claurst.log`.
+/// The TUI owns the terminal, so log lines must never reach stdout/stderr (#396).
+pub fn log_file_path() -> PathBuf {
+    log_file_path_in(&claurst_home())
+}
+
+/// [`log_file_path`] rooted at an explicit home directory.
+pub fn log_file_path_in(home: &Path) -> PathBuf {
+    home.join("logs").join("claurst.log")
+}
+
+/// Whether a log file of `current_len` bytes should be rotated before appending.
+pub fn log_needs_rotation(current_len: u64) -> bool {
+    current_len >= LOG_FILE_MAX_BYTES
+}
+
+/// Open `path` for appending, creating its parent directory. When the existing
+/// file has reached [`LOG_FILE_MAX_BYTES`] it is first renamed to
+/// `<name>.old` (replacing any previous one), so the log keeps at most two
+/// generations on disk.
+pub fn open_log_file(path: &Path) -> std::io::Result<File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if let Ok(meta) = std::fs::metadata(path) {
+        if log_needs_rotation(meta.len()) {
+            let mut rotated = path.as_os_str().to_owned();
+            rotated.push(".old");
+            std::fs::rename(path, PathBuf::from(rotated))?;
+        }
+    }
+    OpenOptions::new().create(true).append(true).open(path)
+}
+
+#[cfg(test)]
+mod log_file_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn log_file_lives_under_home_logs_dir() {
+        let home = Path::new("/tmp/claurst-home");
+        assert_eq!(
+            log_file_path_in(home),
+            home.join("logs").join("claurst.log")
+        );
+    }
+
+    #[test]
+    fn rotation_threshold() {
+        assert!(!log_needs_rotation(0));
+        assert!(!log_needs_rotation(LOG_FILE_MAX_BYTES - 1));
+        assert!(log_needs_rotation(LOG_FILE_MAX_BYTES));
+    }
+
+    #[test]
+    fn open_creates_dir_and_appends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = log_file_path_in(tmp.path());
+        writeln!(open_log_file(&path).unwrap(), "one").unwrap();
+        writeln!(open_log_file(&path).unwrap(), "two").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\n");
+    }
+
+    #[test]
+    fn open_rotates_oversized_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = log_file_path_in(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![b'x'; LOG_FILE_MAX_BYTES as usize]).unwrap();
+
+        writeln!(open_log_file(&path).unwrap(), "fresh").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh\n");
+        let old = path.with_file_name("claurst.log.old");
+        assert_eq!(std::fs::metadata(old).unwrap().len(), LOG_FILE_MAX_BYTES);
+    }
 }
 
 // These tests drive the resolver through `HOME`/`XDG_CONFIG_HOME`, which only
