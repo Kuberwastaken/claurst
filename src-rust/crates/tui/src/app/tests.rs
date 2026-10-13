@@ -519,6 +519,20 @@ use super::types::{ContextMenuItem, ContextMenuState};
     }
 
     #[test]
+    fn test_yolo_on_when_already_bypassed_is_noop() {
+        // `/yolo on` while already bypassed must not record BypassPermissions
+        // as the "previous" mode, or `/yolo off` would leave bypass on.
+        let mut app = make_app();
+        app.config.permission_mode = PermissionMode::BypassPermissions;
+        assert!(app.intercept_slash_command_with_args("yolo", "on"));
+        assert!(!app.bypass_permissions_dialog.visible);
+        assert!(!app.yolo_pending);
+        assert!(app.yolo_previous_mode.is_none());
+        assert!(app.intercept_slash_command_with_args("yolo", "off"));
+        assert_eq!(app.config.permission_mode, PermissionMode::Default);
+    }
+
+    #[test]
     fn test_yolo_toggle_when_not_bypass_shows_dialog() {
         let mut app = make_app();
         // Bare /yolo with Default mode: toggle on → dialog.

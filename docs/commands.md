@@ -291,17 +291,17 @@ Setting persists to `~/.claurst/ui-settings.json`.
 ---
 
 ### /yolo
-**Aliases:** `danger`
 
 Toggle YOLO mode. In YOLO mode the effective permission mode is
-`bypassPermissions`: all tool-permission prompts are bypassed. The first
+`bypassPermissions`: all tool-permission prompts are bypassed. Every
 `/yolo on` shows the bypass-permissions security dialog before activating;
-acceptance activates it for the session, declining cancels the toggle.
+acceptance activates it for the session only (nothing is written to
+settings), declining cancels the toggle.
 
 ```
 /yolo          — toggle (shows dialog when turning on)
 /yolo on       — show the security dialog, then activate
-/yolo off      — restore default permission mode
+/yolo off      — restore the permission mode active before /yolo on
 ```
 
 YOLO mode can also be enabled persistently via `"yoloMode": true` in the

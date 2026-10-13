@@ -2287,37 +2287,20 @@ pub mod config {
             assert!(merged2.config.yolo_mode);
         }
 
-        #[tokio::test]
-        async fn project_settings_cannot_enable_yolo_mode() {
-            // Isolate the global settings dir so the test cannot pick up the
-            // real user settings.
-            let home = tempfile::tempdir().unwrap();
-            let project = tempfile::tempdir().unwrap();
-            let project_claurst = project.path().join(".claurst");
-            tokio::fs::create_dir_all(&project_claurst).await.unwrap();
-
-            // Global: yolo off. Project: yolo on.
+        #[test]
+        fn project_settings_cannot_enable_yolo_mode() {
+            // Global: yolo off (built in memory, no filesystem or env access).
             let global = Settings::default();
-            tokio::fs::write(
-                home.path().join("settings.json"),
-                serde_json::to_string(&global).unwrap(),
-            )
-            .await
-            .unwrap();
-            // Project settings JSON enabling yoloMode.
-            let project_json = serde_json::to_string(&Settings::default()).unwrap();
-            let project_json = project_json.replace(
-                "\"yoloMode\":false",
-                "\"yoloMode\":true",
-            );
-            tokio::fs::write(project_claurst.join("settings.json"), project_json)
-                .await
-                .unwrap();
+            // Project settings JSON enabling yoloMode, parsed as a project
+            // `.claurst/settings.json` would be.
+            let project_json = serde_json::to_string(&Settings::default())
+                .unwrap()
+                .replace("\"yoloMode\":false", "\"yoloMode\":true");
+            assert!(project_json.contains("\"yoloMode\":true"));
+            let project: Settings = serde_json::from_str(&project_json).unwrap();
+            assert!(project.config.yolo_mode);
 
-            // Point CLAURST_HOME at the isolated home and load hierarchically.
-            std::env::set_var("CLAURST_HOME", home.path());
-            let merged = Settings::load_hierarchical(project.path()).await.unwrap();
-            std::env::remove_var("CLAURST_HOME");
+            let merged = Settings::merge(global, project);
             assert!(
                 !merged.config.yolo_mode,
                 "project settings must not be able to enable yoloMode"

@@ -99,12 +99,11 @@ pub(super) fn help_overlay_entries() -> Vec<HelpEntry> {
 }
 
 impl App {
-    /// Handle slash commands that should open UI screens rather than execute
-    /// as normal commands. Returns `true` if the command was intercepted.
     /// Handle `/yolo [on|off]`. Toggles YOLO mode (bypass all permission
     /// prompts). When turning on, shows the BypassPermissionsModeDialog
-    /// (security gate) before activating. When turning off, restores
-    /// the Default permission mode (not Plan/AcceptEdits).
+    /// (security gate) before activating. When turning off, restores the
+    /// permission mode that was active before `/yolo on` (or `Default` if
+    /// YOLO came from settings or the CLI).
     pub fn handle_yolo_command(&mut self, args: &str) {
         let turning_on = match args.trim() {
             "" => {
@@ -119,6 +118,10 @@ impl App {
         };
 
         if turning_on {
+            if self.config.permission_mode == claurst_core::PermissionMode::BypassPermissions {
+                self.status_message = Some("YOLO mode is already on.".to_string());
+                return;
+            }
             // Show the security dialog before activating. Mark it as a
             // runtime toggle so key handling knows acceptance should switch
             // the permission mode (and decline cancels instead of exiting).
@@ -141,6 +144,8 @@ impl App {
         }
     }
 
+    /// Handle slash commands that should open UI screens rather than execute
+    /// as normal commands. Returns `true` if the command was intercepted.
     pub fn intercept_slash_command_with_args(&mut self, cmd: &str, args: &str) -> bool {
         if cmd == "yolo" {
             self.handle_yolo_command(args.trim());
