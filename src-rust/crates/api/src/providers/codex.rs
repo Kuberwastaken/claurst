@@ -270,23 +270,18 @@ impl CodexProvider {
         self.tokens.lock().unwrap().account_id.clone()
     }
 
-    fn system_prompt_to_text(request: &ProviderRequest) -> String {
-        match request.system_prompt.as_ref() {
-            Some(crate::provider_types::SystemPrompt::Text(text)) => text.clone(),
-            Some(crate::provider_types::SystemPrompt::Blocks(blocks)) => blocks
-                .iter()
-                .map(|b| b.text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n"),
-            None => String::new(),
-        }
-    }
-
     /// Build the Responses-API request body for Codex.
     fn build_responses_body(request: &ProviderRequest) -> Value {
         // Re-use the same message translation that the Copilot provider uses.
-        let input = CopilotProvider::to_responses_input_pub(request);
-        let instructions = Self::system_prompt_to_text(request);
+        // It emits the system prompt as a leading `role: system` input item;
+        // the official client sends base instructions exactly once, as an
+        // `input[0]` developer message with no top-level `instructions`.
+        let mut input = CopilotProvider::to_responses_input_pub(request);
+        if let Some(first) = input.first_mut() {
+            if first.get("role").and_then(Value::as_str) == Some("system") {
+                first["role"] = json!("developer");
+            }
+        }
 
         let tools: Vec<Value> = request
             .tools
@@ -305,7 +300,6 @@ impl CodexProvider {
         let mut body = json!({
             "model": request.model,
             "input": input,
-            "instructions": instructions,
             "store": false,
         });
 
@@ -998,6 +992,37 @@ mod tests {
     fn jwt(payload: Value) -> String {
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string());
         format!("h.{b64}.s")
+    }
+
+    fn request(system: Option<&str>) -> ProviderRequest {
+        ProviderRequest {
+            model: "gpt-5.5".to_string(),
+            messages: vec![claurst_core::types::Message::user("hi")],
+            system_prompt: system
+                .map(|text| crate::provider_types::SystemPrompt::Text(text.to_string())),
+            tools: Vec::new(),
+            max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: Vec::new(),
+            thinking: None,
+            provider_options: json!({}),
+        }
+    }
+
+    #[test]
+    fn body_sends_system_prompt_once_as_developer_message() {
+        let body = CodexProvider::build_responses_body(&request(Some("SYSTEM PROMPT")));
+        assert!(body.get("instructions").is_none());
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input[0]["content"][0]["text"], "SYSTEM PROMPT");
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(body.to_string().matches("SYSTEM PROMPT").count(), 1);
+
+        let body = CodexProvider::build_responses_body(&request(None));
+        assert_eq!(body["input"][0]["role"], "user");
     }
 
     #[test]
