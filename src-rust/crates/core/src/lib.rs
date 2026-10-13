@@ -2612,11 +2612,40 @@ pub mod permissions {
                     Ok(pat) => pat,
                     Err(_) => return false,
                 };
-                if !pat.matches(p) {
+                if !pat.matches(p) && !Self::canonical_prefix_matches(pattern, p) {
                     return false;
                 }
             }
             true
+        }
+
+        /// Retry an absolute glob whose literal directory prefix goes through
+        /// a symlink (e.g. `/tmp` on macOS, or a symlinked project directory)
+        /// against the canonical form of that prefix. Rules are stored from
+        /// the lexical path the user approved, while tools re-check the real
+        /// location of the file they opened (#415); both must match the same
+        /// rule. The final component is never resolved.
+        fn canonical_prefix_matches(pattern: &str, path: &str) -> bool {
+            if !std::path::Path::new(pattern).is_absolute() {
+                return false;
+            }
+            let literal_end = pattern.find(['*', '?', '[']).unwrap_or(pattern.len());
+            let Some(split) = pattern[..literal_end].rfind(['/', std::path::MAIN_SEPARATOR]) else {
+                return false;
+            };
+            if split == 0 {
+                return false;
+            }
+            let (dir, rest) = pattern.split_at(split);
+            let Ok(canonical_dir) = std::fs::canonicalize(dir) else {
+                return false;
+            };
+            let canonical_dir = canonical_dir.to_string_lossy();
+            if canonical_dir == dir {
+                return false;
+            }
+            let rebuilt = format!("{}{}", glob::Pattern::escape(&canonical_dir), rest);
+            glob::Pattern::new(&rebuilt).is_ok_and(|pat| pat.matches(path))
         }
     }
 
@@ -3363,6 +3392,30 @@ pub mod permissions {
                 m.evaluate("Write", "write", Some("/tmp/foo/bar.txt"), None, &[]),
                 PermissionDecision::Allow
             );
+        }
+
+        /// #415: a rule stored from a lexical path whose directory is a
+        /// symlink must also match the canonical path tools re-check.
+        #[cfg(unix)]
+        #[test]
+        fn glob_rule_with_symlinked_prefix_matches_canonical_path() {
+            let dir = tempfile::tempdir().unwrap();
+            let real = std::fs::canonicalize(dir.path()).unwrap().join("real");
+            std::fs::create_dir(&real).unwrap();
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&real, &alias).unwrap();
+            let rule = PermissionRule {
+                tool_name: Some("Edit".to_string()),
+                path_pattern: Some(format!("{}/*", alias.display())),
+                action: PermissionAction::Allow,
+                scope: PermissionScope::Session,
+            };
+            let lexical = format!("{}/notes.txt", alias.display());
+            let canonical = format!("{}/notes.txt", real.display());
+            assert!(rule.matches("Edit", Some(&lexical)));
+            assert!(rule.matches("Edit", Some(&canonical)));
+            assert!(!rule.matches("Edit", Some("/etc/hosts")));
+            assert!(!rule.matches("Read", Some(&canonical)));
         }
 
         #[test]
