@@ -35,7 +35,8 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::{self, Stdout};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::OnceLock;
 
 /// Whether the active terminal speaks the kitty keyboard protocol (progressive
 /// keyboard enhancement). Detected once during [`setup_terminal`]. Defaults to
@@ -58,6 +59,13 @@ pub fn keyboard_enhancement_active() -> bool {
 /// emit `DisableMouseCapture` (issue #104). Defaults to `true` so a restore
 /// that runs before setup keeps the historical always-disable behaviour.
 static MOUSE_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(true);
+
+/// The OSC 7501 program status last written to the terminal, as
+/// `ProgramStatus::code()`; `0` means nothing has been emitted (or it was
+/// cleared). Lets [`set_program_status`] write only on change and lets the
+/// restore / panic paths emit the clear sequence only when there is a record
+/// to clear, so sessions that never reported stay byte-for-byte silent.
+static PROGRAM_STATUS_EMITTED: AtomicU8 = AtomicU8::new(0);
 
 // ---------------------------------------------------------------------------
 // Sub-modules
@@ -83,6 +91,8 @@ pub mod input;
 pub mod render;
 /// Post-paint OSC 8 hyperlink emission — makes URLs Ctrl/Cmd-clickable.
 pub mod osc8;
+/// OSC 7501 Program Status Protocol reports (idle/working/blocked/done/error).
+pub mod program_status;
 /// Permission dialogs and confirmation dialogs.
 pub mod dialogs;
 /// Notification / banner system.
@@ -206,6 +216,7 @@ pub use free_mode_dialog::{FreeModeDialogState, FreeModeField, render_free_mode_
 // (FreeModeField type is now per-provider; legacy callers may still import both names.)
 pub use device_auth_dialog::{DeviceAuthDialogState, DeviceAuthStatus, DeviceAuthEvent, render_device_auth_dialog};
 pub use file_injection::{parse_at_refs, build_file_blocks, AtFileRef, AtFileIssue};
+pub use program_status::{BlockedKind, ProgramStatus, TurnOutcome};
 pub use file_injection_dialog::{FileInjectionDialogState, FileInjectionOutcome, render_file_injection_dialog};
 
 // ---------------------------------------------------------------------------
@@ -267,6 +278,7 @@ pub fn setup_terminal(mouse_capture: bool) -> io::Result<Terminal<CrosstermBacke
             // Best-effort restore — ignore errors, we're already unwinding.
             let _ = disable_raw_mode();
             let _ = restore_terminal_cleanup();
+            clear_program_status();
             let _ = execute!(io::stdout(), crossterm::cursor::Show);
         }
         original_hook(panic_info);
@@ -336,6 +348,8 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io
     disable_raw_mode()?;
     // Clear any terminal "busy" progress indicator (OSC 9;4) we may have set.
     set_terminal_progress(false);
+    // Drop the OSC 7501 program status record, if we reported one.
+    clear_program_status();
     // Restore the original title by clearing it (terminals fall back to default).
     let _ = execute!(
         terminal.backend_mut(),
@@ -397,6 +411,53 @@ pub fn set_terminal_progress(active: bool) {
     let mut out = io::stdout();
     let _ = out.write_all(seq);
     let _ = out.flush();
+}
+
+/// Whether to emit OSC 7501 program status reports. The spec requires
+/// terminals to ignore unknown OSCs, so unlike OSC 9;4 there is no terminal
+/// allow-list (supporting terminals such as Rex and cmux need not be known in
+/// advance). We still require a real tty and skip `TERM=dumb` and tmux/screen,
+/// which do not forward the sequence to the outer terminal. Evaluated once.
+pub fn supports_program_status_osc() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        use std::io::IsTerminal;
+        if !io::stdout().is_terminal() || std::env::var_os("TMUX").is_some() {
+            return false;
+        }
+        let term = std::env::var("TERM").unwrap_or_default();
+        !(term == "dumb" || term.starts_with("screen") || term.starts_with("tmux"))
+    })
+}
+
+fn write_osc(seq: &[u8]) {
+    use std::io::Write;
+    let mut out = io::stdout();
+    let _ = out.write_all(seq);
+    let _ = out.flush();
+}
+
+/// Report `status` to the terminal via OSC 7501, writing only when it differs
+/// from the last report. Call once per frame from the interactive TUI; never
+/// from headless, ACP or bridge paths. No-op when the terminal is unsuitable
+/// (see [`supports_program_status_osc`]).
+pub fn set_program_status(status: program_status::ProgramStatus) {
+    let code = status.code();
+    if PROGRAM_STATUS_EMITTED.load(Ordering::Relaxed) == code || !supports_program_status_osc() {
+        return;
+    }
+    write_osc(status.osc_sequence().as_bytes());
+    PROGRAM_STATUS_EMITTED.store(code, Ordering::Relaxed);
+}
+
+/// Remove our OSC 7501 record (`state=clear`). Called from
+/// [`restore_terminal`] and the panic hook; writes nothing if no status was
+/// ever reported, and resets the dedupe state so a re-entered TUI (after an
+/// OAuth flow, for example) reports again.
+pub fn clear_program_status() {
+    if PROGRAM_STATUS_EMITTED.swap(0, Ordering::Relaxed) != 0 {
+        write_osc(program_status::CLEAR_SEQUENCE.as_bytes());
+    }
 }
 
 /// Update the terminal title to reflect the current session context.

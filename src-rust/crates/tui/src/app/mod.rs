@@ -451,6 +451,9 @@ pub struct App {
         Option<tokio::sync::mpsc::UnboundedReceiver<claurst_tools::UserQuestionEvent>>,
     /// State for the model-initiated ask-user question dialog.
     pub ask_user_dialog: crate::ask_user_dialog::AskUserDialogState,
+    /// How the last finished turn ended, reported as OSC 7501 `done` / `error`
+    /// until the user starts typing the next prompt. `None` = report `idle`.
+    pub last_turn_outcome: Option<crate::program_status::TurnOutcome>,
 
     // ---- Context window & rate limit info ----------------------------------
 
@@ -772,6 +775,7 @@ impl App {
             model_fetch_rx: None,
             user_question_rx: None,
             ask_user_dialog: crate::ask_user_dialog::AskUserDialogState::new(),
+            last_turn_outcome: None,
             context_window_size: 0,
             context_used_tokens: 0,
             rate_limit_5h_pct: None,
