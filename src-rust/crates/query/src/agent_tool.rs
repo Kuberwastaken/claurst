@@ -348,6 +348,9 @@ impl Tool for AgentTool {
             model,
             max_tokens: claurst_core::constants::DEFAULT_MAX_TOKENS,
             max_turns: resolved_max_turns,
+            // Sub-agents run under their own resolved cap, not the parent
+            // session's /turns override.
+            max_turns_override: None,
             system_prompt: Some(system_prompt),
             append_system_prompt: None,
             output_style: ctx.config.effective_output_style(),
@@ -372,6 +375,7 @@ impl Tool for AgentTool {
             // Sub-agents run to their own completion and never drive goal
             // continuation — stop after one turn like every non-goal run.
             continuation: crate::continuation::ContinuationMode::Default,
+            degradation_enabled: ctx.config.degradation_summary_enabled_or_default(),
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.
@@ -646,6 +650,7 @@ pub fn init_team_swarm_runner() {
                     enabled_tools: Some(
                         agent_tools.iter().map(|t| t.name().to_string()).collect(),
                     ),
+                    degradation_enabled: ctx.config.degradation_summary_enabled_or_default(),
                     ..Default::default()
                 };
 

@@ -45,6 +45,17 @@ impl App {
         self.history_index = self.prompt_input.history_pos;
     }
 
+    /// Install the result of background skill discovery. Skills that share a
+    /// name with a TUI built-in are dropped so autocomplete lists each name
+    /// once; the prompt suggestions are refreshed immediately.
+    pub fn set_discovered_slash_commands(&mut self, mut commands: Vec<(String, String)>) {
+        let builtin: std::collections::HashSet<&str> =
+            PROMPT_SLASH_COMMANDS.iter().map(|(name, _)| *name).collect();
+        commands.retain(|(name, _)| !builtin.contains(name.as_str()));
+        self.discovered_slash_commands = commands;
+        self.refresh_prompt_input();
+    }
+
     pub fn refresh_prompt_input(&mut self) {
         self.prompt_input.mode = self.prompt_mode();
         if self.file_injection_dialog.visible {
@@ -54,7 +65,13 @@ impl App {
         }
         let file_autocomplete_limit = self.config.file_autocomplete_limit;
         let file_autocomplete_show_hidden = self.config.file_autocomplete_show_hidden_files;
-        self.prompt_input.update_suggestions(PROMPT_SLASH_COMMANDS, file_autocomplete_limit, file_autocomplete_show_hidden);
+        // Merge built-in slash commands with discovered skill commands so
+        // skills appear in autocomplete (already de-duplicated on install).
+        let mut all_cmds: Vec<(&str, &str)> = PROMPT_SLASH_COMMANDS.to_vec();
+        for (name, desc) in &self.discovered_slash_commands {
+            all_cmds.push((name.as_str(), desc.as_str()));
+        }
+        self.prompt_input.update_suggestions(&all_cmds, file_autocomplete_limit, file_autocomplete_show_hidden);
         self.sync_legacy_prompt_fields();
     }
 

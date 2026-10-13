@@ -1427,17 +1427,21 @@ impl SlashCommand for SkillCommand {
 ///
 /// Pass the project `cwd` and the `skills` section of the effective config.
 /// Bundled skills take precedence — any discovered skill whose name clashes
-/// with a built-in command will be silently skipped.
+/// with a built-in command name or alias will be silently skipped. Only the
+/// skills are returned, never the built-ins themselves.
+///
+/// Discovery walks the filesystem and may `git clone` configured skill URLs,
+/// so call this off the UI thread.
 pub fn commands_from_discovered_skills(
     cwd: &std::path::Path,
     skills_config: &claurst_core::SkillsConfig,
 ) -> Vec<Box<dyn SlashCommand>> {
     let discovered = claurst_core::discover_skills(cwd, skills_config);
-    // Build a set of built-in command names so we can skip collisions.
+    // Build a set of built-in command names and aliases to skip collisions.
     let all_cmds = all_commands();
     let builtin_names: std::collections::HashSet<&str> = all_cmds
         .iter()
-        .map(|c| c.name())
+        .flat_map(|c| std::iter::once(c.name()).chain(c.aliases()))
         .collect();
 
     discovered

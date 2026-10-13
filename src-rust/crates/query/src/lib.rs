@@ -95,6 +95,15 @@ pub struct QueryConfig {
     pub model: String,
     pub max_tokens: u32,
     pub max_turns: u32,
+    /// Session-local turn-cap override (e.g. from `/turns`). When set it
+    /// takes precedence over BOTH the agent definition and `max_turns`.
+    /// Always a finite cap; `/turns off` maps to a high ceiling, not to
+    /// "unlimited".
+    pub max_turns_override: Option<u32>,
+    /// Whether the max-steps graceful degradation summary turn is enabled.
+    /// When `false`, exceeding `max_turns` returns cold (last assistant
+    /// message) instead of running a final tool-less summary turn.
+    pub degradation_enabled: bool,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
     pub output_style: claurst_core::system_prompt::OutputStyle,
@@ -174,6 +183,8 @@ impl Default for QueryConfig {
             model: claurst_core::constants::DEFAULT_MODEL.to_string(),
             max_tokens: claurst_core::constants::DEFAULT_MAX_TOKENS,
             max_turns: claurst_core::constants::MAX_TURNS_DEFAULT,
+            max_turns_override: None,
+            degradation_enabled: true,
             system_prompt: None,
             append_system_prompt: None,
             output_style: claurst_core::system_prompt::OutputStyle::Default,
@@ -211,6 +222,7 @@ impl QueryConfig {
                 .map(|p| p.display().to_string()),
             managed_agents: cfg.managed_agents.clone(),
             effort_level: cfg.effective_effort_level(),
+            degradation_enabled: cfg.degradation_summary_enabled_or_default(),
             ..Default::default()
         }
     }
@@ -233,6 +245,7 @@ impl QueryConfig {
                 .map(|p| p.display().to_string()),
             managed_agents: cfg.managed_agents.clone(),
             effort_level: cfg.effective_effort_level(),
+            degradation_enabled: cfg.degradation_summary_enabled_or_default(),
             ..Default::default()
         }
     }
@@ -428,10 +441,13 @@ pub async fn run_query_loop(
     // (anti-recursion guard).
     let mut degradation_done = false;
 
-    // If an agent defines a max_turns override, respect it (agent wins over config).
-    let effective_max_turns = config.agent_definition
-        .as_ref()
-        .and_then(|a| a.max_turns)
+    // Turn-cap precedence (PR #398 review): session override (set via
+    // `/turns`) wins over the agent definition, which wins over config.
+    // Without the explicit override field, agent definitions like the
+    // built-in `plan` agent (max_turns: Some(20)) would silently ignore a
+    // user-requested cap change.
+    let effective_max_turns = config.max_turns_override
+        .or_else(|| config.agent_definition.as_ref().and_then(|a| a.max_turns))
         .unwrap_or(config.max_turns);
 
     // In-loop continuation policy (issue #230 / MI-3). Consulted at the end of
@@ -473,10 +489,12 @@ pub async fn run_query_loop(
         // dispatched exactly once, and re-exceeding the cap afterwards returns
         // cold. Applies to both goal and non-goal runs.
         let degradation_turn = if turn > effective_max_turns {
-            if degradation_done {
+            if !config.degradation_enabled || degradation_done {
                 info!(
                     turns = turn,
-                    "Max turns reached after degradation summary — returning"
+                    max = effective_max_turns,
+                    degradation_enabled = config.degradation_enabled,
+                    "Max turns reached — returning without a further summary turn"
                 );
                 let last_msg = messages
                     .last()
@@ -2146,6 +2164,8 @@ mod tests {
             model: "claude-sonnet-4-6".to_string(),
             max_tokens: 4096,
             max_turns: 10,
+            max_turns_override: None,
+            degradation_enabled: true,
             system_prompt: sys.map(String::from),
             append_system_prompt: append.map(String::from),
             output_style: claurst_core::system_prompt::OutputStyle::Default,
@@ -2918,6 +2938,31 @@ mod tests {
         tools: Vec<Box<dyn Tool>>,
         continuation: crate::continuation::ContinuationMode,
     ) -> (QueryOutcome, Vec<bool>, Vec<Message>) {
+        drive_loop_with_options(
+            always_end_turn,
+            max_turns,
+            tools,
+            continuation,
+            true,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Same as [`drive_loop_with_mock`], plus explicit control over the
+    /// `degradation_enabled` flag on `QueryConfig`, the session-level
+    /// `max_turns_override`, and the agent definition's `max_turns` (the
+    /// latter two feed `effective_max_turns`).
+    async fn drive_loop_with_options(
+        always_end_turn: bool,
+        max_turns: u32,
+        tools: Vec<Box<dyn Tool>>,
+        continuation: crate::continuation::ContinuationMode,
+        degradation_enabled: bool,
+        max_turns_override: Option<u32>,
+        agent_max_turns: Option<u32>,
+    ) -> (QueryOutcome, Vec<bool>, Vec<Message>) {
         let recorded = Arc::new(StdMutex::new(Vec::new()));
         let provider = Arc::new(RecordingProvider {
             id: claurst_core::provider_id::ProviderId::new("mockprov"),
@@ -2941,6 +2986,14 @@ mod tests {
         let mut config = make_config(None, None);
         config.model = "mock-model".to_string();
         config.max_turns = max_turns;
+        config.degradation_enabled = degradation_enabled;
+        config.max_turns_override = max_turns_override;
+        if let Some(agent_turns) = agent_max_turns {
+            config.agent_definition = Some(claurst_core::AgentDefinition {
+                max_turns: Some(agent_turns),
+                ..Default::default()
+            });
+        }
         config.provider_registry = Some(registry);
         config.continuation = continuation;
 
@@ -3033,6 +3086,131 @@ mod tests {
                 .any(|m| m.get_all_text().contains("maximum number of steps")),
             "the tool-less summary prompt must be injected into the history"
         );
+    }
+
+    /// (c-1) Turn-cap precedence (PR #398 review): the session override set
+    /// via `/turns` must win over the agent definition's cap, which in turn
+    /// wins over the plain config cap. Without the override field, a
+    /// `max_turns: Some(20)` agent definition would silently ignore the
+    /// user's `/turns 1`.
+    #[tokio::test]
+    async fn turns_override_wins_over_agent_and_config_caps() {
+        // Without an override, the agent definition wins over config:
+        // agent cap 3 > config cap 5 → the loop stops at 3 tool turns + 1
+        // degradation summary turn (4 requests, the last tool-less).
+        let (_outcome, recorded, _msgs) = drive_loop_with_options(
+            false,
+            5,
+            noop_tools(),
+            crate::continuation::ContinuationMode::Default,
+            true,
+            None,
+            Some(3),
+        )
+        .await;
+        assert_eq!(
+            recorded.len(),
+            4,
+            "agent cap 3 must beat config cap 5 (3 tool turns + degradation), got {:?}",
+            recorded
+        );
+
+        // With the override, it beats the agent definition: override 2 wins
+        // over agent cap 3 → 2 tool turns + 1 degradation turn (3 requests).
+        let (_outcome, recorded, _msgs) = drive_loop_with_options(
+            false,
+            5,
+            noop_tools(),
+            crate::continuation::ContinuationMode::Default,
+            true,
+            Some(2),
+            Some(3),
+        )
+        .await;
+        assert_eq!(
+            recorded.len(),
+            3,
+            "session override 2 must beat agent cap 3 (2 tool turns + degradation), got {:?}",
+            recorded
+        );
+
+        // The override can also RAISE the cap above the agent definition
+        // (what `/turns off` relies on): override 4 over agent cap 1 → 4 tool
+        // turns + 1 degradation turn (5 requests), more than the agent cap.
+        let (_outcome, recorded, _msgs) = drive_loop_with_options(
+            false,
+            1,
+            noop_tools(),
+            crate::continuation::ContinuationMode::Default,
+            true,
+            Some(4),
+            Some(1),
+        )
+        .await;
+        assert_eq!(
+            recorded.len(),
+            5,
+            "session override 4 must lift agent cap 1 (4 tool turns + degradation), got {:?}",
+            recorded
+        );
+    }
+
+    /// (c-2) With `degradation_summary_enabled: false`, hitting the turn cap
+    /// returns cold immediately: NO extra tool-less summary request is made
+    /// and the summary prompt is never injected into the history.
+    #[tokio::test]
+    async fn max_steps_with_degradation_disabled_returns_cold() {
+        // max_turns = 2: turns 1 & 2 are tool_use turns, turn 3 exceeds the cap.
+        // With the flag off the loop must stop after exactly 2 requests.
+        let (outcome, recorded, msgs) = drive_loop_with_options(
+            false,
+            2,
+            noop_tools(),
+            crate::continuation::ContinuationMode::Default,
+            false,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, QueryOutcome::EndTurn { .. }),
+            "the disabled-flag loop must still end with EndTurn (cold return)"
+        );
+        assert_eq!(
+            recorded.len(),
+            2,
+            "no extra summary request must be dispatched when the flag is off, got {:?}",
+            recorded
+        );
+        assert!(
+            recorded.iter().all(|&empty| !empty),
+            "tools must stay enabled on every dispatched turn: {:?}",
+            recorded
+        );
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| m.get_all_text().contains("maximum number of steps")),
+            "the summary prompt must NOT be injected when the flag is off"
+        );
+        // The cold return must carry the last assistant message verbatim.
+        let last_assistant = msgs
+            .iter()
+            .rev()
+            .find(|m| m.role == claurst_core::types::Role::Assistant)
+            .cloned();
+        if let QueryOutcome::EndTurn { message, .. } = &outcome {
+            let returned_text = message.get_all_text();
+            let expected_text = last_assistant
+                .as_ref()
+                .map(|m| m.get_all_text())
+                .unwrap_or_default();
+            assert_eq!(
+                returned_text, expected_text,
+                "cold return must carry the last assistant message"
+            );
+        }
     }
 
     /// (b) The goal continuation guards, exercised against an in-memory store:
