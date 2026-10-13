@@ -4045,13 +4045,15 @@ mod status_line_tests {
     use ratatui::{backend::TestBackend, Terminal};
 
     fn app_with_status_line(padding: Option<u16>, max_lines: Option<u16>) -> App {
-        let mut config = Config::default();
-        config.status_line = Some(StatusLineConfig {
-            command: "true".into(),
-            poll_interval_ms: None,
-            padding,
-            max_lines,
-        });
+        let config = Config {
+            status_line: Some(StatusLineConfig {
+                command: "true".into(),
+                poll_interval_ms: None,
+                padding,
+                max_lines,
+            }),
+            ..Config::default()
+        };
         App::new(config, CostTracker::new())
     }
 
