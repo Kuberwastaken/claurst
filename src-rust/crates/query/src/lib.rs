@@ -58,7 +58,7 @@ pub use session_memory::{
 
 use claurst_api::{
     ApiMessage, ApiToolDefinition, AnthropicStreamEvent, CreateMessageRequest, StreamAccumulator,
-    StreamHandler, SystemPrompt, ThinkingConfig,
+    StreamHandler, SystemBlock, SystemPrompt, ThinkingConfig,
 };
 use claurst_core::config::Config;
 use claurst_core::cost::CostTracker;
@@ -2246,103 +2246,80 @@ mod tests {
 
     // ---- build_system_prompt tests ------------------------------------------
 
+    /// Unwrap the `[stable, dynamic]` system blocks and assert that the
+    /// internal boundary marker reaches neither of them.
+    fn prompt_halves(prompt: SystemPrompt) -> (String, String) {
+        let SystemPrompt::Blocks(blocks) = prompt else {
+            panic!("expected [stable, dynamic] system blocks");
+        };
+        assert_eq!(blocks.len(), 2, "expected exactly two system blocks");
+        for block in &blocks {
+            assert!(
+                !block.text.contains(claurst_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
+                "the boundary marker must never be sent to the model"
+            );
+        }
+        (blocks[0].text.clone(), blocks[1].text.clone())
+    }
+
     #[test]
     fn test_system_prompt_default_when_empty() {
         // The default prompt (no custom system prompt set) should include the
-        // Claurst attribution and standard sections.
+        // Claurst attribution and standard sections in the stable block.
         let cfg = make_config(None, None);
-        let prompt = build_system_prompt(&cfg);
-        if let SystemPrompt::Text(text) = prompt {
-            assert!(
-                text.contains("Claurst") || text.contains("Claude agent"),
-                "Default prompt should contain attribution: {}",
-                text
-            );
-            assert!(
-                text.contains(claurst_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
-                "Default prompt must contain the dynamic boundary marker"
-            );
-        } else {
-            panic!("Expected SystemPrompt::Text");
-        }
+        let (stable, _dynamic) = prompt_halves(build_system_prompt(&cfg));
+        assert!(
+            stable.contains("Claurst") || stable.contains("Claude agent"),
+            "Default prompt should contain attribution: {}",
+            stable
+        );
     }
 
     #[test]
     fn test_system_prompt_with_custom() {
-        // A custom system prompt is injected into the cacheable section as
+        // A custom system prompt is injected into the stable block as
         // <custom_instructions>; the default sections are still present.
         let cfg = make_config(Some("You are a code reviewer."), None);
-        let prompt = build_system_prompt(&cfg);
-        if let SystemPrompt::Text(text) = prompt {
-            assert!(
-                text.contains("You are a code reviewer."),
-                "Custom prompt text should appear in the output"
-            );
-            assert!(
-                text.contains("Claurst") || text.contains("Claude agent"),
-                "Default attribution should still be present"
-            );
-        } else {
-            panic!("Expected SystemPrompt::Text");
-        }
+        let (stable, _dynamic) = prompt_halves(build_system_prompt(&cfg));
+        assert!(
+            stable.contains("You are a code reviewer."),
+            "Custom prompt text should appear in the stable block"
+        );
+        assert!(
+            stable.contains("Claurst") || stable.contains("Claude agent"),
+            "Default attribution should still be present"
+        );
     }
 
     #[test]
     fn test_system_prompt_with_append() {
-        // Appended text lands after the dynamic boundary.
+        // Appended text lands in the dynamic block.
         let cfg = make_config(Some("Base prompt."), Some("Additional context."));
-        let prompt = build_system_prompt(&cfg);
-        if let SystemPrompt::Text(text) = prompt {
-            assert!(text.contains("Base prompt."));
-            assert!(text.contains("Additional context."));
-            // append_system_prompt appears after the boundary
-            let boundary_pos = text
-                .find(claurst_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
-                .expect("boundary must exist");
-            let append_pos = text.find("Additional context.").unwrap();
-            assert!(
-                append_pos > boundary_pos,
-                "Appended text must appear after the dynamic boundary"
-            );
-        } else {
-            panic!("Expected SystemPrompt::Text");
-        }
+        let (stable, dynamic) = prompt_halves(build_system_prompt(&cfg));
+        assert!(stable.contains("Base prompt."));
+        assert!(!stable.contains("Additional context."));
+        assert!(dynamic.contains("Additional context."));
     }
 
     #[test]
     fn test_system_prompt_append_only() {
         // When only append is set, default sections are present plus the
-        // appended text after the dynamic boundary.
+        // appended text in the dynamic block.
         let cfg = make_config(None, Some("Appended text."));
-        let prompt = build_system_prompt(&cfg);
-        if let SystemPrompt::Text(text) = prompt {
-            assert!(
-                text.contains("Appended text."),
-                "Appended text must appear in the prompt"
-            );
-            let boundary_pos = text
-                .find(claurst_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
-                .expect("boundary must exist");
-            let append_pos = text.find("Appended text.").unwrap();
-            assert!(
-                append_pos > boundary_pos,
-                "Appended text must appear after the dynamic boundary"
-            );
-        } else {
-            panic!("Expected SystemPrompt::Text");
-        }
+        let (stable, dynamic) = prompt_halves(build_system_prompt(&cfg));
+        assert!(!stable.contains("Appended text."));
+        assert!(
+            dynamic.contains("Appended text."),
+            "Appended text must appear in the dynamic block"
+        );
     }
 
     #[test]
     fn test_system_prompt_with_custom_output_style_prompt() {
         let mut cfg = make_config(None, None);
         cfg.output_style_prompt = Some("Answer like a pirate.".to_string());
-        let prompt = build_system_prompt(&cfg);
-        if let SystemPrompt::Text(text) = prompt {
-            assert!(text.contains("Answer like a pirate."));
-        } else {
-            panic!("Expected SystemPrompt::Text");
-        }
+        let (stable, dynamic) = prompt_halves(build_system_prompt(&cfg));
+        assert!(stable.contains("Answer like a pirate.") || dynamic.contains("Answer like a pirate."));
     }
 
     // ---- QueryConfig tests --------------------------------------------------

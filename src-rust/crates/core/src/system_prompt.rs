@@ -17,6 +17,16 @@ use std::collections::HashMap;
 /// Matches the TypeScript constant `SYSTEM_PROMPT_DYNAMIC_BOUNDARY`.
 pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
 
+/// Split an assembled system prompt into `(stable, dynamic)` at
+/// [`SYSTEM_PROMPT_DYNAMIC_BOUNDARY`]. The marker is dropped and the newlines
+/// around it are trimmed. A prompt without the marker is entirely stable.
+pub fn split_at_dynamic_boundary(prompt: &str) -> (&str, &str) {
+    match prompt.split_once(SYSTEM_PROMPT_DYNAMIC_BOUNDARY) {
+        Some((stable, dynamic)) => (stable.trim_end(), dynamic.trim_start()),
+        None => (prompt, ""),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Section cache (mirrors bootstrap/state.ts systemPromptSectionCache)
 // ---------------------------------------------------------------------------
@@ -218,7 +228,7 @@ pub struct SystemPromptOptions {
     pub replace_system_prompt: bool,
     /// Inject the coordinator-mode section.
     pub coordinator_mode: bool,
-    /// Skip auto-injecting platform/shell/date env info (set true only in tests).
+    /// Skip auto-injecting platform/shell env info (set true only in tests).
     pub skip_env_info: bool,
     /// Active goal addendum (injected in dynamic section when a goal is running).
     pub active_goal_addendum: Option<String>,
@@ -240,9 +250,9 @@ pub struct SystemPromptOptions {
 /// Build the complete system prompt string.
 ///
 /// The returned string contains `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` as an
-/// internal marker.  Callers (e.g. `buildSystemPromptBlocks` in cc-query)
-/// split on this marker to determine which portions are eligible for
-/// Anthropic prompt-caching.
+/// internal marker. It must never be sent to a model: callers split on it
+/// with [`split_at_dynamic_boundary`] and send the halves as separate system
+/// blocks, the first of which is eligible for Anthropic prompt caching.
 pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
     // Replace mode: skip all default sections.
     if opts.replace_system_prompt {
@@ -308,7 +318,7 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
     // DYNAMIC / UNCACHEABLE sections (after the boundary)                //
     // ------------------------------------------------------------------ //
 
-    // 10. Environment info (platform, OS version, shell, date)
+    // 10. Environment info (platform, OS version, shell)
     if !opts.skip_env_info {
         parts.push(build_env_info_section(opts.working_directory.as_deref()));
     }
@@ -410,23 +420,6 @@ fn build_env_info_section(working_dir: Option<&str>) -> String {
     let is_git = working_dir
         .map(|d| std::path::Path::new(d).join(".git").exists())
         .unwrap_or(false);
-
-    // Today's date
-    let today = {
-        // Use chrono if available; otherwise fall back to env or skip
-        // We avoid adding a new dep just for formatting, so use a rough ISO format.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        // Simple YYYY-MM-DD from seconds since epoch
-        let days = now / 86400;
-        let year_approx = 1970 + days / 365;
-        // Not perfectly accurate but good enough for the system prompt context.
-        // For exact dates a chrono dep would be needed; use SystemTime string as fallback.
-        format!("{}", year_approx)
-    };
-    let _ = today; // suppress unused warning — date is included below via SystemTime
 
     // Build the section
     let cwd_line = working_dir
@@ -627,6 +620,22 @@ mod tests {
             prompt.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
             "System prompt must contain the dynamic boundary marker"
         );
+    }
+
+    #[test]
+    fn split_at_dynamic_boundary_drops_the_marker() {
+        let opts = SystemPromptOptions {
+            working_directory: Some("/home/user/project".to_string()),
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+        let (stable, dynamic) = split_at_dynamic_boundary(&prompt);
+        assert!(!stable.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
+        assert!(!dynamic.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
+        assert!(stable.contains("Claurst"));
+        assert!(dynamic.contains("/home/user/project"));
+        assert!(!stable.contains("/home/user/project"));
+        assert_eq!(split_at_dynamic_boundary("no marker"), ("no marker", ""));
     }
 
     #[test]

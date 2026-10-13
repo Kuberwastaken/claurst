@@ -6,14 +6,15 @@ use crate::*;
 /// Build the system prompt from config.
 ///
 /// Delegates to `claurst_core::system_prompt::build_system_prompt` so that all
-/// default content (capabilities, safety guidelines, dynamic-boundary marker,
-/// etc.) is assembled in one place.  The `QueryConfig` fields map directly to
-/// `SystemPromptOptions`:
+/// default content (capabilities, safety guidelines, etc.) is assembled in one
+/// place, then splits it at the dynamic boundary into two system blocks:
+/// `[stable, dynamic]`. The boundary marker itself is never sent. Empty halves
+/// are omitted. The `QueryConfig` fields map directly to `SystemPromptOptions`:
 ///
-/// - `system_prompt`        → `custom_system_prompt` (added to cacheable block)
-/// - `append_system_prompt` → `append_system_prompt` (added after boundary)
+/// - `system_prompt`        → `custom_system_prompt` (stable block)
+/// - `append_system_prompt` → `append_system_prompt` (dynamic block)
 pub(crate) fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
-    use claurst_core::system_prompt::SystemPromptOptions;
+    use claurst_core::system_prompt::{split_at_dynamic_boundary, SystemPromptOptions};
 
     let opts = SystemPromptOptions {
         custom_system_prompt: config.system_prompt.clone(),
@@ -33,5 +34,15 @@ pub(crate) fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
     };
 
     let text = claurst_core::system_prompt::build_system_prompt(&opts);
-    SystemPrompt::Text(text)
+    let (stable, dynamic) = split_at_dynamic_boundary(&text);
+    let blocks = [stable, dynamic]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .map(|part| SystemBlock {
+            block_type: "text".to_string(),
+            text: part.to_string(),
+            cache_control: None,
+        })
+        .collect();
+    SystemPrompt::Blocks(blocks)
 }
