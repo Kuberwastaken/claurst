@@ -439,4 +439,46 @@ mod tests {
         assert_eq!(std::fs::read_to_string(ws.join("notes.txt")).unwrap(), "token = new\n");
         assert!(std::fs::symlink_metadata(&alias).unwrap().file_type().is_symlink());
     }
+
+    /// #415 review: re-pointing the aliased directory after the rule exists
+    /// must not let the rule cover the new target.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_rule_alias_repointed_after_creation_asks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let ws = root.join("ws");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&ws, &alias).unwrap();
+        std::fs::write(outside.join("notes.txt"), "token = old\n").unwrap();
+
+        let mut manager = claurst_core::permissions::PermissionManager::new(
+            claurst_core::config::PermissionMode::Default,
+            &claurst_core::config::Settings::default(),
+        );
+        manager.add_session_allow_path("Edit", &format!("{}/*", alias.display()));
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&outside, &alias).unwrap();
+
+        let handler = crate::test_support::SwapAfterCheckHandler::new(manager, None);
+        let ctx = crate::test_support::context_with_handler(ws, std::sync::Arc::new(handler));
+        let res = FileEditTool
+            .execute(
+                json!({
+                    "file_path": alias.join("notes.txt").to_string_lossy(),
+                    "old_string": "old",
+                    "new_string": "pwned",
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(res.is_error, "re-pointed alias edit was allowed: {}", res.content);
+        assert_eq!(
+            std::fs::read_to_string(outside.join("notes.txt")).unwrap(),
+            "token = old\n"
+        );
+    }
 }

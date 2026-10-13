@@ -633,7 +633,19 @@ impl ToolContext {
         let real = opened_file_location(file, path).map_err(|e| {
             format!("Refusing to use {}: could not verify the opened file: {}", path.display(), e)
         })?;
-        if grant == PermissionGrant::Policy || real.as_path() != path {
+        // Compare against `path` with `.` and `..` folded lexically, so
+        // `./x` or `a/../x` does not by itself count as a different location.
+        let mut lexical = PathBuf::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    lexical.pop();
+                }
+                other => lexical.push(other),
+            }
+        }
+        if grant == PermissionGrant::Policy || real != lexical {
             self.check_permission_for_path(
                 tool_name,
                 &format!("{} {}", verb, real.display()),

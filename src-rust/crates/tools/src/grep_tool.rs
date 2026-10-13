@@ -242,15 +242,6 @@ impl Tool for GrepTool {
 
             let path = entry.path();
 
-            // Open first, then fence the handle's real location: a file that
-            // resolves outside the workspace asks, as before, and a symlink
-            // swapped in after this check cannot redirect the read (#415).
-            let file = match ctx.open_walked_file(self.name(), "Grep result", path, &roots) {
-                Ok(Some(file)) => file,
-                Ok(None) => continue,
-                Err(e) => return ToolResult::error(e),
-            };
-
             // Type filter
             if !type_exts.is_empty() {
                 let ext = path
@@ -271,6 +262,15 @@ impl Tool for GrepTool {
                     }
                 }
             }
+
+            // Only now open, then fence the handle's real location: a file that
+            // resolves outside the workspace asks, as before, and a symlink
+            // swapped in after this check cannot redirect the read (#415).
+            let file = match ctx.open_walked_file(self.name(), "Grep result", path, &roots) {
+                Ok(Some(file)) => file,
+                Ok(None) => continue,
+                Err(e) => return ToolResult::error(e),
+            };
 
             // Read file (skip binary)
             let mut content = String::new();
