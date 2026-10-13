@@ -906,22 +906,16 @@ impl App {
     }
 
     /// Update the context window size from the model registry for the current model.
+    ///
+    /// Delegates to the same resolver auto-compact uses so the footer and the
+    /// compaction thresholds always agree on the window (#393).
     pub fn refresh_context_window_size(&mut self) {
         let provider = self.config.provider.as_deref().unwrap_or("anthropic");
-        let model_id = self.model_name
-            .strip_prefix(&format!("{}/", provider))
-            .unwrap_or(&self.model_name);
-        if let Some(entry) = self.model_registry.get(provider, model_id) {
-            self.context_window_size = entry.info.context_window as u64;
-        } else {
-            // Fallback: common defaults
-            self.context_window_size = match provider {
-                "anthropic" => 200_000,
-                "openai" => 128_000,
-                "google" => 1_048_576,
-                _ => 128_000,
-            };
-        }
+        self.context_window_size = claurst_query::compact::resolve_context_window(
+            Some(&self.model_registry),
+            provider,
+            &self.model_name,
+        );
     }
 
     /// Apply a theme by name, persisting it to config.

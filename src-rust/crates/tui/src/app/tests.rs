@@ -958,3 +958,42 @@ use super::types::{ContextMenuItem, ContextMenuState};
         app.handle_key_event(press_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.should_exit);
     }
+
+    // ---- free-mode context window (issues #393, #394) ----
+
+    #[tokio::test]
+    async fn free_mode_zen_pin_window_agrees_across_consumers() {
+        use claurst_api::LlmProvider;
+
+        let model = "opencode-zen/minimax-m2.5-free";
+        let mut app = make_app();
+        // Pin to the bundled snapshot so a local models.dev cache can't skew it.
+        app.model_registry = claurst_api::ModelRegistry::new();
+        app.set_model(model.to_string());
+        assert_eq!(app.config.provider.as_deref(), Some("free"));
+
+        // Footer / token warnings.
+        assert_eq!(app.context_window_size, 204_800);
+        // Auto-compact sizing.
+        assert_eq!(
+            claurst_query::compact::resolve_context_window(
+                Some(&app.model_registry),
+                "free",
+                model
+            ),
+            app.context_window_size
+        );
+        // `/model` picker catalog served by the Free provider.
+        let upstream = *claurst_api::FREE_CATALOG
+            .iter()
+            .find(|u| u.id == "opencode-zen")
+            .unwrap();
+        let provider = claurst_api::FreeProvider::new(vec![claurst_api::FreeEntry {
+            upstream,
+            provider: Arc::new(claurst_api::GoogleProvider::new(String::new())),
+        }]);
+        let models = provider.discover_models().await.unwrap();
+        let pin = models.iter().find(|m| &*m.id == model).unwrap();
+        assert_eq!(u64::from(pin.context_window), app.context_window_size);
+        assert_eq!(pin.max_output_tokens, 131_072);
+    }
