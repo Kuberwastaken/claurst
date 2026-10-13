@@ -169,7 +169,7 @@ impl DsmlStreamParser {
                     self.emit_prefix(reopen, out);
                     self.scanned = body_start;
                 }
-                (None, None) => {
+                _ => {
                     let mut scanned = self
                         .buf
                         .len()
@@ -408,8 +408,7 @@ fn repair_json(text: &str) -> String {
     let mut repaired = String::with_capacity(text.len());
     let mut in_string = false;
     let mut escaped = false;
-    let mut chars = text.char_indices();
-    while let Some((i, c)) = chars.next() {
+    for (i, c) in text.char_indices() {
         if in_string {
             match c {
                 _ if escaped => {
@@ -541,7 +540,7 @@ mod tests {
     #[test]
     fn text_around_envelope_is_preserved_in_order() {
         let input = format!("Let me look.\n{FULL}\nDone looking.");
-        let out = run(&[&input]);
+        let out = run(&[input.as_str()]);
         assert_eq!(out.len(), 3);
         assert_eq!(out[0], DsmlSegment::Text("Let me look.\n".to_string()));
         assert!(matches!(&out[1], DsmlSegment::ToolCall(c) if c.name == "read_file"));
@@ -699,7 +698,7 @@ mod tests {
         let input = format!(
             "<｜DSML｜tool_calls><｜DSML｜invoke name=\"write\"><｜DSML｜parameter name=\"content\" string=\"true\">{content}</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>"
         );
-        let out = run(&[&input]);
+        let out = run(&[input.as_str()]);
         assert_eq!(calls_of(&out)[0].input["content"], json!(content));
     }
 

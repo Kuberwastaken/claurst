@@ -701,7 +701,7 @@ mod tests {
         let mut d = OpenAiChatDecoder::new(None);
         let (events, _) = drain(
             &mut d,
-            &[&line, r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#],
+            &[line.as_str(), r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#],
         );
         assert_eq!(text_deltas(&events), DSML_ENVELOPE);
         assert!(tool_uses(&events).is_empty());
@@ -717,7 +717,7 @@ mod tests {
         let first = content_line("Trying ");
         let second = content_line(partial);
         let mut d = OpenAiChatDecoder::new(None).with_dsml_tool_calls(true);
-        let (events, done) = drain(&mut d, &[&first, &second, "data: [DONE]"]);
+        let (events, done) = drain(&mut d, &[first.as_str(), second.as_str(), "data: [DONE]"]);
         assert!(done);
         assert_eq!(text_deltas(&events), format!("Trying {partial}"));
         assert!(tool_uses(&events).is_empty());
@@ -730,7 +730,7 @@ mod tests {
         let mut d = OpenAiChatDecoder::new(None).with_dsml_tool_calls(true);
         let (events, _) = drain(
             &mut d,
-            &[&partial, r#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#],
+            &[partial.as_str(), r#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#],
         );
         assert_eq!(text_deltas(&events), "<｜DSML｜tool_calls><｜DSML｜inv");
         assert!(events.iter().any(|e| matches!(
