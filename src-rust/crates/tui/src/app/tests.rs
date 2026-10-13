@@ -958,3 +958,109 @@ use super::types::{ContextMenuItem, ContextMenuState};
         app.handle_key_event(press_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.should_exit);
     }
+
+    // ---- Session listing reads the store sessions are written to (#382) ----
+
+    /// Serializes the tests below: they point the process-global
+    /// `CLAURST_HOME` at a tempdir.
+    static SESSION_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Points `CLAURST_HOME` at a tempdir for its lifetime, restoring the
+    /// previous value on drop.
+    struct SessionHome {
+        dir: tempfile::TempDir,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl SessionHome {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let saved = std::env::var_os("CLAURST_HOME");
+            std::env::set_var("CLAURST_HOME", dir.path());
+            Self { dir, saved }
+        }
+    }
+
+    impl Drop for SessionHome {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var("CLAURST_HOME", v),
+                None => std::env::remove_var("CLAURST_HOME"),
+            }
+        }
+    }
+
+    async fn save_test_session(title: &str, working_dir: &std::path::Path) -> String {
+        let mut session =
+            claurst_core::history::ConversationSession::new("test-model".to_string());
+        session.title = Some(title.to_string());
+        session.working_dir = Some(working_dir.to_string_lossy().into_owned());
+        session.add_message(Message::user("hello"));
+        claurst_core::history::save_session(&session).await.unwrap();
+        session.id
+    }
+
+    #[tokio::test]
+    async fn session_browser_lists_sessions_written_by_history_save_session() {
+        let _lock = SESSION_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = SessionHome::new();
+        let id = save_test_session("issue 382", home.dir.path()).await;
+
+        let entries = super::run::load_session_entries().await;
+        let entry = entries.iter().find(|e| e.id == id).expect("saved session listed");
+        assert_eq!(entry.title, "issue 382");
+        assert_eq!(entry.message_count, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn poll_session_loads_populates_the_session_browser() {
+        let _lock = SESSION_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = SessionHome::new();
+        let id = save_test_session("browser", home.dir.path()).await;
+
+        let mut app = make_app();
+        app.recent_sessions_pending = false;
+        assert!(app.intercept_slash_command_with_args("session", ""));
+        assert!(app.session_browser.visible);
+        for _ in 0..200 {
+            app.poll_session_loads();
+            if !app.session_browser.sessions.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            app.session_browser.sessions.iter().any(|e| e.id == id),
+            "the /session browser must list the session saved to <config_dir>/sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_sessions_are_scoped_to_the_project_root() {
+        let _lock = SESSION_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = SessionHome::new();
+        let project = home.dir.path().join("project");
+        let other = home.dir.path().join("other");
+        save_test_session("in project", &project.join("sub")).await;
+        save_test_session("elsewhere", &other).await;
+
+        let recent = super::run::load_recent_sessions(&project).await;
+        let labels: Vec<&str> = recent.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, vec!["in project"]);
+    }
+
+    #[test]
+    fn session_browser_enter_resubmits_resume_for_the_selected_session() {
+        let mut app = make_app();
+        app.session_browser.open(vec![crate::session_browser::SessionEntry {
+            id: "abc-123".to_string(),
+            title: "t".to_string(),
+            last_updated: "just now".to_string(),
+            message_count: 1,
+            cost_usd: 0.0,
+        }]);
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.session_browser.visible);
+        assert_eq!(app.prompt_input.text, "/resume abc-123");
+        assert!(app.pending_auto_submit);
+    }
