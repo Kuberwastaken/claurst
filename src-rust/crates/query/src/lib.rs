@@ -478,25 +478,12 @@ pub async fn run_query_loop(
         // dispatched exactly once, and re-exceeding the cap afterwards returns
         // cold. Applies to both goal and non-goal runs.
         let degradation_turn = if turn > effective_max_turns {
-            if !config.degradation_enabled {
+            if !config.degradation_enabled || degradation_done {
                 info!(
                     turns = turn,
                     max = effective_max_turns,
-                    "Max turns reached — degradation disabled, returning cold"
-                );
-                let last_msg = messages
-                    .last()
-                    .cloned()
-                    .unwrap_or_else(|| Message::assistant("Max turns reached."));
-                return QueryOutcome::EndTurn {
-                    message: last_msg,
-                    usage: UsageInfo::default(),
-                };
-            }
-            if degradation_done {
-                info!(
-                    turns = turn,
-                    "Max turns reached after degradation summary — returning"
+                    degradation_enabled = config.degradation_enabled,
+                    "Max turns reached — returning without a further summary turn"
                 );
                 let last_msg = messages
                     .last()
