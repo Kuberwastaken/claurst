@@ -1768,6 +1768,69 @@ fn permission_request_from_core(
 }
 
 
+/// Cap on captured status-line command output.
+const STATUS_LINE_MAX_OUTPUT_BYTES: u64 = 4096;
+
+/// Run the external status-line command once: write `input` to its stdin and
+/// read at most `STATUS_LINE_MAX_OUTPUT_BYTES` of stdout. Writing stdin, reading
+/// stdout and waiting for exit all run concurrently under `timeout`, so a child
+/// that never reads stdin or floods stdout cannot wedge the poll; stdout is
+/// closed once the cap is reached. On timeout the child is killed and `None`
+/// is returned. stderr is discarded so it cannot corrupt the TUI.
+async fn run_status_line_command(
+    cmd: &str,
+    input: &str,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut command = if cfg!(target_os = "windows") {
+        let mut c = tokio::process::Command::new("cmd");
+        c.args(["/C", cmd]);
+        c
+    } else {
+        let mut c = tokio::process::Command::new("sh");
+        c.args(["-c", cmd]);
+        c
+    };
+    let mut child = command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take()?;
+
+    let write = async move {
+        if let Some(mut stdin) = stdin {
+            // Ignore EPIPE: the command may exit without reading its input.
+            let _ = stdin.write_all(input.as_bytes()).await;
+        }
+    };
+    let read = async move {
+        let mut buf = Vec::new();
+        let _ = stdout.take(STATUS_LINE_MAX_OUTPUT_BYTES).read_to_end(&mut buf).await;
+        buf
+    };
+    let run = async {
+        let ((), buf) = tokio::join!(write, read);
+        // stdout is dropped by now, so a child still writing gets EPIPE and exits.
+        let _ = child.wait().await;
+        buf
+    };
+    let result = tokio::time::timeout(timeout, run).await;
+    match result {
+        Ok(buf) => Some(String::from_utf8_lossy(&buf).trim().to_string()),
+        Err(_elapsed) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            None
+        }
+    }
+}
+
 async fn run_interactive(
     config: Config,
     settings: claurst_core::config::Settings,
@@ -2002,14 +2065,15 @@ async fn run_interactive(
     let status_cmd_cfg = live_config.status_line.as_ref().map(|s| {
         (s.command.clone(), s.poll_interval_ms.unwrap_or(5000))
     }).or_else(|| {
-        std::env::var("CLAUDE_STATUS_COMMAND").ok().map(|c| (c, 500u16 as u64))
+        std::env::var("CLAUDE_STATUS_COMMAND").ok().map(|c| (c, 500))
     });
     let (status_cmd_tx, mut status_cmd_rx) = mpsc::channel::<String>(4);
-    // Shared session data for the polling task (updated from the main loop).
-    let session_data: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
-    // Provide an initial empty payload so the status command has input on its
-    // very first run and does not block on or fail to parse an empty stdin.
-    *session_data.lock().unwrap() = Some(r#"{}"#.to_string());
+    // Shared session payload for the polling task (refreshed from the main
+    // loop). Seeded with an empty object so the first run has valid JSON.
+    let session_data = Arc::new(ParkingMutex::new(String::from("{}")));
+    // Elapsed-seconds value of the last payload build; the payload has 1 s
+    // resolution, so the main loop rebuilds it at most once per second.
+    let mut status_payload_secs: Option<u64> = None;
     let status_line_cancel = CancellationToken::new();
     if let Some((ref cmd_str, poll_ms)) = status_cmd_cfg {
         let cmd_str = cmd_str.clone();
@@ -2018,61 +2082,18 @@ async fn run_interactive(
         let cancel = status_line_cancel.clone();
         tokio::spawn(async move {
             // Clamp interval: minimum 1000ms, maximum 300000ms (5 minutes).
-            let interval_ms = poll_ms.clamp(1000, 300000);
-            // Cap captured output at 4 KB.
-            let max_output_bytes: usize = 4096;
+            let interval = Duration::from_millis(poll_ms.clamp(1000, 300000));
             // Wait briefly before first poll so the main loop has a chance to
             // populate session_data with real values.
             tokio::time::sleep(Duration::from_millis(500)).await;
             loop {
-                let input = sd.lock().unwrap().clone().unwrap_or_default();
-                let output = if cfg!(target_os = "windows") {
-                    tokio::process::Command::new("cmd")
-                        .args(["/C", &cmd_str])
-                        .stdin(std::process::Stdio::piped())
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::null())
-                        .spawn()
-                } else {
-                    tokio::process::Command::new("sh")
-                        .args(["-c", &cmd_str])
-                        .stdin(std::process::Stdio::piped())
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::null())
-                        .spawn()
-                };
-                if let Ok(mut child) = output {
-                    use tokio::io::{AsyncWriteExt, AsyncReadExt};
-                    if let Some(mut stdin) = child.stdin.take() {
-                        stdin.write_all(input.as_bytes()).await.ok();
-                        drop(stdin);
-                    }
-                    let mut child_stdout = child.stdout.take();
-                    // Timeout: kill child if it doesn't finish within interval_ms.
-                    let timed_out = tokio::time::timeout(
-                        Duration::from_millis(interval_ms),
-                        child.wait(),
-                    ).await;
-                    match timed_out {
-                        Ok(Ok(_)) => {
-                            let mut buf = Vec::with_capacity(max_output_bytes);
-                            if let Some(ref mut stdout) = child_stdout {
-                                stdout.read_to_end(&mut buf).await.ok();
-                            }
-                            let text = String::from_utf8_lossy(&buf[..buf.len().min(max_output_bytes)])
-                                .trim().to_string();
-                            let _ = tx.try_send(text);
-                        }
-                        Ok(Err(_)) => {}
-                        Err(_elapsed) => {
-                            let _ = child.start_kill();
-                            let _ = child.wait().await;
-                        }
-                    }
+                let input = sd.lock().clone();
+                if let Some(text) = run_status_line_command(&cmd_str, &input, interval).await {
+                    let _ = tx.try_send(text);
                 }
                 tokio::select! {
                     _ = cancel.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {}
+                    _ = tokio::time::sleep(interval) => {}
                 }
             }
         });
@@ -3693,49 +3714,50 @@ async fn run_interactive(
         // Update shared session data for status line polling task.
         if status_cmd_cfg.is_some() {
             let elapsed = app.session_start.elapsed().as_secs();
-            let ctx_size = app.context_window_size;
-            let used_pct = if ctx_size > 0 {
-                Some(app.context_used_tokens as f64 / ctx_size as f64 * 100.0)
-            } else {
-                None
-            };
-            let total_input = cost_tracker.input_tokens()
-                + cost_tracker.cache_creation_tokens()
-                + cost_tracker.cache_read_tokens();
-            let total_output = cost_tracker.output_tokens();
-            let json = serde_json::json!({
-                "session_id": tool_ctx.session_id,
-                "model": {
-                    "display_name": app.model_name,
-                    "id": app.model_name,
-                },
-                "workspace": {
-                    "current_dir": app.current_dir,
-                },
-                "context_window": {
-                    "total_input_tokens": total_input,
-                    "total_output_tokens": total_output,
-                    "context_window_size": ctx_size,
-                    "current_usage": {
-                        "input_tokens": cost_tracker.input_tokens(),
-                        "output_tokens": total_output,
-                        "cache_creation_input_tokens": cost_tracker.cache_creation_tokens(),
-                        "cache_read_input_tokens": cost_tracker.cache_read_tokens(),
+            if status_payload_secs != Some(elapsed) {
+                status_payload_secs = Some(elapsed);
+                let ctx_size = app.context_window_size;
+                let used_pct = if ctx_size > 0 {
+                    Some(app.context_used_tokens as f64 / ctx_size as f64 * 100.0)
+                } else {
+                    None
+                };
+                let total_input = cost_tracker.input_tokens()
+                    + cost_tracker.cache_creation_tokens()
+                    + cost_tracker.cache_read_tokens();
+                let total_output = cost_tracker.output_tokens();
+                let json = serde_json::json!({
+                    "session_id": tool_ctx.session_id,
+                    "model": {
+                        "display_name": app.model_name,
+                        "id": app.model_name,
                     },
-                    "used_percentage": used_pct,
-                    "remaining_percentage": used_pct.map(|p| 100.0 - p),
-                },
-                "cost": {
-                    "total_cost_usd": app.cost_usd,
-                },
-                "elapsed_seconds": elapsed,
-            });
-            *session_data.lock().unwrap() = Some(serde_json::to_string(&json).unwrap_or_default());
-        }
-        // Drain status line results (most recent wins)
-        if status_cmd_cfg.is_some() {
+                    "workspace": {
+                        "current_dir": app.current_dir,
+                    },
+                    "context_window": {
+                        "total_input_tokens": total_input,
+                        "total_output_tokens": total_output,
+                        "context_window_size": ctx_size,
+                        "current_usage": {
+                            "input_tokens": cost_tracker.input_tokens(),
+                            "output_tokens": total_output,
+                            "cache_creation_input_tokens": cost_tracker.cache_creation_tokens(),
+                            "cache_read_input_tokens": cost_tracker.cache_read_tokens(),
+                        },
+                        "used_percentage": used_pct,
+                        "remaining_percentage": used_pct.map(|p| 100.0 - p),
+                    },
+                    "cost": {
+                        "total_cost_usd": app.cost_usd,
+                    },
+                    "elapsed_seconds": elapsed,
+                });
+                *session_data.lock() = json.to_string();
+            }
+            // Drain status line results (most recent wins)
             while let Ok(text) = status_cmd_rx.try_recv() {
-                app.status_line_override = if text.is_empty() { None } else { Some(text) };
+                app.set_status_line_output(&text);
             }
         }
 
@@ -4996,5 +5018,49 @@ mod bare_mode_tests {
         hooks.clear(); // mirrors `config.hooks.clear()` in bare mode
 
         assert!(hooks.is_empty(), "bare mode leaves no hooks to run");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod status_line_command_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn status_line_command_receives_stdin_payload() {
+        let out = run_status_line_command("cat", r#"{"a":1}"#, Duration::from_secs(5)).await;
+        assert_eq!(out.as_deref(), Some(r#"{"a":1}"#));
+    }
+
+    #[tokio::test]
+    async fn status_line_command_large_output_is_capped_not_wedged() {
+        // 1 MiB on stdout, far beyond the pipe buffer: the old wait-then-read
+        // path blocked the child on a full pipe until the timeout killed it.
+        let started = std::time::Instant::now();
+        let out = run_status_line_command(
+            "head -c 1048576 /dev/zero | tr '\\0' a",
+            "{}",
+            Duration::from_secs(5),
+        )
+        .await;
+        let text = out.expect("large output must still produce a status line");
+        assert_eq!(text.len(), STATUS_LINE_MAX_OUTPUT_BYTES as usize);
+        assert!(text.chars().all(|c| c == 'a'));
+        assert!(started.elapsed() < Duration::from_secs(5), "must not wait for the timeout");
+    }
+
+    #[tokio::test]
+    async fn status_line_command_ignoring_large_stdin_does_not_hang() {
+        let input = "x".repeat(1 << 20);
+        let out = run_status_line_command("echo ok", &input, Duration::from_secs(5)).await;
+        assert_eq!(out.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn status_line_command_times_out() {
+        let started = std::time::Instant::now();
+        let out = run_status_line_command("sleep 10", "{}", Duration::from_millis(200)).await;
+        assert!(out.is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
