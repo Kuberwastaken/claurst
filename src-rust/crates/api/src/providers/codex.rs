@@ -6,8 +6,10 @@
 // Auth: Bearer token obtained via the Codex OAuth flow stored in
 //   ~/.claurst/codex_tokens.json (`CodexTokens` struct).
 //
-// Token refresh: if `expires_at` is in the past we POST to the OpenAI token
-//   endpoint with `grant_type=refresh_token` before making the request.
+// Token refresh: when the access token (JWT `exp`, else the stored
+//   `expires_at`) expires within `REFRESH_WINDOW_SECS` we POST to the OpenAI
+//   token endpoint with `grant_type=refresh_token` before making the request,
+//   matching the official client's 5-minute proactive refresh window.
 //
 // Model list: static — the Codex endpoint does not expose a /models route,
 //   so we use the `CODEX_MODELS` constant from `claurst-core`.
@@ -43,11 +45,25 @@ use crate::providers::copilot::CopilotProvider;
 // CodexProvider
 // ---------------------------------------------------------------------------
 
+/// Refresh the access token this many seconds before it expires (the official
+/// client's `CHATGPT_ACCESS_TOKEN_REFRESH_WINDOW_MINUTES` = 5).
+const REFRESH_WINDOW_SECS: u64 = 5 * 60;
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub struct CodexProvider {
     id: ProviderId,
     http_client: reqwest::Client,
     /// Mutable token cache: updated in-place when a refresh succeeds.
     tokens: Arc<Mutex<CodexTokens>>,
+    /// Serialises refreshes: refresh tokens are single-use, so two concurrent
+    /// requests must not both spend the same one.
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl CodexProvider {
@@ -61,6 +77,7 @@ impl CodexProvider {
             id: ProviderId::new(ProviderId::CODEX),
             http_client,
             tokens: Arc::new(Mutex::new(tokens)),
+            refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -77,31 +94,35 @@ impl CodexProvider {
     // Token management
     // -----------------------------------------------------------------------
 
-    fn is_expired(tokens: &CodexTokens) -> bool {
-        let Some(expires_at) = tokens.expires_at else {
-            return false; // No expiry info — assume still valid.
-        };
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // Treat as expired 60 s early to avoid races.
-        now + 60 >= expires_at
+    /// True when the access token expires within `REFRESH_WINDOW_SECS` of
+    /// `now`. Tokens with no known expiry are treated as valid.
+    fn is_expired(tokens: &CodexTokens, now: u64) -> bool {
+        tokens
+            .access_token_expiry()
+            .is_some_and(|expires_at| now.saturating_add(REFRESH_WINDOW_SECS) >= expires_at)
+    }
+
+    /// Snapshot `(access_token, expired, refresh_token)` under the token lock.
+    fn token_state(&self) -> (String, bool, Option<String>) {
+        let guard = self.tokens.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            guard.access_token.clone(),
+            Self::is_expired(&guard, unix_now()),
+            guard.refresh_token.clone(),
+        )
     }
 
     /// Return the current access token, refreshing first if it is expired.
     async fn access_token(&self) -> Result<String, ProviderError> {
-        // Check expiry under the lock; clone what we need; release.
-        let (token, needs_refresh, refresh_token) = {
-            let guard = self.tokens.lock().unwrap();
-            let expired = Self::is_expired(&guard);
-            (
-                guard.access_token.clone(),
-                expired,
-                guard.refresh_token.clone(),
-            )
-        };
+        let (token, needs_refresh, _) = self.token_state();
+        if !needs_refresh {
+            return Ok(token);
+        }
 
+        // Re-check under the refresh lock: a concurrent request may already
+        // have refreshed (and spent the single-use refresh token).
+        let _refresh_guard = self.refresh_lock.lock().await;
+        let (token, needs_refresh, refresh_token) = self.token_state();
         if !needs_refresh {
             return Ok(token);
         }
@@ -181,15 +202,11 @@ impl CodexProvider {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        let expires_in = json_val.get("expires_in").and_then(|v| v.as_u64());
-
-        let new_expires_at = expires_in.map(|secs| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
-                + secs
-        });
+        let new_expires_at = claurst_core::oauth_config::codex_expires_at(
+            json_val.get("expires_in").and_then(|v| v.as_u64()),
+            &new_access,
+            unix_now(),
+        );
 
         // Persist and cache the refreshed tokens.
         let mut updated = {
@@ -934,7 +951,7 @@ impl LlmProvider for CodexProvider {
                 reason: "no Codex access token — run /connect to authenticate".to_string(),
             });
         }
-        if Self::is_expired(&guard) && guard.refresh_token.is_none() {
+        if Self::is_expired(&guard, unix_now()) && guard.refresh_token.is_none() {
             return Ok(ProviderStatus::Unavailable {
                 reason: "Codex access token expired and no refresh token — re-run /connect"
                     .to_string(),
@@ -956,5 +973,42 @@ impl LlmProvider for CodexProvider {
             structured_output: false,
             system_prompt_style: SystemPromptStyle::SystemMessage,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+
+    fn jwt(payload: Value) -> String {
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string());
+        format!("h.{b64}.s")
+    }
+
+    #[test]
+    fn is_expired_uses_jwt_exp_with_five_minute_window() {
+        let tokens = CodexTokens {
+            access_token: jwt(json!({ "exp": 10_000 })),
+            ..Default::default()
+        };
+        assert!(!CodexProvider::is_expired(&tokens, 10_000 - REFRESH_WINDOW_SECS - 1));
+        assert!(CodexProvider::is_expired(&tokens, 10_000 - REFRESH_WINDOW_SECS));
+        assert!(CodexProvider::is_expired(&tokens, 20_000));
+    }
+
+    #[test]
+    fn is_expired_falls_back_to_stored_expiry_then_valid() {
+        let stored = CodexTokens {
+            access_token: "opaque".into(),
+            expires_at: Some(1_000),
+            ..Default::default()
+        };
+        assert!(CodexProvider::is_expired(&stored, 900));
+        let unknown = CodexTokens {
+            access_token: "opaque".into(),
+            ..Default::default()
+        };
+        assert!(!CodexProvider::is_expired(&unknown, u64::MAX - 1));
     }
 }

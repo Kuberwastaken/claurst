@@ -321,6 +321,8 @@ pub(crate) fn set_user_only_dir_perms(path: &std::path::Path) {
 pub struct JwtIdentity {
     pub email: Option<String>,
     pub account_id: Option<String>,
+    /// Standard `exp` claim: unix seconds at which the token expires.
+    pub exp: Option<u64>,
 }
 
 /// Decode the payload of a JWT (`header.payload.signature`) and pull out the
@@ -360,6 +362,8 @@ pub fn jwt_identity(token: &str) -> JwtIdentity {
             out.email = Some(email.to_string());
         }
     }
+
+    out.exp = json.get("exp").and_then(|v| v.as_u64());
 
     // OpenAI puts account_id under the custom auth claim.
     if let Some(auth) = json
@@ -447,6 +451,17 @@ mod tests {
         assert_eq!(identity.account_id.as_deref(), Some("acc_abc123"));
 
         assert_eq!(id_from_identity(&identity), "kuber");
+    }
+
+    #[test]
+    fn jwt_identity_reads_exp_claim() {
+        use base64::Engine;
+        let payload = serde_json::json!({ "exp": 1_900_000_000u64 });
+        let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_string(&payload).unwrap());
+        let identity = jwt_identity(&format!("header.{}.signature", payload_b64));
+        assert_eq!(identity.exp, Some(1_900_000_000));
+        assert!(jwt_identity("not.a.jwt").exp.is_none());
     }
 
     #[test]
