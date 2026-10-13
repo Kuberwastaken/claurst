@@ -97,7 +97,9 @@ impl AnthropicProvider {
             builder = builder.thinking(tc);
         }
 
-        builder.build()
+        let mut api_request = builder.build();
+        api_request.apply_cache_breakpoints();
+        api_request
     }
 
     /// Map a string stop_reason from Anthropic wire format to [`StopReason`].

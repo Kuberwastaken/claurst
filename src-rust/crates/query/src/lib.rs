@@ -796,7 +796,11 @@ pub async fn run_query_loop(
             req_builder = req_builder.temperature(t);
         }
 
-        let request = req_builder.build();
+        // `request` is only ever sent through the Anthropic client below (the
+        // provider dispatch path builds its own `ProviderRequest`), so the
+        // Anthropic prompt-cache breakpoints are placed here unconditionally.
+        let mut request = req_builder.build();
+        request.apply_cache_breakpoints();
 
         // Create a stream handler that forwards to the event channel
         let handler: Arc<dyn StreamHandler> = if let Some(ref tx) = event_tx {

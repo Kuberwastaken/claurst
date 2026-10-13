@@ -1270,6 +1270,65 @@ pub mod client {
             }
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn oauth_stealth_keeps_the_stable_block_breakpoint() {
+            let client = AnthropicClient::new(ClientConfig {
+                api_key: "oauth-token".to_string(),
+                use_bearer_auth: true,
+                ..Default::default()
+            })
+            .expect("client");
+            let block = |text: &str| SystemBlock {
+                block_type: "text".to_string(),
+                text: text.to_string(),
+                cache_control: None,
+            };
+            let mut request = CreateMessageRequest::builder("claude-opus-4-6", 1024)
+                .system(SystemPrompt::Blocks(vec![
+                    block("You are Claurst, an agent.\n\nstable rules"),
+                    block("dynamic context"),
+                ]))
+                .messages(vec![ApiMessage {
+                    role: "user".to_string(),
+                    content: Value::String("hi".to_string()),
+                }])
+                .build();
+            request.apply_cache_breakpoints();
+            client.apply_oauth_stealth(&mut request);
+
+            let Some(SystemPrompt::Blocks(blocks)) = &request.system else {
+                panic!("expected system blocks");
+            };
+            assert_eq!(blocks.len(), 4);
+            assert!(blocks[0].text.starts_with("x-anthropic-billing-header:"));
+            assert!(blocks[0].cache_control.is_none());
+            assert!(blocks[1].cache_control.is_none());
+            assert_eq!(blocks[2].text, "stable rules");
+            assert!(blocks[2].cache_control.is_some());
+            assert_eq!(blocks[3].text, "dynamic context");
+            assert!(blocks[3].cache_control.is_none());
+        }
+
+        /// `cache_read_input_tokens` / `cache_creation_input_tokens` on a
+        /// `message_start` event reach the parsed usage.
+        #[test]
+        fn message_start_usage_parses_cache_fields() {
+            let data = r#"{"message":{"id":"m1","model":"claude","usage":{"input_tokens":12,"output_tokens":1,"cache_creation_input_tokens":3400,"cache_read_input_tokens":51000}}}"#;
+            let event = AnthropicClient::frame_to_event(&Some("message_start".to_string()), data);
+            let Some(streaming::AnthropicStreamEvent::MessageStart { usage, .. }) = event else {
+                panic!("expected message_start");
+            };
+            assert_eq!(usage.input_tokens, 12);
+            assert_eq!(usage.cache_creation_input_tokens, 3400);
+            assert_eq!(usage.cache_read_input_tokens, 51000);
+            assert_eq!(usage.total_input(), 12 + 3400 + 51000);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1291,6 +1350,144 @@ impl CreateMessageRequest {
             stop_sequences: None,
             thinking: None,
         }
+    }
+
+    /// Place Anthropic prompt-cache breakpoints (`cache_control:
+    /// {"type":"ephemeral"}`) in the standard four-breakpoint layout:
+    ///
+    /// 1. the first system block, which is the stable half of the system
+    ///    prompt (the dynamic half follows it uncached),
+    /// 2. the last tool definition,
+    /// 3. the last user message, and
+    /// 4. the user message before it.
+    ///
+    /// The cached prefix renders as tools, then system, then messages, and a
+    /// request may carry at most 4 breakpoints. Each breakpoint looks back at
+    /// most 20 content blocks for an earlier cache entry, so the previous user
+    /// turn (where the previous request wrote its entry) is marked too: a turn
+    /// that appends more than 20 blocks, such as a long tool loop, still gets
+    /// an exact read point. See "Prompt caching" in the Anthropic docs,
+    /// sections "Cache limitations" and "20-block lookback window":
+    /// <https://docs.claude.com/en/docs/build-with-claude/prompt-caching>.
+    /// Prompt caching is GA on the Messages API and needs no beta header.
+    ///
+    /// Markers already present count towards the limit and are kept. Only
+    /// call this for requests sent to Anthropic's Messages API.
+    pub fn apply_cache_breakpoints(&mut self) {
+        let existing = self.cache_breakpoint_count();
+        let mut budget = MAX_CACHE_BREAKPOINTS.saturating_sub(existing);
+
+        let system_marked = match &self.system {
+            Some(SystemPrompt::Blocks(blocks)) => {
+                blocks.iter().any(|b| b.cache_control.is_some())
+            }
+            _ => false,
+        };
+        if budget > 0 && !system_marked {
+            match &mut self.system {
+                Some(SystemPrompt::Blocks(blocks)) => {
+                    if let Some(first) = blocks.iter_mut().find(|b| !b.text.is_empty()) {
+                        first.cache_control = Some(CacheControl::ephemeral());
+                        budget -= 1;
+                    }
+                }
+                Some(SystemPrompt::Text(text)) if !text.is_empty() => {
+                    let text = std::mem::take(text);
+                    self.system = Some(SystemPrompt::Blocks(vec![SystemBlock {
+                        block_type: "text".to_string(),
+                        text,
+                        cache_control: Some(CacheControl::ephemeral()),
+                    }]));
+                    budget -= 1;
+                }
+                _ => {}
+            }
+        }
+
+        if budget > 0 {
+            if let Some(last) = self.tools.as_mut().and_then(|tools| tools.last_mut()) {
+                if last.cache_control.is_none() {
+                    last.cache_control = Some(CacheControl::ephemeral());
+                    budget -= 1;
+                }
+            }
+        }
+
+        for message in self.messages.iter_mut().rev().filter(|m| m.role == "user").take(2) {
+            if budget == 0 {
+                break;
+            }
+            if mark_last_cacheable_block(&mut message.content) {
+                budget -= 1;
+            }
+        }
+    }
+
+    /// Number of `cache_control` markers already present in the request.
+    fn cache_breakpoint_count(&self) -> usize {
+        let system = match &self.system {
+            Some(SystemPrompt::Blocks(blocks)) => {
+                blocks.iter().filter(|b| b.cache_control.is_some()).count()
+            }
+            _ => 0,
+        };
+        let tools = self
+            .tools
+            .iter()
+            .flatten()
+            .filter(|t| t.cache_control.is_some())
+            .count();
+        let messages = self
+            .messages
+            .iter()
+            .filter_map(|m| m.content.as_array())
+            .flatten()
+            .filter(|b| b.get("cache_control").is_some())
+            .count();
+        system + tools + messages
+    }
+}
+
+/// Maximum number of `cache_control` breakpoints the Messages API accepts in
+/// one request.
+pub const MAX_CACHE_BREAKPOINTS: usize = 4;
+
+/// Mark the last block of a message's content that may carry `cache_control`.
+/// String content becomes a single text block. Empty text blocks and thinking
+/// blocks cannot be cache breakpoints and are skipped. Returns whether a
+/// marker was placed.
+fn mark_last_cacheable_block(content: &mut Value) -> bool {
+    let ephemeral = || serde_json::json!({ "type": "ephemeral" });
+    match content {
+        Value::String(text) if !text.is_empty() => {
+            let text = std::mem::take(text);
+            *content = serde_json::json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": ephemeral(),
+            }]);
+            true
+        }
+        Value::Array(blocks) => {
+            for block in blocks.iter_mut().rev() {
+                let Some(obj) = block.as_object_mut() else {
+                    continue;
+                };
+                let eligible = match obj.get("type").and_then(Value::as_str) {
+                    Some("thinking" | "redacted_thinking") | None => false,
+                    Some("text") => {
+                        matches!(obj.get("text"), Some(Value::String(t)) if !t.is_empty())
+                    }
+                    Some(_) => true,
+                };
+                if eligible {
+                    obj.insert("cache_control".to_string(), ephemeral());
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
     }
 }
 
@@ -1541,6 +1738,94 @@ impl StreamAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn caching_fixture() -> CreateMessageRequest {
+        use serde_json::json;
+        let block = |text: &str| SystemBlock {
+            block_type: "text".to_string(),
+            text: text.to_string(),
+            cache_control: None,
+        };
+        let tool = |name: &str| ApiToolDefinition {
+            name: name.to_string(),
+            description: String::new(),
+            input_schema: json!({ "type": "object" }),
+            cache_control: None,
+        };
+        let msg = |role: &str, content: Value| ApiMessage {
+            role: role.to_string(),
+            content,
+        };
+        CreateMessageRequest::builder("claude-opus-4-6", 1024)
+            .system(SystemPrompt::Blocks(vec![block("stable"), block("dynamic")]))
+            .tools(vec![tool("Read"), tool("Bash")])
+            .messages(vec![
+                msg("user", json!("first")),
+                msg("assistant", json!([{ "type": "tool_use", "id": "t1", "name": "Read", "input": {} }])),
+                msg("user", json!([{ "type": "tool_result", "tool_use_id": "t1", "content": "ok" }])),
+                msg("assistant", json!([{ "type": "text", "text": "done" }])),
+                msg("user", json!("second")),
+            ])
+            .build()
+    }
+
+    /// Request-body snapshot: two system blocks (only the stable one cached),
+    /// with breakpoints on the last tool and on the last two user messages.
+    #[test]
+    fn cache_breakpoints_request_body_snapshot() {
+        use serde_json::json;
+        let mut request = caching_fixture();
+        request.apply_cache_breakpoints();
+        let body = serde_json::to_value(&request).expect("serialize");
+        let eph = json!({ "type": "ephemeral" });
+
+        assert_eq!(
+            body["system"],
+            json!([
+                { "type": "text", "text": "stable", "cache_control": eph },
+                { "type": "text", "text": "dynamic" },
+            ])
+        );
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["tools"][1]["cache_control"], eph);
+        assert_eq!(body["messages"][0]["content"], json!("first"));
+        assert_eq!(
+            body["messages"][2]["content"],
+            json!([{ "type": "tool_result", "tool_use_id": "t1", "content": "ok", "cache_control": eph }])
+        );
+        assert_eq!(body["messages"][3]["content"], json!([{ "type": "text", "text": "done" }]));
+        assert_eq!(
+            body["messages"][4]["content"],
+            json!([{ "type": "text", "text": "second", "cache_control": eph }])
+        );
+        assert_eq!(body.to_string().matches("cache_control").count(), MAX_CACHE_BREAKPOINTS);
+    }
+
+    #[test]
+    fn cache_breakpoints_are_idempotent_and_skip_empty_text() {
+        use serde_json::json;
+        let mut request = caching_fixture();
+        request.apply_cache_breakpoints();
+        request.apply_cache_breakpoints();
+        let body = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(body.to_string().matches("cache_control").count(), MAX_CACHE_BREAKPOINTS);
+
+        let mut request = CreateMessageRequest::builder("claude-opus-4-6", 1024)
+            .system_text("plain system")
+            .messages(vec![ApiMessage {
+                role: "user".to_string(),
+                content: json!([{ "type": "text", "text": "hi" }, { "type": "text", "text": "" }]),
+            }])
+            .build();
+        request.apply_cache_breakpoints();
+        let body = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(
+            body["system"],
+            json!([{ "type": "text", "text": "plain system", "cache_control": { "type": "ephemeral" } }])
+        );
+        assert_eq!(body["messages"][0]["content"][0]["cache_control"], json!({ "type": "ephemeral" }));
+        assert!(body["messages"][0]["content"][1].get("cache_control").is_none());
+    }
 
     #[test]
     fn test_sse_parser_basic() {
