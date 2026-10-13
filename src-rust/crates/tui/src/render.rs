@@ -2840,8 +2840,8 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(vec![Line::from(spans)]), padded_area);
 }
 
-/// Strip ANSI escape sequences and C0 control characters (except \n, \t)
-/// from text, returning clean plain text.
+/// Strip ANSI escape sequences, C0 controls (except \n) and C1 controls from
+/// text, turning tabs into spaces, returning clean plain text.
 pub(crate) fn strip_ansi(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let bytes = text.as_bytes();
@@ -2895,12 +2895,16 @@ pub(crate) fn strip_ansi(text: &str) -> String {
             }
         } else if c.is_ascii_control() && c != b'\n' && c != b'\t' {
             i += 1;
+        } else if c == b'\t' {
+            // A raw tab would make the terminal jump to the next tab stop.
+            out.push(' ');
+            i += 1;
         } else {
-            // Multi-byte UTF-8: copy the full character
+            // Multi-byte UTF-8: copy the full character, dropping C1 controls
+            // (U+0080..U+009F), which terminals may interpret.
             let char_len = utf8_char_len(c);
-            out.push_str(
-                core::str::from_utf8(&bytes[i..i + char_len]).unwrap_or("�"),
-            );
+            let ch = core::str::from_utf8(&bytes[i..i + char_len]).unwrap_or("�");
+            out.extend(ch.chars().filter(|ch| !('\u{80}'..='\u{9f}').contains(ch)));
             i += char_len;
         }
     }
@@ -2920,25 +2924,6 @@ fn utf8_char_len(lead: u8) -> usize {
     }
 }
 
-/// Truncate each line to `max_width` chars, appending "..." if truncated.
-fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
-    let mut out = String::new();
-    for (idx, line) in text.lines().enumerate() {
-        if idx > 0 {
-            out.push('\n');
-        }
-        if line.chars().count() <= max_width {
-            out.push_str(line);
-        } else if max_width > 3 {
-            out.extend(line.chars().take(max_width - 3));
-            out.push_str("...");
-        } else {
-            out.extend(line.chars().take(max_width));
-        }
-    }
-    out
-}
-
 fn render_status_line_override(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 {
         return;
@@ -2950,16 +2935,16 @@ fn render_status_line_override(frame: &mut Frame, app: &App, area: Rect) {
     if content_width == 0 {
         return;
     }
-    let display = truncate_with_ellipsis(text, usize::from(content_width));
     let padded = Rect {
         x: area.x.saturating_add(pad),
         y: area.y,
         width: content_width,
         height: area.height,
     };
-    let lines: Vec<Line> = display
+    let style = Style::default().fg(Color::DarkGray);
+    let lines: Vec<Line> = text
         .lines()
-        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::DarkGray))))
+        .map(|l| Line::from(Span::styled(truncate_end(l, usize::from(content_width)), style)))
         .collect();
     frame.render_widget(Paragraph::new(lines), padded);
 }
@@ -4069,34 +4054,24 @@ mod status_line_tests {
     }
 
     #[test]
-    fn truncate_with_ellipsis_keeps_short_lines() {
-        assert_eq!(truncate_with_ellipsis("abc", 3), "abc");
-        assert_eq!(truncate_with_ellipsis("a\nbc", 5), "a\nbc");
-    }
-
-    #[test]
-    fn truncate_with_ellipsis_cuts_to_exact_width() {
-        assert_eq!(truncate_with_ellipsis("abcdefghij", 8), "abcde...");
-        assert_eq!(truncate_with_ellipsis("abcdefghij\nxy", 6), "abc...\nxy");
-    }
-
-    #[test]
-    fn truncate_with_ellipsis_counts_chars_not_bytes() {
-        let out = truncate_with_ellipsis("\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}", 5);
-        assert_eq!(out, "\u{e9}\u{e9}...");
-        assert_eq!(out.chars().count(), 5);
-    }
-
-    #[test]
-    fn truncate_with_ellipsis_clips_without_ellipsis_when_too_narrow() {
-        assert_eq!(truncate_with_ellipsis("abcdef", 3), "abc");
-        assert_eq!(truncate_with_ellipsis("abcdef", 0), "");
+    fn status_line_truncation_is_display_width_aware() {
+        assert_eq!(truncate_end("abc", 3), "abc");
+        assert_eq!(truncate_end("abcdefghij", 8), "abcdefg\u{2026}");
+        // Wide (2-cell) CJK chars: the result never exceeds the width.
+        let out = truncate_end("\u{65e5}\u{672c}\u{8a9e}\u{30c6}\u{30ad}", 7);
+        assert_eq!(out, "\u{65e5}\u{672c}\u{8a9e}\u{2026}");
+        assert!(UnicodeWidthStr::width(out.as_str()) <= 7);
     }
 
     #[test]
     fn strip_ansi_removes_escapes_and_controls() {
         let raw = "\x1b[1;32mgreen\x1b[0m \x1b]8;;https://x\x07link\x1b]8;;\x1b\\\x08\nnext\ttab";
-        assert_eq!(strip_ansi(raw), "green link\nnext\ttab");
+        assert_eq!(strip_ansi(raw), "green link\nnext tab");
+    }
+
+    #[test]
+    fn strip_ansi_drops_c1_controls() {
+        assert_eq!(strip_ansi("a\u{85}b\u{9b}31mc\u{e9}"), "ab31mc\u{e9}");
     }
 
     #[test]
@@ -4116,7 +4091,7 @@ mod status_line_tests {
         terminal
             .draw(|f| render_status_line_override(f, &app, f.area()))
             .unwrap();
-        assert_eq!(rows(&terminal)[0], "   abcdefghijk...   ");
+        assert_eq!(rows(&terminal)[0], "   abcdefghijklm\u{2026}   ");
     }
 
     #[test]
