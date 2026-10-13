@@ -1,13 +1,22 @@
-// FileRead tool: read files with optional line range, image support, PDF page ranges.
+// FileRead tool: read a text file a bounded page at a time, with offset/limit
+// continuation. Images and PDFs are not decoded; see `execute`.
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::io::AsyncReadExt;
+use tokio::io::AsyncBufReadExt;
 use tracing::debug;
 
 pub struct FileReadTool;
+
+/// Lines returned when the caller gives no `limit`.
+const DEFAULT_LINE_LIMIT: usize = 2000;
+/// Most bytes of file text one call returns, so a huge file cannot flood the
+/// context; the trailer says where to continue.
+const MAX_OUTPUT_BYTES: usize = 50 * 1024;
+/// A single line longer than this is cut (on a char boundary).
+const MAX_LINE_BYTES: usize = 2000;
 
 #[derive(Debug, Deserialize)]
 struct FileReadInput {
@@ -28,10 +37,13 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Reads a file from the local filesystem. You can access any file directly. \
-         By default reads up to 2000 lines from the beginning. Results are returned \
-         with line numbers starting at 1. This tool can read images (PNG, JPG) and \
-         PDF files."
+        "Reads a text file from the local filesystem. Each line is prefixed with \
+         its number and a tab (\"12<TAB>\"), starting at 1. Returns at most 2000 \
+         lines and 50 KB per call; lines longer than 2000 bytes are cut. When more \
+         remains, a trailer gives the offset to continue from: keep calling Read \
+         with that offset until the file is fully read, rather than using cat or \
+         sed. Images and PDFs are not decoded: the tool only confirms the file \
+         exists and you do not see its content. Binary files are rejected."
     }
 
     fn permission_level(&self) -> PermissionLevel {
@@ -48,11 +60,11 @@ impl Tool for FileReadTool {
                 },
                 "offset": {
                     "type": "number",
-                    "description": "The line number to start reading from (1-based). Only provide if the file is too large to read at once."
+                    "description": "The line number to start reading from (1-based). Use the offset from a truncation trailer to continue a large file."
                 },
                 "limit": {
                     "type": "number",
-                    "description": "The number of lines to read. Only provide if the file is too large to read at once."
+                    "description": "The maximum number of lines to read (default 2000). Output is also capped at 50 KB."
                 }
             },
             "required": ["file_path"]
@@ -99,17 +111,24 @@ impl Tool for FileReadTool {
             .unwrap_or("")
             .to_lowercase();
 
-        let image_exts = ["png", "jpg", "jpeg", "gif", "bmp", "webp", "svg", "ico"];
+        // The tool result is text only (`ToolResult::content`), so image and
+        // PDF bytes cannot reach the model from here. Say so instead of
+        // implying the content was seen. SVG is XML text and is read as such.
+        let image_exts = ["png", "jpg", "jpeg", "gif", "bmp", "webp", "ico"];
         if image_exts.contains(&ext.as_str()) {
             return ToolResult::success(format!(
-                "[Image file: {}. The image content has been captured for visual analysis.]",
+                "[Image file: {}. Read returns text only, so the image content was not \
+                 loaded and you have not seen it. Do not describe it; ask the user to \
+                 attach the image to the conversation if you need to see it.]",
                 path.display()
             ));
         }
 
         if ext == "pdf" {
             return ToolResult::success(format!(
-                "[PDF file: {}. Use the `pages` parameter to read specific page ranges.]",
+                "[PDF file: {}. Read does not extract PDF content, so you have not seen \
+                 it. If a PDF-to-text tool such as `pdftotext` is installed, run it with \
+                 Bash; otherwise ask the user for the text.]",
                 path.display()
             ));
         }
@@ -123,63 +142,117 @@ impl Tool for FileReadTool {
         if let Err(e) = ctx.confirm_opened_path(self.name(), "Read", &path, &file, grant, true) {
             return ToolResult::error(e);
         }
-        let mut file = tokio::fs::File::from_std(file);
-        let mut content = String::new();
-        if let Err(e) = file.read_to_string(&mut content).await {
-            // Might be binary
-            if e.kind() == std::io::ErrorKind::InvalidData {
+
+        let start = params.offset.unwrap_or(0).saturating_sub(1);
+        let limit = params.limit.unwrap_or(DEFAULT_LINE_LIMIT).max(1);
+        let page = match read_page(tokio::fs::File::from_std(file), start, limit).await {
+            Ok(page) => page,
+            Err(PageError::Binary) => {
                 return ToolResult::error(format!(
                     "File appears to be binary and cannot be displayed as text: {}",
                     path.display()
                 ));
             }
-            return ToolResult::error(format!("Failed to read file: {}", e));
-        }
+            Err(PageError::Io(e)) => return ToolResult::error(format!("Failed to read file: {}", e)),
+        };
 
-        if content.is_empty() {
+        if page.total_lines == 0 {
             return ToolResult::success(format!(
                 "[File {} exists but is empty]",
                 path.display()
             ));
         }
 
-        let lines: Vec<&str> = content.lines().collect();
-        let total_lines = lines.len();
-
-        let offset = params.offset.unwrap_or(0);
-        let limit = params.limit.unwrap_or(2000);
-
-        // Convert 1-based offset to 0-based index
-        let start = if offset > 0 { offset - 1 } else { 0 };
-        let end = (start + limit).min(total_lines);
-
-        if start >= total_lines {
+        if start >= page.total_lines {
             return ToolResult::error(format!(
                 "Offset {} exceeds total line count {} in {}",
-                offset,
-                total_lines,
+                start + 1,
+                page.total_lines,
                 path.display()
             ));
         }
 
-        let mut output = String::new();
+        let end = start + page.lines.len();
+        let mut output = String::with_capacity(page.bytes + page.lines.len() * 8);
         let width = format!("{}", end).len();
 
-        for (i, line) in lines[start..end].iter().enumerate() {
-            let line_num = start + i + 1;
-            output.push_str(&format!("{:>width$}\t{}\n", line_num, line, width = width));
+        for (i, line) in page.lines.iter().enumerate() {
+            output.push_str(&format!("{:>width$}\t{}\n", start + i + 1, line, width = width));
         }
 
-        if end < total_lines {
+        if end < page.total_lines {
             output.push_str(&format!(
-                "\n... ({} more lines, {} total. Use offset/limit to read more.)\n",
-                total_lines - end,
-                total_lines
+                "\n[truncated: {} more lines; call Read with offset={} to continue]\n",
+                page.total_lines - end,
+                end + 1
             ));
         }
 
         ToolResult::success(output)
     }
+}
+
+/// One page of a text file: the lines from the requested start that fit the
+/// line limit and [`MAX_OUTPUT_BYTES`], plus the file's total line count.
+struct Page {
+    lines: Vec<String>,
+    /// Bytes of text in `lines`, excluding separators.
+    bytes: usize,
+    total_lines: usize,
+}
+
+enum PageError {
+    Binary,
+    Io(std::io::Error),
+}
+
+/// Stream `file` line by line, keeping only lines `start..start + limit` that
+/// fit the byte cap; later lines are only counted, so memory stays bounded by
+/// the page (and the longest single line) rather than the file. A UTF-8 BOM
+/// on the first line is dropped so it is never copied into an edit.
+async fn read_page(file: tokio::fs::File, start: usize, limit: usize) -> Result<Page, PageError> {
+    let mut reader = tokio::io::BufReader::new(file);
+    let mut buf = Vec::new();
+    let mut page = Page { lines: Vec::new(), bytes: 0, total_lines: 0 };
+    let mut full = false;
+    loop {
+        buf.clear();
+        if reader.read_until(b'\n', &mut buf).await.map_err(PageError::Io)? == 0 {
+            break;
+        }
+        let index = page.total_lines;
+        page.total_lines += 1;
+        if full || index < start {
+            continue;
+        }
+        let mut raw = buf.as_slice();
+        if index == 0 {
+            raw = raw.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(raw);
+        }
+        raw = raw.strip_suffix(b"\n").unwrap_or(raw);
+        raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if raw.contains(&0) {
+            return Err(PageError::Binary);
+        }
+        let text = std::str::from_utf8(raw).map_err(|_| PageError::Binary)?;
+        let line = if text.len() > MAX_LINE_BYTES {
+            let mut cut = MAX_LINE_BYTES;
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            format!("{}... [line truncated: {} bytes]", &text[..cut], text.len())
+        } else {
+            text.to_string()
+        };
+        if !page.lines.is_empty() && page.bytes + line.len() > MAX_OUTPUT_BYTES {
+            full = true;
+            continue;
+        }
+        page.bytes += line.len();
+        page.lines.push(line);
+        full = page.lines.len() >= limit;
+    }
+    Ok(page)
 }
 
 #[cfg(all(test, unix))]
@@ -189,6 +262,98 @@ mod tests {
     use claurst_core::config::{PermissionMode, Settings};
     use claurst_core::permissions::PermissionManager;
     use std::sync::Arc;
+    use crate::test_support::allow_all_context;
+
+    async fn read(path: &std::path::Path, extra: Value) -> ToolResult {
+        let mut input = json!({ "file_path": path.to_string_lossy() });
+        if let (Some(obj), Some(more)) = (input.as_object_mut(), extra.as_object()) {
+            obj.extend(more.clone());
+        }
+        let dir = path.parent().unwrap().to_path_buf();
+        FileReadTool.execute(input, &allow_all_context(dir)).await
+    }
+
+    /// #443: a file longer than the default line limit is cut with a trailer
+    /// naming the offset to continue from, and that offset resumes exactly.
+    #[tokio::test]
+    async fn read_caps_lines_and_continues_from_trailer_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.txt");
+        let text: String = (1..=2500).map(|i| format!("line {}\n", i)).collect();
+        std::fs::write(&path, text).unwrap();
+
+        let first = read(&path, json!({})).await;
+        assert!(!first.is_error, "{}", first.content);
+        assert!(first.content.contains("2000\tline 2000\n"));
+        assert!(!first.content.contains("line 2001"));
+        assert!(
+            first.content.contains("[truncated: 500 more lines; call Read with offset=2001 to continue]"),
+            "missing trailer: {}",
+            &first.content[first.content.len().saturating_sub(200)..]
+        );
+
+        let rest = read(&path, json!({ "offset": 2001 })).await;
+        assert!(!rest.is_error, "{}", rest.content);
+        assert!(rest.content.starts_with("2001\tline 2001\n"), "{}", &rest.content[..40]);
+        assert!(rest.content.contains("2500\tline 2500\n"));
+        assert!(!rest.content.contains("truncated"), "last page must not have a trailer");
+    }
+
+    /// #443: the byte cap applies before the line limit, and over-long lines
+    /// are cut rather than returned whole.
+    #[tokio::test]
+    async fn read_caps_bytes_and_long_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wide.txt");
+        let wide = "x".repeat(1000);
+        let mut text: String = (0..200).map(|_| format!("{}\n", wide)).collect();
+        text.push_str(&"y".repeat(10_000));
+        text.push('\n');
+        std::fs::write(&path, text).unwrap();
+
+        let res = read(&path, json!({})).await;
+        assert!(!res.is_error, "{}", res.content);
+        assert!(res.content.len() < MAX_OUTPUT_BYTES + 4096, "output not capped: {}", res.content.len());
+        let shown = res.content.lines().filter(|l| l.contains("\tx")).count();
+        assert!(shown < 200 && shown > 0, "shown {} lines", shown);
+        assert!(
+            res.content.contains(&format!("call Read with offset={} to continue]", shown + 1)),
+            "trailer: {}",
+            &res.content[res.content.len().saturating_sub(120)..]
+        );
+
+        let last = read(&path, json!({ "offset": 201 })).await;
+        assert!(last.content.contains("[line truncated: 10000 bytes]"), "{}", last.content.len());
+        assert!(last.content.len() < 2200);
+    }
+
+    /// #443: images and PDFs return an honest note, not a claim that the
+    /// content was captured.
+    #[tokio::test]
+    async fn read_image_and_pdf_placeholders_are_honest() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("a.png");
+        let pdf = dir.path().join("a.pdf");
+        std::fs::write(&png, [0x89, b'P', b'N', b'G']).unwrap();
+        std::fs::write(&pdf, b"%PDF-1.4").unwrap();
+
+        let img = read(&png, json!({})).await;
+        assert!(img.content.contains("you have not seen it"), "{}", img.content);
+        assert!(!img.content.contains("captured"), "{}", img.content);
+        let doc = read(&pdf, json!({})).await;
+        assert!(doc.content.contains("you have not seen"), "{}", doc.content);
+        assert!(!doc.content.contains("`pages`"), "{}", doc.content);
+    }
+
+    /// A UTF-8 BOM is not shown as part of the first line.
+    #[tokio::test]
+    async fn read_drops_utf8_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bom.txt");
+        std::fs::write(&path, "\u{feff}first\nsecond\n").unwrap();
+        let res = read(&path, json!({})).await;
+        assert!(res.content.starts_with("1\tfirst\n"), "{:?}", res.content);
+    }
 
     /// Workspace `ws/` and a sibling `outside/secret.txt`, both canonical.
     fn workspace_and_secret(dir: &tempfile::TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
