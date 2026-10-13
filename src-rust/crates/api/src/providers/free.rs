@@ -365,29 +365,40 @@ impl LlmProvider for FreeProvider {
     }
 
     async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
-        let provider_id = self.id.clone();
-        let mk = |id: &str, name: &str, ctx: u32| ModelInfo {
+        // Limits for an upstream model the registry has no usable entry for.
+        const FALLBACK_CONTEXT_WINDOW: u32 = 128_000;
+        const FALLBACK_MAX_OUTPUT_TOKENS: u32 = 8_192;
+
+        let mk = |id: String, name: String, context_window: u32, max_output_tokens: u32| ModelInfo {
             id: ModelId::new(id),
-            provider_id: provider_id.clone(),
-            name: name.to_string(),
-            context_window: ctx,
-            max_output_tokens: 8_192,
+            provider_id: self.id.clone(),
+            name,
+            context_window,
+            max_output_tokens,
             ..Default::default()
         };
 
         let mut models = vec![mk(
-            "free/auto",
-            "Free \u{2014} Auto (round-robin across configured providers)",
+            "free/auto".to_string(),
+            "Free \u{2014} Auto (round-robin across configured providers)".to_string(),
             200_000,
+            FALLBACK_MAX_OUTPUT_TOKENS,
         )];
 
+        // Size each pin from the bundled models.dev snapshot via
+        // `resolve_entry` under the `free` provider with the exact id the
+        // picker emits: the same lookup the TUI footer and auto-compact
+        // perform, so all three agree (#393).
+        let registry = crate::ModelRegistry::new();
         for entry in &self.chain {
+            let id = format!("{}/{}", entry.upstream.id, entry.upstream.default_model);
+            let (context_window, max_output_tokens) = registry
+                .resolve_entry(ProviderId::FREE, &id)
+                .map_or((FALLBACK_CONTEXT_WINDOW, FALLBACK_MAX_OUTPUT_TOKENS), |e| {
+                    (e.info.context_window, e.info.max_output_tokens)
+                });
             let label = format!("{} \u{2014} {}", entry.upstream.title, entry.upstream.default_model);
-            models.push(mk(
-                &format!("{}/{}", entry.upstream.id, entry.upstream.default_model),
-                &label,
-                128_000,
-            ));
+            models.push(mk(id, label, context_window, max_output_tokens));
         }
 
         Ok(models)
@@ -655,6 +666,25 @@ mod tests {
             .await
             .expect("should succeed via cerebras");
         assert_eq!(resp.model, "qwen-3-235b-a22b-instruct-2507");
+    }
+
+    #[tokio::test]
+    async fn discover_models_sizes_pins_from_registry() {
+        let provider = FreeProvider::new(vec![
+            entry("opencode-zen", true),
+            entry("google", true),
+            entry("cohere", true),
+        ]);
+        let models = provider.discover_models().await.unwrap();
+        let limits = |id: &str| {
+            let m = models.iter().find(|m| &*m.id == id).unwrap();
+            (m.context_window, m.max_output_tokens)
+        };
+        // Zen lives under models.dev's "opencode" id (#394).
+        assert_eq!(limits("opencode-zen/minimax-m2.5-free"), (204_800, 131_072));
+        assert_eq!(limits("google/gemini-2.5-flash"), (1_048_576, 65_536));
+        // The bundled snapshot has no cohere/command-r-plus: fallback limits.
+        assert_eq!(limits("cohere/command-r-plus"), (128_000, 8_192));
     }
 
     #[tokio::test]

@@ -93,6 +93,32 @@ fn provider_from_key(provider_id: &str, key: String) -> Option<Arc<dyn LlmProvid
     }
 }
 
+/// Whether `provider_id` names a provider this build can dispatch to.
+///
+/// OpenAI-compatible ids are answered by `provider_for_id` itself, so new
+/// compat providers are accepted automatically. The remaining ids are the
+/// bespoke backends dispatched by `provider_from_key`, `provider_from_config`
+/// and `ProviderRegistry::from_environment_with_auth_store`; keep them in sync
+/// with those match arms.
+pub fn is_known_provider_id(provider_id: &str) -> bool {
+    crate::providers::openai_compat_providers::provider_for_id(provider_id).is_some()
+        || matches!(
+            provider_id,
+            ProviderId::ANTHROPIC
+                | ProviderId::OPENAI
+                | ProviderId::GOOGLE
+                | ProviderId::GITHUB_COPILOT
+                | ProviderId::CODEX
+                | "openai-codex"
+                | ProviderId::COHERE
+                | ProviderId::MINIMAX
+                | ProviderId::AZURE
+                | ProviderId::AMAZON_BEDROCK
+                | "custom-openai"
+                | ProviderId::FREE
+        )
+}
+
 /// Build a [`FreeProvider`] by walking [`FREE_CATALOG`] and pulling any keys
 /// the user has stored in the auth store. Each catalog entry whose upstream
 /// has a key becomes one link in the fallback chain.
@@ -695,5 +721,27 @@ mod tests {
         registry.set_default(ProviderId::new("lmstudio"));
 
         assert_eq!(&**registry.default_provider_id(), ProviderId::LM_STUDIO);
+    }
+
+    #[test]
+    fn known_provider_ids_cover_every_dispatchable_backend() {
+        for id in [
+            ProviderId::ANTHROPIC,
+            ProviderId::OPENAI,
+            ProviderId::AMAZON_BEDROCK,
+            ProviderId::CODEX,
+            ProviderId::FREE,
+            ProviderId::TOGETHER_AI,
+            ProviderId::FIREWORKS,
+            ProviderId::NEURALWATT,
+            ProviderId::LM_STUDIO,
+            "lmstudio",
+            "custom-openai",
+        ] {
+            assert!(is_known_provider_id(id), "{id} should be accepted");
+        }
+        for id in ["togetherai", "anthropik", "", ProviderId::GOOGLE_VERTEX, ProviderId::GITLAB] {
+            assert!(!is_known_provider_id(id), "{id} has no backend and should be rejected");
+        }
     }
 }

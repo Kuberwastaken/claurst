@@ -35,7 +35,8 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::{self, Stdout};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::OnceLock;
 
 /// Whether the active terminal speaks the kitty keyboard protocol (progressive
 /// keyboard enhancement). Detected once during [`setup_terminal`]. Defaults to
@@ -58,6 +59,13 @@ pub fn keyboard_enhancement_active() -> bool {
 /// emit `DisableMouseCapture` (issue #104). Defaults to `true` so a restore
 /// that runs before setup keeps the historical always-disable behaviour.
 static MOUSE_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(true);
+
+/// The OSC 7501 program status last written to the terminal, as
+/// `ProgramStatus::code()`; `0` means nothing has been emitted (or it was
+/// cleared). Lets [`set_program_status`] write only on change and lets the
+/// restore / panic paths emit the clear sequence only when there is a record
+/// to clear, so sessions that never reported stay byte-for-byte silent.
+static PROGRAM_STATUS_EMITTED: AtomicU8 = AtomicU8::new(0);
 
 // ---------------------------------------------------------------------------
 // Sub-modules
@@ -83,6 +91,8 @@ pub mod input;
 pub mod render;
 /// Post-paint OSC 8 hyperlink emission — makes URLs Ctrl/Cmd-clickable.
 pub mod osc8;
+/// OSC 7501 Program Status Protocol reports (idle/working/blocked/done/error).
+pub mod program_status;
 /// Permission dialogs and confirmation dialogs.
 pub mod dialogs;
 /// Notification / banner system.
@@ -206,6 +216,7 @@ pub use free_mode_dialog::{FreeModeDialogState, FreeModeField, render_free_mode_
 // (FreeModeField type is now per-provider; legacy callers may still import both names.)
 pub use device_auth_dialog::{DeviceAuthDialogState, DeviceAuthStatus, DeviceAuthEvent, render_device_auth_dialog};
 pub use file_injection::{parse_at_refs, build_file_blocks, AtFileRef, AtFileIssue};
+pub use program_status::{BlockedKind, ProgramStatus, TurnOutcome};
 pub use file_injection_dialog::{FileInjectionDialogState, FileInjectionOutcome, render_file_injection_dialog};
 
 // ---------------------------------------------------------------------------
@@ -267,6 +278,11 @@ pub fn setup_terminal(mouse_capture: bool) -> io::Result<Terminal<CrosstermBacke
             // Best-effort restore — ignore errors, we're already unwinding.
             let _ = disable_raw_mode();
             let _ = restore_terminal_cleanup();
+            // Leave an `error` record rather than clearing, so an unattended
+            // tab still shows that Claurst crashed.
+            if PROGRAM_STATUS_EMITTED.swap(0, Ordering::Relaxed) != 0 {
+                write_osc(program_status::ProgramStatus::Error.osc_sequence().as_bytes());
+            }
             let _ = execute!(io::stdout(), crossterm::cursor::Show);
         }
         original_hook(panic_info);
@@ -336,6 +352,8 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io
     disable_raw_mode()?;
     // Clear any terminal "busy" progress indicator (OSC 9;4) we may have set.
     set_terminal_progress(false);
+    // Drop the OSC 7501 program status record, if we reported one.
+    clear_program_status();
     // Restore the original title by clearing it (terminals fall back to default).
     let _ = execute!(
         terminal.backend_mut(),
@@ -344,6 +362,109 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io
     restore_terminal_cleanup()?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Signal-based terminal restore
+// ---------------------------------------------------------------------------
+
+/// Human-readable name for a Unix termination signal number.
+#[cfg(unix)]
+fn signal_name(sig: i32) -> &'static str {
+    match sig {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        15 => "SIGTERM",
+        _ => "signal",
+    }
+}
+
+/// Best-effort terminal restore for a signal-driven exit, then death by the
+/// same signal. The panic-hook path (`setup_terminal`) already covers panics,
+/// but SIGINT / SIGTERM / SIGHUP / SIGQUIT kill the process without unwinding,
+/// so the terminal would otherwise be left in raw mode with the kitty keyboard
+/// protocol pushed, mouse capture on, and bracketed paste enabled. The shell
+/// then echoes garbage like `e1;1:3u` until the user runs `reset`.
+///
+/// Holds the stdout lock from the first escape sequence until the process is
+/// gone, so a concurrent `terminal.draw` on the main thread cannot interleave
+/// a frame with the cleanup. The lock is reentrant, so the `execute!` calls on
+/// `io::stdout()` below (same thread) do not deadlock.
+///
+/// After restoring, the disposition is reset to `SIG_DFL` and the signal is
+/// re-raised so the parent sees a death-by-signal status (bash's cooperative
+/// SIGINT exit, SIGQUIT core dumps) instead of a plain `128 + sig` exit code.
+#[cfg(unix)]
+fn restore_terminal_from_signal_and_reraise(sig: nix::sys::signal::Signal) -> ! {
+    use nix::sys::signal::{raise, signal, SigHandler};
+    use std::io::Write;
+
+    let stdout = io::stdout();
+    let _guard = stdout.lock();
+    let _ = disable_raw_mode();
+    set_terminal_progress(false);
+    let _ = execute!(io::stdout(), crossterm::terminal::SetTitle(""));
+    let _ = restore_terminal_cleanup();
+    let _ = execute!(io::stdout(), crossterm::cursor::Show);
+    let _ = io::stdout().flush();
+
+    // SAFETY: installing SIG_DFL registers no Rust code as a handler, so none
+    // of the async-signal-safety requirements of `signal()` apply. It replaces
+    // the tokio/signal-hook handler for this one signal, which is intended:
+    // the process is about to die from it.
+    let _ = unsafe { signal(sig, SigHandler::SigDfl) };
+    let _ = raise(sig);
+    // Only reached if the re-raise did not terminate the process.
+    std::process::exit(128 + sig as i32);
+}
+
+/// Spawn tokio tasks that restore the terminal and then re-raise the signal
+/// when a termination signal arrives. Must be called from inside the tokio
+/// runtime after [`setup_terminal`] so the cleanup sequences match what was
+/// enabled.
+///
+/// In raw mode Ctrl+C and Ctrl+\ arrive as key events, not signals, so this
+/// path covers `kill <pid>`, SIGHUP from a closed terminal, SIGINT/SIGQUIT
+/// sent externally, and the cooked-mode windows (e.g. during OAuth login).
+/// Ported from jcode's `spawn_session_signal_watchers` (issue #898 there).
+#[cfg(unix)]
+pub fn spawn_signal_restore_watchers() {
+    use nix::sys::signal::Signal;
+    use tokio::signal::unix::{SignalKind, signal};
+
+    fn spawn_one(sig: Signal, kind: SignalKind) {
+        tokio::spawn(async move {
+            let mut stream = match signal(kind) {
+                Ok(s) => s,
+                Err(e) => {
+                    // Not fatal: the process still exits cleanly through the
+                    // normal path; we just lose the graceful terminal restore
+                    // on this signal.
+                    eprintln!(
+                        "claurst: failed to install {} handler: {}",
+                        signal_name(sig as i32),
+                        e
+                    );
+                    return;
+                }
+            };
+            if stream.recv().await.is_some() {
+                restore_terminal_from_signal_and_reraise(sig);
+            }
+        });
+    }
+
+    spawn_one(Signal::SIGHUP, SignalKind::hangup());
+    spawn_one(Signal::SIGINT, SignalKind::interrupt());
+    spawn_one(Signal::SIGQUIT, SignalKind::quit());
+    spawn_one(Signal::SIGTERM, SignalKind::terminate());
+}
+
+#[cfg(not(unix))]
+pub fn spawn_signal_restore_watchers() {
+    // Windows console control events go through the Ctrl+C handler registered
+    // by crossterm; the panic hook covers the rest.
 }
 
 /// Set the terminal window title via OSC escape sequence.
@@ -399,6 +520,53 @@ pub fn set_terminal_progress(active: bool) {
     let _ = out.flush();
 }
 
+/// Whether to emit OSC 7501 program status reports. The spec requires
+/// terminals to ignore unknown OSCs, so unlike OSC 9;4 there is no terminal
+/// allow-list (supporting terminals such as Rex and cmux need not be known in
+/// advance). We still require a real tty and skip `TERM=dumb` and tmux/screen,
+/// which do not forward the sequence to the outer terminal. Evaluated once.
+pub fn supports_program_status_osc() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        use std::io::IsTerminal;
+        if !io::stdout().is_terminal() || std::env::var_os("TMUX").is_some() {
+            return false;
+        }
+        let term = std::env::var("TERM").unwrap_or_default();
+        !(term == "dumb" || term.starts_with("screen") || term.starts_with("tmux"))
+    })
+}
+
+fn write_osc(seq: &[u8]) {
+    use std::io::Write;
+    let mut out = io::stdout();
+    let _ = out.write_all(seq);
+    let _ = out.flush();
+}
+
+/// Report `status` to the terminal via OSC 7501, writing only when it differs
+/// from the last report. Call once per frame from the interactive TUI; never
+/// from headless, ACP or bridge paths. No-op when the terminal is unsuitable
+/// (see [`supports_program_status_osc`]).
+pub fn set_program_status(status: program_status::ProgramStatus) {
+    let code = status.code();
+    if PROGRAM_STATUS_EMITTED.load(Ordering::Relaxed) == code || !supports_program_status_osc() {
+        return;
+    }
+    write_osc(status.osc_sequence().as_bytes());
+    PROGRAM_STATUS_EMITTED.store(code, Ordering::Relaxed);
+}
+
+/// Remove our OSC 7501 record (`state=clear`). Called from
+/// [`restore_terminal`] (the panic hook reports `error` instead); writes nothing if no status was
+/// ever reported, and resets the dedupe state so a re-entered TUI (after an
+/// OAuth flow, for example) reports again.
+pub fn clear_program_status() {
+    if PROGRAM_STATUS_EMITTED.swap(0, Ordering::Relaxed) != 0 {
+        write_osc(program_status::CLEAR_SEQUENCE.as_bytes());
+    }
+}
+
 /// Update the terminal title to reflect the current session context.
 /// Format: "🦀 | <topic>" or just "🦀 Claurst" when no topic is set.
 pub fn update_terminal_title(topic: Option<&str>) {
@@ -429,6 +597,18 @@ mod tests {
 
     fn make_app() -> App {
         App::new(Config::default(), CostTracker::new())
+    }
+
+    // ---- signal helpers --------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_names_map_known_signals() {
+        assert_eq!(signal_name(1), "SIGHUP");
+        assert_eq!(signal_name(2), "SIGINT");
+        assert_eq!(signal_name(3), "SIGQUIT");
+        assert_eq!(signal_name(15), "SIGTERM");
+        assert_eq!(signal_name(9), "signal");
     }
 
     // ---- input helpers ---------------------------------------------------

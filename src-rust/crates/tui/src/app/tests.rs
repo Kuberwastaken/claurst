@@ -4,6 +4,7 @@ use super::*;
 
 use claurst_core::config::Config;
 use claurst_core::types::Role;
+use claurst_core::PermissionMode;
 use super::keys::{
     key_event_to_keystroke, layout_to_latin, normalize_char_with_shift,
     normalize_layout_shortcut_key,
@@ -463,6 +464,81 @@ use super::types::{ContextMenuItem, ContextMenuState};
         }
         assert_eq!(app.prompt_input.text, "line1\nline2");
         assert!(app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn test_yolo_on_shows_dialog_and_accept_activates() {
+        let mut app = make_app();
+        assert!(app.intercept_slash_command_with_args("yolo", "on"));
+        // Dialog visible, mode not yet switched.
+        assert!(app.bypass_permissions_dialog.visible);
+        assert!(app.yolo_pending);
+        assert_eq!(app.config.permission_mode, PermissionMode::Default);
+
+        // Accept via '2'.
+        app.handle_key_event(press_key(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert!(!app.bypass_permissions_dialog.visible);
+        assert!(!app.yolo_pending);
+        assert_eq!(app.config.permission_mode, PermissionMode::BypassPermissions);
+    }
+
+    #[test]
+    fn test_yolo_on_decline_cancels_without_exit() {
+        let mut app = make_app();
+        assert!(app.intercept_slash_command_with_args("yolo", "on"));
+        // Decline via '1'.
+        app.handle_key_event(press_key(KeyCode::Char('1'), KeyModifiers::NONE));
+        assert!(!app.bypass_permissions_dialog.visible);
+        assert!(!app.yolo_pending);
+        // No exit: decline only cancels the runtime toggle.
+        assert!(!app.should_exit);
+        assert_eq!(app.config.permission_mode, PermissionMode::Default);
+    }
+
+    #[test]
+    fn test_yolo_off_restores_previous_mode_not_default() {
+        // /yolo off must not kick the user out of plan/acceptEdits.
+        let mut app = make_app();
+        app.config.permission_mode = PermissionMode::Plan;
+        assert!(app.intercept_slash_command_with_args("yolo", "on"));
+        app.handle_key_event(press_key(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(app.config.permission_mode, PermissionMode::BypassPermissions);
+
+        assert!(app.intercept_slash_command_with_args("yolo", "off"));
+        // Plan mode restored, not Default.
+        assert_eq!(app.config.permission_mode, PermissionMode::Plan);
+    }
+
+    #[test]
+    fn test_yolo_off_restores_default_mode() {
+        let mut app = make_app();
+        app.config.permission_mode = PermissionMode::BypassPermissions;
+        assert!(app.intercept_slash_command_with_args("yolo", "off"));
+        assert_eq!(app.config.permission_mode, PermissionMode::Default);
+        assert!(!app.bypass_permissions_dialog.visible);
+    }
+
+    #[test]
+    fn test_yolo_on_when_already_bypassed_is_noop() {
+        // `/yolo on` while already bypassed must not record BypassPermissions
+        // as the "previous" mode, or `/yolo off` would leave bypass on.
+        let mut app = make_app();
+        app.config.permission_mode = PermissionMode::BypassPermissions;
+        assert!(app.intercept_slash_command_with_args("yolo", "on"));
+        assert!(!app.bypass_permissions_dialog.visible);
+        assert!(!app.yolo_pending);
+        assert!(app.yolo_previous_mode.is_none());
+        assert!(app.intercept_slash_command_with_args("yolo", "off"));
+        assert_eq!(app.config.permission_mode, PermissionMode::Default);
+    }
+
+    #[test]
+    fn test_yolo_toggle_when_not_bypass_shows_dialog() {
+        let mut app = make_app();
+        // Bare /yolo with Default mode: toggle on → dialog.
+        assert!(app.intercept_slash_command_with_args("yolo", ""));
+        assert!(app.bypass_permissions_dialog.visible);
+        assert!(app.yolo_pending);
     }
 
     #[test]
@@ -1063,4 +1139,43 @@ use super::types::{ContextMenuItem, ContextMenuState};
         assert!(!app.session_browser.visible);
         assert_eq!(app.prompt_input.text, "/resume abc-123");
         assert!(app.pending_auto_submit);
+    }
+
+    // ---- free-mode context window (issues #393, #394) ----
+
+    #[tokio::test]
+    async fn free_mode_zen_pin_window_agrees_across_consumers() {
+        use claurst_api::LlmProvider;
+
+        let model = "opencode-zen/minimax-m2.5-free";
+        let mut app = make_app();
+        // Pin to the bundled snapshot so a local models.dev cache can't skew it.
+        app.model_registry = claurst_api::ModelRegistry::new();
+        app.set_model(model.to_string());
+        assert_eq!(app.config.provider.as_deref(), Some("free"));
+
+        // Footer / token warnings.
+        assert_eq!(app.context_window_size, 204_800);
+        // Auto-compact sizing.
+        assert_eq!(
+            claurst_query::compact::resolve_context_window(
+                Some(&app.model_registry),
+                "free",
+                model
+            ),
+            app.context_window_size
+        );
+        // `/model` picker catalog served by the Free provider.
+        let upstream = *claurst_api::FREE_CATALOG
+            .iter()
+            .find(|u| u.id == "opencode-zen")
+            .unwrap();
+        let provider = claurst_api::FreeProvider::new(vec![claurst_api::FreeEntry {
+            upstream,
+            provider: Arc::new(claurst_api::GoogleProvider::new(String::new())),
+        }]);
+        let models = provider.discover_models().await.unwrap();
+        let pin = models.iter().find(|m| &*m.id == model).unwrap();
+        assert_eq!(u64::from(pin.context_window), app.context_window_size);
+        assert_eq!(pin.max_output_tokens, 131_072);
     }

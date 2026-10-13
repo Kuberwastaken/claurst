@@ -19,7 +19,7 @@ use crate::provider::{LlmProvider, ModelInfo};
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
     ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus,
-    StreamEvent, SystemPromptStyle,
+    StopReason, StreamEvent, SystemPromptStyle,
 };
 
 // Re-use the message transformation helpers from openai.rs.
@@ -93,6 +93,12 @@ pub struct ProviderQuirks {
     /// Native LM Studio host used to discover loaded model instances and their
     /// configured context lengths from `/api/v1/models`.
     pub lm_studio_native_host: Option<String>,
+
+    /// Parse DeepSeek DSML tool-call envelopes (`<｜DSML｜tool_calls>…`) out of
+    /// assistant text content and turn them into tool calls (#395). Always on
+    /// for model ids containing `deepseek`; set this to force it for every
+    /// model the provider serves (e.g. aliased DeepSeek V4 routes).
+    pub dsml_tool_calls: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +457,14 @@ impl OpenAiCompatProvider {
         builder
     }
 
+    /// Whether DeepSeek DSML tool-call envelopes should be parsed out of this
+    /// request's text output: forced by the provider quirk, or implied by a
+    /// DeepSeek model id (DeepSeek V4 is served by many compat vendors).
+    fn dsml_enabled(&self, request: &ProviderRequest) -> bool {
+        self.quirks.dsml_tool_calls
+            || request.model.to_ascii_lowercase().contains("deepseek")
+    }
+
     fn map_http_error(&self, status: u16, body: &str) -> ProviderError {
         parse_error_response(status, body, &self.id)
     }
@@ -530,7 +544,14 @@ impl OpenAiCompatProvider {
                 body: Some(text.clone()),
             })?;
 
-        OpenAiProvider::parse_non_streaming_response_pub(&json, &self.id)
+        let mut response = OpenAiProvider::parse_non_streaming_response_pub(&json, &self.id)?;
+        if self.dsml_enabled(request)
+            && crate::protocol::dsml::extract_tool_calls_from_blocks(&mut response.content)
+            && response.stop_reason == StopReason::EndTurn
+        {
+            response.stop_reason = StopReason::ToolUse;
+        }
+        Ok(response)
     }
 
     // -----------------------------------------------------------------------
@@ -933,6 +954,7 @@ impl LlmProvider for OpenAiCompatProvider {
         let resp = self.do_streaming(&request).await?;
         let provider_id = self.id.clone();
         let reasoning_field = self.quirks.reasoning_field.clone();
+        let dsml_tool_calls = self.dsml_enabled(&request);
 
         let s = stream! {
             use futures::StreamExt;
@@ -944,7 +966,10 @@ impl LlmProvider for OpenAiCompatProvider {
             // Sans-IO OpenAI-Chat protocol decoder (#228): owns all message /
             // reasoning / tool-call / finish-reason decoding for this wire
             // format (extracted from this loop into `protocol::openai_chat`).
-            let mut chat_decoder = crate::OpenAiChatDecoder::new(reasoning_field);
+            // DeepSeek V4 DSML tool-call envelopes in text content (#395)
+            // are lifted into tool calls when enabled for this model.
+            let mut chat_decoder = crate::OpenAiChatDecoder::new(reasoning_field)
+                .with_dsml_tool_calls(dsml_tool_calls);
 
             // Bound infinite mid-stream stalls (issue #185): some
             // OpenAI-compatible providers begin a streamed tool call and then
@@ -1274,5 +1299,90 @@ mod tests {
             Some("http://192.0.2.20:1234"),
         );
         assert!(provider.quirks.include_usage_in_stream);
+    }
+
+    fn request(model: &str, messages: Vec<claurst_core::types::Message>) -> ProviderRequest {
+        ProviderRequest {
+            model: model.to_string(),
+            messages,
+            system_prompt: None,
+            tools: Vec::new(),
+            max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: Vec::new(),
+            thinking: None,
+            provider_options: json!({}),
+        }
+    }
+
+    #[test]
+    fn dsml_gated_on_deepseek_model_or_quirk() {
+        let plain = OpenAiCompatProvider::new("siliconflow", "SiliconFlow", "https://example.com");
+        assert!(plain.dsml_enabled(&request("deepseek-ai/DeepSeek-V4-Flash", Vec::new())));
+        assert!(!plain.dsml_enabled(&request("qwen3-coder", Vec::new())));
+
+        let forced = OpenAiCompatProvider::new("zen", "Zen", "https://example.com")
+            .with_quirks(ProviderQuirks {
+                dsml_tool_calls: true,
+                ..Default::default()
+            });
+        assert!(forced.dsml_enabled(&request("big-pickle", Vec::new())));
+    }
+
+    /// Tool calls lifted out of DSML text must go back to the provider as a
+    /// standard `tool_calls` assistant message plus a `role: tool` result,
+    /// never as DSML text.
+    #[test]
+    fn dsml_tool_calls_round_trip_as_openai_tool_calls() {
+        use claurst_core::types::{Message, ToolResultContent};
+
+        let mut blocks = vec![ContentBlock::Text {
+            text: concat!(
+                "Looking.",
+                "<｜DSML｜tool_calls><｜DSML｜invoke name=\"read_file\">",
+                "<｜DSML｜parameter name=\"path\" string=\"true\">a.rs</｜DSML｜parameter>",
+                "</｜DSML｜invoke></｜DSML｜tool_calls>",
+            )
+            .to_string(),
+        }];
+        assert!(crate::protocol::dsml::extract_tool_calls_from_blocks(&mut blocks));
+        let tool_id = match &blocks[1] {
+            ContentBlock::ToolUse { id, .. } => id.clone(),
+            other => panic!("expected tool use, got {other:?}"),
+        };
+
+        let messages = vec![
+            Message::user("read a.rs"),
+            Message::assistant_blocks(blocks),
+            Message::user_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: tool_id.clone(),
+                content: ToolResultContent::Text("fn main() {}".to_string()),
+                is_error: None,
+            }]),
+        ];
+        let provider = OpenAiCompatProvider::new("deepseek", "DeepSeek", "https://example.com")
+            .with_quirks(ProviderQuirks {
+                reasoning_field: Some("reasoning_content".to_string()),
+                requires_reasoning_roundtrip: true,
+                dsml_tool_calls: true,
+                ..Default::default()
+            });
+        let wire = provider.build_messages(&request("deepseek-v4-flash", messages));
+
+        assert_eq!(wire.len(), 3);
+        assert_eq!(wire[1]["role"], json!("assistant"));
+        assert_eq!(wire[1]["content"], json!("Looking."));
+        let call = &wire[1]["tool_calls"][0];
+        assert_eq!(call["id"], json!(tool_id));
+        assert_eq!(call["function"]["name"], json!("read_file"));
+        let args: Value = serde_json::from_str(
+            call["function"]["arguments"].as_str().expect("arguments string"),
+        )
+        .expect("arguments are JSON");
+        assert_eq!(args, json!({"path": "a.rs"}));
+        assert_eq!(wire[2]["role"], json!("tool"));
+        assert_eq!(wire[2]["tool_call_id"], json!(tool_id));
     }
 }

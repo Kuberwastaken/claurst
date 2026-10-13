@@ -4,6 +4,7 @@ use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::io::AsyncReadExt;
 use tracing::debug;
 
 pub struct FileReadTool;
@@ -68,14 +69,15 @@ impl Tool for FileReadTool {
         debug!(path = %path.display(), "Reading file");
 
         // Permission check
-        if let Err(e) = ctx.check_permission_for_path(
+        let grant = match ctx.check_permission_for_path(
             self.name(),
             &format!("Read {}", path.display()),
             path.clone(),
             true,
         ) {
-            return ToolResult::error(e.to_string());
-        }
+            Ok(grant) => grant,
+            Err(e) => return ToolResult::error(e.to_string()),
+        };
 
         // Check if file exists
         if !path.exists() {
@@ -112,20 +114,27 @@ impl Tool for FileReadTool {
             ));
         }
 
-        // Read text file
-        let content = match tokio::fs::read_to_string(&path).await {
-            Ok(c) => c,
-            Err(e) => {
-                // Might be binary
-                if e.kind() == std::io::ErrorKind::InvalidData {
-                    return ToolResult::error(format!(
-                        "File appears to be binary and cannot be displayed as text: {}",
-                        path.display()
-                    ));
-                }
-                return ToolResult::error(format!("Failed to read file: {}", e));
-            }
+        // Read text file through a handle whose real location has been
+        // re-checked, never by re-resolving `path` (#415).
+        let file = match crate::open_regular_file(&path) {
+            Ok(f) => f,
+            Err(e) => return ToolResult::error(format!("Failed to read file: {}", e)),
         };
+        if let Err(e) = ctx.confirm_opened_path(self.name(), "Read", &path, &file, grant, true) {
+            return ToolResult::error(e);
+        }
+        let mut file = tokio::fs::File::from_std(file);
+        let mut content = String::new();
+        if let Err(e) = file.read_to_string(&mut content).await {
+            // Might be binary
+            if e.kind() == std::io::ErrorKind::InvalidData {
+                return ToolResult::error(format!(
+                    "File appears to be binary and cannot be displayed as text: {}",
+                    path.display()
+                ));
+            }
+            return ToolResult::error(format!("Failed to read file: {}", e));
+        }
 
         if content.is_empty() {
             return ToolResult::success(format!(
@@ -170,5 +179,66 @@ impl Tool for FileReadTool {
         }
 
         ToolResult::success(output)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::test_support::{context_with_handler, SwapAfterCheckHandler};
+    use claurst_core::config::{PermissionMode, Settings};
+    use claurst_core::permissions::PermissionManager;
+    use std::sync::Arc;
+
+    /// Workspace `ws/` and a sibling `outside/secret.txt`, both canonical.
+    fn workspace_and_secret(dir: &tempfile::TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let ws = root.join("ws");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, "TOP-SECRET\n").unwrap();
+        (ws, secret)
+    }
+
+    /// #415: an in-workspace file swapped for a symlink to a host file right
+    /// after the fence allowed it must not be read without a prompt.
+    #[tokio::test]
+    async fn read_refuses_symlink_swapped_in_after_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, secret) = workspace_and_secret(&dir);
+        let notes = ws.join("notes.txt");
+        std::fs::write(&notes, "inside\n").unwrap();
+
+        let manager = PermissionManager::new(PermissionMode::Default, &Settings::default());
+        let handler = SwapAfterCheckHandler::new(manager, Some((notes.clone(), secret)));
+        let ctx = context_with_handler(ws, Arc::new(handler));
+
+        let res = FileReadTool
+            .execute(json!({ "file_path": notes.to_string_lossy() }), &ctx)
+            .await;
+        assert!(res.is_error, "swapped read was allowed: {}", res.content);
+        assert!(!res.content.contains("TOP-SECRET"), "leaked: {}", res.content);
+        assert!(res.content.contains("Permission denied"), "unexpected error: {}", res.content);
+    }
+
+    /// A symlink that resolves inside the workspace keeps reading silently.
+    #[tokio::test]
+    async fn read_follows_symlink_within_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, _secret) = workspace_and_secret(&dir);
+        std::fs::write(ws.join("real.txt"), "hello\n").unwrap();
+        let link = ws.join("link.txt");
+        std::os::unix::fs::symlink(ws.join("real.txt"), &link).unwrap();
+
+        let manager = PermissionManager::new(PermissionMode::Default, &Settings::default());
+        let ctx = context_with_handler(ws, Arc::new(SwapAfterCheckHandler::new(manager, None)));
+
+        let res = FileReadTool
+            .execute(json!({ "file_path": link.to_string_lossy() }), &ctx)
+            .await;
+        assert!(!res.is_error, "read failed: {}", res.content);
+        assert!(res.content.contains("hello"), "unexpected content: {}", res.content);
     }
 }

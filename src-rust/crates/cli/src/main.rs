@@ -547,6 +547,15 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         config.permission_mode = PermissionMode::BypassPermissions;
+    } else if config.yolo_mode {
+        // YOLO mode from global settings.json: same root/sudo guard.
+        #[cfg(unix)]
+        if nix::unistd::Uid::effective().is_root() {
+            anyhow::bail!(
+                "yoloMode cannot be used with root/sudo privileges for security reasons"
+            );
+        }
+        config.permission_mode = PermissionMode::BypassPermissions;
     } else {
         config.permission_mode = cli.permission_mode.into();
     }
@@ -1873,6 +1882,10 @@ async fn run_interactive(
 
     // Set up terminal
     let mut terminal = setup_terminal(live_config.mouse_capture_enabled())?;
+    // Restore the terminal on SIGINT / SIGTERM / SIGHUP / SIGQUIT. Raw mode,
+    // the kitty keyboard stack, bracketed paste and mouse capture are process
+    // state that would otherwise outlive a signalled exit and garble the shell.
+    claurst_tui::spawn_signal_restore_watchers();
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
     if let Some(error) = settings_load_error {
         app.invalid_config_dialog =
@@ -2163,9 +2176,12 @@ async fn run_interactive(
     // setting; read it once at startup. `progress_shown` tracks whether we've
     // told the terminal we're "busy", so the escape is only emitted on an actual
     // streaming-state edge.
-    let progress_bar_enabled = claurst_core::config::Settings::load_sync()
-        .map(|s| s.terminal_progress_bar)
-        .unwrap_or(true);
+    // OSC 7501 program status reporting is likewise opt-out, via the
+    // terminalProgramStatus setting.
+    let (progress_bar_enabled, program_status_enabled) =
+        claurst_core::config::Settings::load_sync()
+            .map(|s| (s.terminal_progress_bar, s.terminal_program_status))
+            .unwrap_or((true, true));
     let mut progress_shown = false;
     'main: loop {
         app.frame_count = app.frame_count.wrapping_add(1);
@@ -2216,6 +2232,13 @@ async fn run_interactive(
             progress_shown = want_progress;
         }
 
+        // Report OSC 7501 program status (idle / working / blocked / done /
+        // error) so terminals and multiplexer UIs can show which session needs
+        // attention. Written only on change; cleared in restore_terminal.
+        if program_status_enabled {
+            claurst_tui::set_program_status(app.program_status(current_query.is_some()));
+        }
+
         // Poll for crossterm events (keyboard/mouse) with short timeout
         // unless an auto-submit (queued message) is pending — in which case
         // synthesize an Enter event to dequeue and submit it.
@@ -2259,6 +2282,11 @@ async fn run_interactive(
                     // Only process Press to avoid double-registering input.
                     if key.kind != crossterm::event::KeyEventKind::Press {
                         continue;
+                    }
+                    // Any key press after a turn ends means the user has seen
+                    // its result: OSC 7501 `done` / `error` falls back to `idle`.
+                    if current_query.is_none() {
+                        app.last_turn_outcome = None;
                     }
 
                     // Ctrl+C and Ctrl+D: exit confirmation handling
@@ -4026,7 +4054,9 @@ async fn run_interactive(
         if task_finished {
             if let Some((handle, msgs_arc)) = current_query.take() {
                 // Get the outcome and handle errors
-                if let Ok(QueryOutcome::Error(err)) = handle.await {
+                let result = handle.await;
+                app.last_turn_outcome = claurst_tui::TurnOutcome::from_query_result(&result);
+                if let Ok(QueryOutcome::Error(err)) = result {
                     while app.notifications.current_is_error() {
                         app.notifications.dismiss_current();
                     }

@@ -244,27 +244,53 @@ impl App {
         // Accepting is remembered in settings.json (skipDangerousModePermissionPrompt)
         // so the warning is shown once, not on every launch.
         if self.bypass_permissions_dialog.visible {
-            match key.code {
-                KeyCode::Char('1') | KeyCode::Esc => {
-                    // "No, exit" — quit immediately
-                    self.should_exit = true;
+            // When the dialog was opened by `/yolo` at runtime, acceptance
+            // activates YOLO mode and declining cancels the toggle (no exit).
+            let yolo_runtime = self.yolo_pending;
+            let accepted = match key.code {
+                // "No, exit"
+                KeyCode::Char('1') | KeyCode::Esc => Some(false),
+                // "Yes, I accept"
+                KeyCode::Char('2') => Some(true),
+                KeyCode::Enter => Some(self.bypass_permissions_dialog.is_accept_selected()),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.bypass_permissions_dialog.select_prev();
+                    None
                 }
-                KeyCode::Char('2') => {
-                    // "Yes, I accept" — dismiss and continue
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.bypass_permissions_dialog.select_next();
+                    None
+                }
+                _ => None,
+            };
+            match accepted {
+                Some(true) => {
                     self.bypass_permissions_dialog.dismiss();
-                    let _ = Self::persist_bypass_permissions_accepted();
-                }
-                KeyCode::Up | KeyCode::Char('k') => self.bypass_permissions_dialog.select_prev(),
-                KeyCode::Down | KeyCode::Char('j') => self.bypass_permissions_dialog.select_next(),
-                KeyCode::Enter => {
-                    if self.bypass_permissions_dialog.is_accept_selected() {
-                        self.bypass_permissions_dialog.dismiss();
+                    if yolo_runtime {
+                        // Runtime `/yolo` is session-only: never write settings.json.
+                        self.yolo_pending = false;
+                        self.config.permission_mode =
+                            claurst_core::PermissionMode::BypassPermissions;
+                        self.status_message = Some(
+                            "YOLO mode on. All permission prompts bypassed.".to_string(),
+                        );
+                    } else {
                         let _ = Self::persist_bypass_permissions_accepted();
+                    }
+                }
+                Some(false) => {
+                    // For the startup gate, quit immediately. For `/yolo`,
+                    // just cancel the toggle (and hide the dialog).
+                    if yolo_runtime {
+                        self.yolo_pending = false;
+                        self.yolo_previous_mode = None;
+                        self.bypass_permissions_dialog.dismiss();
+                        self.status_message = Some("YOLO mode cancelled.".to_string());
                     } else {
                         self.should_exit = true;
                     }
                 }
-                _ => {}
+                None => {}
             }
             return false;
         }

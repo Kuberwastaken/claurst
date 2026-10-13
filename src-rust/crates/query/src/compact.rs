@@ -818,26 +818,6 @@ pub fn context_window_for_model(model: &str) -> u64 {
     }
 }
 
-/// Smallest registry context-window value we treat as real.
-///
-/// When models.dev omits a limit, `ModelRegistry` stores a `4096` placeholder
-/// (see `model_registry.rs`). Compacting a live session at ~3.7k tokens would
-/// be absurd, so any registry value below this threshold is treated as
-/// "unknown" and we fall back to the model-name heuristic instead.
-const MIN_PLAUSIBLE_REGISTRY_WINDOW: u64 = 8192;
-
-/// Look up a plausible context-window value in the registry for a given
-/// `(provider, model_id)` pair. Returns `None` when there is no entry or the
-/// stored window is an implausible placeholder.
-fn registry_context_window(
-    registry: &claurst_api::ModelRegistry,
-    provider: &str,
-    model_id: &str,
-) -> Option<u64> {
-    let window = registry.get(provider, model_id)?.info.context_window as u64;
-    (window >= MIN_PLAUSIBLE_REGISTRY_WINDOW).then_some(window)
-}
-
 /// Resolve the effective context window for the active provider + model.
 ///
 /// The models.dev-backed [`claurst_api::ModelRegistry`] is the source of truth:
@@ -846,33 +826,21 @@ fn registry_context_window(
 /// Claude-only [`context_window_for_model`] heuristic only when the registry is
 /// absent, has no matching entry, or only holds a placeholder value.
 ///
-/// `model` may be either a bare model id (`"gemini-3-pro"`) or a canonical
-/// `"provider/model"` string; both forms are handled.
+/// Key derivation (bare id, `"provider/model"`, Free-mode `"upstream/model"`
+/// pins, gateway aliases) is delegated to
+/// [`claurst_api::ModelRegistry::resolve_entry`], the same path the TUI footer
+/// and the Free provider catalog use.
 pub fn resolve_context_window(
     registry: Option<&claurst_api::ModelRegistry>,
     provider: &str,
     model: &str,
 ) -> u64 {
-    if let Some(registry) = registry {
-        // The registry is keyed by bare model id, so strip a matching
-        // `"<provider>/"` prefix if the caller passed a canonical string.
-        let stripped = model
-            .strip_prefix(&format!("{}/", provider))
-            .unwrap_or(model);
-        if let Some(window) = registry_context_window(registry, provider, stripped) {
-            return window;
-        }
-        // Fall back to interpreting the model string itself as
-        // `"provider/model"` (e.g. when no explicit provider was supplied).
-        if let Some((embedded_provider, embedded_model)) = model.split_once('/') {
-            if let Some(window) =
-                registry_context_window(registry, embedded_provider, embedded_model)
-            {
-                return window;
-            }
-        }
-    }
-    context_window_for_model(model)
+    registry
+        .and_then(|registry| registry.resolve_entry(provider, model))
+        .map_or_else(
+            || context_window_for_model(model),
+            |entry| entry.info.context_window as u64,
+        )
 }
 
 /// Best-effort estimate of the CURRENT context size in tokens.
@@ -2025,6 +1993,23 @@ mod tests {
             context_window_for_model("tiny-model")
         );
         assert_eq!(resolve_context_window(Some(&reg), "testprov", "tiny-model"), 100_000);
+    }
+
+    #[test]
+    fn resolve_sizes_free_mode_zen_pin_from_registry() {
+        // Free mode pins carry the upstream inside the model id; the Zen
+        // gateway lives under models.dev's "opencode" id (#393, #394).
+        let reg = claurst_api::ModelRegistry::new();
+        assert_eq!(
+            resolve_context_window(Some(&reg), "free", "opencode-zen/minimax-m2.5-free"),
+            204_800
+        );
+        assert_eq!(
+            resolve_context_window(Some(&reg), "free", "zen/minimax-m2.5-free"),
+            204_800
+        );
+        // `free/auto` has no single upstream; heuristic fallback applies.
+        assert_eq!(resolve_context_window(Some(&reg), "free", "free/auto"), 100_000);
     }
 
     // ---- estimate_tokens_for_messages --------------------------------------
