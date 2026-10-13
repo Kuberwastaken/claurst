@@ -210,6 +210,7 @@ impl QueryConfig {
                 .as_ref()
                 .map(|p| p.display().to_string()),
             managed_agents: cfg.managed_agents.clone(),
+            effort_level: cfg.effective_effort_level(),
             ..Default::default()
         }
     }
@@ -231,6 +232,7 @@ impl QueryConfig {
                 .as_ref()
                 .map(|p| p.display().to_string()),
             managed_agents: cfg.managed_agents.clone(),
+            effort_level: cfg.effective_effort_level(),
             ..Default::default()
         }
     }
@@ -2120,6 +2122,23 @@ mod tests {
         assert_eq!(turn_usage.input_tokens, 900);
         assert_eq!(turn_usage.cache_creation_input_tokens, 100);
         assert_eq!(turn_usage.output_tokens, 75);
+    }
+
+    #[test]
+    fn from_config_carries_effort_level_through() {
+        let cfg = claurst_core::config::Config {
+            effort: Some("high".to_string()),
+            ..Default::default()
+        };
+        let query_config = QueryConfig::from_config(&cfg);
+        assert_eq!(query_config.effort_level, Some(claurst_core::effort::EffortLevel::High));
+    }
+
+    #[test]
+    fn from_config_unset_effort_is_none() {
+        let cfg = claurst_core::config::Config::default();
+        let query_config = QueryConfig::from_config(&cfg);
+        assert_eq!(query_config.effort_level, None);
     }
 
     fn make_config(sys: Option<&str>, append: Option<&str>) -> QueryConfig {
