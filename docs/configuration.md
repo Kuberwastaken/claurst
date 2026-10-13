@@ -31,6 +31,30 @@ global settings):
 Settings that appear in the project file override the corresponding global
 values. Keys absent from the project file fall back to the global value.
 
+A project settings file comes from the repository and is treated as untrusted.
+Settings that run commands, fetch URLs, redirect provider traffic, or widen what
+the agent may do without asking are **global-only**: Claurst reads them only from
+the global settings file and ignores them (with a warning in the log) when a
+project file sets them:
+
+| Global-only setting | Why |
+|---------------------|-----|
+| `hooks` (every event) | Runs shell commands |
+| `formatter` (top-level and `config.formatter`) | Runs a command after every file write |
+| `lsp_servers` | Spawns language-server processes |
+| `skills.urls` (top-level and `config.skills.urls`) | Clones the URL with git |
+| `providers` / `config.provider_configs` | Can point the API base URL, and your API key, at another host |
+| `workspace_paths`, `additional_dirs` | Widen the auto-allowed read set |
+| `permission_mode`, `permissionRules`, `allowedBashPrefixes`, `skipDangerousModePermissionPrompt` | Grant or pre-approve permissions |
+| `trustProjectMcpServers` | Bypasses the project MCP server approval prompt |
+| `enabledPlugins` | Enables plugins, which can ship hooks and servers |
+| `remoteControlAtStartup` | Exposes the session over the remote-control bridge |
+
+Project-defined MCP servers are still read from the project file, but they do
+not launch until you approve them for that project (or set
+`trustProjectMcpServers` globally). `skills.paths` from a project file is merged
+with the global list.
+
 ---
 
 ## Top-level Settings Structure
