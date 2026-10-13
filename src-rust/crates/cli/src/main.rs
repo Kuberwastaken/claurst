@@ -2200,6 +2200,10 @@ async fn run_interactive(
             last_auto_scroll = app.auto_scroll;
         }
 
+        // Load/drain the session browser and welcome-screen session lists
+        // (this loop does not go through `App::run`; issue #382).
+        app.poll_session_loads();
+
         // Draw the UI
         terminal.draw(|f| render_app(f, &app))?;
 
@@ -2392,7 +2396,15 @@ async fn run_interactive(
                             // Always runs — some commands need BOTH (e.g. /clear clears
                             // app state via TUI AND the messages vec via CLI).
                             cmd_ctx.messages = messages.clone();
-                            let cli_result = execute_command(&input, &mut cmd_ctx).await;
+                            // A bare `/resume` opened the session browser; the
+                            // user picks a session there (Enter re-submits
+                            // `/resume <id>`), so don't also auto-resume the
+                            // most recent one underneath it (issue #382).
+                            let cli_result = if handled_by_tui && cmd_name == "resume" {
+                                None
+                            } else {
+                                execute_command(&input, &mut cmd_ctx).await
+                            };
                             // Start optimistically true; set false for Silent/None below.
                             let mut handled_by_cli = cli_result.is_some();
 

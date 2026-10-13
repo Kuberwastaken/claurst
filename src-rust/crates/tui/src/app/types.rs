@@ -207,16 +207,16 @@ pub enum FocusTarget {
 /// A lightweight record of a recent session, shown in the welcome screen's
 /// "Recent activity" list.
 ///
-/// Loaded asynchronously from `session_storage` (see `recent_sessions_pending`
-/// in the run loop) so the render path never touches disk. Holds only what the
-/// welcome box needs: a display label plus the transcript's modification time,
-/// from which a relative timestamp ("2h ago") is computed at render time.
+/// Loaded asynchronously from the saved-session store (see
+/// `App::poll_session_loads`) so the render path never touches disk. Holds only
+/// what the welcome box needs: a display label plus the session's last-update
+/// time, from which a relative timestamp ("2h ago") is computed at render time.
 #[derive(Debug, Clone)]
 pub struct RecentSession {
     /// Display label: the custom title, else a truncated last prompt, else
     /// `"(untitled)"`.
     pub label: String,
-    /// Transcript modification time, used to derive a relative timestamp.
+    /// Session last-update time, used to derive a relative timestamp.
     pub mtime: std::time::SystemTime,
 }
 

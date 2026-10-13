@@ -839,6 +839,17 @@ impl App {
                 SessionBrowserMode::Browse => {
                     match key.code {
                         KeyCode::Esc => self.session_browser.close(),
+                        KeyCode::Enter => {
+                            // Hand the pick to the CLI's `/resume <id>` path,
+                            // which owns session swapping (issue #382).
+                            if let Some(id) =
+                                self.session_browser.selected_session().map(|s| s.id.clone())
+                            {
+                                self.session_browser.close();
+                                self.set_prompt_text(format!("/resume {}", id));
+                                self.pending_auto_submit = true;
+                            }
+                        }
                         KeyCode::Up => self.session_browser.select_prev(),
                         KeyCode::Down => self.session_browser.select_next(),
                         KeyCode::Char('r') => self.session_browser.start_rename(),
