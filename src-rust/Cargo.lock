@@ -1041,6 +1041,7 @@ dependencies = [
  "hound",
  "icy_sixel",
  "image",
+ "nix 0.29.0",
  "once_cell",
  "parking_lot",
  "ratatui",

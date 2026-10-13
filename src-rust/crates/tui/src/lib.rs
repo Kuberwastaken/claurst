@@ -362,38 +362,60 @@ fn signal_name(sig: i32) -> &'static str {
     }
 }
 
-/// Best-effort terminal restore for a signal-driven exit. The panic-hook path
-/// (`setup_terminal`) already covers panics, but SIGINT / SIGTERM / SIGHUP
-/// kill the process without unwinding, so the terminal would otherwise be left
-/// in raw mode with the kitty keyboard protocol pushed, mouse capture on, and
-/// bracketed paste enabled. The shell then echoes garbage like `e1;1:3u` until
-/// the user runs `reset`.
+/// Best-effort terminal restore for a signal-driven exit, then death by the
+/// same signal. The panic-hook path (`setup_terminal`) already covers panics,
+/// but SIGINT / SIGTERM / SIGHUP / SIGQUIT kill the process without unwinding,
+/// so the terminal would otherwise be left in raw mode with the kitty keyboard
+/// protocol pushed, mouse capture on, and bracketed paste enabled. The shell
+/// then echoes garbage like `e1;1:3u` until the user runs `reset`.
 ///
-/// Writes to stderr: at signal time stdout may be a TTY mid-frame, and stderr
-/// is where the shell prompt lands next anyway.
+/// Holds the stdout lock from the first escape sequence until the process is
+/// gone, so a concurrent `terminal.draw` on the main thread cannot interleave
+/// a frame with the cleanup. The lock is reentrant, so the `execute!` calls on
+/// `io::stdout()` below (same thread) do not deadlock.
+///
+/// After restoring, the disposition is reset to `SIG_DFL` and the signal is
+/// re-raised so the parent sees a death-by-signal status (bash's cooperative
+/// SIGINT exit, SIGQUIT core dumps) instead of a plain `128 + sig` exit code.
 #[cfg(unix)]
-fn restore_terminal_from_signal() {
+fn restore_terminal_from_signal_and_reraise(sig: nix::sys::signal::Signal) -> ! {
+    use nix::sys::signal::{raise, signal, SigHandler};
     use std::io::Write;
 
-    let mut err = io::stderr();
+    let stdout = io::stdout();
+    let _guard = stdout.lock();
     let _ = disable_raw_mode();
+    set_terminal_progress(false);
+    let _ = execute!(io::stdout(), crossterm::terminal::SetTitle(""));
     let _ = restore_terminal_cleanup();
-    let _ = write!(err, "\x1b[?25h"); // Show cursor
-    let _ = err.flush();
+    let _ = execute!(io::stdout(), crossterm::cursor::Show);
+    let _ = io::stdout().flush();
+
+    // SAFETY: installing SIG_DFL registers no Rust code as a handler, so none
+    // of the async-signal-safety requirements of `signal()` apply. It replaces
+    // the tokio/signal-hook handler for this one signal, which is intended:
+    // the process is about to die from it.
+    let _ = unsafe { signal(sig, SigHandler::SigDfl) };
+    let _ = raise(sig);
+    // Only reached if the re-raise did not terminate the process.
+    std::process::exit(128 + sig as i32);
 }
 
-/// Spawn tokio tasks that restore the terminal and exit the process when a
-/// termination signal arrives. Must be called from inside the tokio runtime
-/// after [`setup_terminal`] so the cleanup sequences match what was enabled.
+/// Spawn tokio tasks that restore the terminal and then re-raise the signal
+/// when a termination signal arrives. Must be called from inside the tokio
+/// runtime after [`setup_terminal`] so the cleanup sequences match what was
+/// enabled.
 ///
-/// Ported from jcode's `spawn_session_signal_watchers` (issue #898 there):
-/// without this, Ctrl+C in a kitty-protocol terminal leaves CSI u mode active
-/// after exit.
+/// In raw mode Ctrl+C and Ctrl+\ arrive as key events, not signals, so this
+/// path covers `kill <pid>`, SIGHUP from a closed terminal, SIGINT/SIGQUIT
+/// sent externally, and the cooked-mode windows (e.g. during OAuth login).
+/// Ported from jcode's `spawn_session_signal_watchers` (issue #898 there).
 #[cfg(unix)]
 pub fn spawn_signal_restore_watchers() {
+    use nix::sys::signal::Signal;
     use tokio::signal::unix::{SignalKind, signal};
 
-    fn spawn_one(sig: i32, kind: SignalKind) {
+    fn spawn_one(sig: Signal, kind: SignalKind) {
         tokio::spawn(async move {
             let mut stream = match signal(kind) {
                 Ok(s) => s,
@@ -403,23 +425,22 @@ pub fn spawn_signal_restore_watchers() {
                     // on this signal.
                     eprintln!(
                         "claurst: failed to install {} handler: {}",
-                        signal_name(sig),
+                        signal_name(sig as i32),
                         e
                     );
                     return;
                 }
             };
             if stream.recv().await.is_some() {
-                restore_terminal_from_signal();
-                std::process::exit(128 + sig);
+                restore_terminal_from_signal_and_reraise(sig);
             }
         });
     }
 
-    spawn_one(1, SignalKind::hangup()); // SIGHUP
-    spawn_one(2, SignalKind::interrupt()); // SIGINT
-    spawn_one(3, SignalKind::quit()); // SIGQUIT
-    spawn_one(15, SignalKind::terminate()); // SIGTERM
+    spawn_one(Signal::SIGHUP, SignalKind::hangup());
+    spawn_one(Signal::SIGINT, SignalKind::interrupt());
+    spawn_one(Signal::SIGQUIT, SignalKind::quit());
+    spawn_one(Signal::SIGTERM, SignalKind::terminate());
 }
 
 #[cfg(not(unix))]
