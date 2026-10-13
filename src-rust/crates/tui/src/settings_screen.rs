@@ -848,11 +848,14 @@ mod tests {
 
     #[test]
     fn all_entries_returns_expected_settings() {
-        let screen = SettingsScreen::new();
-        let entries = all_entries(&screen);
-        // Base settings are always present, plus 0-3 conditional file injection settings
-        assert!(entries.len() >= 16, "Should have at least 16 editable settings, got {}", entries.len());
-        assert!(entries.len() <= 20, "Should have at most 20 editable settings, got {}", entries.len());
+        // SettingsScreen::new() reads the real settings file, so pin the one
+        // field that changes the entry count to keep this independent of HOME.
+        let mut screen = SettingsScreen::new();
+        screen.file_injection_enabled = false;
+        assert_eq!(all_entries(&screen).len(), 19, "base settings only");
+        // File injection adds 3 conditional settings.
+        screen.file_injection_enabled = true;
+        assert_eq!(all_entries(&screen).len(), 22, "base plus file injection settings");
     }
 
     #[test]
