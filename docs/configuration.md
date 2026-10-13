@@ -192,8 +192,11 @@ Hook entry fields:
 `config.statusLine` runs a shell command periodically and shows its stdout as a row
 above the footer, compatible with Claude Code `statusLine` scripts (for example
 the `cc-statusline` ecosystem). The command receives a JSON session payload on
-stdin (`session_id`, `model`, `workspace.current_dir`, `context_window`
-token counts and percentages, `cost.total_cost_usd`, `elapsed_seconds`).
+stdin (`session_id`, `cwd`, `model`, `workspace.current_dir`, `context_window`,
+`cost.total_cost_usd`, `elapsed_seconds`). In `context_window`,
+`total_input_tokens` is the number of tokens in the current context window (the
+figure `used_percentage` is derived from, not a session total), while `total_output_tokens` and the `current_usage` breakdown are cumulative
+session totals.
 
 ```json
 "statusLine": {

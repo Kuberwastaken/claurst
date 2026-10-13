@@ -3722,12 +3722,10 @@ async fn run_interactive(
                 } else {
                     None
                 };
-                let total_input = cost_tracker.input_tokens()
-                    + cost_tracker.cache_creation_tokens()
-                    + cost_tracker.cache_read_tokens();
                 let total_output = cost_tracker.output_tokens();
                 let json = serde_json::json!({
                     "session_id": tool_ctx.session_id,
+                    "cwd": app.current_dir,
                     "model": {
                         "display_name": app.model_name,
                         "id": app.model_name,
@@ -3736,7 +3734,10 @@ async fn run_interactive(
                         "current_dir": app.current_dir,
                     },
                     "context_window": {
-                        "total_input_tokens": total_input,
+                        // Tokens in the current context window (the same figure as
+                        // used_percentage), not a session total, so scripts dividing
+                        // by context_window_size stay within 100%.
+                        "total_input_tokens": app.context_used_tokens,
                         "total_output_tokens": total_output,
                         "context_window_size": ctx_size,
                         "current_usage": {
