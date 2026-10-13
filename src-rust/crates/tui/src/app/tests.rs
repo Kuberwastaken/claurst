@@ -963,7 +963,7 @@ use super::types::{ContextMenuItem, ContextMenuState};
 
     /// Serializes the tests below: they point the process-global
     /// `CLAURST_HOME` at a tempdir.
-    static SESSION_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static SESSION_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Points `CLAURST_HOME` at a tempdir for its lifetime, restoring the
     /// previous value on drop.
@@ -1002,7 +1002,7 @@ use super::types::{ContextMenuItem, ContextMenuState};
 
     #[tokio::test]
     async fn session_browser_lists_sessions_written_by_history_save_session() {
-        let _lock = SESSION_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SESSION_HOME_LOCK.lock().await;
         let home = SessionHome::new();
         let id = save_test_session("issue 382", home.dir.path()).await;
 
@@ -1014,7 +1014,7 @@ use super::types::{ContextMenuItem, ContextMenuState};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn poll_session_loads_populates_the_session_browser() {
-        let _lock = SESSION_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SESSION_HOME_LOCK.lock().await;
         let home = SessionHome::new();
         let id = save_test_session("browser", home.dir.path()).await;
 
@@ -1037,7 +1037,7 @@ use super::types::{ContextMenuItem, ContextMenuState};
 
     #[tokio::test]
     async fn recent_sessions_are_scoped_to_the_project_root() {
-        let _lock = SESSION_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = SESSION_HOME_LOCK.lock().await;
         let home = SessionHome::new();
         let project = home.dir.path().join("project");
         let other = home.dir.path().join("other");
