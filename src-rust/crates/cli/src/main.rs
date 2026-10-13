@@ -2266,6 +2266,11 @@ async fn run_interactive(
                     if key.kind != crossterm::event::KeyEventKind::Press {
                         continue;
                     }
+                    // Any key press after a turn ends means the user has seen
+                    // its result: OSC 7501 `done` / `error` falls back to `idle`.
+                    if current_query.is_none() {
+                        app.last_turn_outcome = None;
+                    }
 
                     // Ctrl+C and Ctrl+D: exit confirmation handling
                     if handle_exit_key(&mut app, key, &cancel) {

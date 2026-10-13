@@ -131,9 +131,10 @@ impl App {
     /// Priority: a dialog waiting on the user (`blocked`) beats an in-flight
     /// turn (`working`), which beats the last turn's outcome (`done` /
     /// `error`). `query_in_flight` covers the gaps between model turns while
-    /// tools run, when `is_streaming` briefly drops. A finished turn's outcome
-    /// is acknowledged (and reported as `idle`) once the user starts typing.
-    pub fn program_status(&mut self, query_in_flight: bool) -> ProgramStatus {
+    /// tools run, when `is_streaming` briefly drops. The interactive loop
+    /// clears `last_turn_outcome` on the first key press after a turn ends,
+    /// which turns `done` / `error` back into `idle`.
+    pub fn program_status(&self, query_in_flight: bool) -> ProgramStatus {
         if self.permission_request.is_some() || self.mcp_approval.visible {
             return ProgramStatus::Blocked(BlockedKind::Permission);
         }
@@ -145,9 +146,6 @@ impl App {
         }
         if self.is_streaming || query_in_flight {
             return ProgramStatus::Working;
-        }
-        if !self.prompt_input.text.is_empty() {
-            self.last_turn_outcome = None;
         }
         match self.last_turn_outcome {
             Some(TurnOutcome::Done) => ProgramStatus::Done,
@@ -229,7 +227,7 @@ mod tests {
 
     #[test]
     fn fresh_app_is_idle() {
-        let mut app = make_app();
+        let app = make_app();
         assert_eq!(app.program_status(false), ProgramStatus::Idle);
     }
 
@@ -274,17 +272,16 @@ mod tests {
     }
 
     #[test]
-    fn finished_turn_reports_outcome_until_user_types() {
+    fn finished_turn_reports_outcome_until_acknowledged() {
         let mut app = make_app();
         app.last_turn_outcome = Some(TurnOutcome::Done);
         assert_eq!(app.program_status(false), ProgramStatus::Done);
-        // Still done on the next frame: the outcome persists while idle.
+        // A draft typed during the turn does not hide the result.
+        app.prompt_input.text = "follow-up".to_string();
         assert_eq!(app.program_status(false), ProgramStatus::Done);
 
-        app.prompt_input.text = "n".to_string();
-        assert_eq!(app.program_status(false), ProgramStatus::Idle);
-        // Clearing the prompt again does not resurrect the old outcome.
-        app.prompt_input.text.clear();
+        // The interactive loop clears the outcome on the next key press.
+        app.last_turn_outcome = None;
         assert_eq!(app.program_status(false), ProgramStatus::Idle);
 
         app.last_turn_outcome = Some(TurnOutcome::Error);
