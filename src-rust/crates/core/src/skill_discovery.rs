@@ -5,8 +5,9 @@
 //!   1. Project `.claurst/skills/` — walk up from `cwd`
 //!   2. Project `.agents/skills/`  — walk up from `cwd`
 //!   3. Global `~/.claurst/skills/`
-//!   4. Configured extra paths from `SkillsConfig.paths`
-//!   5. Git-URL repos from `SkillsConfig.urls` (cloned once, then cached)
+//!   4. Global `~/.agents/skills/` (unless already reached by step 2)
+//!   5. Configured extra paths from `SkillsConfig.paths`
+//!   6. Git-URL repos from `SkillsConfig.urls` (cloned once, then cached)
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -118,9 +119,9 @@ fn scan_dir(dir: &Path) -> Vec<DiscoveredSkill> {
     }
 
     // If `dir` directly contains a SKILL.md file, parse it as a single skill.
-    // Only check the canonical casing — on case-insensitive filesystems
-    // (macOS, Windows) both `SKILL.md` and `skill.md` resolve to the same
-    // file, so checking both would double-count.
+    // Both casings are tried, but only the first hit is used: on
+    // case-insensitive filesystems (macOS, Windows) `SKILL.md` and `skill.md`
+    // resolve to the same file, so taking both would double-count.
     for skill_file in ["SKILL.md", "skill.md"] {
         let candidate = dir.join(skill_file);
         if candidate.is_file() {
@@ -194,16 +195,18 @@ fn scan_dir(dir: &Path) -> Vec<DiscoveredSkill> {
 }
 
 /// Resolve a configured path string, expanding `~` to the user's home
-/// directory. Handles both `/` and `\\` separators so it works on Windows.
-/// `~user` paths (e.g. `~alice/skills`) are left unexpanded rather than
-/// silently resolving to the wrong home.
+/// directory. `~` followed by any platform separator (`/`, plus `\` on
+/// Windows) is expanded; when the home directory is unknown the path is left
+/// untouched. `~user` paths (e.g. `~alice/skills`) are left unexpanded rather
+/// than silently resolving to the wrong home.
 fn resolve_path(path_str: &str, cwd: &Path) -> PathBuf {
     let trimmed = path_str.trim();
     if trimmed == "~" {
-        dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
-    } else if let Some(rest) = trimmed.strip_prefix("~/") {
-        dirs::home_dir().map(|h| h.join(rest)).unwrap_or_else(|| PathBuf::from(trimmed))
-    } else if let Some(rest) = trimmed.strip_prefix("~\\\\") {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from(trimmed))
+    } else if let Some(rest) = trimmed
+        .strip_prefix('~')
+        .and_then(|r| r.strip_prefix(std::path::is_separator))
+    {
         dirs::home_dir().map(|h| h.join(rest)).unwrap_or_else(|| PathBuf::from(trimmed))
     } else if trimmed.starts_with('~') {
         // `~user/...` — we can't resolve another user's home reliably.
@@ -269,7 +272,9 @@ pub fn discover_skills(
     ));
 
     // ---- 3. Global .agents skills: ~/.agents/skills/ -------------------------
-    if let Some(home) = dirs::home_dir() {
+    // Skipped when cwd is under $HOME: the walk-up in step 1 already scanned
+    // it, and scanning again would report every skill there as a duplicate.
+    if let Some(home) = dirs::home_dir().filter(|home| !cwd.starts_with(home)) {
         add(scan_dir(&home.join(".agents").join("skills")));
     }
 
@@ -333,8 +338,14 @@ fn fetch_git_skills(url: &str) -> Option<Vec<DiscoveredSkill>> {
         }
 
         let repo_dir_str = repo_dir.to_str()?;
+        // Discovery can run while the TUI owns the terminal: keep git off the
+        // tty entirely and fail instead of prompting for credentials.
         let status = std::process::Command::new("git")
             .args(["clone", "--depth=1", url, repo_dir_str])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status();
 
         match status {
@@ -577,6 +588,19 @@ mod tests {
         // ~user path should NOT be expanded to $HOME
         let unexpanded = resolve_path("~alice/skills", &cwd);
         assert_eq!(unexpanded, PathBuf::from("~alice/skills"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_resolve_path_windows_backslash_tilde() {
+        let cwd = PathBuf::from(r"C:\workspace\project");
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(
+                resolve_path(r"~\.agents\skills", &cwd),
+                home.join(".agents").join("skills")
+            );
+        }
+        assert_eq!(resolve_path(r"~alice\skills", &cwd), PathBuf::from(r"~alice\skills"));
     }
 
     // ---- discover_skills with directory-based skills ------------------------
