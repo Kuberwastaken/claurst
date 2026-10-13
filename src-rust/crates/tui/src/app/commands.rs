@@ -62,7 +62,7 @@ pub(super) const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("stats", "Open token and cost stats"),
     ("survey", "Open session feedback survey"),
     ("theme", "Open the theme picker"),
-    ("turns", "Set or disable the max turn limit for this session, e.g. /turns 25 or /turns off"),
+    ("turns", "Set the max turn limit for this session, e.g. /turns 25, or /turns off for a 1000-turn ceiling"),
     ("ultrareview", "Run an exhaustive multi-dimensional code review"),
     ("update", "Check for updates and upgrade to the latest version"),
     ("upgrade", "Check for updates and upgrade to the latest version"),
@@ -97,6 +97,10 @@ pub(super) fn help_overlay_entries() -> Vec<HelpEntry> {
         .collect()
 }
 
+/// Turn cap applied by `/turns off`. Deliberately finite so a runaway loop
+/// still terminates (and still gets its degradation summary turn).
+const TURNS_OFF_CEILING: u32 = 1000;
+
 impl App {
     /// Handle slash commands that should open UI screens rather than execute
     /// as normal commands. Returns `true` if the command was intercepted.
@@ -105,29 +109,26 @@ impl App {
             let args = args.trim();
             if args.is_empty() {
                 let msg = match self.max_turns_override {
-                    Some(n) if n == u32::MAX => {
-                        "Max turns: disabled (no limit) for this session.".to_string()
-                    }
+                    Some(TURNS_OFF_CEILING) => format!(
+                        "Max turns: off (ceiling of {} turns) for this session.",
+                        TURNS_OFF_CEILING
+                    ),
                     Some(n) => format!("Max turns: {} (session override).", n),
                     None => "Max turns: using config/agent default.".to_string(),
                 };
                 self.status_message = Some(msg);
             } else if args == "off" || args == "disable" {
-                self.max_turns_override = Some(u32::MAX);
-                self.status_message =
-                    Some("Max turns disabled (no limit) for this session.".to_string());
-            } else if let Ok(n) = args.parse::<u32>() {
-                if n == 0 {
-                    self.max_turns_override = Some(u32::MAX);
-                    self.status_message =
-                        Some("Max turns disabled (no limit) for this session.".to_string());
-                } else {
-                    self.max_turns_override = Some(n);
-                    self.status_message = Some(format!("Max turns set to {} for this session.", n));
-                }
+                self.max_turns_override = Some(TURNS_OFF_CEILING);
+                self.status_message = Some(format!(
+                    "Max turns off (ceiling of {} turns) for this session.",
+                    TURNS_OFF_CEILING
+                ));
+            } else if let Some(n) = args.parse::<u32>().ok().filter(|&n| n > 0) {
+                self.max_turns_override = Some(n);
+                self.status_message = Some(format!("Max turns set to {} for this session.", n));
             } else {
                 self.status_message = Some(
-                    "Usage: /turns <number> | off | (blank to show current).".to_string(),
+                    "Usage: /turns <positive number> | off | (blank to show current).".to_string(),
                 );
             }
             return true;

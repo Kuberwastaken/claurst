@@ -168,7 +168,8 @@ pub struct App {
     /// Whether fast mode is currently active (model locked to FAST_MODE_MODEL).
     pub fast_mode: bool,
     /// Session-local max-turns override set via `/turns`. `None` = use the
-    /// config/agent default; `Some(u32::MAX)` = unlimited. Not persisted —
+    /// config/agent default; `/turns off` stores a finite ceiling (1000
+    /// turns) rather than removing the cap. Not persisted —
     /// it lives and dies with this session.
     pub max_turns_override: Option<u32>,
     /// Current agent mode name: "build", "plan".

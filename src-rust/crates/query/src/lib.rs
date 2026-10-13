@@ -97,7 +97,8 @@ pub struct QueryConfig {
     pub max_turns: u32,
     /// Session-local turn-cap override (e.g. from `/turns`). When set it
     /// takes precedence over BOTH the agent definition and `max_turns`.
-    /// `Some(u32::MAX)` means unlimited.
+    /// Always a finite cap; `/turns off` maps to a high ceiling, not to
+    /// "unlimited".
     pub max_turns_override: Option<u32>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
@@ -3098,23 +3099,23 @@ mod tests {
             recorded
         );
 
-        // `Some(u32::MAX)` disables the cap entirely: the loop keeps running
-        // tool turns until the model ends the turn (always_end_turn provider
-        // after tools are dropped by the degradation path is not expected —
-        // with an unlimited cap the loop only ends when the provider ends the
-        // turn). Use always_end_turn=true so the run terminates deterministically.
-        let (outcome, _recorded, _msgs) = drive_loop_with_override(
-            true,
+        // The override can also RAISE the cap above the agent definition
+        // (what `/turns off` relies on): override 4 over agent cap 1 → 4 tool
+        // turns + 1 degradation turn (5 requests), more than the agent cap.
+        let (_outcome, recorded, _msgs) = drive_loop_with_override(
+            false,
             1,
             noop_tools(),
             crate::continuation::ContinuationMode::Default,
-            Some(u32::MAX),
+            Some(4),
             Some(1),
         )
         .await;
-        assert!(
-            matches!(outcome, QueryOutcome::EndTurn { .. }),
-            "u32::MAX override must mean unlimited, not the agent cap"
+        assert_eq!(
+            recorded.len(),
+            5,
+            "session override 4 must lift agent cap 1 (4 tool turns + degradation), got {:?}",
+            recorded
         );
     }
 
