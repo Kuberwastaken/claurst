@@ -172,3 +172,84 @@ pub fn spawn_drainer(
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(tool_name: &str, is_read_only: bool) -> PermissionRequest {
+        PermissionRequest {
+            tool_name: tool_name.to_string(),
+            description: String::new(),
+            details: None,
+            is_read_only,
+            path: None,
+            working_dir: None,
+            allowed_roots: Vec::new(),
+            context_description: None,
+        }
+    }
+
+    #[test]
+    fn read_only_requests_are_always_classified_as_read() {
+        // Even a tool whose name would otherwise map to Execute/Delete/etc.
+        // should report Read once the caller marks it read-only.
+        assert_eq!(infer_tool_kind(&request("Bash", true)), acp::ToolKind::Read);
+        assert_eq!(infer_tool_kind(&request("Rm", true)), acp::ToolKind::Read);
+    }
+
+    #[test]
+    fn tool_names_map_to_expected_kinds() {
+        let cases = [
+            ("Edit", acp::ToolKind::Edit),
+            ("FileWrite", acp::ToolKind::Edit),
+            ("ApplyPatch", acp::ToolKind::Edit),
+            ("Bash", acp::ToolKind::Execute),
+            ("Shell", acp::ToolKind::Execute),
+            ("WebFetch", acp::ToolKind::Fetch),
+            ("WebSearch", acp::ToolKind::Fetch),
+            ("Glob", acp::ToolKind::Search),
+            ("Grep", acp::ToolKind::Search),
+            ("Delete", acp::ToolKind::Delete),
+            ("Rm", acp::ToolKind::Delete),
+            ("Move", acp::ToolKind::Move),
+            ("Rename", acp::ToolKind::Move),
+            ("Think", acp::ToolKind::Think),
+            ("Sequential", acp::ToolKind::Think),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(infer_tool_kind(&request(name, false)), expected, "tool: {name}");
+        }
+    }
+
+    #[test]
+    fn unknown_tool_names_map_to_other() {
+        assert_eq!(
+            infer_tool_kind(&request("SomeCustomMcpTool", false)),
+            acp::ToolKind::Other
+        );
+    }
+
+    #[test]
+    fn handler_check_permission_always_asks_with_empty_reason() {
+        let handler = AcpPermissionHandler;
+        let decision = handler.check_permission(&request("Bash", false));
+        assert!(matches!(decision, PermissionDecision::Ask { reason } if reason.is_empty()));
+    }
+
+    #[test]
+    fn handler_request_permission_includes_tool_name_and_detail() {
+        let handler = AcpPermissionHandler;
+        let mut req = request("Bash", false);
+        req.details = Some("rm -rf /tmp/x".to_string());
+
+        let decision = handler.request_permission(&req);
+        match decision {
+            PermissionDecision::Ask { reason } => {
+                assert!(reason.contains("Bash"));
+                assert!(reason.contains("rm -rf /tmp/x"));
+            }
+            other => panic!("expected Ask decision, got {other:?}"),
+        }
+    }
+}

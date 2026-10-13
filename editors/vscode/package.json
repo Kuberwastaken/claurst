@@ -1,0 +1,69 @@
+{
+  "name": "claurst-vscode",
+  "displayName": "Claurst",
+  "description": "Chat with Claurst, an AI coding agent, without leaving VS Code.",
+  "version": "0.1.0",
+  "publisher": "claurst",
+  "license": "GPL-3.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Kuberwastaken/claurst.git",
+    "directory": "editors/vscode"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "activationEvents": [
+    "onCommand:claurst.openChat"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "claurst.openChat",
+        "title": "Claurst: Open Chat",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "claurst.newSession",
+        "title": "Claurst: New Session"
+      },
+      {
+        "command": "claurst.stopSession",
+        "title": "Claurst: Stop Current Turn"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        { "command": "claurst.openChat" },
+        { "command": "claurst.newSession" },
+        { "command": "claurst.stopSession" }
+      ]
+    },
+    "configuration": {
+      "title": "Claurst",
+      "properties": {
+        "claurst.executablePath": {
+          "type": "string",
+          "default": "claurst",
+          "description": "Path to the claurst executable. Defaults to resolving 'claurst' from PATH."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -w -p ./",
+    "vscode:prepublish": "npm run compile",
+    "test": "npm run compile && node --test out/acpProtocol.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}

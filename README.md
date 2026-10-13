@@ -55,7 +55,7 @@ curl -fsSL https://github.com/kuberwastaken/claurst/releases/latest/download/ins
 irm https://github.com/kuberwastaken/claurst/releases/latest/download/install.ps1 | iex
 ```
 
-This drops `claurst` into `~/.claurst/bin` (or `%USERPROFILE%\.claurst\bin` on Windows) and adds it to your `PATH` automatically. Open a new terminal and run `claurst`.
+This drops `claurst` into `~/.local/bin` (or `%LOCALAPPDATA%\Programs\claurst` on Windows; Git Bash uses the same Windows path) and adds it to your `PATH` automatically. Open a new terminal and run `claurst`.
 
 ## Via npm / bun
 

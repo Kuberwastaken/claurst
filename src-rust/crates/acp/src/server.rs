@@ -203,3 +203,36 @@ fn parse_params<T: serde::de::DeserializeOwned>(params: Option<Value>) -> Result
         acp::Error::invalid_params().data(Some(serde_json::json!({ "deserialize_error": e.to_string() })))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(serde::Deserialize, PartialEq, Debug)]
+    struct Params {
+        name: String,
+    }
+
+    #[test]
+    fn parse_params_missing_returns_invalid_params_error() {
+        let result: Result<Params, acp::Error> = parse_params(None);
+        let err = result.expect_err("None params should be rejected");
+        assert_eq!(err.code, acp::ErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn parse_params_deserializes_matching_shape() {
+        let value = serde_json::json!({ "name": "claurst" });
+        let result: Params = parse_params(Some(value)).expect("valid params should parse");
+        assert_eq!(result, Params { name: "claurst".to_string() });
+    }
+
+    #[test]
+    fn parse_params_mismatched_shape_returns_invalid_params_error_with_detail() {
+        let value = serde_json::json!({ "wrong_field": 1 });
+        let result: Result<Params, acp::Error> = parse_params(Some(value));
+        let err = result.expect_err("mismatched shape should be rejected");
+        assert_eq!(err.code, acp::ErrorCode::InvalidParams);
+        assert!(err.data.is_some());
+    }
+}
