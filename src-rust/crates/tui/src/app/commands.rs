@@ -12,6 +12,7 @@ pub(super) const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("advisor", "Set or unset the server-side advisor model"),
     ("agent", "List available agents or show agent details"),
     ("agents", "Browse agent definitions and active agents"),
+    ("cc-statusline", "Show the external status line configuration"),
     ("changes", "Inspect changes from the current session"),
     ("clear", "Clear the conversation transcript"),
     ("compact", "Compact the conversation context"),
@@ -74,7 +75,8 @@ pub(super) fn help_command_category(name: &str) -> &'static str {
         "connect" | "model" | "providers" | "refresh" | "fast" | "effort" | "voice" => "Model & Provider",
         "changes" | "diff" | "review" | "rewind" | "export" | "copy" | "share" | "links" => "Review & History",
         "stats" | "cost" | "context" | "insights" | "heapdump" | "doctor" => "Diagnostics",
-        "config" | "settings" | "theme" | "keybindings" | "hooks" | "mcp" | "import-config" => {
+        "config" | "settings" | "theme" | "keybindings" | "hooks" | "mcp" | "import-config"
+        | "cc-statusline" => {
             "Workspace"
         }
         "agent" | "agents" | "memory" | "plugin" | "survey" => "Tools",

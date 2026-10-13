@@ -187,6 +187,37 @@ Hook entry fields:
 | `tool_filter` | string \| null | Only run for this tool name (`PreToolUse`/`PostToolUse` only). |
 | `blocking` | boolean | If true, a non-zero exit code blocks the operation. Default: false. |
 
+### External status line
+
+`config.statusLine` runs a shell command periodically and shows its stdout as a row
+above the footer, compatible with Claude Code `statusLine` scripts (for example
+the `cc-statusline` ecosystem). The command receives a JSON session payload on
+stdin (`session_id`, `model`, `workspace.current_dir`, `context_window`
+token counts and percentages, `cost.total_cost_usd`, `elapsed_seconds`).
+
+```json
+"statusLine": {
+  "command": "~/.claurst/statusline.sh",
+  "pollIntervalMs": 5000,
+  "padding": 1,
+  "maxLines": 2
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `command` | string | required | Shell command (`sh -c`, `cmd /C` on Windows). |
+| `pollIntervalMs` | integer | 5000 | Poll interval, clamped to 1000–300000. A run that exceeds it is killed. |
+| `padding` | integer | 0 | Horizontal padding in spaces, clamped to half the terminal width. |
+| `maxLines` | integer | 10 | Maximum number of output lines shown. |
+
+Output is capped at 4 KiB, ANSI escapes and control characters are stripped,
+long lines are truncated with `...`, and stderr is discarded. Empty output hides
+the row. `statusLine` is only read from the global `~/.claurst/settings.json`;
+a project `.claurst/settings.json` cannot set or override it. The legacy
+`CLAUDE_STATUS_COMMAND` environment variable is used when `statusLine` is unset.
+Run `/cc-statusline` to show the active configuration.
+
 ---
 
 ## Permission Modes

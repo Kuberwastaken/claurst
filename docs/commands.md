@@ -419,6 +419,16 @@ Configure the status line displayed at the bottom of the TUI. Toggle individual 
 
 ---
 
+### /cc-statusline
+
+Show the external `statusLine` command configured in `~/.claurst/settings.json` (command, poll interval, padding). See [External status line](configuration.md#external-status-line).
+
+```
+/cc-statusline
+```
+
+---
+
 ### /vim
 
 Toggle vim keybinding mode on or off. In vim mode the input field behaves like a vim editor (normal/insert/visual modes). Persisted to config.
