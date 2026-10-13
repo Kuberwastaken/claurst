@@ -14,14 +14,20 @@ use claurst_core::types::{ContentBlock, UsageInfo};
 use serde_json::{json, Value};
 use tracing::debug;
 
+use crate::protocol::dsml::{new_tool_use_id, DsmlSegment, DsmlStreamParser};
 use crate::protocol::LineStreamDecoder;
 use crate::providers::openai::OpenAiProvider;
-use crate::provider_types::StreamEvent;
+use crate::provider_types::{StopReason, StreamEvent};
 
 /// Dedicated index for the Thinking content block emitted when a provider
 /// streams a `reasoning_content` field (DeepSeek V4, etc.). Chosen to avoid
 /// colliding with text (index 0) or tool calls (1 + tc_index).
 const THINKING_BLOCK_INDEX: usize = usize::MAX - 100;
+
+/// First content-block index for tool calls lifted out of DeepSeek DSML text
+/// envelopes (#395). Far above native `1 + tc_index` blocks and below
+/// [`THINKING_BLOCK_INDEX`].
+const DSML_TOOL_BLOCK_BASE: usize = usize::MAX / 2;
 
 /// Streaming decoder for the OpenAI Chat Completions SSE format.
 ///
@@ -38,6 +44,11 @@ pub struct OpenAiChatDecoder {
     thinking_open: bool,
     /// Keyed by content-block index → (tool_call_id, name, accumulated_args).
     tool_call_buffers: HashMap<usize, (String, String, String)>,
+    /// Extracts DeepSeek DSML tool-call envelopes from text content (#395).
+    /// `None` unless enabled via [`with_dsml_tool_calls`](Self::with_dsml_tool_calls).
+    dsml: Option<DsmlStreamParser>,
+    /// Number of tool calls lifted out of DSML envelopes in this stream.
+    dsml_tool_calls: usize,
 }
 
 impl OpenAiChatDecoder {
@@ -49,7 +60,58 @@ impl OpenAiChatDecoder {
             model_name: String::new(),
             thinking_open: false,
             tool_call_buffers: HashMap::new(),
+            dsml: None,
+            dsml_tool_calls: 0,
         }
+    }
+
+    /// Parse DeepSeek DSML tool-call envelopes out of `delta.content` text and
+    /// surface them as `ToolUse` blocks instead of assistant text (#395).
+    pub fn with_dsml_tool_calls(mut self, enabled: bool) -> Self {
+        self.dsml = enabled.then(DsmlStreamParser::default);
+        self
+    }
+
+    /// Turn DSML parser output into stream events. Tool-use blocks are
+    /// registered in `tool_call_buffers` so they are closed on finish like
+    /// native tool calls.
+    fn emit_dsml_segments(&mut self, segments: Vec<DsmlSegment>, out: &mut Vec<StreamEvent>) {
+        for segment in segments {
+            match segment {
+                DsmlSegment::Text(text) => out.push(StreamEvent::TextDelta { index: 0, text }),
+                DsmlSegment::ToolCall(call) => {
+                    let index = DSML_TOOL_BLOCK_BASE + self.dsml_tool_calls;
+                    self.dsml_tool_calls += 1;
+                    let id = new_tool_use_id();
+                    let args = Value::Object(call.input).to_string();
+                    out.push(StreamEvent::ContentBlockStart {
+                        index,
+                        content_block: ContentBlock::ToolUse {
+                            id: id.clone(),
+                            name: call.name.clone(),
+                            input: json!({}),
+                            thought_signature: None,
+                        },
+                    });
+                    out.push(StreamEvent::InputJsonDelta {
+                        index,
+                        partial_json: args.clone(),
+                    });
+                    self.tool_call_buffers.insert(index, (id, call.name, args));
+                }
+            }
+        }
+    }
+
+    /// Flush text still held by the DSML parser (a partial opener or an
+    /// unterminated envelope) so it is never lost when the message ends.
+    fn flush_dsml(&mut self, out: &mut Vec<StreamEvent>) {
+        let Some(parser) = self.dsml.as_mut() else {
+            return;
+        };
+        let mut segments = Vec::new();
+        parser.finish(&mut segments);
+        self.emit_dsml_segments(segments, out);
     }
 
     /// Feed one SSE line. See [`LineStreamDecoder::feed_line`].
@@ -66,6 +128,7 @@ impl OpenAiChatDecoder {
         };
 
         if data == "[DONE]" {
+            self.flush_dsml(out);
             out.push(StreamEvent::MessageStop);
             return true;
         }
@@ -188,10 +251,17 @@ impl OpenAiChatDecoder {
                     });
                     self.thinking_open = false;
                 }
-                out.push(StreamEvent::TextDelta {
-                    index: 0,
-                    text: content.to_string(),
-                });
+                match self.dsml.as_mut() {
+                    Some(parser) => {
+                        let mut segments = Vec::new();
+                        parser.push(content, &mut segments);
+                        self.emit_dsml_segments(segments, out);
+                    }
+                    None => out.push(StreamEvent::TextDelta {
+                        index: 0,
+                        text: content.to_string(),
+                    }),
+                }
             }
         }
 
@@ -259,6 +329,7 @@ impl OpenAiChatDecoder {
                     });
                     self.thinking_open = false;
                 }
+                self.flush_dsml(out);
                 out.push(StreamEvent::ContentBlockStop { index: 0 });
                 let mut tc_indices: Vec<usize> = self.tool_call_buffers.keys().cloned().collect();
                 tc_indices.sort();
@@ -266,7 +337,12 @@ impl OpenAiChatDecoder {
                     out.push(StreamEvent::ContentBlockStop { index: idx });
                 }
 
-                let stop_reason = OpenAiProvider::map_finish_reason_pub(finish_reason);
+                let mut stop_reason = OpenAiProvider::map_finish_reason_pub(finish_reason);
+                // DSML tool calls arrive as text, so providers report a plain
+                // "stop"; the turn still has to run the extracted tools.
+                if self.dsml_tool_calls > 0 && stop_reason == StopReason::EndTurn {
+                    stop_reason = StopReason::ToolUse;
+                }
                 let usage_val = chunk_json.get("usage");
                 let usage = usage_val.map(|u| OpenAiProvider::parse_usage_pub(Some(u)));
 
@@ -284,6 +360,7 @@ impl OpenAiChatDecoder {
     /// ended without an explicit `[DONE]` sentinel.
     pub fn finish(&mut self, out: &mut Vec<StreamEvent>) {
         if self.message_started {
+            self.flush_dsml(out);
             out.push(StreamEvent::MessageStop);
         }
     }
@@ -490,5 +567,175 @@ mod tests {
             out.as_slice(),
             [StreamEvent::MessageDelta { stop_reason: None, usage: Some(_) }]
         ));
+    }
+
+    /// SSE line carrying `content` as a delta.
+    fn content_line(content: &str) -> String {
+        format!(
+            "data: {}",
+            json!({"id": "c", "model": "deepseek-v4-flash", "choices": [{"delta": {"content": content}}]})
+        )
+    }
+
+    const DSML_ENVELOPE: &str = concat!(
+        "<｜DSML｜tool_calls>\n",
+        "<｜DSML｜invoke name=\"read_file\">\n",
+        "<｜DSML｜parameter name=\"path\" string=\"true\">a.rs</｜DSML｜parameter>\n",
+        "</｜DSML｜invoke>\n",
+        "<｜DSML｜invoke name=\"bash\">\n",
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n",
+        "<｜DSML｜parameter name=\"timeout\" string=\"false\">30</｜DSML｜parameter>\n",
+        "</｜DSML｜invoke>\n",
+        "</｜DSML｜tool_calls>",
+    );
+
+    fn text_deltas(events: &[StreamEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta { index: 0, text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// (index, id, name, assembled args) for every tool-use block opened.
+    fn tool_uses(events: &[StreamEvent]) -> Vec<(usize, String, String, Value)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ContentBlockStart {
+                    index,
+                    content_block: ContentBlock::ToolUse { id, name, .. },
+                } => {
+                    let args: String = events
+                        .iter()
+                        .filter_map(|e| match e {
+                            StreamEvent::InputJsonDelta { index: i, partial_json } if i == index => {
+                                Some(partial_json.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    let args = serde_json::from_str(&args).expect("tool args are valid JSON");
+                    Some((*index, id.clone(), name.clone(), args))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assert_dsml_tool_uses(events: &[StreamEvent]) {
+        let tools = tool_uses(events);
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].2, "read_file");
+        assert_eq!(tools[0].3, json!({"path": "a.rs"}));
+        assert_eq!(tools[1].2, "bash");
+        assert_eq!(tools[1].3, json!({"command": "ls", "timeout": 30}));
+        assert_ne!(tools[0].1, tools[1].1, "synthesized ids must be unique");
+        assert!(tools.iter().all(|t| t.1.starts_with("call_")));
+        for (index, ..) in &tools {
+            assert!(events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ContentBlockStop { index: i } if i == index)));
+        }
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::MessageDelta { stop_reason: Some(StopReason::ToolUse), .. }
+        )));
+        let text_stop = events
+            .iter()
+            .position(|e| matches!(e, StreamEvent::ContentBlockStop { index: 0 }));
+        let last_text = events
+            .iter()
+            .rposition(|e| matches!(e, StreamEvent::TextDelta { .. }));
+        assert!(last_text < text_stop, "all text precedes the text block stop");
+    }
+
+    #[test]
+    fn dsml_envelope_across_many_deltas_becomes_tool_calls() {
+        let full = format!("I'll check.\n{DSML_ENVELOPE}\nThen report.");
+        let chars: Vec<char> = full.chars().collect();
+        let mut lines: Vec<String> = chars
+            .chunks(3)
+            .map(|c| content_line(&c.iter().collect::<String>()))
+            .collect();
+        lines.push(r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#.to_string());
+        lines.push("data: [DONE]".to_string());
+
+        let mut d = OpenAiChatDecoder::new(None).with_dsml_tool_calls(true);
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let (events, done) = drain(&mut d, &refs);
+        assert!(done);
+        assert_eq!(text_deltas(&events), "I'll check.\n\nThen report.");
+        assert_dsml_tool_uses(&events);
+    }
+
+    /// Bytes split anywhere (including inside the 3-byte fullwidth bars) are
+    /// reassembled by the SSE byte decoder before DSML parsing.
+    #[test]
+    fn dsml_envelope_survives_byte_level_splits() {
+        let mut wire = String::new();
+        for piece in ["ok ", DSML_ENVELOPE] {
+            wire.push_str(&content_line(piece));
+            wire.push('\n');
+        }
+        wire.push_str("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n");
+
+        let mut bytes = crate::SseByteDecoder::new();
+        let mut d = OpenAiChatDecoder::new(None).with_dsml_tool_calls(true);
+        let mut events = Vec::new();
+        for byte in wire.as_bytes() {
+            for line in bytes.push(std::slice::from_ref(byte)) {
+                d.feed_line(&line, &mut events);
+            }
+        }
+        d.finish(&mut events);
+        assert_eq!(text_deltas(&events), "ok ");
+        assert_dsml_tool_uses(&events);
+    }
+
+    #[test]
+    fn dsml_disabled_passes_envelope_through_as_text() {
+        let line = content_line(DSML_ENVELOPE);
+        let mut d = OpenAiChatDecoder::new(None);
+        let (events, _) = drain(
+            &mut d,
+            &[&line, r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#],
+        );
+        assert_eq!(text_deltas(&events), DSML_ENVELOPE);
+        assert!(tool_uses(&events).is_empty());
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::MessageDelta { stop_reason: Some(StopReason::EndTurn), .. }
+        )));
+    }
+
+    #[test]
+    fn unterminated_dsml_is_flushed_as_text_before_message_stop() {
+        let partial = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"bash\">";
+        let first = content_line("Trying ");
+        let second = content_line(partial);
+        let mut d = OpenAiChatDecoder::new(None).with_dsml_tool_calls(true);
+        let (events, done) = drain(&mut d, &[&first, &second, "data: [DONE]"]);
+        assert!(done);
+        assert_eq!(text_deltas(&events), format!("Trying {partial}"));
+        assert!(tool_uses(&events).is_empty());
+        assert!(matches!(events.last(), Some(StreamEvent::MessageStop)));
+    }
+
+    #[test]
+    fn unterminated_dsml_is_flushed_on_finish_reason() {
+        let partial = content_line("<｜DSML｜tool_calls><｜DSML｜inv");
+        let mut d = OpenAiChatDecoder::new(None).with_dsml_tool_calls(true);
+        let (events, _) = drain(
+            &mut d,
+            &[&partial, r#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#],
+        );
+        assert_eq!(text_deltas(&events), "<｜DSML｜tool_calls><｜DSML｜inv");
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::MessageDelta { stop_reason: Some(StopReason::MaxTokens), .. }
+        )));
     }
 }
