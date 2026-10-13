@@ -1013,7 +1013,6 @@ pub mod config {
 
     /// Top-level configuration values, merged from CLI args + settings file + env.
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-    #[serde(default)]
     pub struct Config {
         pub api_key: Option<String>,
         pub model: Option<String>,
@@ -1166,11 +1165,23 @@ pub mod config {
         }
         #[test]
         fn deserialize_status_line_in_settings() {
-            let json = r#"{"config": {"statusLine": {"command": "date '+%H:%M:%S'", "pollIntervalMs": 1000, "padding": 1}}}"#;
-            let settings: Settings = serde_json::from_str(json).unwrap();
+            // `Config` has no blanket `#[serde(default)]`, so `statusLine` is
+            // added to an otherwise complete settings file, as written by `save()`.
+            let mut value = serde_json::to_value(Settings::default()).unwrap();
+            value["config"]["statusLine"] = serde_json::json!({
+                "command": "date '+%H:%M:%S'",
+                "pollIntervalMs": 1000,
+                "padding": 1
+            });
+            let settings: Settings = serde_json::from_value(value).unwrap();
             let sl = settings.config.status_line.unwrap();
             assert_eq!(sl.command, "date '+%H:%M:%S'");
             assert_eq!(sl.poll_interval_ms, Some(1000));
+        }
+        #[test]
+        fn unset_status_line_is_not_serialized() {
+            let value = serde_json::to_value(Settings::default()).unwrap();
+            assert!(value["config"].get("statusLine").is_none());
         }
         #[test]
         fn project_cannot_override_global_status_line() {
