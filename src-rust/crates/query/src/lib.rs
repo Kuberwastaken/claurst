@@ -270,6 +270,9 @@ pub enum QueryEvent {
     /// `state` is Warning (≥ 80 %) or Critical (≥ 95 %).
     /// `pct_used` is the fraction of the context window consumed (0.0–1.0).
     TokenWarning { state: TokenWarningState, pct_used: f64 },
+    /// Provider-reported subscription usage (0-100 per window), e.g. the
+    /// Codex `x-codex-*` rate-limit headers.
+    RateLimits { primary_used_percent: Option<f32>, secondary_used_percent: Option<f32> },
 }
 
 // ---------------------------------------------------------------------------
@@ -1007,12 +1010,25 @@ pub async fn run_query_loop(
                         } else {
                             None
                         },
-                        provider_options: build_provider_options(
-                            &provider_id_str,
-                            &model_id_str,
-                            effective_effort_level,
-                            effective_thinking_budget,
-                        ),
+                        provider_options: {
+                            let mut options = build_provider_options(
+                                &provider_id_str,
+                                &model_id_str,
+                                effective_effort_level,
+                                effective_thinking_budget,
+                            );
+                            // ChatGPT routes its prompt cache on a stable
+                            // per-session key (official client: session id).
+                            if matches!(provider_id_str.as_str(), "codex" | "openai-codex") {
+                                if let Some(map) = options.as_object_mut() {
+                                    map.insert(
+                                        "prompt_cache_key".to_string(),
+                                        serde_json::json!(tool_ctx.session_id),
+                                    );
+                                }
+                            }
+                            options
+                        },
                     };
 
                     // Use create_message_stream so the TUI receives real-time
@@ -1119,6 +1135,14 @@ pub async fn run_query_loop(
                                                 }
                                             }
                                             claurst_api::StreamEvent::MessageStop => break,
+                                            claurst_api::StreamEvent::RateLimits { primary_used_percent, secondary_used_percent } => {
+                                                if let Some(ref tx) = event_tx {
+                                                    let _ = tx.send(QueryEvent::RateLimits {
+                                                        primary_used_percent: *primary_used_percent,
+                                                        secondary_used_percent: *secondary_used_percent,
+                                                    });
+                                                }
+                                            }
                                             _ => {}
                                         }
                                     }

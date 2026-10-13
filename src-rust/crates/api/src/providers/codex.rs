@@ -249,21 +249,48 @@ impl CodexProvider {
     // Request helpers
     // -----------------------------------------------------------------------
 
+    /// Auth and routing headers for a Codex request. `body` supplies the
+    /// `session-id` header: ChatGPT derives prompt-cache affinity from it, and
+    /// the official client sets it to the same value as `prompt_cache_key`.
     fn codex_headers(
         &self,
         builder: reqwest::RequestBuilder,
         token: &str,
         account_id: Option<&str>,
+        body: &Value,
     ) -> reqwest::RequestBuilder {
-        let builder = builder
+        let mut builder = builder
             .bearer_auth(token)
             .header("User-Agent", concat!("claurst/", env!("CARGO_PKG_VERSION")));
 
         if let Some(id) = account_id {
-            builder.header("ChatGPT-Account-Id", id)
-        } else {
-            builder
+            builder = builder.header("ChatGPT-Account-Id", id);
         }
+        if let Some(session_id) = body.get("prompt_cache_key").and_then(Value::as_str) {
+            builder = builder.header("session-id", session_id);
+        }
+        builder
+    }
+
+    /// Parse the `x-codex-{primary,secondary}-used-percent` headers (official
+    /// `codex-api/src/rate_limits.rs`). `None` when neither is present.
+    fn parse_rate_limits(headers: &reqwest::header::HeaderMap) -> Option<StreamEvent> {
+        let used = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|pct| pct.is_finite())
+        };
+        let primary_used_percent = used("x-codex-primary-used-percent");
+        let secondary_used_percent = used("x-codex-secondary-used-percent");
+        if primary_used_percent.is_none() && secondary_used_percent.is_none() {
+            return None;
+        }
+        Some(StreamEvent::RateLimits {
+            primary_used_percent,
+            secondary_used_percent,
+        })
     }
 
     fn account_id(&self) -> Option<String> {
@@ -353,7 +380,7 @@ impl CodexProvider {
             .post(CODEX_API_ENDPOINT)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json");
-        let builder = self.codex_headers(builder, &token, account_id.as_deref());
+        let builder = self.codex_headers(builder, &token, account_id.as_deref(), &body);
 
         let resp = builder
             .json(&body)
@@ -403,7 +430,7 @@ impl CodexProvider {
             .post(CODEX_API_ENDPOINT)
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream");
-        let builder = self.codex_headers(builder, &token, account_id.as_deref());
+        let builder = self.codex_headers(builder, &token, account_id.as_deref(), &body);
 
         let resp = builder
             .json(&body)
@@ -598,8 +625,12 @@ impl LlmProvider for CodexProvider {
     {
         let resp = self.send_responses_streaming_request(&request).await?;
         let provider_id = self.id.clone();
+        let rate_limits = Self::parse_rate_limits(resp.headers());
 
         let s = stream! {
+            if let Some(event) = rate_limits {
+                yield Ok(event);
+            }
             let mut byte_stream = resp.bytes_stream();
             let mut leftover = String::new();
             let mut current_event = String::new();
@@ -1023,6 +1054,38 @@ mod tests {
 
         let body = CodexProvider::build_responses_body(&request(None));
         assert_eq!(body["input"][0]["role"], "user");
+    }
+
+    #[test]
+    fn prompt_cache_key_option_reaches_body() {
+        let mut req = request(None);
+        req.provider_options = json!({ "prompt_cache_key": "session-abc" });
+        let body = CodexProvider::build_responses_body(&req);
+        assert_eq!(body["prompt_cache_key"], "session-abc");
+    }
+
+    #[test]
+    fn parses_codex_rate_limit_headers() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut headers = HeaderMap::new();
+        headers.insert("x-codex-primary-used-percent", HeaderValue::from_static("12.5"));
+        headers.insert("x-codex-primary-window-minutes", HeaderValue::from_static("300"));
+        headers.insert("x-codex-secondary-used-percent", HeaderValue::from_static("71"));
+        match CodexProvider::parse_rate_limits(&headers) {
+            Some(StreamEvent::RateLimits {
+                primary_used_percent,
+                secondary_used_percent,
+            }) => {
+                assert_eq!(primary_used_percent, Some(12.5));
+                assert_eq!(secondary_used_percent, Some(71.0));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let mut partial = HeaderMap::new();
+        partial.insert("x-codex-secondary-used-percent", HeaderValue::from_static("garbage"));
+        assert!(CodexProvider::parse_rate_limits(&partial).is_none());
+        assert!(CodexProvider::parse_rate_limits(&HeaderMap::new()).is_none());
     }
 
     #[test]

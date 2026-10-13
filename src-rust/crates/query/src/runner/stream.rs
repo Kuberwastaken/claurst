@@ -74,6 +74,7 @@ pub(crate) fn map_to_anthropic_event(
             })
         }
         StreamEvent::MessageStop => Some(AnthropicStreamEvent::MessageStop),
+        StreamEvent::RateLimits { .. } => None,
         StreamEvent::Error { error_type, message } => {
             Some(AnthropicStreamEvent::Error {
                 error_type: error_type.clone(),
