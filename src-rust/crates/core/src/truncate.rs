@@ -42,6 +42,25 @@ pub fn truncate_tool_output(text: &str, max_chars: usize) -> (String, bool) {
     )
 }
 
+/// Keep the first and last `max_bytes / 2` bytes of `text` around a marker
+/// naming how many bytes were dropped. Both cuts land on char boundaries, so
+/// multibyte output at the cut point never panics (#442). Returns `text`
+/// unchanged when it already fits.
+pub fn truncate_middle(text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let half = max_bytes / 2;
+    let head_end = text.floor_char_boundary(half);
+    let tail_start = text.ceil_char_boundary(text.len() - half);
+    format!(
+        "{}\n\n... ({} bytes truncated) ...\n\n{}",
+        &text[..head_end],
+        tail_start - head_end,
+        &text[tail_start..]
+    )
+}
+
 /// Truncate a file path for display, keeping the filename and shortening the directory.
 pub fn truncate_path(path: &str, max_chars: usize) -> String {
     if path.len() <= max_chars {
@@ -79,6 +98,29 @@ mod tests {
         let t = truncate_text("hello world", 5);
         assert!(t.starts_with("hello"));
         assert!(t.contains("truncated"));
+    }
+
+    #[test]
+    fn truncate_middle_short_text_is_unchanged() {
+        assert_eq!(truncate_middle("hello".to_string(), 10), "hello");
+    }
+
+    /// #442: a multibyte char straddling either cut must not panic, and both
+    /// halves must stay valid UTF-8 slices of the input.
+    #[test]
+    fn truncate_middle_multibyte_at_cut_does_not_panic() {
+        // 'é' is 2 bytes and '€' is 3, so every byte offset is hit by a cut
+        // somewhere across these lengths.
+        for max in 1..40 {
+            let text = "é€".repeat(20);
+            let out = truncate_middle(text.clone(), max);
+            assert!(out.contains("bytes truncated"), "max={max}: {out}");
+            let (head, rest) = out.split_once("\n\n... (").unwrap();
+            let (_, tail) = rest.split_once(") ...\n\n").unwrap();
+            assert!(text.starts_with(head));
+            assert!(text.ends_with(tail));
+            assert!(head.len() <= max / 2 && tail.len() <= max / 2);
+        }
     }
 
     #[test]

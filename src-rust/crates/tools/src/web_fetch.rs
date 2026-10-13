@@ -378,9 +378,10 @@ impl Tool for WebFetchTool {
         // Truncate very long content
         const MAX_LEN: usize = 100_000;
         let text = if text.len() > MAX_LEN {
+            // Cut on a char boundary so multibyte pages cannot panic (#442).
             format!(
                 "{}\n\n... (truncated, {} total characters)",
-                &text[..MAX_LEN],
+                &text[..text.floor_char_boundary(MAX_LEN)],
                 text.len()
             )
         } else {

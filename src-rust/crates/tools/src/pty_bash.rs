@@ -148,7 +148,7 @@ fn apply_restored_env(cmd: &mut portable_pty::CommandBuilder, env_vars: &HashMap
 // ---------------------------------------------------------------------------
 
 async fn run_in_background(command: String, cwd: PathBuf, timeout_ms: u64) -> ToolResult {
-    let task_name = format!("bg: {}", &command[..command.len().min(60)]);
+    let task_name = format!("bg: {}", &command[..command.floor_char_boundary(60)]);
     let mut task = BackgroundTask::new(&task_name);
     task.pid = None;
     let task_id = global_registry().register(task);
@@ -698,19 +698,9 @@ async fn run_windows_fallback(
 // Shared output truncation helper
 // ---------------------------------------------------------------------------
 
-fn truncate_output(mut output: String, exit_code: i32) -> ToolResult {
+fn truncate_output(output: String, exit_code: i32) -> ToolResult {
     const MAX_OUTPUT_LEN: usize = 100_000;
-    if output.len() > MAX_OUTPUT_LEN {
-        let half = MAX_OUTPUT_LEN / 2;
-        let start = output[..half].to_string();
-        let end = output[output.len() - half..].to_string();
-        output = format!(
-            "{}\n\n... ({} characters truncated) ...\n\n{}",
-            start,
-            output.len() - MAX_OUTPUT_LEN,
-            end
-        );
-    }
+    let output = claurst_core::truncate::truncate_middle(output, MAX_OUTPUT_LEN);
 
     if exit_code != 0 {
         ToolResult::error(format!("Command exited with code {}\n{}", exit_code, output))
@@ -974,6 +964,18 @@ mod tests {
                 "secret value leaked into CommandBuilder argv: {arg:?}"
             );
         }
+    }
+
+    /// #442: output whose cut point lands inside a multibyte char used to panic
+    /// on a byte-offset slice. 'é' is 2 bytes; the leading ASCII byte puts every
+    /// char boundary on an odd offset, so the 50 000-byte head cut splits one.
+    #[test]
+    fn truncate_output_multibyte_at_cut_does_not_panic() {
+        let output = format!("a{}", "é".repeat(60_000));
+        let result = truncate_output(output, 0);
+        assert!(!result.is_error);
+        assert!(result.content.contains("bytes truncated"));
+        assert!(result.content.starts_with('a') && result.content.ends_with('é'));
     }
 
     // -----------------------------------------------------------------------
