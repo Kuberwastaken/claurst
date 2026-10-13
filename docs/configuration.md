@@ -73,6 +73,7 @@ The `config` object holds runtime behaviour options.
 | `model` | string \| null | provider default | Model ID to use. When absent, the provider's default is used (e.g. `claude-sonnet-4-6` for Anthropic, `gpt-4o` for OpenAI). |
 | `max_tokens` | integer \| null | 8192 | Maximum tokens per model response. |
 | `provider` | string \| null | `"anthropic"` | Active provider. See the [Providers](#providers) section. |
+| `degradationSummaryEnabled` | boolean \| null | null (on) | When set to `false`, exceeding `max_turns` returns the last assistant message immediately instead of running one final tool-less degradation summary turn. Applies to sub-agents as well. Unset means enabled. Note the camelCase key. |
 
 ### Permission mode
 
@@ -97,7 +98,6 @@ See [Permission Modes](#permission-modes) for a full description of each value.
 |-----|------|---------|-------------|
 | `auto_compact` | boolean | true | Automatically compact the conversation context when the context window nears capacity. |
 | `compact_threshold` | float | 0.85 | Fraction of the context window that triggers auto-compaction (0.0–1.0). |
-| `degradation_summary_enabled` | boolean \| null | null (on) | When set to `false`, exceeding `max_turns` returns the last assistant message immediately instead of running one final tool-less degradation summary turn. Unset means enabled. |
 
 ### System prompt
 
