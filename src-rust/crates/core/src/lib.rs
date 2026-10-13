@@ -2628,41 +2628,40 @@ pub mod permissions {
                     Ok(pat) => pat,
                     Err(_) => return false,
                 };
-                if !pat.matches(p) && !Self::canonical_prefix_matches(pattern, p) {
+                if !pat.matches(p) {
                     return false;
                 }
             }
             true
         }
+    }
 
-        /// Retry an absolute glob whose literal directory prefix goes through
-        /// a symlink (e.g. `/tmp` on macOS, or a symlinked project directory)
-        /// against the canonical form of that prefix. Rules are stored from
-        /// the lexical path the user approved, while tools re-check the real
-        /// location of the file they opened (#415); both must match the same
-        /// rule. The final component is never resolved.
-        fn canonical_prefix_matches(pattern: &str, path: &str) -> bool {
-            if !std::path::Path::new(pattern).is_absolute() {
-                return false;
-            }
-            let literal_end = pattern.find(['*', '?', '[']).unwrap_or(pattern.len());
-            let Some(split) = pattern[..literal_end].rfind(['/', std::path::MAIN_SEPARATOR]) else {
-                return false;
-            };
-            if split == 0 {
-                return false;
-            }
-            let (dir, rest) = pattern.split_at(split);
-            let Ok(canonical_dir) = std::fs::canonicalize(dir) else {
-                return false;
-            };
-            let canonical_dir = canonical_dir.to_string_lossy();
-            if canonical_dir == dir {
-                return false;
-            }
-            let rebuilt = format!("{}{}", glob::Pattern::escape(&canonical_dir), rest);
-            glob::Pattern::new(&rebuilt).is_ok_and(|pat| pat.matches(path))
+    /// The canonical form of an absolute glob whose literal directory prefix
+    /// goes through a symlink (e.g. `/tmp` on macOS, or a symlinked project
+    /// directory), or `None` when the prefix is already canonical or cannot
+    /// be resolved. The final component is never resolved.
+    ///
+    /// Path rules are created from the lexical path a user approved, while
+    /// tools re-check the real location of the file they opened (#415). This
+    /// runs once when a rule is created, so the filesystem at that moment
+    /// decides what the rule covers; matching itself stays pure string
+    /// matching, and a later swap of the prefix cannot widen the rule.
+    fn canonical_prefix_pattern(pattern: &str) -> Option<String> {
+        if !std::path::Path::new(pattern).is_absolute() {
+            return None;
         }
+        let literal_end = pattern.find(['*', '?', '[']).unwrap_or(pattern.len());
+        let split = pattern[..literal_end].rfind(['/', std::path::MAIN_SEPARATOR])?;
+        if split == 0 {
+            return None;
+        }
+        let (dir, rest) = pattern.split_at(split);
+        let canonical_dir = std::fs::canonicalize(dir).ok()?;
+        let canonical_dir = canonical_dir.to_string_lossy();
+        if canonical_dir == dir {
+            return None;
+        }
+        Some(format!("{}{}", glob::Pattern::escape(&canonical_dir), rest))
     }
 
     // -----------------------------------------------------------------------
@@ -2959,13 +2958,20 @@ pub mod permissions {
         }
 
         /// Allow `tool_name` on `path` (glob) for the rest of this session.
+        ///
+        /// When the glob's directory prefix goes through a symlink, a second
+        /// rule with the canonical prefix (resolved now) is added so the rule
+        /// also covers the real path tools re-check after opening (#415).
         pub fn add_session_allow_path(&mut self, tool_name: &str, path: &str) {
-            self.session_rules.push(PermissionRule {
-                tool_name: Some(tool_name.to_string()),
-                path_pattern: Some(path.to_string()),
-                action: PermissionAction::Allow,
-                scope: PermissionScope::Session,
-            });
+            let canonical = canonical_prefix_pattern(path);
+            for pattern in std::iter::once(path.to_string()).chain(canonical) {
+                self.session_rules.push(PermissionRule {
+                    tool_name: Some(tool_name.to_string()),
+                    path_pattern: Some(pattern),
+                    action: PermissionAction::Allow,
+                    scope: PermissionScope::Session,
+                });
+            }
         }
 
         /// Allow `tool_name` persistently and save to settings.
@@ -2990,24 +2996,33 @@ pub mod permissions {
         }
 
         /// Allow `tool_name` persistently on `path` and save settings.
+        ///
+        /// Like [`Self::add_session_allow_path`], a glob whose directory
+        /// prefix goes through a symlink is also stored with the canonical
+        /// prefix resolved now (#415).
         pub fn add_persistent_allow_path(
             &mut self,
             tool_name: &str,
             path: &str,
             settings: &mut crate::config::Settings,
         ) -> crate::error::Result<()> {
-            let rule = PermissionRule {
-                tool_name: Some(tool_name.to_string()),
-                path_pattern: Some(path.to_string()),
-                action: PermissionAction::Allow,
-                scope: PermissionScope::Persistent,
-            };
-            let serialized = SerializedPermissionRule::from(&rule);
-            settings.permission_rules.push(serialized);
+            let canonical = canonical_prefix_pattern(path);
+            let rules: Vec<PermissionRule> = std::iter::once(path.to_string())
+                .chain(canonical)
+                .map(|pattern| PermissionRule {
+                    tool_name: Some(tool_name.to_string()),
+                    path_pattern: Some(pattern),
+                    action: PermissionAction::Allow,
+                    scope: PermissionScope::Persistent,
+                })
+                .collect();
+            settings
+                .permission_rules
+                .extend(rules.iter().map(SerializedPermissionRule::from));
             settings
                 .save_sync()
                 .map_err(|e| crate::error::ClaudeError::Config(e.to_string()))?;
-            self.persistent_rules.push(rule);
+            self.persistent_rules.extend(rules);
             Ok(())
         }
 
@@ -3410,28 +3425,46 @@ pub mod permissions {
             );
         }
 
-        /// #415: a rule stored from a lexical path whose directory is a
-        /// symlink must also match the canonical path tools re-check.
+        /// #415: a rule created through a symlinked directory also covers the
+        /// canonical path tools re-check, resolved when the rule is created.
+        /// Re-pointing the alias afterwards must not widen the rule.
         #[cfg(unix)]
         #[test]
-        fn glob_rule_with_symlinked_prefix_matches_canonical_path() {
+        fn path_rule_via_symlinked_dir_resolves_at_creation() {
             let dir = tempfile::tempdir().unwrap();
-            let real = std::fs::canonicalize(dir.path()).unwrap().join("real");
+            let root = std::fs::canonicalize(dir.path()).unwrap();
+            let real = root.join("real");
+            let other = root.join("other");
             std::fs::create_dir(&real).unwrap();
-            let alias = dir.path().join("alias");
+            std::fs::create_dir(&other).unwrap();
+            let alias = root.join("alias");
             std::os::unix::fs::symlink(&real, &alias).unwrap();
-            let rule = PermissionRule {
-                tool_name: Some("Edit".to_string()),
-                path_pattern: Some(format!("{}/*", alias.display())),
-                action: PermissionAction::Allow,
-                scope: PermissionScope::Session,
-            };
-            let lexical = format!("{}/notes.txt", alias.display());
-            let canonical = format!("{}/notes.txt", real.display());
-            assert!(rule.matches("Edit", Some(&lexical)));
-            assert!(rule.matches("Edit", Some(&canonical)));
-            assert!(!rule.matches("Edit", Some("/etc/hosts")));
-            assert!(!rule.matches("Read", Some(&canonical)));
+
+            let mut m = mgr(PermissionMode::Default);
+            m.add_session_allow_path("Edit", &format!("{}/*", alias.display()));
+            let real_file = format!("{}/notes.txt", real.display());
+            let other_file = format!("{}/notes.txt", other.display());
+            assert_eq!(
+                m.evaluate("Edit", "edit", Some(&real_file), None, &[]),
+                PermissionDecision::Allow
+            );
+
+            // Attacker re-points the alias after the rule exists.
+            std::fs::remove_file(&alias).unwrap();
+            std::os::unix::fs::symlink(&other, &alias).unwrap();
+
+            match m.evaluate("Edit", "edit", Some(&other_file), None, &[]) {
+                PermissionDecision::Ask { .. } => {}
+                d => panic!("re-pointed alias widened the rule: {:?}", d),
+            }
+            match m.evaluate("Edit", "edit", Some("/etc/hosts"), None, &[]) {
+                PermissionDecision::Ask { .. } => {}
+                d => panic!("unexpected decision: {:?}", d),
+            }
+            assert_eq!(
+                m.evaluate("Edit", "edit", Some(&real_file), None, &[]),
+                PermissionDecision::Allow
+            );
         }
 
         #[test]
