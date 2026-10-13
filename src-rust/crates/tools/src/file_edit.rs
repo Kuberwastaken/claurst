@@ -5,6 +5,7 @@ use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
 use tracing::debug;
 
 pub struct FileEditTool;
@@ -82,22 +83,38 @@ impl Tool for FileEditTool {
         debug!(path = %path.display(), "Editing file");
 
         // Permission check
-        if let Err(e) = ctx.check_permission_for_path(
+        let grant = match ctx.check_permission_for_path(
             self.name(),
             &format!("Edit {}", path.display()),
             path.clone(),
             false,
         ) {
-            return ToolResult::error(e.to_string());
-        }
+            Ok(grant) => grant,
+            Err(e) => return ToolResult::error(e.to_string()),
+        };
 
-        // Read current content
-        let content = match tokio::fs::read_to_string(&path).await {
-            Ok(c) => c,
+        // Open once and re-check where the handle really points; the read
+        // and the write below are bound to this handle, so a symlink swapped
+        // in after the permission check cannot redirect the edit (#415).
+        let mut file = match tokio::fs::File::open(&path).await {
+            Ok(f) => f,
             Err(e) => {
                 return ToolResult::error(format!("Failed to read file {}: {}", path.display(), e));
             }
         };
+        let real = match ctx
+            .confirm_opened_path(self.name(), "Edit", &path, &file, grant, false)
+            .await
+        {
+            Ok(real) => real,
+            Err(e) => return ToolResult::error(e),
+        };
+
+        // Read current content
+        let mut content = String::new();
+        if let Err(e) = file.read_to_string(&mut content).await {
+            return ToolResult::error(format!("Failed to read file {}: {}", path.display(), e));
+        }
 
         // Detect the file's original/dominant line ending BEFORE editing so we
         // can re-apply it on write (#225).  Matching is done against an
@@ -140,8 +157,8 @@ impl Tool for FileEditTool {
             params.replace_all,
         );
 
-        // Write back
-        if let Err(e) = crate::write_atomic(&path, new_content.as_bytes()).await {
+        // Write back atomically into the directory that holds the opened file.
+        if let Err(e) = crate::write_atomic_bound(&file, &real, new_content.as_bytes()).await {
             return ToolResult::error(format!("Failed to write file {}: {}", path.display(), e));
         }
 
@@ -228,5 +245,90 @@ mod tests {
         let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(after, "line one\nLINE TWO\nline three\n");
         assert!(!after.contains('\r'), "LF file gained a CR: {:?}", after);
+    }
+
+    /// Workspace `ws/` with `notes.txt`, a sibling `outside/secret.txt` with
+    /// the same text, and a manager whose only allowance is a session rule for
+    /// `Edit` on `ws/*`.
+    #[cfg(unix)]
+    fn edit_fixture(
+        dir: &tempfile::TempDir,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        claurst_core::permissions::PermissionManager,
+    ) {
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let ws = root.join("ws");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let notes = ws.join("notes.txt");
+        let secret = outside.join("secret.txt");
+        std::fs::write(&notes, "token = old\n").unwrap();
+        std::fs::write(&secret, "token = old\n").unwrap();
+        let mut manager = claurst_core::permissions::PermissionManager::new(
+            claurst_core::config::PermissionMode::Default,
+            &claurst_core::config::Settings::default(),
+        );
+        manager.add_session_allow_path("Edit", &format!("{}/*", ws.display()));
+        (ws, notes, secret, manager)
+    }
+
+    /// #415: a file swapped for a symlink to a host file right after the
+    /// permission check must not have the edit land on that host file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_refuses_symlink_swapped_in_after_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, notes, secret, manager) = edit_fixture(&dir);
+        let handler = crate::test_support::SwapAfterCheckHandler::new(
+            manager,
+            Some((notes.clone(), secret.clone())),
+        );
+        let ctx = crate::test_support::context_with_handler(ws, std::sync::Arc::new(handler));
+
+        let res = FileEditTool
+            .execute(
+                json!({
+                    "file_path": notes.to_string_lossy(),
+                    "old_string": "old",
+                    "new_string": "pwned",
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(res.is_error, "swapped edit was allowed: {}", res.content);
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), "token = old\n");
+    }
+
+    /// The same rule still allows a normal in-workspace edit, written back
+    /// atomically through the directory of the opened file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_allowed_by_rule_still_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, notes, _secret, manager) = edit_fixture(&dir);
+        let handler = crate::test_support::SwapAfterCheckHandler::new(manager, None);
+        let ctx = crate::test_support::context_with_handler(ws.clone(), std::sync::Arc::new(handler));
+
+        let res = FileEditTool
+            .execute(
+                json!({
+                    "file_path": notes.to_string_lossy(),
+                    "old_string": "old",
+                    "new_string": "new",
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(!res.is_error, "edit failed: {}", res.content);
+        assert_eq!(std::fs::read_to_string(&notes).unwrap(), "token = new\n");
+        let leftovers = std::fs::read_dir(&ws)
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".claurst-tmp-"))
+            .count();
+        assert_eq!(leftovers, 0, "temp file left behind");
     }
 }
