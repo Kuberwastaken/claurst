@@ -1,5 +1,7 @@
-// FileEdit tool: exact string replacement with old/new strings (like sed but
-// deterministic).  Mirrors the TypeScript Edit tool behaviour.
+// FileEdit tool: string replacement with old/new strings (like sed but
+// deterministic).  Matching is exact first; when that finds nothing, a
+// second tier matches whole lines while ignoring line endings and trailing
+// whitespace, and a miss reports the closest region of the file (#443).
 
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
@@ -29,10 +31,17 @@ impl Tool for FileEditTool {
     }
 
     fn description(&self) -> &str {
-        "Performs exact string replacements in files. The edit will FAIL if \
-         `old_string` is not unique in the file (unless `replace_all` is true). \
-         You MUST read the file first before editing. Preserve the exact \
-         indentation as it appears in the file."
+        "Performs exact string replacements in files. You MUST Read the file \
+         first. When copying text from Read output, keep the exact indentation \
+         and omit the line-number prefix (the \"12<TAB>\" before each line); \
+         never include it in old_string or new_string. Write line breaks as \\n; \
+         the file's existing CRLF or LF endings are preserved. If there is no \
+         exact match, whole lines are matched ignoring line endings and trailing \
+         whitespace, and the result says so. Either way the match must be unique \
+         (unless replace_all=true for an exact match); if old_string is not \
+         found, the error shows the closest region of the file with line \
+         numbers. Add surrounding context to disambiguate, or set \
+         replace_all=true to change every occurrence (e.g. renaming a symbol)."
     }
 
     fn permission_level(&self) -> PermissionLevel {
@@ -70,12 +79,17 @@ impl Tool for FileEditTool {
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
 
+        // A BOM copied into the strings would be duplicated or never match;
+        // the file's own BOM is handled below.
+        let old_string = params.old_string.strip_prefix('\u{feff}').unwrap_or(&params.old_string);
+        let new_string = params.new_string.strip_prefix('\u{feff}').unwrap_or(&params.new_string);
+
         // Validate old != new
-        if params.old_string == params.new_string {
+        if old_string == new_string {
             return ToolResult::error("old_string and new_string must be different".to_string());
         }
 
-        if params.old_string.is_empty() {
+        if old_string.is_empty() {
             return ToolResult::error("old_string must not be empty".to_string());
         }
 
@@ -108,30 +122,28 @@ impl Tool for FileEditTool {
         };
 
         // Read current content
-        let mut content = String::new();
-        if let Err(e) = (&file).read_to_string(&mut content) {
+        let mut original = String::new();
+        if let Err(e) = (&file).read_to_string(&mut original) {
             return ToolResult::error(format!("Failed to read file {}: {}", path.display(), e));
         }
+
+        // Keep a UTF-8 BOM out of matching and put it back on write (#443).
+        let (bom, content) = match original.strip_prefix('\u{feff}') {
+            Some(rest) => ("\u{feff}", rest),
+            None => ("", original.as_str()),
+        };
 
         // Detect the file's original/dominant line ending BEFORE editing so we
         // can re-apply it on write (#225).  Matching is done against an
         // LF-normalized view so CRLF/LF differences never affect the match, but
         // only the lines the edit actually changes are ever rewritten.
-        let eol = crate::line_endings::LineEnding::detect(&content);
+        let eol = crate::line_endings::LineEnding::detect(content);
         let normalized = content.replace("\r\n", "\n");
-        let old_string = params.old_string.replace("\r\n", "\n");
-        let new_string = params.new_string.replace("\r\n", "\n");
+        let old_string = old_string.replace("\r\n", "\n");
+        let new_string = new_string.replace("\r\n", "\n");
 
-        // Count occurrences
+        // Tier 1: exact occurrences.
         let count = normalized.matches(&old_string).count();
-
-        if count == 0 {
-            return ToolResult::error(format!(
-                "old_string not found in {}. Make sure the string matches exactly, \
-                 including whitespace and indentation.",
-                path.display()
-            ));
-        }
 
         if count > 1 && !params.replace_all {
             return ToolResult::error(format!(
@@ -143,16 +155,50 @@ impl Tool for FileEditTool {
             ));
         }
 
-        // Perform the replacement on the ORIGINAL bytes, preserving every
-        // untouched region's line endings and re-rendering inserted lines with
-        // the file's dominant line ending.
-        let (new_content, _replacements) = crate::line_endings::replace_preserving_eol(
-            &content,
-            &old_string,
-            &new_string,
-            eol,
-            params.replace_all,
-        );
+        let (body, replacements, tier) = if count > 0 {
+            // Perform the replacement on the ORIGINAL bytes, preserving every
+            // untouched region's line endings and re-rendering inserted lines
+            // with the file's dominant line ending.
+            let (body, _) = crate::line_endings::replace_preserving_eol(
+                content,
+                &old_string,
+                &new_string,
+                eol,
+                params.replace_all,
+            );
+            (body, if params.replace_all { count } else { 1 }, "exact")
+        } else {
+            // Tier 2: whole lines, ignoring line endings and trailing whitespace.
+            match find_whitespace_normalized(content, &old_string) {
+                LineMatch::One { start, end } => {
+                    let body = format!("{}{}{}", &content[..start], eol.apply(&new_string), &content[end..]);
+                    (body, 1, "trailing_whitespace_normalized")
+                }
+                LineMatch::Many(n) => {
+                    return ToolResult::error(format!(
+                        "old_string has no exact match in {}, and ignoring trailing whitespace \
+                         it matches {} places. Copy old_string exactly from the file, with \
+                         enough surrounding lines to make it unique.",
+                        path.display(),
+                        n
+                    ));
+                }
+                LineMatch::None => {
+                    let hint = match closest_region(&normalized, &old_string) {
+                        Some(region) => format!("\n\n{}", region),
+                        None => "\n\nNo similar region was found; re-read the file.".to_string(),
+                    };
+                    return ToolResult::error(format!(
+                        "old_string not found in {}, even ignoring line endings and trailing \
+                         whitespace. Make sure the string matches exactly, including \
+                         indentation.{}",
+                        path.display(),
+                        hint
+                    ));
+                }
+            }
+        };
+        let new_content = format!("{}{}", bom, body);
 
         // Write back atomically into the directory that holds the opened file.
         if let Err(e) = crate::write_atomic_bound(&file, &real, new_content.as_bytes()).await {
@@ -161,7 +207,7 @@ impl Tool for FileEditTool {
 
         ctx.record_file_change(
             path.clone(),
-            content.as_bytes(),
+            original.as_bytes(),
             new_content.as_bytes(),
             self.name(),
         );
@@ -170,20 +216,134 @@ impl Tool for FileEditTool {
         // Format the file that was written, not whatever `path` names now.
         crate::try_format_file(&real.to_string_lossy(), ctx).await;
 
-        // Build a diff snippet for the response
-        let replacements = if params.replace_all { count } else { 1 };
         let msg = format!(
-            "Successfully edited {} ({} replacement{}).",
+            "Successfully edited {} ({} replacement{}{}).",
             path.display(),
             replacements,
-            if replacements != 1 { "s" } else { "" }
+            if replacements != 1 { "s" } else { "" },
+            if tier == "exact" { "" } else { "; matched after ignoring trailing whitespace" }
         );
 
         ToolResult::success(msg).with_metadata(json!({
             "file_path": path.display().to_string(),
             "replacements": replacements,
+            "match": tier,
         }))
     }
+}
+
+/// Result of the second-tier, whole-line match.
+#[derive(Debug, PartialEq, Eq)]
+enum LineMatch {
+    None,
+    /// The single match, as a byte span of the content.
+    One { start: usize, end: usize },
+    /// The number of places that matched; ambiguous, so not applied.
+    Many(usize),
+}
+
+/// Second tier (#443): match the LF-normalized `old` against whole lines of
+/// `content`, ignoring the line ending and trailing whitespace of every line.
+///
+/// The span covers the matched lines without the last line's terminator,
+/// unless `old` itself ends with a newline, mirroring what an exact match of
+/// the same text would replace.
+fn find_whitespace_normalized(content: &str, old: &str) -> LineMatch {
+    let (body, with_terminator) = match old.strip_suffix('\n') {
+        Some(body) => (body, true),
+        None => (old, false),
+    };
+    let wanted: Vec<&str> = body.split('\n').map(str::trim_end).collect();
+
+    // (byte offset, line including its terminator)
+    let mut lines: Vec<(usize, &str)> = Vec::new();
+    let mut offset = 0;
+    for raw in content.split_inclusive('\n') {
+        lines.push((offset, raw));
+        offset += raw.len();
+    }
+    if wanted.len() > lines.len() {
+        return LineMatch::None;
+    }
+
+    let mut first = None;
+    let mut matches = 0;
+    for i in 0..=lines.len() - wanted.len() {
+        if wanted.iter().zip(&lines[i..]).all(|(w, (_, raw))| raw.trim_end() == *w) {
+            matches += 1;
+            first.get_or_insert(i);
+        }
+    }
+    match (matches, first) {
+        (1, Some(i)) => {
+            let (last_offset, last) = lines[i + wanted.len() - 1];
+            let kept = if with_terminator {
+                last
+            } else {
+                last.trim_end_matches(['\n', '\r'])
+            };
+            LineMatch::One { start: lines[i].0, end: last_offset + kept.len() }
+        }
+        (0, _) | (_, None) => LineMatch::None,
+        (n, Some(_)) => LineMatch::Many(n),
+    }
+}
+
+/// Most line pairs [`closest_region`] compares, so a miss on a large file
+/// stays cheap; past it only a prefix of `old` is used to place the window.
+const MAX_HINT_COMPARISONS: usize = 20_000;
+
+/// The window of `normalized` most similar to `old`, rendered as numbered
+/// lines (as Read shows them) with two lines of context, or `None` when no
+/// window is at least half similar.
+fn closest_region(normalized: &str, old: &str) -> Option<String> {
+    let file: Vec<&str> = normalized.lines().collect();
+    let wanted: Vec<&str> = old.trim_end_matches('\n').split('\n').collect();
+    if file.is_empty() || file.len() > MAX_HINT_COMPARISONS * 5 {
+        return None;
+    }
+    let window = wanted.len().min(file.len());
+    let probe = &wanted[..window.min((MAX_HINT_COMPARISONS / file.len()).max(1))];
+
+    let line_similarity = |a: &str, b: &str| -> f32 {
+        let (a, b) = (a.trim(), b.trim());
+        if a == b {
+            1.0
+        } else {
+            similar::TextDiff::from_chars(a, b).ratio()
+        }
+    };
+    let mut best = (0usize, 0f32);
+    for i in 0..=file.len() - window {
+        let score = probe
+            .iter()
+            .zip(&file[i..])
+            .map(|(w, l)| line_similarity(w, l))
+            .sum::<f32>()
+            / probe.len() as f32;
+        if score > best.1 {
+            best = (i, score);
+        }
+    }
+    let (at, score) = best;
+    if score < 0.5 {
+        return None;
+    }
+
+    let from = at.saturating_sub(2);
+    let to = (at + window + 2).min(file.len()).min(from + 30);
+    let width = format!("{}", to).len();
+    let mut out = format!(
+        "Closest match is lines {}-{} ({:.0}% similar):\n",
+        at + 1,
+        at + window,
+        score * 100.0
+    );
+    for (n, line) in file[from..to].iter().enumerate() {
+        out.push_str(&format!("{:>width$}\t{}\n", from + n + 1, line, width = width));
+    }
+    out.push_str("Copy old_string from the file exactly and retry.");
+    Some(out)
 }
 
 #[cfg(test)]
@@ -243,6 +403,94 @@ mod tests {
         let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(after, "line one\nLINE TWO\nline three\n");
         assert!(!after.contains('\r'), "LF file gained a CR: {:?}", after);
+    }
+
+    async fn edit(path: &std::path::Path, old: &str, new: &str) -> ToolResult {
+        let ctx = allow_all_context(path.parent().unwrap().to_path_buf());
+        FileEditTool
+            .execute(
+                json!({ "file_path": path.to_string_lossy(), "old_string": old, "new_string": new }),
+                &ctx,
+            )
+            .await
+    }
+
+    /// #443: a UTF-8 BOM survives an edit and does not stop a first-line match.
+    #[tokio::test]
+    async fn edit_preserves_utf8_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bom.txt");
+        std::fs::write(&path, "\u{feff}first\r\nsecond\r\n").unwrap();
+
+        let res = edit(&path, "first", "FIRST").await;
+        assert!(!res.is_error, "edit failed: {}", res.content);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "\u{feff}FIRST\r\nsecond\r\n");
+
+        // A BOM copied into old_string still matches and is not doubled.
+        let res = edit(&path, "\u{feff}FIRST", "\u{feff}first").await;
+        assert!(!res.is_error, "edit failed: {}", res.content);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "\u{feff}first\r\nsecond\r\n");
+    }
+
+    /// #443: old_string with different trailing whitespace and line endings
+    /// matches whole lines in the second tier; untouched lines keep CRLF.
+    #[tokio::test]
+    async fn edit_matches_ignoring_trailing_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ws.rs");
+        std::fs::write(&path, "fn a() {\r\n    let x = 1;   \r\n    x\r\n}\r\n").unwrap();
+
+        let res = edit(&path, "fn a() {  \n    let x = 1;\n", "fn a() {\n    let x = 2;\n").await;
+        assert!(!res.is_error, "edit failed: {}", res.content);
+        assert!(res.content.contains("ignoring trailing whitespace"), "{}", res.content);
+        assert_eq!(res.metadata.unwrap()["match"], "trailing_whitespace_normalized");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "fn a() {\r\n    let x = 2;\r\n    x\r\n}\r\n"
+        );
+
+        // Without a trailing newline in old_string the last line's ending stays.
+        let res = edit(&path, "    x  ", "    x + 1").await;
+        assert!(!res.is_error, "edit failed: {}", res.content);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "fn a() {\r\n    let x = 2;\r\n    x + 1\r\n}\r\n"
+        );
+    }
+
+    /// #443: a second-tier match that hits more than one place is rejected.
+    #[tokio::test]
+    async fn edit_rejects_ambiguous_normalized_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dup.txt");
+        let original = "value = 1 \nother\nvalue = 1\t\n";
+        std::fs::write(&path, original).unwrap();
+
+        let res = edit(&path, "value = 1  ", "value = 2").await;
+        assert!(res.is_error, "ambiguous edit applied: {}", res.content);
+        assert!(res.content.contains("matches 2 places"), "{}", res.content);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    /// #443: a miss names the closest region with line numbers and context.
+    #[tokio::test]
+    async fn edit_miss_reports_closest_region() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hint.rs");
+        let original = "use std::io;\n\nfn main() {\n    let total = compute(1, 2);\n    println!(\"{}\", total);\n}\n\nfn other() {}\n";
+        std::fs::write(&path, original).unwrap();
+
+        let res = edit(&path, "    let totl = compute(1, 3);\n    println!(\"{}\", totl);", "x").await;
+        assert!(res.is_error);
+        assert!(res.content.contains("Closest match is lines 4-5"), "{}", res.content);
+        assert!(res.content.contains("4\t    let total = compute(1, 2);"), "{}", res.content);
+        assert!(res.content.contains("3\tfn main() {"), "context before: {}", res.content);
+        assert!(res.content.contains("6\t}"), "context after: {}", res.content);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        let res = edit(&path, "zzzz qqqq 9999", "x").await;
+        assert!(res.is_error);
+        assert!(res.content.contains("No similar region"), "{}", res.content);
     }
 
     /// Workspace `ws/` with `notes.txt`, a sibling `outside/secret.txt` with
