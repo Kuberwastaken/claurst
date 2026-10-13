@@ -116,16 +116,14 @@ impl Tool for FileReadTool {
 
         // Read text file through a handle whose real location has been
         // re-checked, never by re-resolving `path` (#415).
-        let mut file = match tokio::fs::File::open(&path).await {
+        let file = match crate::open_regular_file(&path) {
             Ok(f) => f,
             Err(e) => return ToolResult::error(format!("Failed to read file: {}", e)),
         };
-        if let Err(e) = ctx
-            .confirm_opened_path(self.name(), "Read", &path, &file, grant, true)
-            .await
-        {
+        if let Err(e) = ctx.confirm_opened_path(self.name(), "Read", &path, &file, grant, true) {
             return ToolResult::error(e);
         }
+        let mut file = tokio::fs::File::from_std(file);
         let mut content = String::new();
         if let Err(e) = file.read_to_string(&mut content).await {
             // Might be binary

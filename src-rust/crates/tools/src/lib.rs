@@ -284,7 +284,7 @@ pub(crate) async fn write_atomic(
 /// `write_atomic(real)`, which re-resolves `real`.
 #[cfg(unix)]
 pub(crate) async fn write_atomic_bound(
-    file: &tokio::fs::File,
+    file: &std::fs::File,
     real: &std::path::Path,
     contents: &[u8],
 ) -> std::io::Result<()> {
@@ -294,7 +294,7 @@ pub(crate) async fn write_atomic_bound(
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::io::{AsRawFd, FromRawFd};
 
-    let opened = file.metadata().await?;
+    let opened = file.metadata()?;
     let (Some(parent), Some(name)) = (real.parent(), real.file_name()) else {
         return Err(std::io::Error::other("cannot determine the directory of the opened file"));
     };
@@ -363,24 +363,47 @@ pub(crate) async fn write_atomic_bound(
 /// directory-handle-relative create/rename here, so this re-resolves `real`.
 #[cfg(not(unix))]
 pub(crate) async fn write_atomic_bound(
-    _file: &tokio::fs::File,
+    _file: &std::fs::File,
     real: &std::path::Path,
     contents: &[u8],
 ) -> std::io::Result<()> {
     write_atomic(real, contents).await
 }
 
+/// Open `path` for reading and require a regular file (#415).
+///
+/// On Unix the open uses `O_NONBLOCK` so a FIFO or device swapped in cannot
+/// block before the caller re-checks the handle; anything that is not a
+/// regular file is rejected from the handle's own metadata.
+pub(crate) fn open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    Ok(file)
+}
+
 /// Resolve the real location of an already-open file (#415).
 ///
 /// Linux reads the kernel's path for the descriptor from `/proc/self/fd`, and
 /// macOS asks for it with `fcntl(F_GETPATH)`; both describe the object behind
-/// the handle, independent of what `path` points to now. Elsewhere (or when
-/// those fail) `path` is canonicalized and, on Unix, accepted only if it names
-/// the same `(dev, ino)` as the handle. Windows has no stable std API for a
-/// handle's identity, so it falls back to canonicalizing `path`: a swap
-/// between the open and that call is not detected there.
-async fn opened_file_location(
-    file: &tokio::fs::File,
+/// the handle, independent of what `path` points to now.
+///
+/// Elsewhere (or when those fail) `path` is canonicalized and, on Unix,
+/// accepted only if `metadata(canonical)` has the same `(dev, ino)` as the
+/// handle. That fallback is not bound to the handle: both calls resolve the
+/// path again, so a second swap between them can still fake a match. It only
+/// narrows the window. Windows has no stable std API for a handle's identity,
+/// so it just canonicalizes `path` and a swap after the open is not detected.
+fn opened_file_location(
+    file: &std::fs::File,
     path: &std::path::Path,
 ) -> std::io::Result<PathBuf> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -412,7 +435,7 @@ async fn opened_file_location(
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let opened = file.metadata().await?;
+        let opened = file.metadata()?;
         let named = std::fs::metadata(&resolved)?;
         if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
             return Err(std::io::Error::other("the path was replaced after it was opened"));
@@ -590,26 +613,27 @@ impl ToolContext {
     /// canonicalizes it) and the caller opens `path` afterwards, so a path
     /// component swapped for a symlink in between would let an auto-allowed
     /// in-workspace path reach any file on the host. This resolves where
-    /// `file` really lives and, when the earlier grant came from policy rather
-    /// than a human, re-runs the permission check against that location: if
-    /// the policy would not allow the opened object on its own, the request
-    /// falls back to the normal Ask path. A grant a human approved
-    /// interactively is not re-asked.
+    /// `file` really lives and re-runs the permission check against that
+    /// location when the earlier grant came from policy, or when a human
+    /// approved a different path than the one actually opened (a symlink in
+    /// the final component or in an ancestor). If the opened object is not
+    /// allowed on its own, the request falls back to the normal Ask path. A
+    /// human approval for exactly the opened location is not re-asked.
     ///
     /// Returns the real location of `file`.
-    pub(crate) async fn confirm_opened_path(
+    pub(crate) fn confirm_opened_path(
         &self,
         tool_name: &str,
         verb: &str,
         path: &std::path::Path,
-        file: &tokio::fs::File,
+        file: &std::fs::File,
         grant: PermissionGrant,
         is_read_only: bool,
     ) -> Result<PathBuf, String> {
-        let real = opened_file_location(file, path).await.map_err(|e| {
+        let real = opened_file_location(file, path).map_err(|e| {
             format!("Refusing to use {}: could not verify the opened file: {}", path.display(), e)
         })?;
-        if grant == PermissionGrant::Policy {
+        if grant == PermissionGrant::Policy || real.as_path() != path {
             self.check_permission_for_path(
                 tool_name,
                 &format!("{} {}", verb, real.display()),
@@ -647,6 +671,12 @@ impl ToolContext {
 
     pub fn path_is_within_workspace(&self, path: &std::path::Path) -> bool {
         let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.workspace_roots().iter().any(|root| resolved.starts_with(root))
+    }
+
+    /// Canonicalized workspace roots: the working directory plus the
+    /// configured workspace and additional directories.
+    pub(crate) fn workspace_roots(&self) -> Vec<PathBuf> {
         let mut roots = vec![
             std::fs::canonicalize(&self.working_dir).unwrap_or_else(|_| self.working_dir.clone()),
         ];
@@ -655,7 +685,37 @@ impl ToolContext {
                 .into_iter()
                 .map(|root| std::fs::canonicalize(&root).unwrap_or(root)),
         );
-        roots.iter().any(|root| resolved.starts_with(root))
+        roots
+    }
+
+    /// Open `path` for a read that a directory walk reached without its own
+    /// permission check (#415). The real location of the opened handle must
+    /// lie inside the workspace roots; otherwise the permission check runs
+    /// against that location. Returns `Ok(None)` when the entry cannot be
+    /// opened as a regular file, so the walk can skip it.
+    pub(crate) fn open_walked_file(
+        &self,
+        tool_name: &str,
+        verb: &str,
+        path: &std::path::Path,
+        roots: &[PathBuf],
+    ) -> Result<Option<std::fs::File>, String> {
+        let Ok(file) = open_regular_file(path) else {
+            return Ok(None);
+        };
+        let Ok(real) = opened_file_location(&file, path) else {
+            return Ok(None);
+        };
+        if !roots.iter().any(|root| real.starts_with(root)) {
+            self.check_permission_for_path(
+                tool_name,
+                &format!("{} {}", verb, real.display()),
+                real,
+                true,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(Some(file))
     }
 
     pub fn check_permission_with_details_and_path(
