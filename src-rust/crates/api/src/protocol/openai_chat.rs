@@ -8,7 +8,7 @@
 // now it is a reusable, unit-testable state machine instead of being welded into
 // an `async_stream::stream!` block.
 
-use std::collections::HashMap;
+use std::collections::BTreeSet;
 
 use claurst_core::types::{ContentBlock, UsageInfo};
 use serde_json::{json, Value};
@@ -42,8 +42,9 @@ pub struct OpenAiChatDecoder {
     message_id: String,
     model_name: String,
     thinking_open: bool,
-    /// Keyed by content-block index → (tool_call_id, name, accumulated_args).
-    tool_call_buffers: HashMap<usize, (String, String, String)>,
+    /// Content-block indices of every tool-use block opened in this stream
+    /// (native and DSML), closed in index order on `finish_reason`.
+    tool_blocks: BTreeSet<usize>,
     /// Extracts DeepSeek DSML tool-call envelopes from text content (#395).
     /// `None` unless enabled via [`with_dsml_tool_calls`](Self::with_dsml_tool_calls).
     dsml: Option<DsmlStreamParser>,
@@ -59,7 +60,7 @@ impl OpenAiChatDecoder {
             message_id: String::from("unknown"),
             model_name: String::new(),
             thinking_open: false,
-            tool_call_buffers: HashMap::new(),
+            tool_blocks: BTreeSet::new(),
             dsml: None,
             dsml_tool_calls: 0,
         }
@@ -67,14 +68,16 @@ impl OpenAiChatDecoder {
 
     /// Parse DeepSeek DSML tool-call envelopes out of `delta.content` text and
     /// surface them as `ToolUse` blocks instead of assistant text (#395).
+    /// Independently of this flag, parsing is switched on when the first
+    /// chunk's `model` names a DeepSeek model (gateway aliases, auto-routing).
     pub fn with_dsml_tool_calls(mut self, enabled: bool) -> Self {
         self.dsml = enabled.then(DsmlStreamParser::default);
         self
     }
 
     /// Turn DSML parser output into stream events. Tool-use blocks are
-    /// registered in `tool_call_buffers` so they are closed on finish like
-    /// native tool calls.
+    /// registered in `tool_blocks` so they are closed on finish like native
+    /// tool calls.
     fn emit_dsml_segments(&mut self, segments: Vec<DsmlSegment>, out: &mut Vec<StreamEvent>) {
         for segment in segments {
             match segment {
@@ -82,22 +85,20 @@ impl OpenAiChatDecoder {
                 DsmlSegment::ToolCall(call) => {
                     let index = DSML_TOOL_BLOCK_BASE + self.dsml_tool_calls;
                     self.dsml_tool_calls += 1;
-                    let id = new_tool_use_id();
-                    let args = Value::Object(call.input).to_string();
+                    self.tool_blocks.insert(index);
                     out.push(StreamEvent::ContentBlockStart {
                         index,
                         content_block: ContentBlock::ToolUse {
-                            id: id.clone(),
-                            name: call.name.clone(),
+                            id: new_tool_use_id(),
+                            name: call.name,
                             input: json!({}),
                             thought_signature: None,
                         },
                     });
                     out.push(StreamEvent::InputJsonDelta {
                         index,
-                        partial_json: args.clone(),
+                        partial_json: Value::Object(call.input).to_string(),
                     });
-                    self.tool_call_buffers.insert(index, (id, call.name, args));
                 }
             }
         }
@@ -147,6 +148,12 @@ impl OpenAiChatDecoder {
             }
             if let Some(m) = chunk_json.get("model").and_then(|v| v.as_str()) {
                 self.model_name = m.to_string();
+            }
+            // Gateway aliases (e.g. opencode-zen `big-pickle`) and auto-routing
+            // hide the upstream model from the request; the served model id
+            // arrives here, before any content delta (#395).
+            if self.dsml.is_none() && self.model_name.to_ascii_lowercase().contains("deepseek") {
+                self.dsml = Some(DsmlStreamParser::default());
             }
             out.push(StreamEvent::MessageStart {
                 id: self.message_id.clone(),
@@ -285,10 +292,7 @@ impl OpenAiChatDecoder {
                         .unwrap_or("")
                         .to_string();
                     let block_index = 1 + tc_index;
-                    self.tool_call_buffers.insert(
-                        block_index,
-                        (tc_id.to_string(), name.clone(), String::new()),
-                    );
+                    self.tool_blocks.insert(block_index);
                     out.push(StreamEvent::ContentBlockStart {
                         index: block_index,
                         content_block: ContentBlock::ToolUse {
@@ -305,12 +309,8 @@ impl OpenAiChatDecoder {
                     .and_then(|v| v.as_str())
                 {
                     if !args_frag.is_empty() {
-                        let block_index = 1 + tc_index;
-                        if let Some((_, _, buf)) = self.tool_call_buffers.get_mut(&block_index) {
-                            buf.push_str(args_frag);
-                        }
                         out.push(StreamEvent::InputJsonDelta {
-                            index: block_index,
+                            index: 1 + tc_index,
                             partial_json: args_frag.to_string(),
                         });
                     }
@@ -331,10 +331,8 @@ impl OpenAiChatDecoder {
                 }
                 self.flush_dsml(out);
                 out.push(StreamEvent::ContentBlockStop { index: 0 });
-                let mut tc_indices: Vec<usize> = self.tool_call_buffers.keys().cloned().collect();
-                tc_indices.sort();
-                for idx in tc_indices {
-                    out.push(StreamEvent::ContentBlockStop { index: idx });
+                for &index in &self.tool_blocks {
+                    out.push(StreamEvent::ContentBlockStop { index });
                 }
 
                 let mut stop_reason = OpenAiProvider::map_finish_reason_pub(finish_reason);
@@ -573,7 +571,7 @@ mod tests {
     fn content_line(content: &str) -> String {
         format!(
             "data: {}",
-            json!({"id": "c", "model": "deepseek-v4-flash", "choices": [{"delta": {"content": content}}]})
+            json!({"id": "c", "model": "test-model", "choices": [{"delta": {"content": content}}]})
         )
     }
 
@@ -709,6 +707,43 @@ mod tests {
             e,
             StreamEvent::MessageDelta { stop_reason: Some(StopReason::EndTurn), .. }
         )));
+    }
+
+    /// Request model is an alias (`big-pickle`), so the decoder is built with
+    /// DSML off; the served model in the first chunk switches it on.
+    #[test]
+    fn dsml_enabled_by_first_chunk_model() {
+        let first = format!(
+            "data: {}",
+            json!({"id": "c", "model": "DeepSeek-V4-Flash", "choices": [{"delta": {"content": "ok "}}]})
+        );
+        let envelope = content_line(DSML_ENVELOPE);
+        let mut d = OpenAiChatDecoder::new(None).with_dsml_tool_calls(false);
+        let (events, _) = drain(
+            &mut d,
+            &[
+                first.as_str(),
+                envelope.as_str(),
+                r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            ],
+        );
+        assert_eq!(text_deltas(&events), "ok ");
+        assert_dsml_tool_uses(&events);
+    }
+
+    #[test]
+    fn dsml_stays_off_for_non_deepseek_chunk_model() {
+        let first = format!(
+            "data: {}",
+            json!({"id": "c", "model": "big-pickle", "choices": [{"delta": {"content": DSML_ENVELOPE}}]})
+        );
+        let mut d = OpenAiChatDecoder::new(None).with_dsml_tool_calls(false);
+        let (events, _) = drain(
+            &mut d,
+            &[first.as_str(), r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#],
+        );
+        assert_eq!(text_deltas(&events), DSML_ENVELOPE);
+        assert!(tool_uses(&events).is_empty());
     }
 
     #[test]

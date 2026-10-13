@@ -25,6 +25,10 @@
 //     whose body is `{"name": …, "arguments": {…} | "<json>"}` or an array of
 //     such objects.
 //
+// Not handled: the DeepSeek V3/V3.1 special-token format
+// (`<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>…`), which serving stacks
+// normally translate into `tool_calls` before it reaches the client.
+//
 // The parser is streaming-safe: text is forwarded as soon as it cannot be the
 // start of an envelope opener, a possible opener prefix at the end of the
 // buffer is held back so partial tags never reach the transcript, and a
