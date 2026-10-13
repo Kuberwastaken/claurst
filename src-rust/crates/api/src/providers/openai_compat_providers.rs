@@ -182,6 +182,7 @@ pub fn deepseek() -> OpenAiCompatProvider {
         overflow_patterns: vec!["maximum context length is".to_string()],
         include_usage_in_stream: true,
         max_tokens_cap: None,
+        dsml_tool_calls: true,
         ..Default::default()
     })
 }

@@ -59,6 +59,36 @@ live in the `providers` map. Corrected model metadata for self-hosted or
 unknown models lives in the `modelOverrides` map — see
 [Model metadata overrides](providers.md#overriding-model-metadata).
 
+### Terminal status reporting
+
+The interactive TUI reports its state to the terminal through two escape
+sequences. Both are top-level settings, default to `true`, are read once at
+startup, and are never emitted by headless (`--print`), ACP, or bridge modes.
+
+| Key | Sequence | Description |
+|-----|----------|-------------|
+| `terminalProgressBar` | OSC 9;4 | Busy indicator while a turn is streaming. Only sent to terminals known to render it (iTerm2, WezTerm, Ghostty, Windows Terminal, ConEmu), and never inside tmux/screen. |
+| `terminalProgramStatus` | OSC 7501 | [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status) reports, so terminals and session managers that support it (Rex, cmux) can show which tab is working, waiting on you, or finished. Terminals without support ignore it. Skipped when stdout is not a tty, `TERM=dumb`, or inside tmux/screen. |
+
+OSC 7501 reports use the root record with `app=claurst`:
+
+| State | When |
+|-------|------|
+| `idle` | At startup, after a cancelled turn, and once you start typing after a finished turn. |
+| `working` | A turn is in flight: the model is streaming or tools are running. |
+| `blocked` | Waiting on you. `kind=permission` for a tool permission or MCP server approval, `kind=question` for an AskUserQuestion prompt, `kind=auth` for a device/browser sign-in. Carries a short base64 `msg`. |
+| `done` | The last turn finished and the prompt is waiting. |
+| `error` | The last turn ended in an error. |
+
+On a normal exit Claurst sends `state=clear` to remove its record. If it crashes it reports `state=error` instead, so the tab still shows that something went wrong.
+
+```json
+{
+  "terminalProgressBar": true,
+  "terminalProgramStatus": false
+}
+```
+
 ---
 
 ## The `config` Object
@@ -74,12 +104,14 @@ The `config` object holds runtime behaviour options.
 | `max_tokens` | integer \| null | 8192 | Maximum tokens per model response. |
 | `provider` | string \| null | `"anthropic"` | Active provider. See the [Providers](#providers) section. |
 | `effort` | string \| null | unset | Reasoning effort for new turns: `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`, or `"ultracode"`. When unset, no thinking-budget or temperature override is applied at all — this is not the same as `"medium"`, which has its own explicit values. |
+| `degradationSummaryEnabled` | boolean \| null | null (on) | When set to `false`, exceeding `max_turns` returns the last assistant message immediately instead of running one final tool-less degradation summary turn. Applies to sub-agents as well. Unset means enabled. Note the camelCase key. |
 
 ### Permission mode
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `permission_mode` | string | `"default"` | Controls how tool permissions are enforced. One of `"default"`, `"acceptEdits"`, `"bypassPermissions"`, `"plan"`. |
+| `yoloMode` | boolean | `false` | Persistent YOLO mode: the effective permission mode is `bypassPermissions`. Global-only in the settings merge: a project settings file cannot enable it. |
 
 See [Permission Modes](#permission-modes) for a full description of each value.
 

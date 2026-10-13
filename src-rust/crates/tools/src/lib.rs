@@ -171,6 +171,16 @@ pub enum PermissionLevel {
     Forbidden,
 }
 
+/// How a successful permission check was satisfied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionGrant {
+    /// The handler allowed the request on its own (permission mode, a rule,
+    /// or the workspace fence) without asking anyone.
+    Policy,
+    /// A human approved the request through an interactive prompt.
+    User,
+}
+
 #[derive(Debug)]
 pub struct PendingPermissionRequest {
     pub tool_use_id: String,
@@ -264,6 +274,178 @@ pub(crate) async fn write_atomic(
     }
 }
 
+/// Like [`write_atomic`], but bound to an already-open file instead of a path
+/// (#415): `real` is the location `opened_file_location` reported for `file`.
+///
+/// On Unix the directory is opened once, confirmed to hold `file` under its
+/// name (same `(dev, ino)`, final component not followed), and the temp file
+/// is created and renamed relative to that directory handle, so no path
+/// component is resolved again after the check. Elsewhere this is
+/// `write_atomic(real)`, which re-resolves `real`.
+#[cfg(unix)]
+pub(crate) async fn write_atomic_bound(
+    file: &std::fs::File,
+    real: &std::path::Path,
+    contents: &[u8],
+) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    let opened = file.metadata()?;
+    let (Some(parent), Some(name)) = (real.parent(), real.file_name()) else {
+        return Err(std::io::Error::other("cannot determine the directory of the opened file"));
+    };
+    let dir = std::fs::File::open(parent)?;
+    let dir_fd = dir.as_raw_fd();
+    let name_c = CString::new(name.as_bytes())?;
+    let tmp_c = CString::new(format!(
+        ".{}.claurst-tmp-{}",
+        name.to_string_lossy(),
+        uuid::Uuid::new_v4().simple()
+    ))?;
+
+    // SAFETY: `dir_fd` stays open while `dir` is alive and `name_c` is a
+    // NUL-terminated C string that outlives the call. A non-negative return
+    // is a fresh descriptor whose ownership moves into the `File` below.
+    let current_fd = unsafe {
+        libc::openat(
+            dir_fd,
+            name_c.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if current_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `current_fd` was just returned by `openat` and is owned by no one else.
+    let current = unsafe { std::fs::File::from_raw_fd(current_fd) }.metadata()?;
+    if (current.dev(), current.ino()) != (opened.dev(), opened.ino()) {
+        return Err(std::io::Error::other("the file was moved or replaced while being edited"));
+    }
+
+    let mode: libc::c_uint = 0o600;
+    // SAFETY: as above; `tmp_c` is NUL-terminated and outlives the call, and
+    // `mode` is passed as the variadic `mode_t` argument O_CREAT requires.
+    let tmp_fd = unsafe {
+        libc::openat(
+            dir_fd,
+            tmp_c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            mode,
+        )
+    };
+    if tmp_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `tmp_fd` was just returned by `openat` and is owned by no one else.
+    let mut tmp = unsafe { std::fs::File::from_raw_fd(tmp_fd) };
+    let written = tmp
+        .write_all(contents)
+        // Preserve the original file's permissions (e.g. the executable bit).
+        .and_then(|()| tmp.set_permissions(opened.permissions()))
+        .and_then(|()| {
+            // SAFETY: both names are NUL-terminated C strings that outlive the
+            // call and resolve relative to `dir_fd`, which `dir` keeps open.
+            let rc = unsafe { libc::renameat(dir_fd, tmp_c.as_ptr(), dir_fd, name_c.as_ptr()) };
+            if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+        });
+    if written.is_err() {
+        // SAFETY: `tmp_c` is NUL-terminated and relative to the open `dir_fd`.
+        unsafe { libc::unlinkat(dir_fd, tmp_c.as_ptr(), 0) };
+    }
+    written
+}
+
+/// Non-Unix fallback for [`write_atomic_bound`]: std exposes no
+/// directory-handle-relative create/rename here, so this re-resolves `real`.
+#[cfg(not(unix))]
+pub(crate) async fn write_atomic_bound(
+    _file: &std::fs::File,
+    real: &std::path::Path,
+    contents: &[u8],
+) -> std::io::Result<()> {
+    write_atomic(real, contents).await
+}
+
+/// Open `path` for reading and require a regular file (#415).
+///
+/// On Unix the open uses `O_NONBLOCK` so a FIFO or device swapped in cannot
+/// block before the caller re-checks the handle; anything that is not a
+/// regular file is rejected from the handle's own metadata.
+pub(crate) fn open_regular_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    Ok(file)
+}
+
+/// Resolve the real location of an already-open file (#415).
+///
+/// Linux reads the kernel's path for the descriptor from `/proc/self/fd`, and
+/// macOS asks for it with `fcntl(F_GETPATH)`; both describe the object behind
+/// the handle, independent of what `path` points to now.
+///
+/// Elsewhere (or when those fail) `path` is canonicalized and, on Unix,
+/// accepted only if `metadata(canonical)` has the same `(dev, ino)` as the
+/// handle. That fallback is not bound to the handle: both calls resolve the
+/// path again, so a second swap between them can still fake a match. It only
+/// narrows the window. Windows has no stable std API for a handle's identity,
+/// so it just canonicalizes `path` and a swap after the open is not detected.
+fn opened_file_location(
+    file: &std::fs::File,
+    path: &std::path::Path,
+) -> std::io::Result<PathBuf> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::unix::io::AsRawFd;
+        if let Ok(real) = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())) {
+            return Ok(real);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::AsRawFd;
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        // SAFETY: F_GETPATH writes a NUL-terminated path of at most PATH_MAX
+        // bytes into the buffer, which is PATH_MAX bytes long and outlives the
+        // call; the descriptor is owned by `file`, which is borrowed (and so
+        // kept open) for the duration of the call.
+        let rc = unsafe {
+            libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr().cast::<libc::c_char>())
+        };
+        if rc != -1 {
+            if let Ok(real) = std::ffi::CStr::from_bytes_until_nul(&buf) {
+                return Ok(PathBuf::from(std::ffi::OsStr::from_bytes(real.to_bytes())));
+            }
+        }
+    }
+    let resolved = std::fs::canonicalize(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata()?;
+        let named = std::fs::metadata(&resolved)?;
+        if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
+            return Err(std::io::Error::other("the path was replaced after it was opened"));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+    Ok(resolved)
+}
+
 
 /// A cloneable handle for injecting notification messages into the next agent turn.
 /// Used by background tasks with `notify_on_complete` to signal completion without polling.
@@ -355,11 +537,11 @@ impl ToolContext {
     fn request_permission_inner(
         &self,
         request: PermissionRequest,
-    ) -> Result<(), claurst_core::error::ClaudeError> {
+    ) -> Result<PermissionGrant, claurst_core::error::ClaudeError> {
         let interactive_reason = request.details.clone();
         let decision = self.permission_handler.request_permission(&request);
         match decision {
-            PermissionDecision::Allow | PermissionDecision::AllowPermanently => Ok(()),
+            PermissionDecision::Allow | PermissionDecision::AllowPermanently => Ok(PermissionGrant::Policy),
             PermissionDecision::Ask { reason } if self.non_interactive => Err(
                 claurst_core::error::ClaudeError::PermissionDenied(format!(
                     "Permission denied for tool '{}': {}",
@@ -389,7 +571,7 @@ impl ToolContext {
 
                 let decision = tokio::task::block_in_place(|| rx.blocking_recv());
                 match decision {
-                    Ok(PermissionDecision::Allow | PermissionDecision::AllowPermanently) => Ok(()),
+                    Ok(PermissionDecision::Allow | PermissionDecision::AllowPermanently) => Ok(PermissionGrant::User),
                     _ => Err(claurst_core::error::ClaudeError::PermissionDenied(
                         "Permission denied by user".to_string(),
                     )),
@@ -410,7 +592,7 @@ impl ToolContext {
         is_read_only: bool,
     ) -> Result<(), claurst_core::error::ClaudeError> {
         let request = self.build_permission_request(tool_name, description, None, is_read_only, None);
-        self.request_permission_inner(request)
+        self.request_permission_inner(request).map(|_| ())
     }
 
     pub fn check_permission_for_path(
@@ -419,9 +601,60 @@ impl ToolContext {
         description: &str,
         path: PathBuf,
         is_read_only: bool,
-    ) -> Result<(), claurst_core::error::ClaudeError> {
+    ) -> Result<PermissionGrant, claurst_core::error::ClaudeError> {
         let request = self.build_permission_request(tool_name, description, None, is_read_only, Some(path));
         self.request_permission_inner(request)
+    }
+
+    /// Bind a path-scoped permission check to the file that was actually
+    /// opened (#415).
+    ///
+    /// `check_permission_for_path` evaluates `path` (the workspace fence
+    /// canonicalizes it) and the caller opens `path` afterwards, so a path
+    /// component swapped for a symlink in between would let an auto-allowed
+    /// in-workspace path reach any file on the host. This resolves where
+    /// `file` really lives and re-runs the permission check against that
+    /// location when the earlier grant came from policy, or when a human
+    /// approved a different path than the one actually opened (a symlink in
+    /// the final component or in an ancestor). If the opened object is not
+    /// allowed on its own, the request falls back to the normal Ask path. A
+    /// human approval for exactly the opened location is not re-asked.
+    ///
+    /// Returns the real location of `file`.
+    pub(crate) fn confirm_opened_path(
+        &self,
+        tool_name: &str,
+        verb: &str,
+        path: &std::path::Path,
+        file: &std::fs::File,
+        grant: PermissionGrant,
+        is_read_only: bool,
+    ) -> Result<PathBuf, String> {
+        let real = opened_file_location(file, path).map_err(|e| {
+            format!("Refusing to use {}: could not verify the opened file: {}", path.display(), e)
+        })?;
+        // Compare against `path` with `.` and `..` folded lexically, so
+        // `./x` or `a/../x` does not by itself count as a different location.
+        let mut lexical = PathBuf::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    lexical.pop();
+                }
+                other => lexical.push(other),
+            }
+        }
+        if grant == PermissionGrant::Policy || real != lexical {
+            self.check_permission_for_path(
+                tool_name,
+                &format!("{} {}", verb, real.display()),
+                real.clone(),
+                is_read_only,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(real)
     }
 
     /// Like `check_permission` but also passes structured `details` text
@@ -440,7 +673,7 @@ impl ToolContext {
             is_read_only,
             None,
         );
-        self.request_permission_inner(request).map_err(|_| {
+        self.request_permission_inner(request).map(|_| ()).map_err(|_| {
             claurst_core::error::ClaudeError::PermissionDenied(format!(
                 "Permission denied for tool '{}': {}",
                 tool_name, details
@@ -450,6 +683,12 @@ impl ToolContext {
 
     pub fn path_is_within_workspace(&self, path: &std::path::Path) -> bool {
         let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.workspace_roots().iter().any(|root| resolved.starts_with(root))
+    }
+
+    /// Canonicalized workspace roots: the working directory plus the
+    /// configured workspace and additional directories.
+    pub(crate) fn workspace_roots(&self) -> Vec<PathBuf> {
         let mut roots = vec![
             std::fs::canonicalize(&self.working_dir).unwrap_or_else(|_| self.working_dir.clone()),
         ];
@@ -458,7 +697,37 @@ impl ToolContext {
                 .into_iter()
                 .map(|root| std::fs::canonicalize(&root).unwrap_or(root)),
         );
-        roots.iter().any(|root| resolved.starts_with(root))
+        roots
+    }
+
+    /// Open `path` for a read that a directory walk reached without its own
+    /// permission check (#415). The real location of the opened handle must
+    /// lie inside the workspace roots; otherwise the permission check runs
+    /// against that location. Returns `Ok(None)` when the entry cannot be
+    /// opened as a regular file, so the walk can skip it.
+    pub(crate) fn open_walked_file(
+        &self,
+        tool_name: &str,
+        verb: &str,
+        path: &std::path::Path,
+        roots: &[PathBuf],
+    ) -> Result<Option<std::fs::File>, String> {
+        let Ok(file) = open_regular_file(path) else {
+            return Ok(None);
+        };
+        let Ok(real) = opened_file_location(&file, path) else {
+            return Ok(None);
+        };
+        if !roots.iter().any(|root| real.starts_with(root)) {
+            self.check_permission_for_path(
+                tool_name,
+                &format!("{} {}", verb, real.display()),
+                real,
+                true,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(Some(file))
     }
 
     pub fn check_permission_with_details_and_path(
@@ -476,7 +745,7 @@ impl ToolContext {
             is_read_only,
             Some(path),
         );
-        self.request_permission_inner(request).map_err(|_| {
+        self.request_permission_inner(request).map(|_| ()).map_err(|_| {
             claurst_core::error::ClaudeError::PermissionDenied(format!(
                 "Permission denied for tool '{}': {}",
                 tool_name, details

@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use regex::RegexBuilder;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::Path;
 use tracing::debug;
 use walkdir::WalkDir;
 
@@ -147,14 +148,15 @@ impl Tool for GrepTool {
             .map(|p| ctx.resolve_path(p))
             .unwrap_or_else(|| ctx.working_dir.clone());
 
-        if let Err(e) = ctx.check_permission_for_path(
+        let grant = match ctx.check_permission_for_path(
             self.name(),
             &format!("Grep {} in {}", params.pattern, search_path.display()),
             search_path.clone(),
             true,
         ) {
-            return ToolResult::error(e.to_string());
-        }
+            Ok(grant) => grant,
+            Err(e) => return ToolResult::error(e.to_string()),
+        };
 
         debug!(pattern = %params.pattern, path = %search_path.display(), "Running grep");
 
@@ -183,10 +185,27 @@ impl Tool for GrepTool {
         // Build glob matcher for filtering
         let glob_pattern = params.glob.as_deref();
 
-        // If the search path is a single file, just search it.
+        // If the search path is a single file, just search it, reading through
+        // a handle whose real location has been re-checked (#415).
         if search_path.is_file() {
+            let file = match crate::open_regular_file(&search_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    return ToolResult::error(format!("Failed to read {}: {}", search_path.display(), e))
+                }
+            };
+            if let Err(e) =
+                ctx.confirm_opened_path(self.name(), "Grep", &search_path, &file, grant, true)
+            {
+                return ToolResult::error(e);
+            }
+            let mut content = String::new();
+            if let Err(e) = (&file).read_to_string(&mut content) {
+                return ToolResult::error(format!("Failed to read {}: {}", search_path.display(), e));
+            }
             return self.search_file(
                 &search_path,
+                &content,
                 &regex,
                 &params.output_mode,
                 context_lines,
@@ -195,6 +214,7 @@ impl Tool for GrepTool {
         }
 
         // Walk directory tree
+        let roots = ctx.workspace_roots();
         let mut results: Vec<String> = Vec::new();
         let mut match_count = 0usize;
 
@@ -222,17 +242,6 @@ impl Tool for GrepTool {
 
             let path = entry.path();
 
-            if !ctx.path_is_within_workspace(path) {
-                if let Err(e) = ctx.check_permission_for_path(
-                    self.name(),
-                    &format!("Grep result {}", path.display()),
-                    path.to_path_buf(),
-                    true,
-                ) {
-                    return ToolResult::error(e.to_string());
-                }
-            }
-
             // Type filter
             if !type_exts.is_empty() {
                 let ext = path
@@ -254,11 +263,20 @@ impl Tool for GrepTool {
                 }
             }
 
-            // Read file (skip binary)
-            let content = match std::fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(_) => continue,
+            // Only now open, then fence the handle's real location: a file that
+            // resolves outside the workspace asks, as before, and a symlink
+            // swapped in after this check cannot redirect the read (#415).
+            let file = match ctx.open_walked_file(self.name(), "Grep result", path, &roots) {
+                Ok(Some(file)) => file,
+                Ok(None) => continue,
+                Err(e) => return ToolResult::error(e),
             };
+
+            // Read file (skip binary)
+            let mut content = String::new();
+            if (&file).read_to_string(&mut content).is_err() {
+                continue;
+            }
 
             let lines: Vec<&str> = content.lines().collect();
             let mut file_matches: Vec<(usize, &str)> = Vec::new();
@@ -330,17 +348,13 @@ impl Tool for GrepTool {
 impl GrepTool {
     fn search_file(
         &self,
-        path: &PathBuf,
+        path: &Path,
+        content: &str,
         regex: &regex::Regex,
         output_mode: &str,
         context_lines: usize,
         show_line_numbers: bool,
     ) -> ToolResult {
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(e) => return ToolResult::error(format!("Failed to read {}: {}", path.display(), e)),
-        };
-
         let lines: Vec<&str> = content.lines().collect();
         let mut matching_lines: Vec<usize> = Vec::new();
 
@@ -383,5 +397,75 @@ impl GrepTool {
                 ToolResult::success(results.join("\n"))
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::test_support::{context_with_handler, SwapAfterCheckHandler};
+    use claurst_core::config::{PermissionMode, Settings};
+    use claurst_core::permissions::PermissionManager;
+    use std::sync::Arc;
+
+    /// #415: a single in-workspace file swapped for a symlink to a host file
+    /// right after the fence allowed it must not be searched without a prompt.
+    #[tokio::test]
+    async fn grep_file_refuses_symlink_swapped_in_after_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let ws = root.join("ws");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, "TOP-SECRET\n").unwrap();
+        let notes = ws.join("notes.txt");
+        std::fs::write(&notes, "inside\n").unwrap();
+
+        let manager = PermissionManager::new(PermissionMode::Default, &Settings::default());
+        let handler = SwapAfterCheckHandler::new(manager, Some((notes.clone(), secret)));
+        let ctx = context_with_handler(ws, Arc::new(handler));
+
+        let res = GrepTool
+            .execute(
+                json!({ "pattern": "SECRET", "path": notes.to_string_lossy(), "output_mode": "content" }),
+                &ctx,
+            )
+            .await;
+        assert!(res.is_error, "swapped grep was allowed: {}", res.content);
+        assert!(!res.content.contains("TOP-SECRET"), "leaked: {}", res.content);
+    }
+
+    /// A walk still searches in-workspace files and asks (here: denies) for a
+    /// symlink that leads outside the workspace.
+    #[tokio::test]
+    async fn grep_walk_fences_symlink_to_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let ws = root.join("ws");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "needle TOP-SECRET\n").unwrap();
+        std::fs::write(ws.join("a.txt"), "needle inside\n").unwrap();
+
+        let manager = PermissionManager::new(PermissionMode::Default, &Settings::default());
+        let ctx = context_with_handler(
+            ws.clone(),
+            Arc::new(SwapAfterCheckHandler::new(manager, None)),
+        );
+        let res = GrepTool
+            .execute(json!({ "pattern": "needle", "output_mode": "content" }), &ctx)
+            .await;
+        assert!(!res.is_error, "grep failed: {}", res.content);
+        assert!(res.content.contains("needle inside"), "missing match: {}", res.content);
+
+        std::os::unix::fs::symlink(outside.join("secret.txt"), ws.join("b.txt")).unwrap();
+        let res = GrepTool
+            .execute(json!({ "pattern": "needle", "output_mode": "content" }), &ctx)
+            .await;
+        assert!(res.is_error, "outside symlink was searched: {}", res.content);
+        assert!(!res.content.contains("TOP-SECRET"), "leaked: {}", res.content);
     }
 }

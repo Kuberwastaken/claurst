@@ -1062,6 +1062,13 @@ pub mod config {
         /// load; see [`ModelOverride`]).
         #[serde(default, rename = "modelOverrides", alias = "model_overrides")]
         pub model_overrides: HashMap<String, ModelOverride>,
+        /// Persistent YOLO mode (bypass all permission prompts). When true,
+        /// the effective permission mode is BypassPermissions. The CLI
+        /// `--dangerously-skip-permissions` flag overrides this for a single
+        /// session. SECURITY: this field is global-only in the Settings merge
+        /// (project settings cannot enable it) — see `Settings::merge`.
+        #[serde(default, rename = "yoloMode")]
+        pub yolo_mode: bool,
         /// Formatter configurations (copied from Settings on load).
         #[serde(default)]
         pub formatter: HashMap<String, FormatterConfig>,
@@ -1121,6 +1128,12 @@ pub mod config {
         /// Keyboard scrolling (PageUp/PageDown, etc.) is unaffected either way.
         #[serde(default, rename = "mouseCapture", skip_serializing_if = "Option::is_none")]
         pub mouse_capture: Option<bool>,
+        /// Whether the max-steps graceful degradation summary turn is enabled.
+        /// `None` (default) or `Some(true)` means exceeding `max_turns` runs one
+        /// final tool-less turn asking the model to summarize progress. `Some(false)`
+        /// makes the loop return cold (last assistant message) immediately.
+        #[serde(default, rename = "degradationSummaryEnabled", skip_serializing_if = "Option::is_none")]
+        pub degradation_summary_enabled: Option<bool>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -1304,6 +1317,10 @@ pub mod config {
         /// Whether to show terminal progress bars. Defaults to true.
         #[serde(default = "default_true", rename = "terminalProgressBar")]
         pub terminal_progress_bar: bool,
+        /// Whether to report program status (working / waiting on the user /
+        /// done / error) to the terminal via OSC 7501. Defaults to true.
+        #[serde(default = "default_true", rename = "terminalProgramStatus")]
+        pub terminal_program_status: bool,
         /// Whether to enable auto-compact. Defaults to true.
         #[serde(default = "default_true", rename = "autoCompact")]
         pub auto_compact: bool,
@@ -1411,6 +1428,12 @@ pub mod config {
         /// and copy/paste (issue #104).
         pub fn mouse_capture_enabled(&self) -> bool {
             self.mouse_capture.unwrap_or(true)
+        }
+
+        /// Whether the max-steps degradation summary turn runs when `max_turns`
+        /// is exceeded. Defaults to `true` (enabled) when the setting is unset.
+        pub fn degradation_summary_enabled_or_default(&self) -> bool {
+            self.degradation_summary_enabled.unwrap_or(true)
         }
 
         pub fn selected_provider_id(&self) -> &str {
@@ -1992,12 +2015,17 @@ pub mod config {
                 managed_agents: over.config.managed_agents.or(base.config.managed_agents),
                 auto_commits: over.config.auto_commits.or(base.config.auto_commits),
                 mouse_capture: over.config.mouse_capture.or(base.config.mouse_capture),
+                // SECURITY: yolo_mode bypasses all permission prompts, so
+                // only the user's global settings may enable it. A project
+                // settings file must not be able to flip this on.
+                yolo_mode: base.config.yolo_mode,
                 cursor_blink_enabled: over.config.cursor_blink_enabled || base.config.cursor_blink_enabled,
                 file_autocomplete_limit: if over.config.file_autocomplete_limit != 0 { over.config.file_autocomplete_limit } else { base.config.file_autocomplete_limit },
                 file_autocomplete_show_hidden_files: over.config.file_autocomplete_show_hidden_files || base.config.file_autocomplete_show_hidden_files,
                 file_injection_enabled: over.config.file_injection_enabled || base.config.file_injection_enabled,
                 file_injection_max_size: if over.config.file_injection_max_size != 0 { over.config.file_injection_max_size } else { base.config.file_injection_max_size },
                 request_timeout_secs: over.config.request_timeout_secs.or(base.config.request_timeout_secs),
+                degradation_summary_enabled: over.config.degradation_summary_enabled.or(base.config.degradation_summary_enabled),
             };
             Self {
                 config: merged_config,
@@ -2040,6 +2068,7 @@ pub mod config {
                 show_turn_duration: over.show_turn_duration || base.show_turn_duration,
                 reduce_motion: over.reduce_motion || base.reduce_motion,
                 terminal_progress_bar: over.terminal_progress_bar || base.terminal_progress_bar,
+                terminal_program_status: over.terminal_program_status || base.terminal_program_status,
                 show_cwd: over.show_cwd || base.show_cwd,
                 show_git_branch: over.show_git_branch || base.show_git_branch,
                 auto_compact: over.auto_compact || base.auto_compact,
@@ -2272,6 +2301,55 @@ pub mod config {
             let config = settings.effective_config();
             assert_eq!(config.model_overrides["custom-openai/a"].context_window, Some(111));
             assert_eq!(config.model_overrides["custom-openai/b"].context_window, Some(222));
+        }
+
+        #[test]
+        fn yolo_mode_is_global_only_in_merge() {
+            // Project settings must not be able to enable YOLO mode.
+            let base = Settings::default();
+            let mut over = Settings::default();
+            over.config.yolo_mode = true;
+            let merged = Settings::merge(base.clone(), over);
+            assert!(!merged.config.yolo_mode);
+
+            // Global settings CAN enable it, and a project cannot disable it.
+            let mut base2 = Settings::default();
+            base2.config.yolo_mode = true;
+            let mut over2 = Settings::default();
+            over2.config.yolo_mode = false;
+            let merged2 = Settings::merge(base2, over2);
+            assert!(merged2.config.yolo_mode);
+        }
+
+        #[test]
+        fn project_settings_cannot_enable_yolo_mode() {
+            // Global: yolo off (built in memory, no filesystem or env access).
+            let global = Settings::default();
+            // Project settings JSON enabling yoloMode, parsed as a project
+            // `.claurst/settings.json` would be.
+            let project_json = serde_json::to_string(&Settings::default())
+                .unwrap()
+                .replace("\"yoloMode\":false", "\"yoloMode\":true");
+            assert!(project_json.contains("\"yoloMode\":true"));
+            let project: Settings = serde_json::from_str(&project_json).unwrap();
+            assert!(project.config.yolo_mode);
+
+            let merged = Settings::merge(global, project);
+            assert!(
+                !merged.config.yolo_mode,
+                "project settings must not be able to enable yoloMode"
+            );
+        }
+
+        #[test]
+        fn yolo_mode_json_roundtrip() {
+            // Serializes as camelCase `yoloMode` and deserializes back.
+            let mut settings = Settings::default();
+            settings.config.yolo_mode = true;
+            let json = serde_json::to_string(&settings).unwrap();
+            assert!(json.contains("\"yoloMode\":true"), "got: {json}");
+            let back: Settings = serde_json::from_str(&json).unwrap();
+            assert!(back.config.yolo_mode);
         }
 
         #[test]
@@ -2636,6 +2714,34 @@ pub mod permissions {
         }
     }
 
+    /// The canonical form of an absolute glob whose literal directory prefix
+    /// goes through a symlink (e.g. `/tmp` on macOS, or a symlinked project
+    /// directory), or `None` when the prefix is already canonical or cannot
+    /// be resolved. The final component is never resolved.
+    ///
+    /// Path rules are created from the lexical path a user approved, while
+    /// tools re-check the real location of the file they opened (#415). This
+    /// runs once when a rule is created, so the filesystem at that moment
+    /// decides what the rule covers; matching itself stays pure string
+    /// matching, and a later swap of the prefix cannot widen the rule.
+    fn canonical_prefix_pattern(pattern: &str) -> Option<String> {
+        if !std::path::Path::new(pattern).is_absolute() {
+            return None;
+        }
+        let literal_end = pattern.find(['*', '?', '[']).unwrap_or(pattern.len());
+        let split = pattern[..literal_end].rfind(['/', std::path::MAIN_SEPARATOR])?;
+        if split == 0 {
+            return None;
+        }
+        let (dir, rest) = pattern.split_at(split);
+        let canonical_dir = std::fs::canonicalize(dir).ok()?;
+        let canonical_dir = canonical_dir.to_string_lossy();
+        if canonical_dir == dir {
+            return None;
+        }
+        Some(format!("{}{}", glob::Pattern::escape(&canonical_dir), rest))
+    }
+
     // -----------------------------------------------------------------------
     // Serialised rule (stored in settings.json)
     // -----------------------------------------------------------------------
@@ -2930,13 +3036,20 @@ pub mod permissions {
         }
 
         /// Allow `tool_name` on `path` (glob) for the rest of this session.
+        ///
+        /// When the glob's directory prefix goes through a symlink, a second
+        /// rule with the canonical prefix (resolved now) is added so the rule
+        /// also covers the real path tools re-check after opening (#415).
         pub fn add_session_allow_path(&mut self, tool_name: &str, path: &str) {
-            self.session_rules.push(PermissionRule {
-                tool_name: Some(tool_name.to_string()),
-                path_pattern: Some(path.to_string()),
-                action: PermissionAction::Allow,
-                scope: PermissionScope::Session,
-            });
+            let canonical = canonical_prefix_pattern(path);
+            for pattern in std::iter::once(path.to_string()).chain(canonical) {
+                self.session_rules.push(PermissionRule {
+                    tool_name: Some(tool_name.to_string()),
+                    path_pattern: Some(pattern),
+                    action: PermissionAction::Allow,
+                    scope: PermissionScope::Session,
+                });
+            }
         }
 
         /// Allow `tool_name` persistently and save to settings.
@@ -2961,24 +3074,33 @@ pub mod permissions {
         }
 
         /// Allow `tool_name` persistently on `path` and save settings.
+        ///
+        /// Like [`Self::add_session_allow_path`], a glob whose directory
+        /// prefix goes through a symlink is also stored with the canonical
+        /// prefix resolved now (#415).
         pub fn add_persistent_allow_path(
             &mut self,
             tool_name: &str,
             path: &str,
             settings: &mut crate::config::Settings,
         ) -> crate::error::Result<()> {
-            let rule = PermissionRule {
-                tool_name: Some(tool_name.to_string()),
-                path_pattern: Some(path.to_string()),
-                action: PermissionAction::Allow,
-                scope: PermissionScope::Persistent,
-            };
-            let serialized = SerializedPermissionRule::from(&rule);
-            settings.permission_rules.push(serialized);
+            let canonical = canonical_prefix_pattern(path);
+            let rules: Vec<PermissionRule> = std::iter::once(path.to_string())
+                .chain(canonical)
+                .map(|pattern| PermissionRule {
+                    tool_name: Some(tool_name.to_string()),
+                    path_pattern: Some(pattern),
+                    action: PermissionAction::Allow,
+                    scope: PermissionScope::Persistent,
+                })
+                .collect();
+            settings
+                .permission_rules
+                .extend(rules.iter().map(SerializedPermissionRule::from));
             settings
                 .save_sync()
                 .map_err(|e| crate::error::ClaudeError::Config(e.to_string()))?;
-            self.persistent_rules.push(rule);
+            self.persistent_rules.extend(rules);
             Ok(())
         }
 
@@ -3377,6 +3499,48 @@ pub mod permissions {
             });
             assert_eq!(
                 m.evaluate("Write", "write", Some("/tmp/foo/bar.txt"), None, &[]),
+                PermissionDecision::Allow
+            );
+        }
+
+        /// #415: a rule created through a symlinked directory also covers the
+        /// canonical path tools re-check, resolved when the rule is created.
+        /// Re-pointing the alias afterwards must not widen the rule.
+        #[cfg(unix)]
+        #[test]
+        fn path_rule_via_symlinked_dir_resolves_at_creation() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(dir.path()).unwrap();
+            let real = root.join("real");
+            let other = root.join("other");
+            std::fs::create_dir(&real).unwrap();
+            std::fs::create_dir(&other).unwrap();
+            let alias = root.join("alias");
+            std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+            let mut m = mgr(PermissionMode::Default);
+            m.add_session_allow_path("Edit", &format!("{}/*", alias.display()));
+            let real_file = format!("{}/notes.txt", real.display());
+            let other_file = format!("{}/notes.txt", other.display());
+            assert_eq!(
+                m.evaluate("Edit", "edit", Some(&real_file), None, &[]),
+                PermissionDecision::Allow
+            );
+
+            // Attacker re-points the alias after the rule exists.
+            std::fs::remove_file(&alias).unwrap();
+            std::os::unix::fs::symlink(&other, &alias).unwrap();
+
+            match m.evaluate("Edit", "edit", Some(&other_file), None, &[]) {
+                PermissionDecision::Ask { .. } => {}
+                d => panic!("re-pointed alias widened the rule: {:?}", d),
+            }
+            match m.evaluate("Edit", "edit", Some("/etc/hosts"), None, &[]) {
+                PermissionDecision::Ask { .. } => {}
+                d => panic!("unexpected decision: {:?}", d),
+            }
+            assert_eq!(
+                m.evaluate("Edit", "edit", Some(&real_file), None, &[]),
                 PermissionDecision::Allow
             );
         }
@@ -4763,6 +4927,42 @@ mod tests {
         let back: crate::config::Config = serde_json::from_str(&json).unwrap();
         assert_eq!(back.mouse_capture, Some(false));
         assert!(!back.mouse_capture_enabled());
+    }
+
+    #[test]
+    fn test_config_degradation_summary_defaults_on() {
+        // Unset (None) must read as enabled: a fresh install with no
+        // settings.json keeps the degradation summary turn.
+        let cfg = crate::config::Config::default();
+        assert_eq!(cfg.degradation_summary_enabled, None);
+        assert!(cfg.degradation_summary_enabled_or_default());
+    }
+
+    #[test]
+    fn test_config_degradation_summary_explicit_off_and_serde_roundtrip() {
+        let cfg = crate::config::Config {
+            degradation_summary_enabled: Some(false),
+            ..Default::default()
+        };
+        assert!(!cfg.degradation_summary_enabled_or_default());
+
+        // Unset round-trips as None and is omitted from serialized JSON so
+        // existing settings files stay unchanged.
+        let json = serde_json::to_string(&crate::config::Config::default()).unwrap();
+        assert!(!json.contains("degradationSummaryEnabled"));
+        let back: crate::config::Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.degradation_summary_enabled, None);
+
+        // Explicit off serializes the camelCase key and round-trips.
+        let cfg = crate::config::Config {
+            degradation_summary_enabled: Some(false),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"degradationSummaryEnabled\":false"));
+        let back: crate::config::Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.degradation_summary_enabled, Some(false));
+        assert!(!back.degradation_summary_enabled_or_default());
     }
 
     #[test]

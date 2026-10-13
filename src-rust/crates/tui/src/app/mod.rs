@@ -251,6 +251,11 @@ pub struct App {
     pub remote_session_url: Option<String>,
     /// Live MCP manager snapshot source when available.
     pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
+    /// Discovered skill slash commands `(name, description)`, appended to the
+    /// built-in `PROMPT_SLASH_COMMANDS` for prompt autocomplete. Filled once,
+    /// when the background discovery spawned at startup finishes, via
+    /// [`App::set_discovered_slash_commands`]; never contains built-ins.
+    pub discovered_slash_commands: Vec<(String, String)>,
     /// Queued request for a real MCP reconnect from the interactive loop.
     pub pending_mcp_reconnect: bool,
     /// Set after an in-session provider connection (e.g. a Claude Pro/Max OAuth
@@ -341,6 +346,15 @@ pub struct App {
     pub bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState,
     /// Whether the bypass-permissions dialog has been shown this session.
     pub bypass_permissions_dialog_shown: bool,
+    /// When true, the bypass-permissions dialog was opened by `/yolo` at
+    /// runtime (not by the --dangerously-skip-permissions startup gate).
+    /// Accepting it switches the permission mode to BypassPermissions;
+    /// declining cancels the toggle without exiting.
+    pub yolo_pending: bool,
+    /// Permission mode active before `/yolo` was turned on, so `/yolo off`
+    /// can restore it instead of hard-setting `Default` (which would kick
+    /// the user out of `plan` or `acceptEdits`).
+    pub yolo_previous_mode: Option<claurst_core::PermissionMode>,
     /// File injection warning dialog.
     /// Shown when oversized or binary files are detected in @refs.
     pub file_injection_dialog: crate::file_injection_dialog::FileInjectionDialogState,
@@ -456,6 +470,9 @@ pub struct App {
         Option<tokio::sync::mpsc::UnboundedReceiver<claurst_tools::UserQuestionEvent>>,
     /// State for the model-initiated ask-user question dialog.
     pub ask_user_dialog: crate::ask_user_dialog::AskUserDialogState,
+    /// How the last finished turn ended, reported as OSC 7501 `done` / `error`
+    /// until the user starts typing the next prompt. `None` = report `idle`.
+    pub last_turn_outcome: Option<crate::program_status::TurnOutcome>,
 
     // ---- Context window & rate limit info ----------------------------------
 
@@ -653,6 +670,7 @@ impl App {
             session_title: None,
             remote_session_url: None,
             mcp_manager: None,
+            discovered_slash_commands: Vec::new(),
             pending_mcp_reconnect: false,
             pending_provider_reload: false,
             pending_mcp_panel_auth: None,
@@ -691,6 +709,8 @@ impl App {
             go_to_line_dialog: GoToLineDialog::new(),
             bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState::new(),
             bypass_permissions_dialog_shown: false,
+            yolo_pending: false,
+            yolo_previous_mode: None,
             file_injection_dialog: crate::file_injection_dialog::FileInjectionDialogState::new(),
             file_injection_force: false,
             onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState::new(),
@@ -778,6 +798,7 @@ impl App {
             model_fetch_rx: None,
             user_question_rx: None,
             ask_user_dialog: crate::ask_user_dialog::AskUserDialogState::new(),
+            last_turn_outcome: None,
             context_window_size: 0,
             context_used_tokens: 0,
             rate_limit_5h_pct: None,
@@ -912,22 +933,16 @@ impl App {
     }
 
     /// Update the context window size from the model registry for the current model.
+    ///
+    /// Delegates to the same resolver auto-compact uses so the footer and the
+    /// compaction thresholds always agree on the window (#393).
     pub fn refresh_context_window_size(&mut self) {
         let provider = self.config.provider.as_deref().unwrap_or("anthropic");
-        let model_id = self.model_name
-            .strip_prefix(&format!("{}/", provider))
-            .unwrap_or(&self.model_name);
-        if let Some(entry) = self.model_registry.get(provider, model_id) {
-            self.context_window_size = entry.info.context_window as u64;
-        } else {
-            // Fallback: common defaults
-            self.context_window_size = match provider {
-                "anthropic" => 200_000,
-                "openai" => 128_000,
-                "google" => 1_048_576,
-                _ => 128_000,
-            };
-        }
+        self.context_window_size = claurst_query::compact::resolve_context_window(
+            Some(&self.model_registry),
+            provider,
+            &self.model_name,
+        );
     }
 
     /// Apply a theme by name, persisting it to config.

@@ -4,6 +4,7 @@ use super::*;
 
 use claurst_core::config::Config;
 use claurst_core::types::Role;
+use claurst_core::PermissionMode;
 use super::keys::{
     key_event_to_keystroke, layout_to_latin, normalize_char_with_shift,
     normalize_layout_shortcut_key,
@@ -463,6 +464,81 @@ use super::types::{ContextMenuItem, ContextMenuState};
         }
         assert_eq!(app.prompt_input.text, "line1\nline2");
         assert!(app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn test_yolo_on_shows_dialog_and_accept_activates() {
+        let mut app = make_app();
+        assert!(app.intercept_slash_command_with_args("yolo", "on"));
+        // Dialog visible, mode not yet switched.
+        assert!(app.bypass_permissions_dialog.visible);
+        assert!(app.yolo_pending);
+        assert_eq!(app.config.permission_mode, PermissionMode::Default);
+
+        // Accept via '2'.
+        app.handle_key_event(press_key(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert!(!app.bypass_permissions_dialog.visible);
+        assert!(!app.yolo_pending);
+        assert_eq!(app.config.permission_mode, PermissionMode::BypassPermissions);
+    }
+
+    #[test]
+    fn test_yolo_on_decline_cancels_without_exit() {
+        let mut app = make_app();
+        assert!(app.intercept_slash_command_with_args("yolo", "on"));
+        // Decline via '1'.
+        app.handle_key_event(press_key(KeyCode::Char('1'), KeyModifiers::NONE));
+        assert!(!app.bypass_permissions_dialog.visible);
+        assert!(!app.yolo_pending);
+        // No exit: decline only cancels the runtime toggle.
+        assert!(!app.should_exit);
+        assert_eq!(app.config.permission_mode, PermissionMode::Default);
+    }
+
+    #[test]
+    fn test_yolo_off_restores_previous_mode_not_default() {
+        // /yolo off must not kick the user out of plan/acceptEdits.
+        let mut app = make_app();
+        app.config.permission_mode = PermissionMode::Plan;
+        assert!(app.intercept_slash_command_with_args("yolo", "on"));
+        app.handle_key_event(press_key(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(app.config.permission_mode, PermissionMode::BypassPermissions);
+
+        assert!(app.intercept_slash_command_with_args("yolo", "off"));
+        // Plan mode restored, not Default.
+        assert_eq!(app.config.permission_mode, PermissionMode::Plan);
+    }
+
+    #[test]
+    fn test_yolo_off_restores_default_mode() {
+        let mut app = make_app();
+        app.config.permission_mode = PermissionMode::BypassPermissions;
+        assert!(app.intercept_slash_command_with_args("yolo", "off"));
+        assert_eq!(app.config.permission_mode, PermissionMode::Default);
+        assert!(!app.bypass_permissions_dialog.visible);
+    }
+
+    #[test]
+    fn test_yolo_on_when_already_bypassed_is_noop() {
+        // `/yolo on` while already bypassed must not record BypassPermissions
+        // as the "previous" mode, or `/yolo off` would leave bypass on.
+        let mut app = make_app();
+        app.config.permission_mode = PermissionMode::BypassPermissions;
+        assert!(app.intercept_slash_command_with_args("yolo", "on"));
+        assert!(!app.bypass_permissions_dialog.visible);
+        assert!(!app.yolo_pending);
+        assert!(app.yolo_previous_mode.is_none());
+        assert!(app.intercept_slash_command_with_args("yolo", "off"));
+        assert_eq!(app.config.permission_mode, PermissionMode::Default);
+    }
+
+    #[test]
+    fn test_yolo_toggle_when_not_bypass_shows_dialog() {
+        let mut app = make_app();
+        // Bare /yolo with Default mode: toggle on → dialog.
+        assert!(app.intercept_slash_command_with_args("yolo", ""));
+        assert!(app.bypass_permissions_dialog.visible);
+        assert!(app.yolo_pending);
     }
 
     #[test]
@@ -957,4 +1033,169 @@ use super::types::{ContextMenuItem, ContextMenuState};
         assert!(!app.should_exit);
         app.handle_key_event(press_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.should_exit);
+    }
+
+    // ---- discovered skill slash commands ----
+
+    #[test]
+    fn discovered_skills_do_not_duplicate_builtin_suggestions() {
+        let mut app = make_app();
+        app.set_discovered_slash_commands(vec![
+            ("clear".to_string(), "skill shadowing a built-in".to_string()),
+            ("clean-room".to_string(), "a real skill".to_string()),
+        ]);
+        app.set_prompt_text("/cle".to_string());
+        let texts: Vec<&str> = app
+            .prompt_input
+            .suggestions
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(texts.iter().filter(|t| **t == "/clear").count(), 1);
+        assert!(texts.contains(&"/clean-room"));
+    }
+
+    // ---- Session listing reads the store sessions are written to (#382) ----
+
+    /// Serializes the tests below: they point the process-global
+    /// `CLAURST_HOME` at a tempdir.
+    static SESSION_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Points `CLAURST_HOME` at a tempdir for its lifetime, restoring the
+    /// previous value on drop.
+    struct SessionHome {
+        dir: tempfile::TempDir,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl SessionHome {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let saved = std::env::var_os("CLAURST_HOME");
+            std::env::set_var("CLAURST_HOME", dir.path());
+            Self { dir, saved }
+        }
+    }
+
+    impl Drop for SessionHome {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var("CLAURST_HOME", v),
+                None => std::env::remove_var("CLAURST_HOME"),
+            }
+        }
+    }
+
+    async fn save_test_session(title: &str, working_dir: &std::path::Path) -> String {
+        let mut session =
+            claurst_core::history::ConversationSession::new("test-model".to_string());
+        session.title = Some(title.to_string());
+        session.working_dir = Some(working_dir.to_string_lossy().into_owned());
+        session.add_message(Message::user("hello"));
+        claurst_core::history::save_session(&session).await.unwrap();
+        session.id
+    }
+
+    #[tokio::test]
+    async fn session_browser_lists_sessions_written_by_history_save_session() {
+        let _lock = SESSION_HOME_LOCK.lock().await;
+        let home = SessionHome::new();
+        let id = save_test_session("issue 382", home.dir.path()).await;
+
+        let entries = super::run::load_session_entries().await;
+        let entry = entries.iter().find(|e| e.id == id).expect("saved session listed");
+        assert_eq!(entry.title, "issue 382");
+        assert_eq!(entry.message_count, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn poll_session_loads_populates_the_session_browser() {
+        let _lock = SESSION_HOME_LOCK.lock().await;
+        let home = SessionHome::new();
+        let id = save_test_session("browser", home.dir.path()).await;
+
+        let mut app = make_app();
+        app.recent_sessions_pending = false;
+        assert!(app.intercept_slash_command_with_args("session", ""));
+        assert!(app.session_browser.visible);
+        for _ in 0..200 {
+            app.poll_session_loads();
+            if !app.session_browser.sessions.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            app.session_browser.sessions.iter().any(|e| e.id == id),
+            "the /session browser must list the session saved to <config_dir>/sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_sessions_are_scoped_to_the_project_root() {
+        let _lock = SESSION_HOME_LOCK.lock().await;
+        let home = SessionHome::new();
+        let project = home.dir.path().join("project");
+        let other = home.dir.path().join("other");
+        save_test_session("in project", &project.join("sub")).await;
+        save_test_session("elsewhere", &other).await;
+
+        let recent = super::run::load_recent_sessions(&project).await;
+        let labels: Vec<&str> = recent.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, vec!["in project"]);
+    }
+
+    #[test]
+    fn session_browser_enter_resubmits_resume_for_the_selected_session() {
+        let mut app = make_app();
+        app.session_browser.open(vec![crate::session_browser::SessionEntry {
+            id: "abc-123".to_string(),
+            title: "t".to_string(),
+            last_updated: "just now".to_string(),
+            message_count: 1,
+            cost_usd: 0.0,
+        }]);
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.session_browser.visible);
+        assert_eq!(app.prompt_input.text, "/resume abc-123");
+        assert!(app.pending_auto_submit);
+    }
+
+    // ---- free-mode context window (issues #393, #394) ----
+
+    #[tokio::test]
+    async fn free_mode_zen_pin_window_agrees_across_consumers() {
+        use claurst_api::LlmProvider;
+
+        let model = "opencode-zen/minimax-m2.5-free";
+        let mut app = make_app();
+        // Pin to the bundled snapshot so a local models.dev cache can't skew it.
+        app.model_registry = claurst_api::ModelRegistry::new();
+        app.set_model(model.to_string());
+        assert_eq!(app.config.provider.as_deref(), Some("free"));
+
+        // Footer / token warnings.
+        assert_eq!(app.context_window_size, 204_800);
+        // Auto-compact sizing.
+        assert_eq!(
+            claurst_query::compact::resolve_context_window(
+                Some(&app.model_registry),
+                "free",
+                model
+            ),
+            app.context_window_size
+        );
+        // `/model` picker catalog served by the Free provider.
+        let upstream = *claurst_api::FREE_CATALOG
+            .iter()
+            .find(|u| u.id == "opencode-zen")
+            .unwrap();
+        let provider = claurst_api::FreeProvider::new(vec![claurst_api::FreeEntry {
+            upstream,
+            provider: Arc::new(claurst_api::GoogleProvider::new(String::new())),
+        }]);
+        let models = provider.discover_models().await.unwrap();
+        let pin = models.iter().find(|m| &*m.id == model).unwrap();
+        assert_eq!(u64::from(pin.context_window), app.context_window_size);
+        assert_eq!(pin.max_output_tokens, 131_072);
     }
