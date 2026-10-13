@@ -23,6 +23,7 @@ use async_trait::async_trait;
 use claurst_core::codex_oauth::{
     CODEX_API_ENDPOINT, CODEX_MODELS, CODEX_TOKEN_URL, DEFAULT_CODEX_MODEL,
 };
+use claurst_core::accounts::jwt_identity;
 use claurst_core::oauth_config::{get_codex_tokens, save_codex_tokens, CodexTokens};
 use claurst_core::provider_id::{ModelId, ProviderId};
 use claurst_core::types::UsageInfo;
@@ -67,7 +68,12 @@ pub struct CodexProvider {
 }
 
 impl CodexProvider {
-    pub fn new(tokens: CodexTokens) -> Self {
+    pub fn new(mut tokens: CodexTokens) -> Self {
+        // Token files written before the claim name was fixed carry no
+        // account id; derive it so `ChatGPT-Account-Id` is still sent.
+        if tokens.account_id.is_none() {
+            tokens.account_id = jwt_identity(&tokens.access_token).account_id;
+        }
         let http_client = reqwest::Client::builder()
             .timeout(crate::request_timeout())
             .build()
@@ -218,6 +224,14 @@ impl CodexProvider {
             updated.refresh_token = Some(r);
         }
         updated.expires_at = new_expires_at;
+        if let Some(account_id) = json_val
+            .get("id_token")
+            .and_then(|v| v.as_str())
+            .and_then(|id_token| jwt_identity(id_token).account_id)
+            .or_else(|| jwt_identity(&new_access).account_id)
+        {
+            updated.account_id = Some(account_id);
+        }
 
         if let Err(e) = save_codex_tokens(&updated) {
             warn!("Failed to persist refreshed Codex tokens: {}", e);
@@ -984,6 +998,17 @@ mod tests {
     fn jwt(payload: Value) -> String {
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string());
         format!("h.{b64}.s")
+    }
+
+    #[test]
+    fn new_derives_account_id_from_access_token_claim() {
+        let provider = CodexProvider::new(CodexTokens {
+            access_token: jwt(json!({
+                "https://api.openai.com/auth": { "chatgpt_account_id": "ws_123" }
+            })),
+            ..Default::default()
+        });
+        assert_eq!(provider.account_id().as_deref(), Some("ws_123"));
     }
 
     #[test]
