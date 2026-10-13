@@ -6,7 +6,7 @@ use regex::RegexBuilder;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::Path;
 use tracing::debug;
 use walkdir::WalkDir;
 
@@ -348,7 +348,7 @@ impl Tool for GrepTool {
 impl GrepTool {
     fn search_file(
         &self,
-        path: &PathBuf,
+        path: &Path,
         content: &str,
         regex: &regex::Regex,
         output_mode: &str,
