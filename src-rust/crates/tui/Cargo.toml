@@ -79,5 +79,9 @@ regex = { workspace = true }
 cpal = { version = "0.15", optional = true }
 hound = { version = "3.5", optional = true }
 
+# Signal-driven terminal restore (reset disposition and re-raise).
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }

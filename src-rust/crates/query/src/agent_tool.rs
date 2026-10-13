@@ -372,6 +372,7 @@ impl Tool for AgentTool {
             // Sub-agents run to their own completion and never drive goal
             // continuation — stop after one turn like every non-goal run.
             continuation: crate::continuation::ContinuationMode::Default,
+            degradation_enabled: ctx.config.degradation_summary_enabled_or_default(),
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.
@@ -646,6 +647,7 @@ pub fn init_team_swarm_runner() {
                     enabled_tools: Some(
                         agent_tools.iter().map(|t| t.name().to_string()).collect(),
                     ),
+                    degradation_enabled: ctx.config.degradation_summary_enabled_or_default(),
                     ..Default::default()
                 };
 

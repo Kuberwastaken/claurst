@@ -556,6 +556,64 @@ fn drive_pty_child(
 // Windows fallback (cmd.exe, no PTY)
 // ---------------------------------------------------------------------------
 
+/// Windows counterpart of `PtyKillGuard` (#391). `tokio::process::Child` is not
+/// killed on drop, and even `kill_on_drop(true)` / `Child::kill` only terminate
+/// `cmd.exe` itself — its children (e.g. `python.exe`) would keep running. If
+/// the future driving `run_windows_fallback` is dropped mid-command (turn
+/// cancelled / task aborted), this guard kills the whole process tree with
+/// `taskkill /T /F`.
+///
+/// The guard is disarmed on normal completion and fired explicitly on timeout.
+#[cfg(windows)]
+struct WindowsProcessTreeGuard {
+    /// Root PID of the tree; `None` when there is nothing (left) to kill.
+    pid: Option<u32>,
+}
+
+#[cfg(windows)]
+impl WindowsProcessTreeGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self { pid }
+    }
+
+    /// The command finished on its own — there is nothing left to kill.
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+
+    /// Kill the process tree now (timeout path) and disarm so `Drop` is a no-op.
+    fn kill_now(&mut self) {
+        if let Some(pid) = self.pid.take() {
+            kill_process_tree(pid);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsProcessTreeGuard {
+    fn drop(&mut self) {
+        // Future dropped before completion (cancel / abort): don't leak the tree.
+        self.kill_now();
+    }
+}
+
+/// Forcefully terminate `pid` and every descendant. Runs synchronously so the
+/// tree is gone by the time the guard's drop returns; failures are ignored
+/// (the process may already have exited).
+#[cfg(windows)]
+fn kill_process_tree(pid: u32) {
+    use std::os::windows::process::CommandExt;
+    // Keep taskkill from flashing a console window when the host is a GUI app.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
+}
+
 #[cfg(windows)]
 async fn run_windows_fallback(
     command: &str,
@@ -575,6 +633,10 @@ async fn run_windows_fallback(
         Ok(c) => c,
         Err(e) => return ToolResult::error(format!("Failed to spawn command: {}", e)),
     };
+
+    // Kill-on-drop guard: if this future is dropped mid-command (turn cancelled)
+    // the guard fires and kills cmd.exe and all of its children (#391).
+    let mut guard = WindowsProcessTreeGuard::new(child.id());
 
     let stdout_handle = child.stdout.take();
     let stderr_handle = child.stderr.take();
@@ -604,6 +666,7 @@ async fn run_windows_fallback(
 
     match result {
         Ok((stdout_lines, stderr_lines, status)) => {
+            guard.disarm();
             let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
             let mut output = String::new();
             if !stdout_lines.is_empty() {
@@ -622,6 +685,9 @@ async fn run_windows_fallback(
             truncate_output(output, exit_code)
         }
         Err(_) => {
+            // Kill the whole tree, not just cmd.exe (#391); `child.kill` remains
+            // as a fallback should taskkill be unavailable, and reaps the child.
+            guard.kill_now();
             let _ = child.kill().await;
             ToolResult::error(format!("Command timed out after {}ms", timeout_ms))
         }
@@ -1051,5 +1117,73 @@ mod tests {
             "execute should return promptly after the direct child exits, took {:?}",
             elapsed
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use base64::Engine as _;
+
+    /// Distinctive ping count: doubles as a searchable command-line marker and
+    /// keeps the command running far longer than the test.
+    const MARKER: &str = "31391 127.0.0.1";
+
+    /// PIDs of `cmd.exe` / `PING.EXE` processes whose command line carries
+    /// `MARKER`. Queried through WMI via PowerShell; the script is passed with
+    /// `-EncodedCommand` to sidestep Windows argument-quoting rules.
+    fn marker_pids() -> Vec<u32> {
+        let script = format!(
+            "(Get-CimInstance Win32_Process -Filter \"(Name='PING.EXE' OR Name='cmd.exe') \
+             AND CommandLine LIKE '%{MARKER}%'\").ProcessId"
+        );
+        let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded])
+            .output()
+            .expect("failed to run powershell");
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .filter_map(|p| p.parse().ok())
+            .collect()
+    }
+
+    /// #391: dropping the `run_windows_fallback` future mid-command must kill
+    /// cmd.exe AND its children, not leave them running to completion.
+    #[tokio::test]
+    async fn dropping_the_future_kills_the_process_tree() {
+        let cwd = std::env::temp_dir();
+        let command = format!("ping -n {MARKER}");
+        // Boxed (not `tokio::pin!`) so `drop(fut)` really drops the future.
+        let mut fut =
+            Box::pin(run_windows_fallback(&command, &cwd, Duration::from_secs(120), 120_000));
+
+        // Let the command start, then confirm both cmd.exe and ping.exe are up.
+        tokio::select! {
+            res = &mut fut => panic!("command finished unexpectedly: {}", res.content),
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+        }
+        let before = marker_pids();
+        assert!(
+            before.len() >= 2,
+            "expected cmd.exe and ping.exe to be running, found pids {before:?}"
+        );
+
+        // Cancel: drop the in-flight future.
+        drop(fut);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let lingering = marker_pids();
+            if lingering.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "process tree survived the dropped future; still running: {lingering:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 }

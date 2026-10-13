@@ -822,6 +822,39 @@ impl ModelRegistry {
         self.entries.get(&key)
     }
 
+    /// Resolve the catalog entry backing `model` when it is served through
+    /// `provider`.
+    ///
+    /// This is the single key-derivation path shared by everything that sizes a
+    /// model (auto-compact thresholds, the TUI footer / token warnings, the Free
+    /// provider's picker catalog), so they cannot disagree. `model` may be a
+    /// bare id (`"gemini-2.5-flash"`), carry the active provider's prefix
+    /// (`"google/gemini-2.5-flash"`), or embed a different upstream, e.g. the
+    /// Free-mode pin `"opencode-zen/minimax-m2.5-free"` under provider `"free"`.
+    ///
+    /// Candidates, in order:
+    ///   1. `(provider, model)` verbatim (some ids contain `/`, e.g. `openrouter/free`);
+    ///   2. `(provider, model)` with a leading `"<provider>/"` stripped;
+    ///   3. the embedded `"upstream/model"` split of (2).
+    ///
+    /// Each candidate provider is tried as given and then through
+    /// [`canonical_snapshot_key`], which maps gateway / runtime aliases onto the
+    /// key the catalog is stored under. Entries whose context window is below
+    /// [`MIN_PLAUSIBLE_CONTEXT_WINDOW`] (the placeholder stored when models.dev
+    /// omits a limit) are skipped.
+    pub fn resolve_entry(&self, provider: &str, model: &str) -> Option<&ModelEntry> {
+        let stripped = model
+            .strip_prefix(provider)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .unwrap_or(model);
+        [Some((provider, model)), Some((provider, stripped)), stripped.split_once('/')]
+            .into_iter()
+            .flatten()
+            .flat_map(|(p, m)| [(p, m), (canonical_snapshot_key(p), m)])
+            .filter_map(|(p, m)| self.get(p, m))
+            .find(|entry| entry.info.context_window >= MIN_PLAUSIBLE_CONTEXT_WINDOW)
+    }
+
     /// Resolve a model string into `(ProviderId, ModelId)`.
     ///
     /// Accepts either `"provider/model"` or a bare model name (which defaults
@@ -1362,13 +1395,24 @@ impl Default for ModelRegistry {
 /// but `"codex"` everywhere else. Apply this at every catalog read so a lookup
 /// never silently misses and falls through to an unrelated provider's default
 /// (the bug that used to resolve `"qwen"` to a `claude-*` model).
+///
+/// OpenCode Zen is stored under `"opencode-zen"` (see [`remap_provider_id`]);
+/// models.dev's own id `"opencode"` and the legacy Free-mode pin prefix `"zen"`
+/// are aliases of it.
 pub(crate) fn canonical_snapshot_key(provider_id: &str) -> &str {
     match provider_id {
         "qwen" => "alibaba",
         "openai-codex" => "codex",
+        "opencode" | "zen" => "opencode-zen",
         other => other,
     }
 }
+
+/// Smallest catalog context window [`ModelRegistry::resolve_entry`] treats as
+/// real. When models.dev omits a limit, `transform_api` stores a `4096`
+/// placeholder; sizing a live session from it would compact at ~3.7k tokens,
+/// so such entries count as unknown.
+const MIN_PLAUSIBLE_CONTEXT_WINDOW: u32 = 8_192;
 
 /// Whether a provider id refers to a local runtime whose models are ranked by
 /// capability (coder-first) rather than by the cloud-flagship priority list.
@@ -1669,6 +1713,70 @@ mod tests {
             parsed.models.contains_key("opencode-zen/qwen3.6-plus-free"),
             "model key must use opencode-zen prefix"
         );
+    }
+
+    /// Context window resolved for `(provider, model)`, for terse assertions.
+    fn resolved_window(reg: &ModelRegistry, provider: &str, model: &str) -> Option<u32> {
+        reg.resolve_entry(provider, model).map(|e| e.info.context_window)
+    }
+
+    #[test]
+    fn resolve_entry_maps_zen_gateway_aliases() {
+        // models.dev lists the Zen gateway under "opencode" (stored as
+        // "opencode-zen"); every spelling of a Zen pin must hit that entry
+        // (issues #393, #394). Values come from the bundled snapshot.
+        let reg = ModelRegistry::new();
+        let zen = reg
+            .get("opencode-zen", "minimax-m2.5-free")
+            .expect("bundled snapshot carries opencode/minimax-m2.5-free");
+        assert_eq!(zen.info.context_window, 204_800);
+        assert_eq!(zen.info.max_output_tokens, 131_072);
+        for (provider, model) in [
+            ("opencode-zen", "minimax-m2.5-free"),
+            ("opencode-zen", "opencode-zen/minimax-m2.5-free"),
+            ("free", "opencode-zen/minimax-m2.5-free"),
+            ("free", "free/opencode-zen/minimax-m2.5-free"),
+            ("free", "zen/minimax-m2.5-free"),
+            ("anthropic", "opencode/minimax-m2.5-free"),
+            ("opencode", "minimax-m2.5-free"),
+        ] {
+            assert_eq!(
+                resolved_window(&reg, provider, model),
+                Some(204_800),
+                "{provider} + {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_entry_handles_slashed_upstream_ids() {
+        let reg = ModelRegistry::new();
+        // OpenRouter's free router id itself contains a '/'.
+        assert_eq!(resolved_window(&reg, "openrouter", "openrouter/free"), Some(200_000));
+        assert_eq!(resolved_window(&reg, "free", "openrouter/openrouter/free"), Some(200_000));
+        // NVIDIA NIM ids are `vendor/model`.
+        assert_eq!(
+            resolved_window(&reg, "free", "nvidia/meta/llama-3.3-70b-instruct"),
+            Some(128_000)
+        );
+    }
+
+    #[test]
+    fn resolve_entry_misses_unknown_and_placeholder_models() {
+        let mut reg = ModelRegistry::new();
+        assert!(reg.resolve_entry("free", "free/auto").is_none());
+        assert!(reg.resolve_entry("free", "opencode-zen/no-such-model").is_none());
+        // A models.dev entry without a limit gets the 4096 placeholder, which
+        // must read as "unknown" rather than a real window.
+        merge_json(
+            &mut reg,
+            r#"{"testprov":{"id":"testprov","name":"Test","env":[],"models":{"no-limit":{"id":"no-limit","name":"No Limit"}}}}"#,
+        );
+        assert_eq!(
+            reg.get("testprov", "no-limit").map(|e| e.info.context_window),
+            Some(4_096)
+        );
+        assert!(reg.resolve_entry("testprov", "no-limit").is_none());
     }
 
     #[test]

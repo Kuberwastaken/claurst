@@ -547,6 +547,15 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         config.permission_mode = PermissionMode::BypassPermissions;
+    } else if config.yolo_mode {
+        // YOLO mode from global settings.json: same root/sudo guard.
+        #[cfg(unix)]
+        if nix::unistd::Uid::effective().is_root() {
+            anyhow::bail!(
+                "yoloMode cannot be used with root/sudo privileges for security reasons"
+            );
+        }
+        config.permission_mode = PermissionMode::BypassPermissions;
     } else {
         config.permission_mode = cli.permission_mode.into();
     }
@@ -1873,6 +1882,10 @@ async fn run_interactive(
 
     // Set up terminal
     let mut terminal = setup_terminal(live_config.mouse_capture_enabled())?;
+    // Restore the terminal on SIGINT / SIGTERM / SIGHUP / SIGQUIT. Raw mode,
+    // the kitty keyboard stack, bracketed paste and mouse capture are process
+    // state that would otherwise outlive a signalled exit and garble the shell.
+    claurst_tui::spawn_signal_restore_watchers();
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
     // Discover skill slash commands once at startup so they appear in
     // autocomplete without re-running discovery per keystroke. Discovery walks
@@ -2179,9 +2192,12 @@ async fn run_interactive(
     // setting; read it once at startup. `progress_shown` tracks whether we've
     // told the terminal we're "busy", so the escape is only emitted on an actual
     // streaming-state edge.
-    let progress_bar_enabled = claurst_core::config::Settings::load_sync()
-        .map(|s| s.terminal_progress_bar)
-        .unwrap_or(true);
+    // OSC 7501 program status reporting is likewise opt-out, via the
+    // terminalProgramStatus setting.
+    let (progress_bar_enabled, program_status_enabled) =
+        claurst_core::config::Settings::load_sync()
+            .map(|s| (s.terminal_progress_bar, s.terminal_program_status))
+            .unwrap_or((true, true));
     let mut progress_shown = false;
     'main: loop {
         app.frame_count = app.frame_count.wrapping_add(1);
@@ -2216,6 +2232,10 @@ async fn run_interactive(
             last_auto_scroll = app.auto_scroll;
         }
 
+        // Load/drain the session browser and welcome-screen session lists
+        // (this loop does not go through `App::run`; issue #382).
+        app.poll_session_loads();
+
         // Draw the UI
         terminal.draw(|f| render_app(f, &app))?;
 
@@ -2226,6 +2246,13 @@ async fn run_interactive(
         if want_progress != progress_shown {
             claurst_tui::set_terminal_progress(want_progress);
             progress_shown = want_progress;
+        }
+
+        // Report OSC 7501 program status (idle / working / blocked / done /
+        // error) so terminals and multiplexer UIs can show which session needs
+        // attention. Written only on change; cleared in restore_terminal.
+        if program_status_enabled {
+            claurst_tui::set_program_status(app.program_status(current_query.is_some()));
         }
 
         // Poll for crossterm events (keyboard/mouse) with short timeout
@@ -2271,6 +2298,11 @@ async fn run_interactive(
                     // Only process Press to avoid double-registering input.
                     if key.kind != crossterm::event::KeyEventKind::Press {
                         continue;
+                    }
+                    // Any key press after a turn ends means the user has seen
+                    // its result: OSC 7501 `done` / `error` falls back to `idle`.
+                    if current_query.is_none() {
+                        app.last_turn_outcome = None;
                     }
 
                     // Ctrl+C and Ctrl+D: exit confirmation handling
@@ -2408,7 +2440,15 @@ async fn run_interactive(
                             // Always runs — some commands need BOTH (e.g. /clear clears
                             // app state via TUI AND the messages vec via CLI).
                             cmd_ctx.messages = messages.clone();
-                            let cli_result = execute_command(&input, &mut cmd_ctx).await;
+                            // A bare `/resume` opened the session browser; the
+                            // user picks a session there (Enter re-submits
+                            // `/resume <id>`), so don't also auto-resume the
+                            // most recent one underneath it (issue #382).
+                            let cli_result = if handled_by_tui && cmd_name == "resume" {
+                                None
+                            } else {
+                                execute_command(&input, &mut cmd_ctx).await
+                            };
                             // Start optimistically true; set false for Silent/None below.
                             let mut handled_by_cli = cli_result.is_some();
 
@@ -4035,7 +4075,9 @@ async fn run_interactive(
         if task_finished {
             if let Some((handle, msgs_arc)) = current_query.take() {
                 // Get the outcome and handle errors
-                if let Ok(QueryOutcome::Error(err)) = handle.await {
+                let result = handle.await;
+                app.last_turn_outcome = claurst_tui::TurnOutcome::from_query_result(&result);
+                if let Ok(QueryOutcome::Error(err)) = result {
                     while app.notifications.current_is_error() {
                         app.notifications.dismiss_current();
                     }
