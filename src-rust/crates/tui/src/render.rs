@@ -590,16 +590,11 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         input_height(&app.prompt_input, prompt_text_width) + 1 // +1 for model/mode status line
     };
 
-    let status_line_height: u16 = if let Some(ref text) = app.status_line_override {
-        let clean = strip_ansi(text);
-        let line_count = clean.lines().count().max(1) as u16;
-        let max_lines = app.config.status_line.as_ref()
-            .and_then(|s| s.max_lines)
-            .unwrap_or(10);
-        line_count.min(max_lines)
-    } else {
-        0
-    };
+    // Already stripped and capped to `maxLines` by `App::set_status_line_output`.
+    let status_line_height: u16 = app
+        .status_line_override
+        .as_deref()
+        .map_or(0, |text| u16::try_from(text.lines().count().max(1)).unwrap_or(u16::MAX));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2847,7 +2842,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Strip ANSI escape sequences and C0 control characters (except \n, \t)
 /// from text, returning clean plain text.
-fn strip_ansi(text: &str) -> String {
+pub(crate) fn strip_ansi(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let bytes = text.as_bytes();
     let len = bytes.len();
@@ -2932,20 +2927,13 @@ fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
         if idx > 0 {
             out.push('\n');
         }
-        if line.chars().count() > max_width && max_width > 3 {
-            let mut truncated = String::with_capacity(max_width);
-            let mut char_count = 0;
-            for c in line.chars() {
-                if char_count + 3 >= max_width {
-                    break;
-                }
-                truncated.push(c);
-                char_count += 1;
-            }
-            truncated.push_str("...");
-            out.push_str(&truncated);
-        } else {
+        if line.chars().count() <= max_width {
             out.push_str(line);
+        } else if max_width > 3 {
+            out.extend(line.chars().take(max_width - 3));
+            out.push_str("...");
+        } else {
+            out.extend(line.chars().take(max_width));
         }
     }
     out
@@ -2956,15 +2944,17 @@ fn render_status_line_override(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let text = app.status_line_override.as_deref().unwrap_or("");
-    let clean = strip_ansi(text);
     let padding = app.config.status_line.as_ref().and_then(|s| s.padding).unwrap_or(0);
     let pad = padding.min(area.width.saturating_div(2));
-    let content_width = area.width.saturating_sub(pad.saturating_mul(2)).max(1) as usize;
-    let display = truncate_with_ellipsis(&clean, content_width);
+    let content_width = area.width.saturating_sub(pad.saturating_mul(2));
+    if content_width == 0 {
+        return;
+    }
+    let display = truncate_with_ellipsis(text, usize::from(content_width));
     let padded = Rect {
         x: area.x.saturating_add(pad),
         y: area.y,
-        width: content_width as u16,
+        width: content_width,
         height: area.height,
     };
     let lines: Vec<Line> = display
@@ -4039,5 +4029,114 @@ mod recent_activity_tests {
             .collect();
         assert!(screen.contains("Recent activity"), "header rendered: present");
         assert!(screen.contains("Sortable label"), "session label rendered");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// External status line (`statusLine` setting)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod status_line_tests {
+    use super::*;
+    use crate::app::App;
+    use claurst_core::config::{Config, StatusLineConfig};
+    use claurst_core::cost::CostTracker;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn app_with_status_line(padding: Option<u16>, max_lines: Option<u16>) -> App {
+        let mut config = Config::default();
+        config.status_line = Some(StatusLineConfig {
+            command: "true".into(),
+            poll_interval_ms: None,
+            padding,
+            max_lines,
+        });
+        App::new(config, CostTracker::new())
+    }
+
+    fn rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_keeps_short_lines() {
+        assert_eq!(truncate_with_ellipsis("abc", 3), "abc");
+        assert_eq!(truncate_with_ellipsis("a\nbc", 5), "a\nbc");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_cuts_to_exact_width() {
+        assert_eq!(truncate_with_ellipsis("abcdefghij", 8), "abcde...");
+        assert_eq!(truncate_with_ellipsis("abcdefghij\nxy", 6), "abc...\nxy");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_counts_chars_not_bytes() {
+        let out = truncate_with_ellipsis("\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}", 5);
+        assert_eq!(out, "\u{e9}\u{e9}...");
+        assert_eq!(out.chars().count(), 5);
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_clips_without_ellipsis_when_too_narrow() {
+        assert_eq!(truncate_with_ellipsis("abcdef", 3), "abc");
+        assert_eq!(truncate_with_ellipsis("abcdef", 0), "");
+    }
+
+    #[test]
+    fn strip_ansi_removes_escapes_and_controls() {
+        let raw = "\x1b[1;32mgreen\x1b[0m \x1b]8;;https://x\x07link\x1b]8;;\x1b\\\x08\nnext\ttab";
+        assert_eq!(strip_ansi(raw), "green link\nnext\ttab");
+    }
+
+    #[test]
+    fn set_status_line_output_strips_and_caps_lines() {
+        let mut app = app_with_status_line(None, Some(2));
+        app.set_status_line_output("\x1b[31mone\x1b[0m\ntwo\nthree");
+        assert_eq!(app.status_line_override.as_deref(), Some("one\ntwo"));
+        app.set_status_line_output("\x1b[0m");
+        assert!(app.status_line_override.is_none());
+    }
+
+    #[test]
+    fn status_line_padding_and_truncation_render() {
+        let mut app = app_with_status_line(Some(3), None);
+        app.set_status_line_output("abcdefghijklmnopqrstuvwxyz");
+        let mut terminal = Terminal::new(TestBackend::new(20, 1)).unwrap();
+        terminal
+            .draw(|f| render_status_line_override(f, &app, f.area()))
+            .unwrap();
+        assert_eq!(rows(&terminal)[0], "   abcdefghijk...   ");
+    }
+
+    #[test]
+    fn status_line_padding_larger_than_terminal_does_not_panic() {
+        let mut app = app_with_status_line(Some(u16::MAX), None);
+        app.set_status_line_output("status");
+        for width in [1, 2, 7] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+            terminal
+                .draw(|f| render_status_line_override(f, &app, f.area()))
+                .unwrap();
+            // Padding is clamped to half the width: at most one cell remains.
+            assert!(rows(&terminal)[0].trim().chars().count() <= 1);
+        }
+    }
+
+    #[test]
+    fn status_line_renders_above_footer_in_full_layout() {
+        let mut app = app_with_status_line(None, None);
+        app.set_status_line_output("ext-status-ok");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render_app(f, &app)).unwrap();
+        assert!(rows(&terminal).iter().any(|r| r.contains("ext-status-ok")));
     }
 }

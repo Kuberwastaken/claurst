@@ -419,7 +419,8 @@ pub struct App {
     pub background_task_count: usize,
     /// Background task status text shown in footer pill.
     pub background_task_status: Option<String>,
-    /// External status line command output (from CLAUDE_STATUS_COMMAND).
+    /// External status line output (`statusLine` / CLAUDE_STATUS_COMMAND),
+    /// already stripped and line-capped by `set_status_line_output`.
     pub status_line_override: Option<String>,
     /// Whether auto-compact is enabled (from settings).
     pub auto_compact_enabled: bool,
@@ -903,6 +904,22 @@ impl App {
             other => other,
         };
         self.status_message = Some(format!("Switched to {} mode.", label));
+    }
+
+    /// Store fresh output from the external status-line command. Escape
+    /// sequences and control characters are stripped and the text is capped to
+    /// `statusLine.maxLines` (default 10) once here, so rendering does not
+    /// re-parse it every frame. Empty output hides the status line.
+    pub fn set_status_line_output(&mut self, raw: &str) {
+        let max_lines = self
+            .config
+            .status_line
+            .as_ref()
+            .and_then(|s| s.max_lines)
+            .unwrap_or(10) as usize;
+        let clean = crate::render::strip_ansi(raw);
+        let capped = clean.lines().take(max_lines).collect::<Vec<_>>().join("\n");
+        self.status_line_override = if capped.trim().is_empty() { None } else { Some(capped) };
     }
 
     /// Update the context window size from the model registry for the current model.

@@ -469,7 +469,7 @@ use super::types::{ContextMenuItem, ContextMenuState};
     fn test_cc_statusline_slash_command() {
         let mut app = make_app();
         assert!(app.intercept_slash_command("cc-statusline"));
-        assert!(app.status_message.as_deref().map_or(false, |m| m.contains("No external statusLine configured")));
+        assert!(app.status_message.as_deref().is_some_and(|m| m.contains("No external statusLine configured")));
     }
 
     #[test]
