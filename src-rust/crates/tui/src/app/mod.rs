@@ -246,10 +246,10 @@ pub struct App {
     pub remote_session_url: Option<String>,
     /// Live MCP manager snapshot source when available.
     pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
-    /// Cached list of discovered skill slash commands (name, description),
-    /// built once at startup and refreshed when the config changes. Used to
-    /// augment the autocomplete and command palette without re-running
-    /// discovery on every keystroke.
+    /// Discovered skill slash commands `(name, description)`, appended to the
+    /// built-in `PROMPT_SLASH_COMMANDS` for prompt autocomplete. Filled once,
+    /// when the background discovery spawned at startup finishes, via
+    /// [`App::set_discovered_slash_commands`]; never contains built-ins.
     pub discovered_slash_commands: Vec<(String, String)>,
     /// Queued request for a real MCP reconnect from the interactive loop.
     pub pending_mcp_reconnect: bool,

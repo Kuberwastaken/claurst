@@ -958,3 +958,23 @@ use super::types::{ContextMenuItem, ContextMenuState};
         app.handle_key_event(press_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.should_exit);
     }
+
+    // ---- discovered skill slash commands ----
+
+    #[test]
+    fn discovered_skills_do_not_duplicate_builtin_suggestions() {
+        let mut app = make_app();
+        app.set_discovered_slash_commands(vec![
+            ("clear".to_string(), "skill shadowing a built-in".to_string()),
+            ("clean-room".to_string(), "a real skill".to_string()),
+        ]);
+        app.set_prompt_text("/cle".to_string());
+        let texts: Vec<&str> = app
+            .prompt_input
+            .suggestions
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(texts.iter().filter(|t| **t == "/clear").count(), 1);
+        assert!(texts.contains(&"/clean-room"));
+    }

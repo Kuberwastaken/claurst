@@ -1427,17 +1427,21 @@ impl SlashCommand for SkillCommand {
 ///
 /// Pass the project `cwd` and the `skills` section of the effective config.
 /// Bundled skills take precedence — any discovered skill whose name clashes
-/// with a built-in command will be silently skipped.
+/// with a built-in command name or alias will be silently skipped. Only the
+/// skills are returned, never the built-ins themselves.
+///
+/// Discovery walks the filesystem and may `git clone` configured skill URLs,
+/// so call this off the UI thread.
 pub fn commands_from_discovered_skills(
     cwd: &std::path::Path,
     skills_config: &claurst_core::SkillsConfig,
 ) -> Vec<Box<dyn SlashCommand>> {
     let discovered = claurst_core::discover_skills(cwd, skills_config);
-    // Build a set of built-in command names so we can skip collisions.
+    // Build a set of built-in command names and aliases to skip collisions.
     let all_cmds = all_commands();
     let builtin_names: std::collections::HashSet<&str> = all_cmds
         .iter()
-        .map(|c| c.name())
+        .flat_map(|c| std::iter::once(c.name()).chain(c.aliases()))
         .collect();
 
     discovered
@@ -1451,37 +1455,6 @@ pub fn commands_from_discovered_skills(
             }) as Box<dyn SlashCommand>
         })
         .collect()
-}
-
-/// Return all slash command names and descriptions (built-in + discovered
-/// skills), suitable for autocomplete and the command palette. Discovered
-/// skills whose name clashes with a built-in are excluded.
-///
-/// The built-in list is returned as owned `String`s because `all_commands()`
-/// returns `Box<dyn SlashCommand>` with borrowed `&str` fields — we need
-/// owned strings to mix with discovered skill names in one `Vec`.
-pub fn all_slash_command_names(
-    cwd: &std::path::Path,
-    skills_config: &claurst_core::SkillsConfig,
-) -> Vec<(String, String)> {
-    // Built-in commands.
-    let cmds = all_commands();
-    let mut result: Vec<(String, String)> = cmds
-        .iter()
-        .map(|c| (c.name().to_string(), c.description().to_string()))
-        .collect();
-    // Discovered skills (excluding name collisions with built-ins).
-    let builtin_names: std::collections::HashSet<String> = result
-        .iter()
-        .map(|(name, _)| name.clone())
-        .collect();
-    let discovered = claurst_core::discover_skills(cwd, skills_config);
-    for skill in discovered.values() {
-        if !builtin_names.contains(&skill.name) {
-            result.push((skill.name.clone(), skill.description.clone()));
-        }
-    }
-    result
 }
 
 /// Execute a slash command string (with leading /).

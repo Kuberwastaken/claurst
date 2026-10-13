@@ -1875,11 +1875,21 @@ async fn run_interactive(
     let mut terminal = setup_terminal(live_config.mouse_capture_enabled())?;
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
     // Discover skill slash commands once at startup so they appear in
-    // autocomplete without re-running discovery per keystroke.
-    app.discovered_slash_commands = claurst_commands::all_slash_command_names(
-        &tool_ctx.working_dir,
-        &live_config.skills,
-    );
+    // autocomplete without re-running discovery per keystroke. Discovery walks
+    // the filesystem and may `git clone` skill URLs, so it runs on the blocking
+    // pool and the main loop installs the result when it arrives.
+    let (skill_cmds_tx, mut skill_cmds_rx) = mpsc::channel::<Vec<(String, String)>>(1);
+    {
+        let cwd = tool_ctx.working_dir.clone();
+        let skills_config = live_config.skills.clone();
+        tokio::task::spawn_blocking(move || {
+            let commands = claurst_commands::commands_from_discovered_skills(&cwd, &skills_config)
+                .iter()
+                .map(|c| (c.name().to_string(), c.description().to_string()))
+                .collect();
+            let _ = skill_cmds_tx.blocking_send(commands);
+        });
+    }
     if let Some(error) = settings_load_error {
         app.invalid_config_dialog =
             claurst_tui::InvalidConfigDialogState::show_settings_error(&error);
@@ -3840,6 +3850,11 @@ async fn run_interactive(
         // Refresh task list if the overlay is visible.
         if app.tasks_overlay.visible {
             app.tasks_overlay.refresh_tasks(&claurst_tools::TASK_STORE);
+        }
+
+        // Install skill slash commands once background discovery finishes.
+        if let Ok(commands) = skill_cmds_rx.try_recv() {
+            app.set_discovered_slash_commands(commands);
         }
 
         // Check if the background update task has reported a result.
