@@ -58,6 +58,7 @@ pub struct SettingsScreen {
     pub output_style: String,
     pub reduce_motion: bool,
     pub terminal_progress_bar: bool,
+    pub terminal_program_status: bool,
     pub verbose: bool,
     pub cursor_blink_enabled: bool,
     pub auto_copy_enabled: bool,
@@ -92,6 +93,7 @@ impl SettingsScreen {
             output_style: "default".to_string(),
             reduce_motion: false,
             terminal_progress_bar: true,
+            terminal_program_status: true,
             verbose: false,
             cursor_blink_enabled: false,
             auto_copy_enabled: false,
@@ -121,6 +123,7 @@ impl SettingsScreen {
         self.output_style = self.settings_snapshot.config.output_style.clone().unwrap_or_else(|| "default".to_string());
         self.reduce_motion = self.settings_snapshot.reduce_motion;
         self.terminal_progress_bar = self.settings_snapshot.terminal_progress_bar;
+        self.terminal_program_status = self.settings_snapshot.terminal_program_status;
         self.verbose = self.settings_snapshot.config.verbose;
         self.cursor_blink_enabled = self.settings_snapshot.config.cursor_blink_enabled;
         self.auto_copy_enabled = self.settings_snapshot.auto_copy_on_highlight;
@@ -310,6 +313,13 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
             description: "Show progress during tool use.",
             kind: SettingKind::Bool,
             value: if screen.terminal_progress_bar { "true" } else { "false" }.to_string(),
+        },
+        SettingsEntry {
+            key: "terminal_program_status",
+            label: "Terminal program status",
+            description: "Report working / waiting / done to the terminal (OSC 7501). Takes effect on next session.",
+            kind: SettingKind::Bool,
+            value: if screen.terminal_program_status { "true" } else { "false" }.to_string(),
         },
         SettingsEntry {
             key: "verbose",
@@ -726,6 +736,11 @@ fn toggle_or_cycle_current(screen: &mut SettingsScreen) {
                     "terminal_progress_bar" => {
                         screen.terminal_progress_bar = new_value;
                         screen.settings_snapshot.terminal_progress_bar = new_value;
+                        let _ = screen.settings_snapshot.save_sync();
+                    }
+                    "terminal_program_status" => {
+                        screen.terminal_program_status = new_value;
+                        screen.settings_snapshot.terminal_program_status = new_value;
                         let _ = screen.settings_snapshot.save_sync();
                     }
                     "verbose" => {

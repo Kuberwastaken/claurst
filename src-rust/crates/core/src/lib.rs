@@ -1297,6 +1297,10 @@ pub mod config {
         /// Whether to show terminal progress bars. Defaults to true.
         #[serde(default = "default_true", rename = "terminalProgressBar")]
         pub terminal_progress_bar: bool,
+        /// Whether to report program status (working / waiting on the user /
+        /// done / error) to the terminal via OSC 7501. Defaults to true.
+        #[serde(default = "default_true", rename = "terminalProgramStatus")]
+        pub terminal_program_status: bool,
         /// Whether to enable auto-compact. Defaults to true.
         #[serde(default = "default_true", rename = "autoCompact")]
         pub auto_compact: bool,
@@ -2024,6 +2028,7 @@ pub mod config {
                 show_turn_duration: over.show_turn_duration || base.show_turn_duration,
                 reduce_motion: over.reduce_motion || base.reduce_motion,
                 terminal_progress_bar: over.terminal_progress_bar || base.terminal_progress_bar,
+                terminal_program_status: over.terminal_program_status || base.terminal_program_status,
                 show_cwd: over.show_cwd || base.show_cwd,
                 show_git_branch: over.show_git_branch || base.show_git_branch,
                 auto_compact: over.auto_compact || base.auto_compact,

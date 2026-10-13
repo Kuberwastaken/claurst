@@ -2163,9 +2163,12 @@ async fn run_interactive(
     // setting; read it once at startup. `progress_shown` tracks whether we've
     // told the terminal we're "busy", so the escape is only emitted on an actual
     // streaming-state edge.
-    let progress_bar_enabled = claurst_core::config::Settings::load_sync()
-        .map(|s| s.terminal_progress_bar)
-        .unwrap_or(true);
+    // OSC 7501 program status reporting is likewise opt-out, via the
+    // terminalProgramStatus setting.
+    let (progress_bar_enabled, program_status_enabled) =
+        claurst_core::config::Settings::load_sync()
+            .map(|s| (s.terminal_progress_bar, s.terminal_program_status))
+            .unwrap_or((true, true));
     let mut progress_shown = false;
     'main: loop {
         app.frame_count = app.frame_count.wrapping_add(1);
@@ -2210,6 +2213,13 @@ async fn run_interactive(
         if want_progress != progress_shown {
             claurst_tui::set_terminal_progress(want_progress);
             progress_shown = want_progress;
+        }
+
+        // Report OSC 7501 program status (idle / working / blocked / done /
+        // error) so terminals and multiplexer UIs can show which session needs
+        // attention. Written only on change; cleared in restore_terminal.
+        if program_status_enabled {
+            claurst_tui::set_program_status(app.program_status(current_query.is_some()));
         }
 
         // Poll for crossterm events (keyboard/mouse) with short timeout
@@ -4014,7 +4024,9 @@ async fn run_interactive(
         if task_finished {
             if let Some((handle, msgs_arc)) = current_query.take() {
                 // Get the outcome and handle errors
-                if let Ok(QueryOutcome::Error(err)) = handle.await {
+                let result = handle.await;
+                app.last_turn_outcome = claurst_tui::TurnOutcome::from_query_result(&result);
+                if let Ok(QueryOutcome::Error(err)) = result {
                     while app.notifications.current_is_error() {
                         app.notifications.dismiss_current();
                     }
