@@ -278,7 +278,11 @@ pub fn setup_terminal(mouse_capture: bool) -> io::Result<Terminal<CrosstermBacke
             // Best-effort restore — ignore errors, we're already unwinding.
             let _ = disable_raw_mode();
             let _ = restore_terminal_cleanup();
-            clear_program_status();
+            // Leave an `error` record rather than clearing, so an unattended
+            // tab still shows that Claurst crashed.
+            if PROGRAM_STATUS_EMITTED.swap(0, Ordering::Relaxed) != 0 {
+                write_osc(program_status::ProgramStatus::Error.osc_sequence().as_bytes());
+            }
             let _ = execute!(io::stdout(), crossterm::cursor::Show);
         }
         original_hook(panic_info);
@@ -451,7 +455,7 @@ pub fn set_program_status(status: program_status::ProgramStatus) {
 }
 
 /// Remove our OSC 7501 record (`state=clear`). Called from
-/// [`restore_terminal`] and the panic hook; writes nothing if no status was
+/// [`restore_terminal`] (the panic hook reports `error` instead); writes nothing if no status was
 /// ever reported, and resets the dedupe state so a re-entered TUI (after an
 /// OAuth flow, for example) reports again.
 pub fn clear_program_status() {

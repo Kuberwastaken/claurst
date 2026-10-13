@@ -76,11 +76,11 @@ OSC 7501 reports use the root record with `app=claurst`:
 |-------|------|
 | `idle` | At startup, after a cancelled turn, and once you start typing after a finished turn. |
 | `working` | A turn is in flight: the model is streaming or tools are running. |
-| `blocked` | Waiting on you. `kind=permission` for a tool permission or MCP server approval, `kind=question` for an AskUserQuestion or MCP elicitation form, `kind=auth` for a device/browser sign-in. Carries a short base64 `msg`. |
+| `blocked` | Waiting on you. `kind=permission` for a tool permission or MCP server approval, `kind=question` for an AskUserQuestion prompt, `kind=auth` for a device/browser sign-in. Carries a short base64 `msg`. |
 | `done` | The last turn finished and the prompt is waiting. |
 | `error` | The last turn ended in an error. |
 
-On exit (including a crash), Claurst sends `state=clear` to remove its record.
+On a normal exit Claurst sends `state=clear` to remove its record. If it crashes it reports `state=error` instead, so the tab still shows that something went wrong.
 
 ```json
 {
