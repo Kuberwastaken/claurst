@@ -1,17 +1,19 @@
 //! Instruction files: `AGENTS.md` / `CLAUDE.md` loaded into the system prompt.
 //!
 //! Load order (stable; later files are more specific):
-//!   1. The global directory (`<claurst home>`)
+//!   1. The global directories (`<claurst home>`, then `~/.claude`)
 //!   2. Each project directory from the git root down to `cwd`
 //!      (`skill_discovery::project_search_dirs`: never past the git root,
 //!      only `cwd` when there is no `.git`)
 //!
 //! In each directory `AGENTS.override.md`, when present, replaces the other
-//! files; otherwise `AGENTS.md` then `CLAUDE.md` are loaded (a `CLAUDE.md`
-//! that is the same file or has the same content as `AGENTS.md` is skipped).
+//! files; otherwise `AGENTS.md`, `CLAUDE.md`, `.claude/CLAUDE.md` and
+//! `.claurst/AGENTS.md` are loaded in that order (a file that is the same
+//! file, or has the same content, as one already loaded is skipped).
 //! YAML frontmatter is stripped and `@include <path>` lines are expanded,
 //! confined to the project root (project files) or the global directory
-//! (global files). All files share a [`INSTRUCTION_BUDGET_BYTES`] budget.
+//! the file came from (global files). All files share a
+//! [`INSTRUCTION_BUDGET_BYTES`] budget.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -36,8 +38,16 @@ pub const INSTRUCTION_BUDGET_BYTES: usize = 32 * 1024;
 /// In a directory that has it, this file replaces `AGENTS.md` and `CLAUDE.md`.
 const OVERRIDE_FILE_NAME: &str = "AGENTS.override.md";
 
-/// Loaded in this order when a directory has no override file.
-const INSTRUCTION_FILE_NAMES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
+/// Loaded in this order when a directory has no override file, as path
+/// components relative to the directory. `.claurst/AGENTS.md` is where
+/// session memories are persisted; `.claude/CLAUDE.md` is Claude Code's
+/// project location.
+const INSTRUCTION_FILE_PATHS: [&[&str]; 4] = [
+    &["AGENTS.md"],
+    &["CLAUDE.md"],
+    &[".claude", "CLAUDE.md"],
+    &[".claurst", "AGENTS.md"],
+];
 
 // ---------------------------------------------------------------------------
 // YAML frontmatter
@@ -143,27 +153,28 @@ fn files_in_dir(dir: &Path) -> Vec<PathBuf> {
     if override_file.is_file() {
         return vec![override_file];
     }
-    INSTRUCTION_FILE_NAMES
+    INSTRUCTION_FILE_PATHS
         .iter()
-        .map(|name| dir.join(name))
+        .map(|components| components.iter().fold(dir.to_path_buf(), |path, c| path.join(c)))
         .filter(|path| path.is_file())
         .collect()
 }
 
-/// Load the instruction files for a session in `cwd`, with `global_dir` as
-/// the user-level directory (normally `Settings::config_dir()`).
+/// Load the instruction files for a session in `cwd`. `global_dirs` are the
+/// user-level directories, in load order (normally `Settings::config_dir()`
+/// then `~/.claude`, see [`default_global_dirs`]).
 ///
 /// Returns the files in load order. Once the combined content reaches
 /// [`INSTRUCTION_BUDGET_BYTES`], the file that crosses it is truncated with a
 /// note and later files carry only a note naming them.
-pub fn load_instruction_files(cwd: &Path, global_dir: &Path) -> Vec<InstructionFile> {
+pub fn load_instruction_files(cwd: &Path, global_dirs: &[PathBuf]) -> Vec<InstructionFile> {
     let project_dirs = crate::skill_discovery::project_search_dirs(cwd);
     let project_root = project_dirs.last().map_or(cwd, PathBuf::as_path);
 
     // (file, root its @include lines are confined to)
-    let mut sources: Vec<(PathBuf, &Path)> = files_in_dir(global_dir)
-        .into_iter()
-        .map(|file| (file, global_dir))
+    let mut sources: Vec<(PathBuf, &Path)> = global_dirs
+        .iter()
+        .flat_map(|dir| files_in_dir(dir).into_iter().map(move |file| (file, dir.as_path())))
         .collect();
     for dir in project_dirs.iter().rev() {
         sources.extend(files_in_dir(dir).into_iter().map(|file| (file, project_root)));
@@ -220,6 +231,16 @@ pub fn load_instruction_files(cwd: &Path, global_dir: &Path) -> Vec<InstructionF
     files
 }
 
+/// The user-level instruction directories: `<claurst home>`, then
+/// `~/.claude` (Claude Code's global `CLAUDE.md`).
+pub fn default_global_dirs() -> Vec<PathBuf> {
+    let mut global = vec![crate::config::Settings::config_dir()];
+    if let Some(home) = dirs::home_dir() {
+        global.push(home.join(".claude"));
+    }
+    global
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,20 +274,50 @@ mod tests {
         std::fs::write(repo.join("CLAUDE.md"), "root claude").unwrap();
         std::fs::write(pkg.join("CLAUDE.md"), "pkg claude").unwrap();
 
-        let files = load_instruction_files(&pkg, &global);
+        let files = load_instruction_files(&pkg, std::slice::from_ref(&global));
         assert_eq!(contents(&files), ["global", "root agents", "root claude", "pkg claude"]);
         assert_eq!(files[0].path, global.join("AGENTS.md"));
         assert_eq!(files[3].path, pkg.join("CLAUDE.md"));
     }
 
     #[test]
-    fn override_replaces_the_directory_files() {
+    fn dot_claude_and_dot_claurst_files_follow_agents_and_claude() {
         let (tmp, repo) = git_repo();
+        let global = tmp.path().join("global");
+        let claude_home = tmp.path().join("claude-home");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(&claude_home).unwrap();
+        std::fs::create_dir_all(repo.join(".claude")).unwrap();
+        std::fs::create_dir_all(repo.join(".claurst")).unwrap();
+        std::fs::write(global.join("AGENTS.md"), "claurst global").unwrap();
+        std::fs::write(claude_home.join("CLAUDE.md"), "claude global").unwrap();
+        std::fs::write(repo.join(".claurst").join("AGENTS.md"), "memories").unwrap();
+        std::fs::write(repo.join(".claude").join("CLAUDE.md"), "dot claude").unwrap();
+        std::fs::write(repo.join("CLAUDE.md"), "claude").unwrap();
+        std::fs::write(repo.join("AGENTS.md"), "agents").unwrap();
+
+        let files = load_instruction_files(&repo, &[global, claude_home]);
+        assert_eq!(
+            contents(&files),
+            ["claurst global", "claude global", "agents", "claude", "dot claude", "memories"]
+        );
+        assert_eq!(files[4].path, repo.join(".claude").join("CLAUDE.md"));
+        assert_eq!(files[5].path, repo.join(".claurst").join("AGENTS.md"));
+
+        // The override still replaces every file in its directory.
+        std::fs::write(repo.join("AGENTS.override.md"), "override").unwrap();
+        let files = load_instruction_files(&repo, &[]);
+        assert_eq!(contents(&files), ["override"]);
+    }
+
+    #[test]
+    fn override_replaces_the_directory_files() {
+        let (_tmp, repo) = git_repo();
         std::fs::write(repo.join("AGENTS.md"), "agents").unwrap();
         std::fs::write(repo.join("CLAUDE.md"), "claude").unwrap();
         std::fs::write(repo.join("AGENTS.override.md"), "override").unwrap();
 
-        let files = load_instruction_files(&repo, &tmp.path().join("no-global"));
+        let files = load_instruction_files(&repo, &[]);
         assert_eq!(contents(&files), ["override"]);
     }
 
@@ -277,7 +328,7 @@ mod tests {
         std::fs::write(tmp.path().join("AGENTS.md"), "outside").unwrap();
         std::fs::write(repo.join("AGENTS.md"), "inside").unwrap();
 
-        let files = load_instruction_files(&repo, &tmp.path().join("no-global"));
+        let files = load_instruction_files(&repo, &[]);
         assert_eq!(contents(&files), ["inside"]);
     }
 
@@ -289,17 +340,17 @@ mod tests {
         std::fs::write(tmp.path().join("AGENTS.md"), "parent").unwrap();
         std::fs::write(cwd.join("AGENTS.md"), "cwd").unwrap();
 
-        let files = load_instruction_files(&cwd, &tmp.path().join("no-global"));
+        let files = load_instruction_files(&cwd, &[]);
         assert_eq!(contents(&files), ["cwd"]);
     }
 
     #[test]
     fn duplicate_claude_md_is_skipped() {
-        let (tmp, repo) = git_repo();
+        let (_tmp, repo) = git_repo();
         std::fs::write(repo.join("AGENTS.md"), "same rules").unwrap();
         std::fs::write(repo.join("CLAUDE.md"), "---\nx: y\n---\nsame rules\n").unwrap();
 
-        let files = load_instruction_files(&repo, &tmp.path().join("no-global"));
+        let files = load_instruction_files(&repo, &[]);
         assert_eq!(contents(&files), ["same rules"]);
     }
 
@@ -315,7 +366,7 @@ mod tests {
         )
         .unwrap();
 
-        let files = load_instruction_files(&repo, &tmp.path().join("no-global"));
+        let files = load_instruction_files(&repo, &[]);
         assert_eq!(files.len(), 1);
         assert!(files[0].content.contains("head\nuse tabs"));
         assert!(!files[0].content.contains("SECRET"));
@@ -334,14 +385,14 @@ mod tests {
 
     #[test]
     fn budget_truncates_then_names_skipped_files() {
-        let (tmp, repo) = git_repo();
+        let (_tmp, repo) = git_repo();
         let pkg = repo.join("pkg");
         std::fs::create_dir_all(&pkg).unwrap();
         std::fs::write(repo.join("AGENTS.md"), "a".repeat(INSTRUCTION_BUDGET_BYTES - 10)).unwrap();
         std::fs::write(repo.join("CLAUDE.md"), "b".repeat(100)).unwrap();
         std::fs::write(pkg.join("AGENTS.md"), "c".repeat(100)).unwrap();
 
-        let files = load_instruction_files(&pkg, &tmp.path().join("no-global"));
+        let files = load_instruction_files(&pkg, &[]);
         assert_eq!(files.len(), 3);
         assert_eq!(files[0].content.len(), INSTRUCTION_BUDGET_BYTES - 10);
         assert!(files[1].content.starts_with(&"b".repeat(10)));

@@ -543,7 +543,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         claurst_core::claudemd::load_instruction_files(
             &cwd,
-            &claurst_core::config::Settings::config_dir(),
+            &claurst_core::claudemd::default_global_dirs(),
         )
     };
 

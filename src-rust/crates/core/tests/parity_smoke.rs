@@ -85,7 +85,7 @@ fn is_tool_use_message_false_for_user() {
 fn load_instructions_from_empty_dir() {
     // A dir with no instruction files (and no global dir) loads nothing.
     let tmp = TempDir::new().unwrap();
-    let files = load_instruction_files(tmp.path(), &tmp.path().join("no-global"));
+    let files = load_instruction_files(tmp.path(), &[]);
     assert!(files.is_empty());
 }
 

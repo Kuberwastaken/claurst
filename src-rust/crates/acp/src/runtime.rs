@@ -110,7 +110,7 @@ impl AgentRuntime {
         if !config.disable_claude_mds {
             query_config.instruction_files = claurst_core::claudemd::load_instruction_files(
                 &working_dir,
-                &Settings::config_dir(),
+                &claurst_core::claudemd::default_global_dirs(),
             );
         }
         let skill_registry = {
