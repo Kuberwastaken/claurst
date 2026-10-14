@@ -58,7 +58,7 @@ pub use session_memory::{
 
 use claurst_api::{
     ApiMessage, ApiToolDefinition, AnthropicStreamEvent, CreateMessageRequest, StreamAccumulator,
-    StreamHandler, SystemBlock, SystemPrompt, ThinkingConfig,
+    StreamHandler, SystemBlock, SystemPrompt,
 };
 use claurst_core::config::Config;
 use claurst_core::cost::CostTracker;
@@ -784,12 +784,25 @@ pub async fn run_query_loop(
             effective_effort_level.and_then(|el| el.thinking_budget_tokens())
         });
 
-        if let Some(budget) = effective_thinking_budget {
-            req_builder = req_builder.thinking(ThinkingConfig::enabled(budget));
+        // Claude reasoning controls: adaptive thinking + `output_config.effort`
+        // on current models, `budget_tokens` on older ones (one table in
+        // `claurst_api::anthropic_reasoning`). Non-Claude models fall into the
+        // budget branch, which is the previous behaviour.
+        let anthropic_reasoning = claurst_api::anthropic_reasoning(
+            &effective_model,
+            effective_effort_level,
+            effective_thinking_budget,
+        );
+        if let Some(thinking) = anthropic_reasoning.thinking.clone() {
+            req_builder = req_builder.thinking(thinking);
+        }
+        if let Some(effort) = anthropic_reasoning.effort {
+            req_builder = req_builder.effort(effort);
         }
 
         // Apply temperature: explicit config value takes precedence, then agent override,
-        // then effort-level override.
+        // then effort-level override (not for adaptive-thinking models, which
+        // reject sampling parameters alongside thinking).
         let effective_temperature = config.temperature
             .or_else(|| {
                 config.agent_definition.as_ref()
@@ -797,7 +810,9 @@ pub async fn run_query_loop(
                     .map(|t| t as f32)
             })
             .or_else(|| {
-                effective_effort_level.and_then(|el| el.temperature())
+                effective_effort_level
+                    .filter(|_| !anthropic_reasoning.is_adaptive())
+                    .and_then(|el| el.temperature())
             });
         if let Some(t) = effective_temperature {
             req_builder = req_builder.temperature(t);
@@ -1012,11 +1027,18 @@ pub async fn run_query_loop(
                         top_p: None,
                         top_k: None,
                         stop_sequences: vec![],
-                        thinking: if caps.thinking {
+                        thinking: if !caps.thinking {
+                            None
+                        } else if provider_id_str == "anthropic" {
+                            claurst_api::anthropic_reasoning(
+                                &model_id_str,
+                                effective_effort_level,
+                                effective_thinking_budget,
+                            )
+                            .thinking
+                        } else {
                             effective_thinking_budget
                                 .map(claurst_api::ThinkingConfig::enabled)
-                        } else {
-                            None
                         },
                         provider_options: build_provider_options(
                             &provider_id_str,

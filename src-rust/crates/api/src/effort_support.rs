@@ -14,8 +14,11 @@
 //! tier), is appended by [`supported_efforts`].
 
 use crate::model_registry::canonical_snapshot_key;
+use crate::types::ThinkingConfig;
 use crate::ModelRegistry;
 use claurst_core::effort::EffortLevel;
+use once_cell::sync::Lazy;
+use regex::Regex;
 
 /// opencode's ultimate fallback npm when neither the model nor its provider
 /// declares one (`... ?? "@ai-sdk/openai-compatible"`).
@@ -197,9 +200,164 @@ fn bare_model(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
 
+// ---------------------------------------------------------------------------
+// Anthropic Messages API reasoning parameters
+// ---------------------------------------------------------------------------
+
+/// Reasoning controls to send to a Claude model on the Messages API.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnthropicReasoning {
+    /// The `thinking` field.
+    pub thinking: Option<ThinkingConfig>,
+    /// `output_config.effort`, for models that take adaptive thinking.
+    pub effort: Option<&'static str>,
+}
+
+impl AnthropicReasoning {
+    /// Adaptive models reject sampling parameters alongside thinking, so an
+    /// effort level's temperature override must not be sent to them.
+    pub fn is_adaptive(&self) -> bool {
+        self.thinking
+            .as_ref()
+            .is_some_and(|t| t.thinking_type == "adaptive")
+    }
+}
+
+/// `opus-4-8`, `sonnet-4-6`, `fable-5`, `haiku-5-5`, ... A minor version must
+/// be one or two digits followed by a non-digit, so the date suffix in
+/// `claude-sonnet-4-20250514` is not read as a minor version.
+static CLAUDE_FAMILY_FIRST: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:opus|sonnet|haiku|fable|mythos)-(\d+)(?:[.-](\d{1,2})(?:\D|$))?").unwrap()
+});
+/// `claude-3-7-sonnet`, `claude-3-opus`.
+static CLAUDE_VERSION_FIRST: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)claude-(\d+)(?:[.-](\d{1,2}))?-(?:opus|sonnet|haiku|fable|mythos)").unwrap()
+});
+
+/// `(major, minor)` of a Claude model id, or `None` for a non-Claude id.
+fn claude_version(model: &str) -> Option<(u32, u32)> {
+    let caps = CLAUDE_FAMILY_FIRST
+        .captures(model)
+        .or_else(|| CLAUDE_VERSION_FIRST.captures(model))?;
+    let major = caps.get(1)?.as_str().parse().ok()?;
+    let minor = caps
+        .get(2)
+        .and_then(|m| m.as_str().parse().ok())
+        .unwrap_or(0);
+    Some((major, minor))
+}
+
+/// The thinking and effort parameters for `model` (the single model-family
+/// table for Anthropic reasoning controls).
+///
+/// * Claude 4.6 and later (Opus, Sonnet, Haiku 5, Fable, Mythos) take adaptive
+///   thinking, `thinking: {type: "adaptive"}`, with depth set by
+///   `output_config.effort`. `budget_tokens` is deprecated on 4.6 and
+///   rejected with HTTP 400 from Opus 4.7 / Sonnet 5 / Fable 5 on, and Opus
+///   4.7/4.8 run without thinking unless adaptive thinking is requested, so it
+///   is always sent. Thinking cannot be disabled on every adaptive model, so
+///   `None`/`Minimal` map to the lowest effort. 4.6 has no `xhigh` tier.
+/// * Older Claude models (3.x, 4.0-4.5) and any non-Claude id keep
+///   `thinking: {type: "enabled", budget_tokens}` from `budget` and get no
+///   `output_config` (Sonnet 4.5 / Haiku 4.5 reject `effort`).
+pub fn anthropic_reasoning(
+    model: &str,
+    effort: Option<EffortLevel>,
+    budget: Option<u32>,
+) -> AnthropicReasoning {
+    match claude_version(model) {
+        Some(version) if version >= (4, 6) => {
+            let has_xhigh = version > (4, 6);
+            let effort = effort.map(|level| match level {
+                EffortLevel::None | EffortLevel::Minimal | EffortLevel::Low => "low",
+                EffortLevel::Medium => "medium",
+                EffortLevel::High => "high",
+                EffortLevel::XHigh if has_xhigh => "xhigh",
+                EffortLevel::XHigh => "high",
+                EffortLevel::Max | EffortLevel::Ultracode => "max",
+            });
+            AnthropicReasoning {
+                thinking: Some(ThinkingConfig::adaptive_summarized()),
+                effort,
+            }
+        }
+        _ => AnthropicReasoning {
+            thinking: budget.map(ThinkingConfig::enabled),
+            effort: None,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_versions_parse_across_id_shapes() {
+        assert_eq!(claude_version("claude-opus-4-8"), Some((4, 8)));
+        assert_eq!(claude_version("anthropic/claude-sonnet-4-6"), Some((4, 6)));
+        assert_eq!(claude_version("us.anthropic.claude-opus-4-1-20250805-v1:0"), Some((4, 1)));
+        assert_eq!(claude_version("claude-sonnet-4-20250514"), Some((4, 0)));
+        assert_eq!(claude_version("claude-3-7-sonnet-20250219"), Some((3, 7)));
+        assert_eq!(claude_version("claude-fable-5"), Some((5, 0)));
+        assert_eq!(claude_version("claude-haiku-5-5"), Some((5, 5)));
+        assert_eq!(claude_version("gpt-5.2"), None);
+    }
+
+    /// Request body per model family: adaptive thinking plus
+    /// `output_config.effort` on current models, `budget_tokens` on older ones.
+    #[test]
+    fn anthropic_reasoning_request_body_per_family() {
+        use serde_json::json;
+        let body = |model: &str, effort: Option<EffortLevel>| {
+            let budget = effort.and_then(|e| e.thinking_budget_tokens());
+            let reasoning = anthropic_reasoning(model, effort, budget);
+            let mut builder = crate::CreateMessageRequest::builder(model, 32_000);
+            if let Some(thinking) = reasoning.thinking {
+                builder = builder.thinking(thinking);
+            }
+            if let Some(effort) = reasoning.effort {
+                builder = builder.effort(effort);
+            }
+            let body = serde_json::to_value(builder.build()).expect("serialize");
+            (body["thinking"].clone(), body.get("output_config").cloned())
+        };
+        let adaptive = json!({ "type": "adaptive", "display": "summarized" });
+
+        for model in ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-5", "claude-fable-5-1", "claude-opus-5-5", "claude-haiku-5-5"] {
+            assert_eq!(
+                body(model, Some(EffortLevel::XHigh)),
+                (adaptive.clone(), Some(json!({ "effort": "xhigh" }))),
+                "{model}"
+            );
+            // No effort selected: still adaptive (Opus 4.7/4.8 would otherwise
+            // run without thinking), API-default effort.
+            assert_eq!(body(model, None), (adaptive.clone(), None), "{model}");
+        }
+        // 4.6 has no xhigh tier.
+        assert_eq!(
+            body("claude-sonnet-4-6", Some(EffortLevel::XHigh)),
+            (adaptive.clone(), Some(json!({ "effort": "high" })))
+        );
+        assert_eq!(
+            body("claude-opus-4-6", Some(EffortLevel::Ultracode)),
+            (adaptive.clone(), Some(json!({ "effort": "max" })))
+        );
+        assert_eq!(
+            body("claude-opus-5-5", Some(EffortLevel::None)),
+            (adaptive, Some(json!({ "effort": "low" })))
+        );
+
+        // Older models keep budget_tokens and never get output_config.
+        for model in ["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5", "claude-3-7-sonnet-20250219"] {
+            assert_eq!(
+                body(model, Some(EffortLevel::High)),
+                (json!({ "type": "enabled", "budget_tokens": 10_000 }), None),
+                "{model}"
+            );
+            assert_eq!(body(model, None), (serde_json::Value::Null, None), "{model}");
+        }
+    }
 
     fn assert_ultracode_last(levels: &[EffortLevel]) {
         assert_eq!(

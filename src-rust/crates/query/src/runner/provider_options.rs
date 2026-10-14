@@ -163,6 +163,17 @@ pub(crate) fn build_provider_options(
         }
     }
 
+    // Anthropic: `output_config.effort` for adaptive-thinking models, read by
+    // `AnthropicProvider` (the thinking field itself travels in
+    // `ProviderRequest::thinking`).
+    if provider_id == "anthropic" {
+        if let Some(effort) =
+            claurst_api::anthropic_reasoning(&model_id, effort_level, thinking_budget).effort
+        {
+            options.insert("effort".to_string(), serde_json::json!(effort));
+        }
+    }
+
     if provider_id == "amazon-bedrock" {
         if model_id.contains("anthropic") || model_id.contains("claude") {
             if let Some(budget) = thinking_budget {

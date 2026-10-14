@@ -96,7 +96,9 @@ pub use model_registry::{
     ModelEntry, ModelRegistry, ModelStatus, ProviderEntry, ProviderOverride,
     effective_model_for_config,
 };
-pub use effort_support::{model_is_reasoning, supported_efforts, variant_ladder};
+pub use effort_support::{
+    anthropic_reasoning, model_is_reasoning, supported_efforts, variant_ladder, AnthropicReasoning,
+};
 pub use variants::{
     variant_efforts, OPENAI_NONE_EFFORT_RELEASE_DATE, OPENAI_XHIGH_EFFORT_RELEASE_DATE,
 };
@@ -203,14 +205,28 @@ pub mod types {
         pub stream: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub thinking: Option<ThinkingConfig>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub output_config: Option<OutputConfig>,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    /// `output_config` on a Messages API request. `effort` is one of `low`,
+    /// `medium`, `high`, `xhigh`, `max` (model-dependent; see
+    /// [`crate::effort_support::anthropic_reasoning`]).
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct OutputConfig {
+        pub effort: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct ThinkingConfig {
         #[serde(rename = "type")]
         pub thinking_type: String,
         #[serde(default, skip_serializing_if = "is_zero")]
         pub budget_tokens: u32,
+        /// Adaptive thinking only: `summarized` returns readable thinking
+        /// (newer models default to `omitted`, an empty thinking string).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub display: Option<String>,
     }
 
     fn is_zero(value: &u32) -> bool {
@@ -222,6 +238,7 @@ pub mod types {
             Self {
                 thinking_type: "enabled".to_string(),
                 budget_tokens: budget,
+                display: None,
             }
         }
 
@@ -229,6 +246,16 @@ pub mod types {
             Self {
                 thinking_type: "adaptive".to_string(),
                 budget_tokens: 0,
+                display: None,
+            }
+        }
+
+        /// Adaptive thinking with `display: "summarized"`, so the thinking
+        /// text is shown instead of arriving empty.
+        pub fn adaptive_summarized() -> Self {
+            Self {
+                display: Some("summarized".to_string()),
+                ..Self::adaptive()
             }
         }
     }
@@ -1349,6 +1376,7 @@ impl CreateMessageRequest {
             top_k: None,
             stop_sequences: None,
             thinking: None,
+            output_config: None,
         }
     }
 
@@ -1502,6 +1530,7 @@ pub struct CreateMessageRequestBuilder {
     top_k: Option<u32>,
     stop_sequences: Option<Vec<String>>,
     thinking: Option<ThinkingConfig>,
+    output_config: Option<OutputConfig>,
 }
 
 impl CreateMessageRequestBuilder {
@@ -1555,6 +1584,12 @@ impl CreateMessageRequestBuilder {
         self
     }
 
+    /// Set `output_config.effort`.
+    pub fn effort(mut self, effort: impl Into<String>) -> Self {
+        self.output_config = Some(OutputConfig { effort: effort.into() });
+        self
+    }
+
     pub fn build(self) -> CreateMessageRequest {
         CreateMessageRequest {
             model: self.model,
@@ -1568,6 +1603,7 @@ impl CreateMessageRequestBuilder {
             stop_sequences: self.stop_sequences,
             stream: true,
             thinking: self.thinking,
+            output_config: self.output_config,
         }
     }
 }
