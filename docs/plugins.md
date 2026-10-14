@@ -1,27 +1,33 @@
 # Plugins
 
-Claurst's plugin system lets you extend the agent with additional slash commands, agents, skills, MCP servers, LSP servers, and lifecycle hooks — all packaged in a single directory.
+Claurst's plugin system lets you extend the agent with additional slash commands, MCP servers, and lifecycle hooks, packaged in a single directory. The manifest also accepts agents, skills, output styles and LSP servers, but those are not loaded yet (see the field reference).
 
 ---
 
 ## Plugin Discovery
 
-Plugins are loaded from the `~/.claurst/plugins/` directory. Each subdirectory that contains a valid `plugin.toml` or `plugin.json` manifest is treated as a plugin.
+Plugins are loaded from `~/.claurst/plugins/` (user plugins) and from `<project>/.claurst/plugins/` (project plugins). Each subdirectory that contains a valid `plugin.json` or `plugin.toml` manifest is treated as a plugin. `--bare` skips plugin loading at startup.
+
+Every discovered plugin is enabled. The `enabledPlugins` / `disabledPlugins` settings written by `/plugin enable` and `/plugin disable` are not consulted when plugins load.
 
 ```
 ~/.claurst/plugins/
 ├── my-plugin/
 │   ├── plugin.toml          <- manifest
 │   ├── commands/            <- *.md slash command definitions
-│   ├── agents/              <- *.md agent definitions
+│   ├── agents/              <- scanned, not used
 │   ├── skills/              <- subdirectories with SKILL.md
 │   ├── hooks/               <- hooks.json (optional)
-│   └── output-styles/       <- *.md or *.json style definitions
+│   └── output-styles/       <- scanned, not used
 └── another-plugin/
     └── plugin.json
 ```
 
-Both `plugin.toml` (TOML format) and `plugin.json` (JSON format) are supported. The loader normalises camelCase and snake_case field names, so manifests written in either convention are accepted.
+Both `plugin.toml` (TOML format) and `plugin.json` (JSON format) are supported; when a directory has both, `plugin.json` is used. The loader normalises camelCase and snake_case field names, so manifests written in either convention are accepted.
+
+### Plugin commands
+
+Every `.md` file under `commands/` (searched recursively) and every path listed in the manifest's `commands` field becomes a slash command named `<plugin>:<subdir>:<file stem>`, e.g. `commands/build/deploy.md` in `my-plugin` is `/my-plugin:build:deploy`. A `SKILL.md` among them becomes `/<plugin>:<its directory name>`. Running the command sends the file's content as a user message, with `Arguments: <args>` appended when arguments are given. Plugin commands are read from disk each time they run.
 
 ---
 
@@ -47,7 +53,7 @@ repository = "https://github.com/you/my-plugin"
 # Extra command files beyond the commands/ directory
 commands = ["./extra/review.md"]
 
-# Extra agent markdown files beyond the agents/ directory
+# Extra agent markdown files (parsed, not loaded yet)
 agents = ["./agents/reviewer.md"]
 
 # Extra skill directories beyond the skills/ directory
@@ -63,7 +69,7 @@ type    = "stdio"
 [mcp_servers.env]
 API_TOKEN = "${MY_SERVICE_TOKEN}"
 
-# Inline LSP server definitions
+# Inline LSP server definitions (parsed, not started yet)
 [[lsp_servers]]
 name    = "pyright"
 command = "pyright-langserver"
@@ -74,7 +80,7 @@ restart_on_crash = true
 [lsp_servers.extension_to_language]
 ".py" = "python"
 
-# User-configurable options (surfaced in /plugin info)
+# User-configurable options (parsed, not used yet)
 [user_config.api_token]
 type        = "string"
 title       = "API Token"
@@ -88,10 +94,10 @@ title       = "Max Results"
 description = "Maximum items to return per query"
 default     = 20
 
-# Capability grants (omit to allow all)
+# Capability grants for plugin slash commands (omit to allow all)
 capabilities = ["read_files", "network", "shell"]
 
-# Marketplace identifier
+# Marketplace identifier (parsed, not used)
 marketplace_id = "you/my-plugin"
 ```
 
@@ -163,25 +169,27 @@ marketplace_id = "you/my-plugin"
 | `homepage` | string | URL for the plugin's home page |
 | `repository` | string | URL for the source repository |
 | `license` | string | SPDX license identifier (e.g. `"MIT"`) |
-| `keywords` | array of strings | Tags used in marketplace search |
-| `marketplace_id` | string | Unique identifier in the plugin marketplace (e.g. `"author/plugin-name"`) |
+| `keywords` | array of strings | Tags (parsed, not used) |
+| `marketplace_id` | string | Parsed, not used; there is no plugin marketplace |
 
 ### Content Declarations
 
 | Field | Type | Description |
 |---|---|---|
 | `commands` | array of strings | Paths to extra slash command `.md` files or directories, relative to the plugin root. Supplements the `commands/` directory. |
-| `agents` | array of strings | Paths to extra agent `.md` files. Supplements the `agents/` directory. |
+| `agents` | array of strings | Parsed, not used: plugin agents (this field and the `agents/` directory) are not loaded. |
 | `skills` | array of strings | Paths to extra skill directories (each must contain a `SKILL.md`). Supplements the `skills/` directory. Plugin skill directories are not yet part of the session skill registry; to use a plugin's skills today, add its `skills/` directory to `skills.paths` (see [Skills](configuration.md#skills)). |
-| `output_styles` | array of strings | Paths to extra output style definitions. |
+| `output_styles` | array of strings | Parsed, not used: plugin output styles (this field and the `output-styles/` directory) are not loaded. |
 
 ### mcp_servers
 
-An array of inline MCP server definitions. Each entry is identical to an `McpServerConfig` (see the MCP documentation). In `plugin.json` the field can also be written as `"mcpServers"` with an object mapping (the loader converts it to the array form automatically).
+An array of inline MCP server definitions with `name`, `command`, `args`, `env`, `url` and `type` (see [MCP](mcp.md)); `headers` and the timeout fields are not read from plugins. In `plugin.json` the field can also be written as `"mcpServers"` with an object mapping (the loader converts it to the array form automatically).
+
+Plugin servers are added to the session's server list at startup unless a configured server already has that name. They are treated as user servers, so they launch without the project-server approval prompt, including servers from plugins in a project's `.claurst/plugins/`. `/plugin reload` does not add or remove servers.
 
 ### lsp_servers
 
-An array of LSP server definitions for language-aware editing support:
+Parsed and counted in the `/reload-plugins` summary, but not started: the `LSP` tool only uses `config.lsp_servers` from settings (see [LspTool](tools.md#lsptool)). Accepted fields:
 
 | Field | Type | Description |
 |---|---|---|
@@ -203,7 +211,7 @@ An inline hooks configuration object (see [Hooks](#hooks) below). A `hooks/hooks
 
 ### user_config
 
-A map of option keys to `PluginUserConfigOption` objects, allowing the plugin to declare user-configurable settings that are surfaced by `/plugin info`:
+A map of option keys to `PluginUserConfigOption` objects declaring user-configurable settings. The field is parsed but not used: `/plugin info` does not show it and no values are passed to the plugin.
 
 | Field | Type | Description |
 |---|---|---|
@@ -216,9 +224,7 @@ A map of option keys to `PluginUserConfigOption` objects, allowing the plugin to
 
 ### capabilities
 
-An optional array of capability category strings. When present, the plugin is restricted to only those categories. Omit the field entirely to allow all capabilities (backwards compatibility behaviour). An empty array (`[]`) grants no capabilities.
-
-Known categories: `"read_files"`, `"write_files"`, `"network"`, `"shell"`, `"browser"`, `"mcp"`.
+An optional array of capability strings. It is checked only when one of the plugin's slash commands runs: a markdown command needs `"read_files"`. Omit the field to allow everything; an empty array (`[]`) blocks the plugin's markdown commands. Hooks and MCP servers are not restricted by it.
 
 ---
 
@@ -268,16 +274,16 @@ Plugin hooks are registered when Claurst starts and re-registered by `/plugin re
 The `/plugin` slash command manages plugins from within an interactive session:
 
 ```
-/plugin                      — list all installed plugins
+/plugin                      — list all installed plugins (alias: /plugins)
 /plugin list                 — list all installed plugins with status
-/plugin info <name>          — show detailed info about a plugin
-/plugin enable <name>        — enable a plugin (persisted to settings)
-/plugin disable <name>       — disable a plugin (persisted to settings)
-/plugin install <path>       — install a plugin from a local directory
-/plugin reload               — reload all plugins from disk
+/plugin info <name>          — show version, source, path, commands and hooks of a plugin
+/plugin enable <name>        — add the name to enabledPlugins in the global settings
+/plugin disable <name>       — add the name to disabledPlugins in the global settings
+/plugin install <path>       — copy a local plugin directory to ~/.claurst/plugins/<name>
+/plugin reload               — reload plugins from disk (alias: /plugin refresh)
 ```
 
-After enabling or disabling a plugin, run `/plugin reload` or use `/reload-plugins` to apply changes in the current session without restarting.
+`enabledPlugins` and `disabledPlugins` are not read when plugins load, so `/plugin enable` and `/plugin disable` currently have no effect on which plugins run.
 
 ### /reload-plugins
 
@@ -285,23 +291,13 @@ After enabling or disabling a plugin, run `/plugin reload` or use `/reload-plugi
 /reload-plugins
 ```
 
-Rescans `~/.claurst/plugins/`, re-reads all manifests, re-registers plugin hooks, and reports what changed. Use this after making changes to a plugin directory or after installing a new plugin.
+Rescans `~/.claurst/plugins/` and `<project>/.claurst/plugins/`, re-reads all manifests, re-registers plugin hooks, and reports what changed. Use this after changing a plugin's hooks or installing a new plugin. Plugin MCP servers are only picked up at startup.
 
 ---
 
-## Plugin Marketplace Integration
+## No Plugin Marketplace
 
-Plugins published to the Claurst marketplace have a `marketplace_id` field in their manifest (e.g. `"author/plugin-name"`). The marketplace integration allows:
-
-- Browsing available plugins
-- Installing plugins by ID
-- Updating installed plugins to newer versions
-
-```
-/plugin install author/plugin-name     — install from the marketplace
-```
-
-Locally installed plugins (via a file path) do not require a `marketplace_id`.
+There is no plugin marketplace. `/plugin install` accepts only a local directory path, and the manifest's `marketplace_id` is not used.
 
 ---
 

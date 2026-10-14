@@ -12,7 +12,7 @@ MCP defines three primitives a server can offer:
 - **Resources** — URI-addressable data sources the model can read
 - **Prompts** — reusable prompt templates the server exposes
 
-Claurst discovers tools, resources, and prompts from connected MCP servers during the handshake phase and wraps them as native `Tool` instances (via `McpToolWrapper`), making them transparent to the query loop.
+Claurst lists tools, resources, and prompts from each server after the handshake. Each tool is wrapped as a native `Tool` (`McpToolWrapper`), so the query loop treats it like a built-in. Resources are reached through the `ListMcpResources` and `ReadMcpResource` tools. Prompts are available only to the user, through `/mcp prompts` and `/mcp get-prompt`.
 
 ---
 
@@ -51,7 +51,7 @@ The `type` field defaults to `"stdio"` when omitted.
 
 ## McpServerConfig Fields
 
-Each entry in the `mcpServers` / `mcp_servers` array (or the `config.mcp_servers` list) is an `McpServerConfig` object:
+Each entry in the `config.mcp_servers` array is an `McpServerConfig` object. A top-level `mcpServers` key is not read; `/import-config` converts one from a Claude Code config.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -128,35 +128,34 @@ Add servers to the `config.mcp_servers` array in `~/.claurst/settings.json`:
 }
 ```
 
-Project-level MCP servers can be added to a `.claurst/settings.json` in your project root. Project settings take precedence over global settings.
+Project-level MCP servers can be added to `config.mcp_servers` in a `.claurst/settings.json` in your project root. They are added to the global list (not substituted for it), and they do not launch until you approve them for that project, unless `trustProjectMcpServers` is `true` in the global settings.
 
 ---
 
 ## The /mcp Command
 
-Use `/mcp` inside an interactive session to inspect and manage MCP servers at runtime.
+Use `/mcp` inside an interactive session to inspect MCP servers at runtime.
 
 ```
-/mcp                     — show status of all configured servers
-/mcp status              — same as above
-/mcp connect <name>      — connect to a server by name
-/mcp disconnect <name>   — disconnect a server
-/mcp restart <name>      — disconnect then reconnect a server
+/mcp                              — open the MCP server panel (TUI)
+/mcp list                         — list configured servers with live status
+/mcp status                       — detailed status table for all servers
+/mcp tools [server]               — list exposed tool names (mcp__<server>__<tool>)
+/mcp auth <server>                — start OAuth for an HTTP/SSE server; stdio servers get env-var instructions
+/mcp connect <server>             — report the server's status and how to recover; it does not reconnect
+/mcp logs <server>                — show the server's status and last connection error
+/mcp resources [server]           — list resources from connected servers
+/mcp prompts [server]             — list prompt templates from connected servers
+/mcp get-prompt <server> <prompt> [key=value ...]  — expand a prompt template
 ```
 
-The status display shows the connection state and discovered tool count for each server:
-
-```
-filesystem     connected (12 tools)
-github         connected (8 tools)
-remote-api     failed – connection refused (retry in 30s)
-```
+There is no `/mcp disconnect` or `/mcp restart`. A failed server stays failed until the MCP runtime is rebuilt or Claurst restarts (see [Startup, Timeouts and Retries](#startup-timeouts-and-retries)).
 
 ---
 
 ## MCP Tools Available to the Model
 
-Two built-in tools let the model interact with MCP resources directly:
+Two built-in tools let the model interact with MCP resources directly (parameters below; see also [MCP Integration Tools](tools.md#mcp-integration-tools)):
 
 ### ListMcpResources
 
@@ -166,7 +165,7 @@ Lists all resources available across connected MCP servers. Optionally filters b
 
 ```json
 {
-  "server_name": "filesystem"   // optional — omit to list resources from all servers
+  "server": "filesystem"   // optional — omit to list resources from all servers
 }
 ```
 
@@ -178,12 +177,14 @@ Reads a specific resource by server name and URI.
 
 ```json
 {
-  "server_name": "filesystem",
+  "server": "filesystem",
   "uri": "file:///home/user/projects/README.md"
 }
 ```
 
-Use `ListMcpResources` to discover available URIs before calling `ReadMcpResource`.
+Use `ListMcpResources` to discover available URIs before calling `ReadMcpResource`. Both tools ask for permission in the `default` permission mode.
+
+A third tool, `mcp__auth` (`{"server_name": "..."}`), runs the OAuth flow for a server; see [McpAuthTool](tools.md#mcpauthtool).
 
 In addition to these, every tool that an MCP server exposes is available to the model (wrapped transparently by `McpToolWrapper`) under a namespaced name, described below.
 
