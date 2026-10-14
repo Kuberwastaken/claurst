@@ -45,6 +45,23 @@ const SHELL_STATE_SENTINEL: &str = "__CC_SHELL_STATE__";
 
 pub struct PtyBashTool;
 
+/// Environment every shell child gets (#442): pagers are disabled so
+/// `git log`, `git diff` or `man` cannot hang in `less`, git never prompts for
+/// credentials on the terminal, and scripts can tell they run under an agent.
+/// On the PTY path these are applied before the restored session env, so an
+/// explicit `export` from an earlier call still wins.
+const CHILD_ENV: [(&str, &str); 6] = [
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+    ("GH_PAGER", "cat"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("CLAURST", "1"),
+    ("AGENT", "1"),
+];
+
+/// `TERM` for the child when the parent environment has none.
+const DEFAULT_TERM: &str = "dumb";
+
 #[derive(Debug, Deserialize)]
 struct BashInput {
     command: String,
@@ -139,6 +156,18 @@ exit $__CC_EXIT_CODE
     )
 }
 
+/// Set [`CHILD_ENV`] on a PTY child, plus [`DEFAULT_TERM`] when it inherited no
+/// `TERM` (#442).
+#[cfg(unix)]
+fn apply_child_env_defaults(cmd: &mut portable_pty::CommandBuilder) {
+    for (key, value) in CHILD_ENV {
+        cmd.env(key, value);
+    }
+    if cmd.get_env("TERM").is_none() {
+        cmd.env("TERM", DEFAULT_TERM);
+    }
+}
+
 /// Plumb the persisted shell env vars into the child process's environment
 /// (NOT its argv). Each var is set with `CommandBuilder::env`, so the child
 /// inherits it exactly as `export` would have — but the value never appears on
@@ -168,6 +197,7 @@ async fn run_in_background(
     let task_id_clone = task_id.clone();
     let command_clone = command.clone();
     let spill_path = spill_dir.join(format!("{task_id}.txt"));
+    let term = std::env::var_os("TERM").unwrap_or_else(|| DEFAULT_TERM.into());
 
     tokio::spawn(async move {
         let result = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
@@ -178,6 +208,7 @@ async fn run_in_background(
                     .arg("/C")
                     .arg(&command_clone)
                     .current_dir(&cwd)
+                    .envs(CHILD_ENV)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .stdin(Stdio::null())
@@ -188,6 +219,8 @@ async fn run_in_background(
                     .arg("-c")
                     .arg(&command_clone)
                     .current_dir(&cwd)
+                    .envs(CHILD_ENV)
+                    .env("TERM", &term)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .stdin(Stdio::null())
@@ -443,6 +476,7 @@ async fn run_in_pty(
     let mut cmd = CommandBuilder::new("bash");
     cmd.args(["-c", script]);
     cmd.cwd(working_dir);
+    apply_child_env_defaults(&mut cmd);
     // Restored shell vars go through the child's ENVIRONMENT, never its argv (#211).
     apply_restored_env(&mut cmd, env_vars);
 
@@ -749,6 +783,7 @@ async fn run_windows_fallback(
         .arg("/C")
         .arg(command)
         .current_dir(effective_cwd)
+        .envs(CHILD_ENV)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
@@ -1160,6 +1195,23 @@ mod tests {
         assert_eq!(state, vec!["/tmp".to_string()]);
     }
 
+    /// #442: TERM is filled in only when the child would otherwise have none.
+    #[test]
+    fn child_env_defaults_keep_an_inherited_term() {
+        use portable_pty::CommandBuilder;
+
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.env_remove("TERM");
+        apply_child_env_defaults(&mut cmd);
+        assert_eq!(cmd.get_env("TERM"), Some(OsStr::new(DEFAULT_TERM)));
+        assert_eq!(cmd.get_env("GIT_PAGER"), Some(OsStr::new("cat")));
+
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.env("TERM", "xterm-256color");
+        apply_child_env_defaults(&mut cmd);
+        assert_eq!(cmd.get_env("TERM"), Some(OsStr::new("xterm-256color")));
+    }
+
     // -----------------------------------------------------------------------
     // Execution tests (#220 / #184) — exercise the live PTY path end-to-end.
     // -----------------------------------------------------------------------
@@ -1369,6 +1421,35 @@ mod tests {
         .await;
         assert_eq!(task.status, claurst_core::tasks::TaskStatus::Completed);
         assert!(task.output.iter().any(|l| l == "done"));
+    }
+
+    const ENV_PROBE: &str = "echo \"$PAGER $GIT_PAGER $GH_PAGER $GIT_TERMINAL_PROMPT $CLAURST $AGENT ${TERM:+term}\"";
+
+    /// #442: the PTY child runs with pagers off, no git prompts, the agent
+    /// markers, and a TERM.
+    #[tokio::test]
+    async fn pty_child_gets_pager_free_agent_env() {
+        let state = parking_lot::Mutex::new(ShellState::new());
+        let spill_dir = tempfile::tempdir().unwrap();
+        let result = run_pty_foreground(
+            ENV_PROBE,
+            &state,
+            &std::env::temp_dir(),
+            Duration::from_secs(30),
+            30_000,
+            spill_dir.path(),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(result.content, "cat cat cat 0 1 1 term");
+    }
+
+    /// #442: background children get the same environment.
+    #[tokio::test]
+    async fn background_child_gets_pager_free_agent_env() {
+        let spill_dir = tempfile::tempdir().unwrap();
+        let task = run_background_to_completion(ENV_PROBE, spill_dir.path()).await;
+        assert_eq!(task.output, vec!["cat cat cat 0 1 1 term".to_string()]);
     }
 
     /// Regression test for #184: a tool command that spawns a child which
