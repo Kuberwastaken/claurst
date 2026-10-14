@@ -38,15 +38,21 @@ pub async fn handle(
         return Err(acp::Error::invalid_params());
     }
 
+    // One prompt at a time per session, each with its own cancel token.
+    let Some(turn) = session.begin_turn() else {
+        return Err(acp::Error::new(
+            i32::from(acp::ErrorCode::InvalidRequest),
+            format!("Session {} already has a prompt running", session.session_id),
+        ));
+    };
+    let cancel = turn.token.clone();
+
     // Append the user turn to the session transcript.
     let mut messages: Vec<Message> = {
         let guard = session.messages.lock();
         guard.clone()
     };
     messages.push(Message::user(user_text));
-
-    // Reset the session's cancellation token for this new turn.
-    let cancel = session.cancel_token.clone();
 
     // Build per-session ToolContext.
     let permission_handler: Arc<dyn claurst_core::PermissionHandler> =
@@ -80,6 +86,7 @@ pub async fn handle(
         session.session_id.clone(),
         session.pending_permissions.clone(),
         drainer_cancel.clone(),
+        cancel.clone(),
     );
 
     // Event channel + forwarder.

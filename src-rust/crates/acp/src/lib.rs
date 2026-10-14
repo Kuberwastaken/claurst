@@ -30,6 +30,9 @@ mod runtime;
 mod server;
 mod sessions;
 
+#[cfg(test)]
+mod e2e_tests;
+
 use std::sync::Arc;
 
 use tokio::sync::mpsc;

@@ -42,11 +42,13 @@ impl PermissionHandler for AcpPermissionHandler {
 
 /// Drain a single pending permission request, route it through the
 /// connection as `session/request_permission`, and fire the oneshot with
-/// the resulting decision.
+/// the resulting decision. A cancel of the prompt denies the request
+/// without waiting for the client, so the blocked tool unwinds.
 pub async fn forward_pending(
     connection: Arc<Connection>,
     session_id: acp::SessionId,
     pending: PendingPermissionRequest,
+    turn_cancel: tokio_util::sync::CancellationToken,
 ) {
     let PendingPermissionRequest {
         tool_use_id,
@@ -93,12 +95,17 @@ pub async fn forward_pending(
     let request_params = acp::RequestPermissionRequest::new(session_id, tool_call, options);
 
     debug!(tool = %request.tool_name, "ACP permission: requesting from client");
-    let result = connection
-        .send_request::<_, acp::RequestPermissionResponse>(
+    let result = tokio::select! {
+        result = connection.send_request::<_, acp::RequestPermissionResponse>(
             "session/request_permission",
             request_params,
-        )
-        .await;
+        ) => result,
+        _ = turn_cancel.cancelled() => {
+            debug!(tool = %request.tool_name, "ACP permission: prompt cancelled, denying");
+            let _ = decision_tx.send(PermissionDecision::Deny);
+            return;
+        }
+    };
 
     let decision = match result {
         Ok(Ok(response)) => match response.outcome {
@@ -143,12 +150,14 @@ fn infer_tool_kind(request: &PermissionRequest) -> acp::ToolKind {
 
 /// Spawn a task that watches the shared `PendingPermissionStore` and
 /// forwards each enqueued request through the ACP connection. The task
-/// exits when `cancel` is fired or the connection drops.
+/// exits when `cancel` is fired or the connection drops; `turn_cancel` is
+/// the prompt's token, which denies requests still waiting on the client.
 pub fn spawn_drainer(
     connection: Arc<Connection>,
     session_id: acp::SessionId,
     store: Arc<parking_lot::Mutex<PendingPermissionStore>>,
     cancel: tokio_util::sync::CancellationToken,
+    turn_cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
@@ -163,11 +172,12 @@ pub fn spawn_drainer(
                 guard.queue.drain(..).collect()
             };
             for pending in popped {
-                let conn = connection.clone();
-                let sid = session_id.clone();
-                tokio::spawn(async move {
-                    forward_pending(conn, sid, pending).await;
-                });
+                tokio::spawn(forward_pending(
+                    connection.clone(),
+                    session_id.clone(),
+                    pending,
+                    turn_cancel.clone(),
+                ));
             }
         }
     })

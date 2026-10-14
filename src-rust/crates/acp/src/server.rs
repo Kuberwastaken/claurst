@@ -104,17 +104,13 @@ impl AgentServer {
                 match parsed {
                     Ok(notif) => {
                         if let Some(session) = self.sessions.get(&notif.session_id) {
-                            info!(session_id = %notif.session_id, "ACP: cancelling session");
-                            session.cancel_token.cancel();
-                            // Re-arm with a fresh token for any subsequent prompt
-                            // calls on this session. (The cancellation only
-                            // affects the in-flight turn.)
-                            //
-                            // SAFETY: we hold an Arc<SessionState>; this races
-                            // with the prompt handler reading cancel_token but
-                            // the race is benign — either the next prompt sees
-                            // the old (cancelled) token (and finishes
-                            // immediately) or the new fresh one.
+                            // Only the running prompt is cancelled; the next
+                            // prompt starts with a fresh token.
+                            if session.cancel_turn() {
+                                info!(session_id = %notif.session_id, "ACP: cancelling prompt");
+                            } else {
+                                debug!(session_id = %notif.session_id, "ACP: cancel with no prompt running");
+                            }
                         }
                     }
                     Err(e) => warn!(?e, "ACP: malformed session/cancel notification"),
