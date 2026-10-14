@@ -35,6 +35,7 @@ pub(crate) fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
         enabled_tools: config.enabled_tools.clone(),
         permission_mode: config.permission_mode.clone(),
         additional_dirs: config.additional_dirs.clone(),
+        sandbox_state: config.sandbox_state.clone(),
         ..Default::default()
     };
 

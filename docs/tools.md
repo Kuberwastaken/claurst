@@ -282,6 +282,24 @@ Execute a command in a pseudo-terminal (PTY) so programs that check `isatty()` b
 | `command` | string | yes | Command to run in PTY |
 | `timeout` | integer | no | Timeout in milliseconds |
 
+#### Sandbox (macOS)
+
+On macOS the shell runs under Seatbelt unless `sandbox.mode` is `off`:
+`/usr/bin/sandbox-exec -p <profile> -DWRITABLE_ROOT_n=<root> ... -- bash -c
+<command>`. The default `workspace-write` profile reads anything, writes only
+beneath the workspace roots, `--add-dir` directories, `$TMPDIR` and `/tmp`
+(with `.git` and `.claurst` kept read-only), and has no network unless
+`sandbox.network` is `true`; `read-only` allows no writes. Background commands
+use the same profile.
+
+A failed command whose output looks like a sandbox denial (`Operation not
+permitted`, `Permission denied`, `Read-only file system`, ...) opens a
+**Sandbox Denied** dialog in the TUI: rerun outside the sandbox once, for the
+session, or always for that command's first word. A rerun starts from the
+shell state the denied run started from. Headless and ACP runs return the
+failure with a `[sandbox]` note instead. See
+[Shell Sandbox](configuration.md#shell-sandbox) for the settings.
+
 ---
 
 ### PowerShellTool

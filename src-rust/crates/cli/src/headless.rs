@@ -749,6 +749,7 @@ mod tests {
             permission_manager: None,
             user_question_tx: None,
             cancel_token: tokio_util::sync::CancellationToken::new(),
+            batch_rejection: Default::default(),
         }
     }
 

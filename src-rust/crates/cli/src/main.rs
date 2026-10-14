@@ -183,11 +183,13 @@ struct Cli {
     #[arg(long = "system-prompt-file")]
     system_prompt_file: Option<PathBuf>,
 
-    /// Tools to allow (comma-separated, default: all)
+    /// Allow without prompting, for this session (comma- or space-separated
+    /// rules: Tool, Tool(pattern) or *; e.g. "Read,Bash(git status *)")
     #[arg(long = "allowed-tools", value_name = "TOOLS")]
     allowed_tools: Option<String>,
 
-    /// Tools to disallow (comma-separated)
+    /// Deny in every mode, for this session (same syntax as --allowed-tools;
+    /// a tool-wide entry also hides the tool from the model)
     #[arg(long = "disallowed-tools", value_name = "TOOLS")]
     disallowed_tools: Option<String>,
 
@@ -297,19 +299,15 @@ fn resolve_bridge_config(
     bridge_config.is_active().then_some(bridge_config)
 }
 
-fn handle_exit_key(app: &mut claurst_tui::app::App, key: crossterm::event::KeyEvent, cancel: &Option<tokio_util::sync::CancellationToken>) -> bool {
+fn handle_exit_key(app: &mut claurst_tui::app::App, key: crossterm::event::KeyEvent) -> bool {
     if !key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
         return false;
     }
 
     match key.code {
         crossterm::event::KeyCode::Char('c') => {
-            // Cancel background task first, then let app handle state cleanup
-            if app.is_streaming {
-                if let Some(ref ct) = cancel {
-                    ct.cancel();
-                }
-            }
+            // During a turn the app interrupts it and sets `cancel_requested`;
+            // the main loop then cancels the token, as for Esc (#444).
             app.handle_key_event(key);
             true
         }
@@ -383,6 +381,7 @@ async fn main() -> anyhow::Result<()> {
                     remote_session_url: None,
                     mcp_manager: None,
                     mcp_auth_runner: None,
+                    permission_manager: None,
                 };
                 // Collect remaining args after the command name
                 let rest: Vec<&str> = raw_args[2..].iter().map(|s| s.as_str()).collect();
@@ -525,6 +524,28 @@ async fn main() -> anyhow::Result<()> {
         config.permission_mode = cli.permission_mode.into();
     }
     config.additional_dirs = cli.add_dir.clone();
+    // --allowed-tools / --disallowed-tools extend the configured lists for
+    // this session only; the permission manager turns them into rules.
+    for (flag, list, target) in [
+        ("--allowed-tools", cli.allowed_tools.as_deref(), &mut config.allowed_tools),
+        ("--disallowed-tools", cli.disallowed_tools.as_deref(), &mut config.disallowed_tools),
+    ] {
+        for spec in list.map(claurst_core::permissions::split_rule_specs).unwrap_or_default() {
+            if claurst_core::permissions::parse_rule_spec(
+                &spec,
+                claurst_core::permissions::PermissionAction::Allow,
+            )
+            .is_none()
+            {
+                anyhow::bail!(
+                    "Invalid {} entry {:?}: expected Tool, Tool(pattern) or *",
+                    flag,
+                    spec
+                );
+            }
+            target.push(spec);
+        }
+    }
     if cli.no_auto_compact {
         config.auto_compact = false;
     }
@@ -670,10 +691,17 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let permission_manager = Arc::new(std::sync::Mutex::new(PermissionManager::new(
-        config.permission_mode.clone(),
-        &settings,
-    )));
+    // Approvals saved "for this project" live under the claurst home, keyed
+    // by the repository root (or the working directory outside a repo).
+    let mut permission_manager =
+        PermissionManager::new(config.permission_mode.clone(), &settings).with_project_store(
+            claurst_core::permissions::project_approvals_path(
+                &claurst_core::config::Settings::config_dir(),
+                &claurst_core::permissions::approvals_project_root(&cwd),
+            ),
+        );
+    permission_manager.sync_config(&config);
+    let permission_manager = Arc::new(std::sync::Mutex::new(permission_manager));
 
     let permission_handler: Arc<dyn claurst_core::PermissionHandler> = if is_headless {
         Arc::new(AutoPermissionHandler::with_manager(permission_manager.clone()))
@@ -767,6 +795,7 @@ async fn main() -> anyhow::Result<()> {
         // Placeholder token; `run_query_loop` rebinds it to the loop's actual
         // cancel token so the parallel tool executor honours Ctrl-C (issue #218).
         cancel_token: tokio_util::sync::CancellationToken::new(),
+        batch_rejection: Default::default(),
     };
 
     // Hourly shadow-snapshot GC loop: only runs when snapshot is explicitly enabled.
@@ -1743,18 +1772,23 @@ fn permission_request_from_core(
     let tool_use_id = pending.tool_use_id.clone();
 
     match (tool_name.as_str(), pending.request.path.clone()) {
+        (claurst_tools::sandbox::SANDBOX_ESCALATION_TOOL, Some(command)) => {
+            let prefix = claurst_tools::sandbox::unsandboxed_prefix(&command).map(str::to_owned);
+            claurst_tui::dialogs::PermissionRequest::sandbox_escalation(
+                tool_use_id,
+                reason,
+                command,
+                prefix.as_deref(),
+            )
+        }
         ("Bash", Some(command)) => {
-            let suggested_prefix = command
-                .split_whitespace()
-                .next()
-                .filter(|prefix| !prefix.is_empty())
-                .map(|prefix| format!("{} ", prefix));
+            let suggested_rules = claurst_core::shell_scan::approval_rules(&command);
             claurst_tui::dialogs::PermissionRequest::bash(
                 tool_use_id,
                 tool_name,
                 reason,
                 command,
-                suggested_prefix,
+                suggested_rules,
             )
         },
         ("PowerShell", Some(command)) => claurst_tui::dialogs::PermissionRequest::powershell(
@@ -1954,6 +1988,23 @@ async fn run_interactive(
     if claurst_core::goals_enabled() {
         base_query_config.continuation = claurst_query::ContinuationMode::Goal;
     }
+    // One queue for the whole session (#444): Enter during a turn pushes
+    // steers, background tasks push completion notices, and every turn's loop
+    // drains it at each step boundary. When it is non-empty while idle, the
+    // main loop starts a turn to deliver it.
+    let command_queue = claurst_query::CommandQueue::new();
+    base_query_config.command_queue = Some(command_queue.clone());
+    // Background sub-agents and Bash commands report completion into the same
+    // queue as `<subagent>` / `<shell>` notices (gated by completionWakeups).
+    tool_ctx.completion_notifier = Some({
+        let queue = command_queue.clone();
+        claurst_tools::CompletionNotifier::new(move |notice| {
+            queue.push(
+                claurst_query::QueuedCommand::InjectUserMessage(notice),
+                claurst_query::CommandPriority::Normal,
+            );
+        })
+    });
     let mut live_config = config.clone();
     if !session.model.is_empty() {
         live_config.model = Some(session.model.clone());
@@ -1971,6 +2022,7 @@ async fn run_interactive(
     // state that would otherwise outlive a signalled exit and garble the shell.
     claurst_tui::spawn_signal_restore_watchers();
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
+    app.command_queue = Some(command_queue.clone());
     // Startup skill discovery runs on the blocking pool so a cold
     // `skills.urls` clone never holds the terminal. When it finishes, the
     // main loop installs the slash commands for autocomplete and every query
@@ -2052,11 +2104,6 @@ async fn run_interactive(
     // Mark whether valid credentials exist so the TUI can show a provider
     // setup dialog instead of failing silently on the first message.
     app.has_credentials = has_credentials;
-
-    // Restore "always allow" bash prefixes persisted from earlier sessions so
-    // previously-approved command prefixes don't prompt again.
-    app.bash_prefix_allowlist
-        .extend(settings.allowed_bash_prefixes.iter().cloned());
 
     // If a non-Anthropic provider is active, prefix model_name with "provider/model"
     // so the status bar can show the provider name.
@@ -2225,6 +2272,7 @@ async fn run_interactive(
         remote_session_url: session.remote_session_url.clone(),
         mcp_manager: tool_ctx.mcp_manager.clone(),
         mcp_auth_runner: None,
+        permission_manager: tool_ctx.permission_manager.clone(),
     };
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
@@ -2304,6 +2352,8 @@ async fn run_interactive(
             .map(|s| (s.terminal_progress_bar, s.terminal_program_status))
             .unwrap_or((true, true));
     let mut progress_shown = false;
+    // Set while an interrupted turn's task winds down (#444).
+    let mut discard_turn_events = false;
     'main: loop {
         app.frame_count = app.frame_count.wrapping_add(1);
         app.tick_rustle_pose();
@@ -2356,9 +2406,17 @@ async fn run_interactive(
         // Report OSC 7501 program status (idle / working / blocked / done /
         // error) so terminals and multiplexer UIs can show which session needs
         // attention. Written only on change; cleared in restore_terminal.
+        let program_status = app.program_status(current_query.is_some());
         if program_status_enabled {
-            claurst_tui::set_program_status(app.program_status(current_query.is_some()));
+            claurst_tui::set_program_status(program_status);
         }
+        // Bell + desktop notification when a turn finishes or waits on the
+        // user while the terminal is in the background (#444).
+        if let Some(attention) = app.attention_alert(program_status) {
+            claurst_tui::attention::emit(attention);
+        }
+
+        app.query_in_flight = current_query.is_some();
 
         // Poll for crossterm events (keyboard/mouse) with short timeout
         // unless an auto-submit (queued message) is pending — in which case
@@ -2411,7 +2469,7 @@ async fn run_interactive(
                     }
 
                     // Ctrl+C and Ctrl+D: exit confirmation handling
-                    if handle_exit_key(&mut app, key, &cancel) {
+                    if handle_exit_key(&mut app, key) {
                         if app.should_exit {
                             break 'main;
                         }
@@ -2454,23 +2512,23 @@ async fn run_interactive(
                         && !key.modifiers.contains(KeyModifiers::SHIFT)
                         && !key.modifiers.contains(KeyModifiers::ALT)
                         && !key.modifiers.contains(KeyModifiers::CONTROL);
-                    if plain_enter && app.is_streaming && !any_dialog_open {
-                        // Queue the message: it will auto-submit once the
-                        // current turn finishes (issue #149).
+                    // A turn is running until its task ends: `is_streaming`
+                    // drops between model requests and right after Esc.
+                    let turn_running = app.is_streaming || current_query.is_some();
+                    if plain_enter && turn_running && !any_dialog_open {
+                        // Steer (#444): the loop delivers the text before its
+                        // next model request. Slash commands cannot steer the
+                        // model, so they wait for the turn to end (issue #149).
+                        // Both show in the queued-prompt dock until delivered.
                         let input = app.take_input();
-                        if !input.is_empty() {
-                            let preview: String = input.chars().take(40).collect();
+                        if input.starts_with('/') {
                             app.queued_messages.push_back(input);
-                            let total = app.queued_messages.len();
-                            app.notifications.push(
-                                claurst_tui::NotificationKind::Info,
-                                format!("Queued ({}): {}", total, preview),
-                                Some(3),
-                            );
+                        } else if !input.is_empty() {
+                            app.steer(input);
                         }
                         continue;
                     }
-                    if plain_enter && !app.is_streaming && !any_dialog_open {
+                    if plain_enter && !turn_running && !any_dialog_open {
                         // If a file-ref suggestion is active, accept it instead of submitting.
                         if !app.prompt_input.suggestions.is_empty()
                             && app.prompt_input.suggestion_index.is_some_and(|index| {
@@ -2565,6 +2623,7 @@ async fn run_interactive(
                                 Some(CommandResult::ClearConversation) => {
                                     messages.clear();
                                     app.replace_messages(Vec::new());
+                                    app.context_used_tokens = 0;
                                     session.messages.clear();
                                     session.updated_at = chrono::Utc::now();
                                     app.status_message =
@@ -2587,6 +2646,7 @@ async fn run_interactive(
                                     );
                                     messages.clear();
                                     app.replace_messages(Vec::new());
+                                    app.context_used_tokens = 0;
                                     tool_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_title = None;
@@ -2817,6 +2877,13 @@ async fn run_interactive(
                                     normalize_provider_from_model(&mut applied_cfg);
                                     cmd_ctx.config = applied_cfg.clone();
                                     tool_ctx.config = applied_cfg.clone();
+                                    // Mode and tool allow/deny lists may have changed
+                                    // (e.g. /permissions); re-derive their rules.
+                                    if let Some(manager) = tool_ctx.permission_manager.as_ref() {
+                                        if let Ok(mut manager) = manager.lock() {
+                                            manager.sync_config(&applied_cfg);
+                                        }
+                                    }
                                     app.config = applied_cfg.clone();
                                     // Sync model/provider shown in the TUI header.
                                     if let Some(ref model) = applied_cfg.model {
@@ -2844,6 +2911,13 @@ async fn run_interactive(
                                     normalize_provider_from_model(&mut applied_cfg);
                                     cmd_ctx.config = applied_cfg.clone();
                                     tool_ctx.config = applied_cfg.clone();
+                                    // Mode and tool allow/deny lists may have changed
+                                    // (e.g. /permissions); re-derive their rules.
+                                    if let Some(manager) = tool_ctx.permission_manager.as_ref() {
+                                        if let Ok(mut manager) = manager.lock() {
+                                            manager.sync_config(&applied_cfg);
+                                        }
+                                    }
                                     // Sync model/provider + fast_mode visual indicator.
                                     if let Some(ref model) = applied_cfg.model {
                                         app.set_model(model.clone());
@@ -3157,7 +3231,7 @@ async fn run_interactive(
 
                         // Share the Arc so the spawned task can access all tools (incl. MCP).
                         let tools_arc_clone = tools_arc.clone();
-                        let mut ctx_clone = tool_ctx.clone();
+                        let ctx_clone = tool_ctx.clone();
                         let mut qcfg = base_query_config.clone();
                         qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                         qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
@@ -3173,16 +3247,6 @@ async fn run_interactive(
                         // Apply active effort level (set via /effort command).
                         if let Some(level) = current_effort {
                             qcfg.effort_level = Some(level);
-                        }
-                        // Wire completion_notifier if a command queue is available.
-                        if let Some(ref cq) = qcfg.command_queue {
-                            let cq = cq.clone();
-                            ctx_clone.completion_notifier = Some(claurst_tools::CompletionNotifier::new(move |msg| {
-                                cq.push(
-                                    claurst_query::QueuedCommand::InjectSystemMessage(msg),
-                                    claurst_query::CommandPriority::Normal,
-                                );
-                            }));
                         }
                         let tracker = cost_tracker.clone();
                         let tx = event_tx.clone();
@@ -3215,64 +3279,91 @@ async fn run_interactive(
                     }
                     if let Some(pr) = app.permission_request.as_mut() {
                         if claurst_tui::dialogs::handle_permission_key(pr, key) {
-                            let tool_use_id = pr.tool_use_id.clone();
-                            let selected_option = pr.selected_option;
-                            let selected_key = pr.options.get(selected_option).map(|o| o.key);
-                            let should_record_bash_prefix = selected_key == Some('P');
-                            let selected_path = pending_permissions
-                                .lock()
-                                .waiting
-                                .get(&tool_use_id)
-                                .and_then(|p| p.request.path.clone());
-                            let bash_prefix = if should_record_bash_prefix {
-                                match &pr.kind {
-                                    claurst_tui::dialogs::PermissionDialogKind::Bash { command, .. } => {
-                                        let first_word = command.split_whitespace().next().unwrap_or("").to_string();
-                                        if first_word.is_empty() { None } else { Some(first_word) }
-                                    }
+                            // "Retry outside the sandbox?" (#470): record the chosen
+                            // scope and answer the waiting Bash call; it never touches
+                            // the permission rules or the Bash prefix allowlist.
+                            if let claurst_tui::dialogs::PermissionDialogKind::SandboxEscalation { command } = &pr.kind {
+                                use claurst_tools::sandbox::{record_escalation, EscalationScope};
+                                let scope = match pr.options.get(pr.selected_option).map(|o| o.key) {
+                                    Some('y') => Some(EscalationScope::Once),
+                                    Some('Y') => Some(EscalationScope::Session),
+                                    Some('P') => Some(EscalationScope::Prefix),
                                     _ => None,
+                                };
+                                if let Some(scope) = scope {
+                                    record_escalation(scope, command);
                                 }
-                            } else {
-                                None
+                                let tool_use_id = pr.tool_use_id.clone();
+                                app.permission_request = None;
+                                if let Some(mut pending) = pending_permissions.lock().waiting.remove(&tool_use_id) {
+                                    let decision = if scope.is_some() {
+                                        claurst_core::permissions::PermissionDecision::Allow
+                                    } else {
+                                        claurst_core::permissions::PermissionDecision::Deny
+                                    };
+                                    if let Some(tx) = pending.decision_tx.take() {
+                                        let _ = tx.send(decision);
+                                    }
+                                }
+                                continue;
+                            }
+                            let tool_use_id = pr.tool_use_id.clone();
+                            let selected_key = pr.options.get(pr.selected_option).map(|o| o.key);
+                            // The reason typed after choosing deny, if any,
+                            // goes back to the model with the denial.
+                            let feedback = pr
+                                .feedback
+                                .take()
+                                .map(|reason| reason.trim().to_string())
+                                .filter(|reason| !reason.is_empty());
+                            let suggested_rules = match &mut pr.kind {
+                                claurst_tui::dialogs::PermissionDialogKind::Bash { suggested_rules, .. } => {
+                                    std::mem::take(suggested_rules)
+                                }
+                                _ => Vec::new(),
                             };
                             app.permission_request = None;
 
-                            if let Some(prefix) = bash_prefix {
-                                app.bash_prefix_allowlist.insert(prefix.clone());
-                                // "Always allow" must survive restarts: persist
-                                // the prefix to settings.json so it is reloaded
-                                // into the allowlist on the next launch.
-                                if let Ok(mut settings) = claurst_core::config::Settings::load_sync() {
-                                    if !settings.allowed_bash_prefixes.contains(&prefix) {
-                                        settings.allowed_bash_prefixes.push(prefix);
-                                        let _ = settings.save_sync();
-                                    }
-                                }
-                            }
-
                             if let Some(mut pending) = pending_permissions.lock().waiting.remove(&tool_use_id) {
-                                let decision = match selected_key {
-                                    Some('n') => claurst_core::permissions::PermissionDecision::Deny,
+                                let decision = match (selected_key, feedback) {
+                                    (Some('n'), Some(reason)) => {
+                                        claurst_core::permissions::PermissionDecision::DenyWithFeedback(reason)
+                                    }
+                                    (Some('n'), None) => claurst_core::permissions::PermissionDecision::Deny,
                                     _ => claurst_core::permissions::PermissionDecision::Allow,
                                 };
 
                                 if let Some(manager) = tool_ctx.permission_manager.as_ref() {
                                     if let Ok(mut manager) = manager.lock() {
+                                        let tool_name = pending.request.tool_name.as_str();
+                                        let target = pending.request.path.as_deref();
+                                        let is_shell = claurst_core::permissions::is_shell_tool(tool_name);
                                         match selected_key {
-                                            Some('Y') => {
-                                                if let Some(path) = selected_path.as_deref() {
-                                                    manager.add_session_allow_path(&pending.request.tool_name, path);
-                                                } else {
-                                                    manager.add_session_allow(&pending.request.tool_name);
+                                            Some('Y') => match target {
+                                                Some(command) if is_shell => {
+                                                    manager.add_session_allow_command(tool_name, command);
                                                 }
-                                            }
-                                            Some('p') => {
-                                                let mut settings = claurst_core::config::Settings::load_sync().unwrap_or_default();
-                                                if let Some(path) = selected_path.as_deref() {
-                                                    let pattern = format!("{}*", path);
-                                                    let _ = manager.add_persistent_allow_path(&pending.request.tool_name, &pattern, &mut settings);
+                                                Some(path) => manager.add_session_allow_path(tool_name, path),
+                                                None => manager.add_session_allow(tool_name),
+                                            },
+                                            Some(key @ ('p' | 'a')) => {
+                                                let scope = if key == 'p' {
+                                                    claurst_core::permissions::ApprovalScope::Project
                                                 } else {
-                                                    let _ = manager.add_persistent_allow(&pending.request.tool_name, &mut settings);
+                                                    claurst_core::permissions::ApprovalScope::Global
+                                                };
+                                                // Shell approvals save the arity prefixes shown in
+                                                // the dialog; path approvals cover the path as a
+                                                // prefix glob; anything else allows the tool.
+                                                let patterns: Vec<Option<String>> = match target {
+                                                    Some(_) if is_shell => suggested_rules.into_iter().map(Some).collect(),
+                                                    Some(path) => vec![Some(format!("{}*", path))],
+                                                    None => vec![None],
+                                                };
+                                                for pattern in patterns {
+                                                    if let Err(e) = manager.save_allow(scope, tool_name, pattern.as_deref()) {
+                                                        app.status_message = Some(format!("Could not save approval: {}", e));
+                                                    }
                                                 }
                                             }
                                             _ => {}
@@ -3362,8 +3453,19 @@ async fn run_interactive(
                 Event::Resize(_, _) => {
                     // Terminal resize - will be handled on next draw
                 }
-                _ => {}
+                Event::FocusGained => app.terminal_focused = true,
+                Event::FocusLost => app.terminal_focused = false,
             }
+        }
+
+        // Esc / Ctrl+C interrupted the turn (#444): cancel its token, which
+        // stops the model request and running tools. Events the task already
+        // queued are dropped so they cannot restart the spinner.
+        if std::mem::take(&mut app.cancel_requested) {
+            if let Some(ref ct) = cancel {
+                ct.cancel();
+            }
+            discard_turn_events = current_query.is_some();
         }
 
         if app.permission_request.is_none() {
@@ -3373,31 +3475,30 @@ async fn run_interactive(
                     break;
                 };
 
-                let prefix_allowed = pending.request.tool_name == "Bash"
-                    && pending
-                        .request
-                        .path
-                        .as_deref()
-                        .map(|command| app.bash_command_allowed_by_prefix(command))
-                        .unwrap_or(false);
+                // A sandbox escalation is always shown: no permission rule may
+                // answer "run outside the sandbox" (#470).
+                if pending.request.tool_name == claurst_tools::sandbox::SANDBOX_ESCALATION_TOOL {
+                    let tool_use_id = pending.tool_use_id.clone();
+                    app.permission_request = Some(permission_request_from_core(&pending));
+                    pending_permissions.lock().waiting.insert(tool_use_id, pending);
+                    break;
+                }
 
-                let reevaluated = if prefix_allowed {
-                    Some(claurst_core::permissions::PermissionDecision::Allow)
-                } else {
-                    tool_ctx
-                        .permission_manager
-                        .as_ref()
-                        .and_then(|manager| manager.lock().ok())
-                        .map(|manager| {
-                            manager.evaluate(
-                                &pending.request.tool_name,
-                                &pending.request.description,
-                                pending.request.path.as_deref(),
-                                pending.request.working_dir.as_deref(),
-                                &pending.request.allowed_roots,
-                            )
-                        })
-                };
+                // Re-evaluate: an approval saved while this request waited
+                // in the queue may cover it now.
+                let reevaluated = tool_ctx
+                    .permission_manager
+                    .as_ref()
+                    .and_then(|manager| manager.lock().ok())
+                    .map(|manager| {
+                        manager.evaluate(
+                            &pending.request.tool_name,
+                            &pending.request.description,
+                            pending.request.path.as_deref(),
+                            pending.request.working_dir.as_deref(),
+                            &pending.request.allowed_roots,
+                        )
+                    });
 
                 match reevaluated {
                     Some(claurst_core::permissions::PermissionDecision::Ask { .. }) | None => {
@@ -3420,6 +3521,9 @@ async fn run_interactive(
             // Record loop compactions in the session (issue #441).
             if let QueryEvent::Compacted(record) = &evt {
                 session.compactions.push(record.clone());
+            }
+            if discard_turn_events {
+                continue;
             }
             // Forward to bridge before consuming (clone only what we need).
             if let Some(ref runtime) = bridge_runtime {
@@ -4192,6 +4296,13 @@ async fn run_interactive(
             if let Some((handle, msgs_arc)) = current_query.take() {
                 // Get the outcome and handle errors
                 let result = handle.await;
+                if std::mem::take(&mut discard_turn_events) {
+                    while let Ok(evt) = event_rx.try_recv() {
+                        if let QueryEvent::Compacted(record) = evt {
+                            session.compactions.push(record);
+                        }
+                    }
+                }
                 let aborted = matches!(result, Ok(QueryOutcome::Cancelled));
                 app.last_turn_outcome = claurst_tui::TurnOutcome::from_query_result(&result);
                 if let Ok(QueryOutcome::Error(err)) = result {
@@ -4219,11 +4330,15 @@ async fn run_interactive(
                 app.is_streaming = false;
                 app.status_message = None;
                 // Drain one queued message into the prompt and request an
-                // auto-submit on the next loop iteration (issue #149).
-                if let Some(next) = app.queued_messages.pop_front() {
-                    app.prompt_input.text = next;
-                    app.prompt_input.cursor = app.prompt_input.text.len();
-                    app.pending_auto_submit = true;
+                // auto-submit on the next loop iteration (issue #149). Steers
+                // still undelivered go first: the idle wake-up below sends
+                // them, and the queued message follows that turn (#444).
+                if command_queue.is_empty() {
+                    if let Some(next) = app.queued_messages.pop_front() {
+                        app.prompt_input.text = next;
+                        app.prompt_input.cursor = app.prompt_input.text.len();
+                        app.pending_auto_submit = true;
+                    }
                 }
 
                 // Save session to JSONL (primary storage)
@@ -4277,6 +4392,59 @@ async fn run_interactive(
                         });
                 }
             }
+        }
+
+        // Idle wake-up (#444): queued input — a steer typed during the final
+        // request of the last turn, or a background task's completion notice —
+        // starts a turn that delivers it. The loop drains the queue before its
+        // first request and reports it through `QueryEvent::InputInjected`.
+        if current_query.is_none()
+            && !app.is_streaming
+            && !app.pending_auto_submit
+            && !app.any_modal_open()
+            && !command_queue.is_empty()
+        {
+            app.is_streaming = true;
+            app.streaming_text.clear();
+            let ct = CancellationToken::new();
+            cancel = Some(ct.clone());
+            let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
+            let msgs_arc_clone = msgs_arc.clone();
+            let tools_arc_clone = tools_arc.clone();
+            let ctx_clone = tool_ctx.clone();
+            let mut qcfg = base_query_config.clone();
+            qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
+            qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+            qcfg.max_turns_override = app.max_turns_override;
+            qcfg.output_style = cmd_ctx.config.effective_output_style();
+            qcfg.output_style_prompt = cmd_ctx.config.resolve_output_style_prompt();
+            qcfg.working_directory = Some(tool_ctx.working_dir.display().to_string());
+            if let Some(level) = current_effort {
+                qcfg.effort_level = Some(level);
+            }
+            let tracker = cost_tracker.clone();
+            let tx = event_tx.clone();
+            let client_clone = client.clone();
+            let skill_listings = skill_listings.clone();
+            let handle = tokio::spawn(async move {
+                qcfg.available_skills = session_skill_listings(skill_listings).await;
+                let mut msgs = msgs_arc_clone.lock().await.clone();
+                let outcome = claurst_query::run_query_loop(
+                    client_clone.as_ref(),
+                    &mut msgs,
+                    tools_arc_clone.as_slice(),
+                    &ctx_clone,
+                    &qcfg,
+                    tracker,
+                    Some(tx),
+                    ct,
+                    None,
+                )
+                .await;
+                *msgs_arc_clone.lock().await = msgs;
+                outcome
+            });
+            current_query = Some((handle, msgs_arc));
         }
 
         if !app.is_streaming && current_query.is_none() {

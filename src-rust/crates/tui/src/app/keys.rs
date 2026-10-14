@@ -1222,6 +1222,10 @@ impl App {
         if let Some(keystroke) = key_event_to_keystroke(&key) {
             let had_pending_chord = self.keybindings.has_pending_chord();
             match self.keybindings.process(keystroke, &key_context) {
+                // Contextual actions that do not apply right now fall through,
+                // so their key keeps its ordinary meaning (Alt+Up scrolls when
+                // nothing is queued).
+                KeybindingResult::Action(action) if !self.keybinding_action_applies(&action) => {}
                 KeybindingResult::Action(action) => {
                     return self.handle_keybinding_action(&action);
                 }
@@ -1383,18 +1387,6 @@ impl App {
         }
 
         match key.code {
-            // ---- ESC: cancel streaming (status bar advertises "esc interrupt") ----
-            KeyCode::Esc if self.is_streaming => {
-                self.is_streaming = false;
-                self.spinner_verb = None;
-                self.streaming_text.clear();
-                self.streaming_thinking.clear();
-                self.tool_use_blocks.clear();
-                self.retry_status = None;
-                self.status_message = Some("Cancelled.".to_string());
-                self.complete_current_turn_snapshot(true);
-            }
-
             // ---- Quit / cancel ----------------------------------------
             // Accept both 'c' and 'C' so Shift+Ctrl+C also triggers copy
             // (issue #149 follow-up).
@@ -1410,15 +1402,8 @@ impl App {
                     if copied {
                         self.push_notification(NotificationKind::Info, "Copied to clipboard".to_string(), Some(2));
                     }
-                } else if self.is_streaming {
-                    // Cancel streaming.
-                    self.is_streaming = false;
-                    self.spinner_verb = None;
-                    self.streaming_text.clear();
-                    self.streaming_thinking.clear();
-                    self.tool_use_blocks.clear();
-                    self.status_message = Some("Cancelled.".to_string());
-                    self.complete_current_turn_snapshot(true);
+                } else if self.turn_running() {
+                    self.interrupt_turn();
                 } else {
                     // No text selected and not streaming: handle exit confirmation sequence.
                     // Always clear the prompt input on Ctrl+C.
@@ -2084,16 +2069,27 @@ impl App {
         self.exit_key_sequence_start = Some(key_char);
     }
 
+    /// Whether a contextual keybinding action has anything to act on.
+    /// Actions that do not apply leave the key to the hardcoded handlers.
+    fn keybinding_action_applies(&self, action: &str) -> bool {
+        match action {
+            "editQueued" | "removeQueued" => self.pending_prompts().next().is_some(),
+            // Idle Esc keeps its other meanings (vim, transcript focus). There
+            // is no backtrack picker, so Esc-Esc on an idle prompt does nothing.
+            "cancelTurn" => self.turn_running(),
+            _ => true,
+        }
+    }
+
     pub(super) fn handle_keybinding_action(&mut self, action: &str) -> bool {
         match action {
+            "cancelTurn" => {
+                self.interrupt_turn();
+                false
+            }
             "interrupt" => {
-                if self.is_streaming {
-                    self.is_streaming = false;
-                    self.spinner_verb = None;
-                    self.streaming_text.clear();
-                    self.streaming_thinking.clear();
-                    self.tool_use_blocks.clear();
-                    self.status_message = Some("Cancelled.".to_string());
+                if self.turn_running() {
+                    self.interrupt_turn();
                 } else {
                     // Handle exit confirmation: require two exit key presses within 2 seconds.
                     // Always clear the prompt input on Ctrl+C.
@@ -2403,6 +2399,23 @@ impl App {
                 }
                 false
             }
+            "editQueued" => {
+                self.edit_last_pending();
+                false
+            }
+            "removeQueued" => {
+                self.remove_last_pending();
+                false
+            }
+            "indent" if self.turn_running() && self.prompt_input.suggestions.is_empty() => {
+                // Tab during a turn: queue the prompt as a new turn for after
+                // this one ends (#444). Enter would steer it into this turn.
+                let input = self.take_input();
+                if !input.is_empty() {
+                    self.queued_messages.push_back(input);
+                }
+                false
+            }
             "indent" => {
                 // Tab: cycle agent mode when prompt is empty, accept
                 // slash-command suggestion otherwise.
@@ -2478,99 +2491,17 @@ impl App {
     }
 
     /// Handle a key event while a permission dialog is active.
+    ///
+    /// The decision itself (and any rule it saves) is applied by the event
+    /// loop that owns the pending request; this only drives the dialog and
+    /// closes it once an option is confirmed.
     pub(super) fn handle_permission_key(&mut self, key: KeyEvent) {
-        let pr = match self.permission_request.as_mut() {
-            Some(p) => p,
-            None => return,
-        };
-
-        match key.code {
-            KeyCode::Char(c) => {
-                if let Some(digit) = c.to_digit(10) {
-                    let idx = (digit as usize).saturating_sub(1);
-                    if idx < pr.options.len() {
-                        pr.selected_option = idx;
-                    }
-                } else {
-                    // Check if any option matches this key.
-                    let mut matched_idx = None;
-                    for (i, opt) in pr.options.iter().enumerate() {
-                        if opt.key == c {
-                            matched_idx = Some(i);
-                            break;
-                        }
-                    }
-                    if let Some(idx) = matched_idx {
-                        pr.selected_option = idx;
-                        // If this is the prefix-allow option ('P'), record the prefix.
-                        self.maybe_record_bash_prefix();
-                        self.permission_request = None;
-                    }
-                }
-            }
-            KeyCode::Enter => {
-                // If the currently selected option is the prefix-allow option, record it.
-                self.maybe_record_bash_prefix();
-                self.permission_request = None;
-            }
-            KeyCode::Up => {
-                let pr = self.permission_request.as_mut().unwrap();
-                if pr.selected_option > 0 {
-                    pr.selected_option -= 1;
-                }
-            }
-            KeyCode::Down => {
-                let pr = self.permission_request.as_mut().unwrap();
-                if pr.selected_option + 1 < pr.options.len() {
-                    pr.selected_option += 1;
-                }
-            }
-            KeyCode::Esc => {
-                self.permission_request = None;
-            }
-            _ => {}
-        }
-    }
-
-    /// If the active permission dialog's selected option is the prefix-allow
-    /// option ('P') for a Bash dialog, extract the suggested prefix and add it
-    /// to `bash_prefix_allowlist` so future requests with the same prefix are
-    /// silently approved.
-    pub(super) fn maybe_record_bash_prefix(&mut self) {
-        use crate::dialogs::PermissionDialogKind;
-        let pr = match self.permission_request.as_ref() {
-            Some(p) => p,
-            None => return,
-        };
-        // Only act on Bash dialogs where the selected option key is 'P'.
-        let selected_key = pr.options.get(pr.selected_option).map(|o| o.key);
-        if selected_key != Some('P') {
+        let Some(pr) = self.permission_request.as_mut() else {
             return;
+        };
+        if crate::dialogs::handle_permission_key(pr, key) {
+            self.permission_request = None;
         }
-        if let PermissionDialogKind::Bash { command, .. } = &pr.kind {
-            // Always normalize to the first whitespace-delimited word so
-            // that the allowlist check in `bash_command_allowed_by_prefix`
-            // (which also uses `split_whitespace().next()`) matches correctly.
-            let first_word = command.split_whitespace().next().unwrap_or("").to_string();
-            if !first_word.is_empty() {
-                self.bash_prefix_allowlist.insert(first_word.clone());
-                // Persist so the "always allow" choice survives restarts.
-                if let Ok(mut settings) = claurst_core::config::Settings::load_sync() {
-                    if !settings.allowed_bash_prefixes.contains(&first_word) {
-                        settings.allowed_bash_prefixes.push(first_word);
-                        let _ = settings.save_sync();
-                    }
-                }
-            }
-        }
-    }
-
-    /// Returns `true` if the given bash `command` is covered by the session-local
-    /// prefix allowlist (i.e. its first word matches an entry in
-    /// `bash_prefix_allowlist`).  Used by callers to skip the permission dialog.
-    pub fn bash_command_allowed_by_prefix(&self, command: &str) -> bool {
-        let first_word = command.split_whitespace().next().unwrap_or("");
-        !first_word.is_empty() && self.bash_prefix_allowlist.contains(first_word)
     }
 
     pub(super) fn prompt_can_accept_selection_paste(&self) -> bool {

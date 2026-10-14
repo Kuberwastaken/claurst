@@ -128,12 +128,13 @@ pub struct QueryConfig {
     /// thinking budget.  Also provides a temperature override when the
     /// level specifies one.
     pub effort_level: Option<claurst_core::effort::EffortLevel>,
-    /// T1-4: Optional shared command queue.
+    /// Optional shared command queue (#444).
     ///
-    /// When set, the query loop drains this queue before each API call and
-    /// injects any resulting messages into the conversation.  The queue is
-    /// shared (Arc-backed) so the TUI input thread can push commands while the
-    /// loop is waiting for a model response.
+    /// When set, the query loop drains this queue before each API call (each
+    /// step boundary) and appends the resulting messages to the conversation,
+    /// emitting [`QueryEvent::InputInjected`]. The queue is shared
+    /// (Arc-backed) so the TUI can push steers, and background tasks their
+    /// completion notices, while the loop is running.
     pub command_queue: Option<CommandQueue>,
     /// Optional USD spend cap. The query loop checks accumulated cost after
     /// each turn and aborts with `QueryOutcome::BudgetExceeded` when exceeded.
@@ -195,6 +196,9 @@ pub struct QueryConfig {
     /// Set for a sub-agent's loop: a finished turn fires `SubagentStop`
     /// hooks instead of `Stop` (#447).
     pub is_subagent: bool,
+    /// Sandbox line for the dynamic system prompt (#470). Always filled by
+    /// `run_query_loop` from the tool context's sandbox settings.
+    pub sandbox_state: Option<String>,
 }
 
 impl Default for QueryConfig {
@@ -232,6 +236,7 @@ impl Default for QueryConfig {
             retry: claurst_api::RetryConfig::default(),
             auto_compact: true,
             is_subagent: false,
+            sandbox_state: None,
         }
     }
 }
@@ -309,6 +314,11 @@ pub enum QueryEvent {
     /// Provider-reported subscription usage (0-100 per window), e.g. the
     /// Codex `x-codex-*` rate-limit headers.
     RateLimits { primary_used_percent: Option<f32>, secondary_used_percent: Option<f32> },
+    /// Queued input drained from [`QueryConfig::command_queue`] at a step
+    /// boundary and appended to the history as user messages, in order
+    /// (#444): steers typed during the turn and background-task completion
+    /// notices.
+    InputInjected(Vec<String>),
     /// A message was appended to the history for good: an assistant reply
     /// (after any retry settled, with its final content blocks and tool-use
     /// ids) or the user message carrying a turn's tool results (#473).
@@ -730,18 +740,21 @@ pub async fn run_query_loop(
             }
         }
 
-        // T1-4: Drain the priority command queue (if wired up) and prepend any
-        // resulting messages to the conversation before the API call.
-        // Mirrors the TS `messageQueueManager` priority-queue drain.
+        // Step boundary (#444): deliver queued input — steers typed while the
+        // turn ran and background-task completion notices — before the next
+        // model request. They are appended after the last tool results, in
+        // queue order, and reported so the UI can show them where they landed.
         if let Some(ref cq) = config.command_queue {
             if !cq.is_empty() {
                 let injected = drain_command_queue(cq);
                 if !injected.is_empty() {
                     debug!(count = injected.len(), "Injecting command-queue messages");
-                    // Prepend so that higher-priority commands appear first.
-                    let tail = std::mem::take(messages);
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::InputInjected(
+                            injected.iter().map(Message::get_all_text).collect(),
+                        ));
+                    }
                     messages.extend(injected);
-                    messages.extend(tail);
                 }
             }
         }
@@ -823,6 +836,7 @@ pub async fn run_query_loop(
         } else {
             tools
                 .iter()
+                .filter(|t| !tool_ctx.tool_is_disallowed(t.name()))
                 .map(|t| ApiToolDefinition::from(&t.to_definition()))
                 .collect()
         };
@@ -866,6 +880,8 @@ pub async fn run_query_loop(
                     .map(|dir| dir.display().to_string())
                     .collect();
             }
+            patched.sandbox_state =
+                claurst_core::sandbox::render_sandbox_state(&tool_ctx.config.sandbox);
 
             // Apply agent system-prompt prefix: prepend before the main system prompt.
             if let Some(ref agent) = config.agent_definition {
@@ -1060,7 +1076,11 @@ pub async fn run_query_loop(
                     // summary turn with no tools so the provider can only emit
                     // text (opencode's `toolChoice:"none"` equivalent).
                     let provider_tools: Vec<claurst_core::types::ToolDefinition> = if caps.tool_calling && !degradation_turn {
-                        tools.iter().map(|t| t.to_definition()).collect()
+                        tools
+                            .iter()
+                            .filter(|t| !tool_ctx.tool_is_disallowed(t.name()))
+                            .map(|t| t.to_definition())
+                            .collect()
                     } else {
                         Vec::new()
                     };
@@ -1487,6 +1507,12 @@ pub async fn run_query_loop(
                             let _ = tx.send(QueryEvent::MessageCommitted(assistant_msg.clone()));
                         }
                         let mut tool_results = Vec::new();
+                        // Reject cascade (#445): once the user denies a call,
+                        // the rest of this turn's calls are not run.
+                        let batch_ctx = ToolContext {
+                            batch_rejection: claurst_tools::BatchRejection::default(),
+                            ..tool_ctx.clone()
+                        };
                         for (tool_id, tool_name, tool_input) in tool_use_blocks {
                             // Notify TUI that a tool is starting (matches Anthropic path).
                             if let Some(ref tx) = event_tx {
@@ -1501,8 +1527,10 @@ pub async fn run_query_loop(
                                 // be parsed — return an error the model can see
                                 // and recover from (issues #215, #439).
                                 invalid_tool_input_result(&tool_name, err)
+                            } else if batch_ctx.batch_rejection.is_rejected() {
+                                ToolResult::error(claurst_tools::BATCH_REJECTED_MSG)
                             } else {
-                                run_tool_with_hooks(&tool_name, tool_input, tools, tool_ctx).await
+                                run_tool_with_hooks(&tool_name, tool_input, tools, &batch_ctx).await
                             };
                             if let Some(ref tx) = event_tx {
                                 let _ = tx.send(QueryEvent::ToolEnd {
@@ -2050,6 +2078,18 @@ pub async fn run_query_loop(
                     call: PreToolUse,
                 }
 
+                // Reject cascade (#445): the batch gets a fresh `BatchRejection`.
+                // When the user denies one call, the calls that have not
+                // started yet return an error instead of running, and calls
+                // that would prompt are rejected without asking. join_all
+                // polls in order and a prompt blocks the task until answered,
+                // so the calls after a prompted one have not started by then.
+                let batch_ctx = ToolContext {
+                    batch_rejection: claurst_tools::BatchRejection::default(),
+                    ..tool_ctx.clone()
+                };
+                let batch_ctx = &batch_ctx;
+
                 // Phase 1: sequential pre-hook pass.
                 let mut prepared: Vec<PreparedTool> = Vec::with_capacity(tool_blocks.len());
                 for block in tool_blocks {
@@ -2067,7 +2107,7 @@ pub async fn run_query_loop(
                         let call = if let Some(err) = invalid_tool_inputs.get(id) {
                             PreToolUse::Blocked(invalid_tool_input_result(name, err))
                         } else {
-                            pre_tool_use(name, input.clone(), tool_ctx).await
+                            pre_tool_use(name, input.clone(), batch_ctx).await
                         };
                         prepared.push(PreparedTool { id: id.clone(), name: name.clone(), call });
                     }
@@ -2076,17 +2116,20 @@ pub async fn run_query_loop(
                 // Phase 2: build execution futures for non-blocked tools and join them.
                 // Blocked tools yield a ready future with their error result.
                 // A call a hook allowed runs with that call's permission context.
+                // Every context of the batch shares `batch_ctx.batch_rejection`
+                // (hook contexts are clones of it), so a denial anywhere in the
+                // batch rejects the calls that have not started yet.
                 let exec_futures: Vec<_> = prepared
                     .iter()
                     .map(|p| match &p.call {
                         PreToolUse::Blocked(result) => {
                             futures::future::Either::Left(std::future::ready(result.clone()))
                         }
-                        PreToolUse::Run { input, ctx } => futures::future::Either::Right(execute_tool(
+                        PreToolUse::Run { input, ctx } => futures::future::Either::Right(execute_batch_call(
                             &p.name,
                             input,
                             tools,
-                            ctx.as_deref().unwrap_or(tool_ctx),
+                            ctx.as_deref().unwrap_or(batch_ctx),
                         )),
                     })
                     .collect();
@@ -2298,6 +2341,7 @@ mod tests {
             retry: claurst_api::RetryConfig::default(),
             auto_compact: true,
             is_subagent: false,
+            sandbox_state: None,
         }
     }
 
@@ -2718,6 +2762,7 @@ mod tests {
             permission_manager: None,
             user_question_tx: None,
             cancel_token: tokio_util::sync::CancellationToken::new(),
+            batch_rejection: Default::default(),
         }
     }
 
@@ -2798,6 +2843,114 @@ mod tests {
                 level
             );
         }
+    }
+
+    /// #445: a tool covered by `disallowed_tools` is refused before it runs,
+    /// even a read-only one the central backstop would not gate.
+    #[tokio::test]
+    async fn disallowed_tool_is_refused_before_running() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockTool {
+            name: "MockSafe",
+            level: PermissionLevel::ReadOnly,
+            self_gates: false,
+            ran: ran.clone(),
+        })];
+        let mut manager = claurst_core::permissions::PermissionManager::new(
+            claurst_core::config::PermissionMode::BypassPermissions,
+            &claurst_core::config::Settings::default(),
+        );
+        manager.sync_config(&claurst_core::config::Config {
+            permission_mode: claurst_core::config::PermissionMode::BypassPermissions,
+            disallowed_tools: vec!["MockSafe".to_string()],
+            ..Default::default()
+        });
+        let ctx = ToolContext {
+            permission_manager: Some(Arc::new(std::sync::Mutex::new(manager))),
+            ..deny_all_context()
+        };
+
+        assert!(ctx.tool_is_disallowed("MockSafe"));
+        let result = execute_tool("MockSafe", &serde_json::json!({}), &tools, &ctx).await;
+        assert!(result.is_error);
+        assert!(result.content.contains("disallowed"), "{}", result.content);
+        assert!(!ran.load(AtomicOrdering::SeqCst), "a disallowed tool must not run");
+    }
+
+    /// #445: when the user denies a call in a parallel batch with a reason,
+    /// the reason reaches the model and the batch's remaining calls are
+    /// rejected instead of run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_denial_rejects_the_rest_of_the_batch() {
+        let queue = Arc::new(parking_lot::Mutex::new(
+            claurst_tools::PendingPermissionStore::default(),
+        ));
+        // Answer the first prompt as the TUI does when the user types a
+        // reason and denies.
+        let responder_queue = queue.clone();
+        let responder = std::thread::spawn(move || loop {
+            let next = responder_queue.lock().queue.pop_front();
+            if let Some(mut pending) = next {
+                if let Some(tx) = pending.decision_tx.take() {
+                    let _ = tx.send(claurst_core::permissions::PermissionDecision::DenyWithFeedback(
+                        "use cargo check instead".to_string(),
+                    ));
+                }
+                return pending.request.tool_name;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        });
+
+        let asked_ran = Arc::new(AtomicBool::new(false));
+        let later_ran = Arc::new(AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(MockTool {
+                name: "MockExec",
+                level: PermissionLevel::Execute,
+                self_gates: false,
+                ran: asked_ran.clone(),
+            }),
+            Box::new(MockTool {
+                name: "MockSafe",
+                level: PermissionLevel::ReadOnly,
+                self_gates: false,
+                ran: later_ran.clone(),
+            }),
+        ];
+        let ctx = ToolContext {
+            non_interactive: false,
+            pending_permissions: Some(queue),
+            ..deny_all_context()
+        };
+        let input = serde_json::json!({});
+        let batch = vec![
+            execute_batch_call("MockExec", &input, &tools, &ctx),
+            execute_batch_call("MockSafe", &input, &tools, &ctx),
+        ];
+        let (results, cancelled) = run_tool_batch(batch, &ctx.cancel_token).await;
+
+        assert_eq!(responder.join().unwrap(), "MockExec");
+        assert!(!cancelled);
+        assert!(results[0].is_error);
+        assert!(
+            results[0].content.contains("The user said: use cargo check instead"),
+            "{}",
+            results[0].content
+        );
+        assert!(!asked_ran.load(AtomicOrdering::SeqCst));
+        assert!(results[1].is_error);
+        assert_eq!(results[1].content, claurst_tools::BATCH_REJECTED_MSG);
+        assert!(!later_ran.load(AtomicOrdering::SeqCst), "a call after the denial must not run");
+        assert!(ctx.batch_rejection.is_rejected());
+
+        // A fresh batch runs normally again.
+        let fresh = ToolContext {
+            batch_rejection: claurst_tools::BatchRejection::default(),
+            ..ctx.clone()
+        };
+        let result = execute_batch_call("MockSafe", &input, &tools, &fresh).await;
+        assert!(!result.is_error);
+        assert!(later_ran.load(AtomicOrdering::SeqCst));
     }
 
     #[test]
@@ -3712,7 +3865,7 @@ mod tests {
         max_retries: u32,
         tools: Vec<Box<dyn Tool>>,
     ) -> ScriptedRun {
-        drive_scripted_with(steps, max_retries, tools, None, Vec::new(), None).await
+        drive_scripted_with(steps, max_retries, tools, None, Vec::new(), None, None).await
     }
 
     /// [`drive_scripted`] with an explicit turn cap and queued user messages
@@ -3724,6 +3877,7 @@ mod tests {
         max_turns: Option<u32>,
         mut pending: Vec<String>,
         history: Option<Vec<Message>>,
+        command_queue: Option<CommandQueue>,
     ) -> ScriptedRun {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider = Arc::new(ScriptedProvider {
@@ -3755,6 +3909,7 @@ mod tests {
         if let Some(max_turns) = max_turns {
             config.max_turns = max_turns;
         }
+        config.command_queue = command_queue;
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut messages = history.unwrap_or_else(|| vec![Message::user("start")]);
@@ -4007,6 +4162,7 @@ mod tests {
             noop_tools(),
             Some(0),
             vec!["typed during the attempt".to_string()],
+            None,
             None,
         )
         .await;
@@ -4349,6 +4505,7 @@ mod tests {
             None,
             Vec::new(),
             Some(long_history(7, 20_000)),
+            None,
         )
         .await;
         assert_eq!(run.calls, 3, "overflow, summary, retried request");
@@ -4364,6 +4521,136 @@ mod tests {
             "exactly one compaction: {:?}",
             run.events
         );
+    }
+
+    // ---- Issue #444: steering through the command queue ---------------------
+
+    /// A tool that, while it runs, does what the TUI does when the user
+    /// presses Enter mid-turn: push steers into the shared queue.
+    struct SteerWhileRunningTool {
+        queue: CommandQueue,
+        steers: Vec<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for SteerWhileRunningTool {
+        fn name(&self) -> &str { "noop_tool" }
+        fn description(&self) -> &str { "pushes steers while running" }
+        fn permission_level(&self) -> PermissionLevel { PermissionLevel::ReadOnly }
+        fn input_schema(&self) -> Value { serde_json::json!({"type": "object"}) }
+        async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
+            for steer in &self.steers {
+                self.queue.push(
+                    QueuedCommand::InjectUserMessage((*steer).to_string()),
+                    CommandPriority::Normal,
+                );
+            }
+            ToolResult::success("tool done")
+        }
+    }
+
+    fn texts_of(messages: &[Message]) -> Vec<(Role, String)> {
+        messages.iter().map(|m| (m.role.clone(), m.get_all_text())).collect()
+    }
+
+    #[tokio::test]
+    async fn steer_is_delivered_after_tool_results_before_the_next_request() {
+        let queue = CommandQueue::new();
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(SteerWhileRunningTool {
+            queue: queue.clone(),
+            steers: vec!["also check the docs", "and the tests"],
+        })];
+        let run = drive_scripted_with(
+            vec![ScriptStep::Stream(tool_call_turn("{}"))],
+            0,
+            tools,
+            None,
+            Vec::new(),
+            None,
+            Some(queue.clone()),
+        )
+        .await;
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(run.calls, 2, "the steers ride the request after the tool batch");
+        assert!(queue.is_empty(), "the step boundary drained the queue");
+
+        let history = texts_of(&run.messages);
+        let result_at = run
+            .messages
+            .iter()
+            .position(|m| !m.get_tool_result_blocks().is_empty())
+            .expect("tool result in history");
+        assert_eq!(
+            &history[result_at + 1..result_at + 3],
+            &[
+                (Role::User, "also check the docs".to_string()),
+                (Role::User, "and the tests".to_string()),
+            ],
+            "steers follow the tool results in the order typed: {history:?}"
+        );
+        assert_eq!(history.last().map(|(role, _)| role.clone()), Some(Role::Assistant));
+
+        let injected: Vec<&Vec<String>> = run
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                QueryEvent::InputInjected(texts) => Some(texts),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            injected,
+            [&vec!["also check the docs".to_string(), "and the tests".to_string()]]
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_input_is_drained_before_the_first_request_of_a_turn() {
+        // The idle wake-up path: a turn starts with only a queued notice, and
+        // the loop delivers it before its first request.
+        let queue = CommandQueue::new();
+        queue.push(
+            QueuedCommand::InjectUserMessage(
+                "<background-shell id=\"t1\" state=\"completed\">ok</background-shell>".into(),
+            ),
+            CommandPriority::Normal,
+        );
+        let history = vec![Message::user("start"), Message::assistant("started it")];
+        let run = drive_scripted_with(
+            Vec::new(),
+            0,
+            noop_tools(),
+            None,
+            Vec::new(),
+            Some(history),
+            Some(queue.clone()),
+        )
+        .await;
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(run.calls, 1);
+        assert!(queue.is_empty());
+        let history = texts_of(&run.messages);
+        assert_eq!(history[2].0, Role::User);
+        assert!(history[2].1.starts_with("<background-shell "), "{history:?}");
+        assert_eq!(history[3], (Role::Assistant, "final answer".to_string()));
+    }
+
+    #[tokio::test]
+    async fn an_empty_queue_injects_nothing() {
+        let queue = CommandQueue::new();
+        let run = drive_scripted_with(
+            vec![ScriptStep::Stream(tool_call_turn("{}"))],
+            0,
+            noop_tools(),
+            None,
+            Vec::new(),
+            None,
+            Some(queue),
+        )
+        .await;
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert!(!run.events.iter().any(|e| matches!(e, QueryEvent::InputInjected(_))));
+        assert_eq!(run.messages.iter().filter(|m| m.role == Role::User).count(), 2);
     }
 }
 
@@ -4601,6 +4888,7 @@ mod hook_loop_tests {
             permission_manager: None,
             user_question_tx: None,
             cancel_token: tokio_util::sync::CancellationToken::new(),
+            batch_rejection: Default::default(),
         };
 
         let query_config = QueryConfig {

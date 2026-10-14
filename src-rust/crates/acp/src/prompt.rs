@@ -80,6 +80,7 @@ pub async fn handle(
         // sub-agents observe cancellation (issue #218). `run_query_loop` also
         // rebinds this to the token it is driven by.
         cancel_token: cancel.clone(),
+        batch_rejection: Default::default(),
     };
 
     // Spawn the permission drainer for this turn.

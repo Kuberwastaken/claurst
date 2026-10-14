@@ -14,8 +14,9 @@
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol_schema as acp;
-use claurst_core::config::Settings;
-use claurst_core::permissions::{PermissionDecision, PermissionManager, PermissionRequest};
+use claurst_core::permissions::{
+    is_shell_tool, ApprovalScope, PermissionDecision, PermissionManager, PermissionRequest,
+};
 use claurst_tools::{PendingPermissionStore, PendingPermissionRequest};
 use tracing::{debug, warn};
 
@@ -43,6 +44,15 @@ pub async fn forward_pending(
         warn!(tool_use_id, "ACP permission: pending request had no decision_tx");
         return;
     };
+
+    // The OS sandbox's "rerun outside the sandbox?" offer (#470) is not put
+    // to the client: dropping the sender leaves it unanswered, so the Bash
+    // tool returns the denial with a sandbox note and the client decides.
+    if request.tool_name == claurst_tools::sandbox::SANDBOX_ESCALATION_TOOL {
+        debug!(tool_use_id, "ACP permission: sandbox escalation left to the client");
+        drop(decision_tx);
+        return;
+    }
 
     let title = if reason.is_empty() {
         format!("Approve {}", request.tool_name)
@@ -125,30 +135,39 @@ pub async fn forward_pending(
     let _ = decision_tx.send(decision);
 }
 
-/// Record an "Allow always" answer the way the TUI does: a persistent allow
-/// rule saved to the global settings, scoped to the requested path when there
-/// is one. When the settings cannot be saved the rule is kept for the rest of
-/// the session instead.
+/// Record an "Allow always" answer the way the TUI's "always allow in this
+/// project" does: allow rules saved to the session's project store, scoped to
+/// the requested path (or, for Bash, to the per-command arity prefixes).
+/// When nothing can be saved (an opaque command, or a store error) the
+/// approval is kept for the rest of the session instead.
 fn remember_allow_always(manager: &Mutex<PermissionManager>, request: &PermissionRequest) {
     let Ok(mut manager) = manager.lock() else {
         warn!(tool = %request.tool_name, "ACP permission: manager lock poisoned, allow-always not remembered");
         return;
     };
-    let pattern = request.path.as_deref().map(|path| format!("{path}*"));
-    let persisted = Settings::load_sync().and_then(|mut settings| {
-        match pattern.as_deref() {
-            Some(pattern) => {
-                manager.add_persistent_allow_path(&request.tool_name, pattern, &mut settings)
-            }
-            None => manager.add_persistent_allow(&request.tool_name, &mut settings),
+    let tool = request.tool_name.as_str();
+    let target = request.path.as_deref();
+    let patterns: Vec<Option<String>> = match target {
+        Some(command) if is_shell_tool(tool) => {
+            claurst_core::shell_scan::approval_rules(command).into_iter().map(Some).collect()
         }
-        .map_err(|e| anyhow::anyhow!("{e}"))
-    });
-    if let Err(e) = persisted {
-        warn!(error = %e, tool = %request.tool_name, "ACP permission: could not save allow-always, keeping it for this session");
-        match pattern.as_deref() {
-            Some(pattern) => manager.add_session_allow_path(&request.tool_name, pattern),
-            None => manager.add_session_allow(&request.tool_name),
+        Some(path) => vec![Some(format!("{path}*"))],
+        None => vec![None],
+    };
+    let saved = !patterns.is_empty()
+        && patterns.iter().all(|pattern| {
+            manager
+                .save_allow(ApprovalScope::Project, tool, pattern.as_deref())
+                .inspect_err(|e| {
+                    warn!(error = %e, tool, "ACP permission: could not save allow-always, keeping it for this session");
+                })
+                .is_ok()
+        });
+    if !saved {
+        match target {
+            Some(command) if is_shell_tool(tool) => manager.add_session_allow_command(tool, command),
+            Some(path) => manager.add_session_allow_path(tool, &format!("{path}*")),
+            None => manager.add_session_allow(tool),
         }
     }
 }

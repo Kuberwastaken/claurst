@@ -750,108 +750,6 @@ use super::types::{ContextMenuItem, ContextMenuState};
         assert_eq!(app.prompt_input.text, "hello");
     }
 
-    // ---- Bash prefix allowlist ----------------------------------------------
-
-    #[test]
-    fn test_bash_command_not_allowed_by_default() {
-        let app = make_app();
-        assert!(!app.bash_command_allowed_by_prefix("git status"));
-        assert!(!app.bash_command_allowed_by_prefix("ls -la"));
-        assert!(!app.bash_command_allowed_by_prefix(""));
-    }
-
-    #[test]
-    fn test_bash_prefix_allowlist_after_p_key() {
-        use crate::dialogs::PermissionRequest;
-        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-
-        let mut app = make_app();
-        // Set up a bash permission dialog with a suggested prefix.
-        let pr = PermissionRequest::bash(
-            "tu-1".to_string(),
-            "Bash".to_string(),
-            "This will execute a shell command.".to_string(),
-            "git status".to_string(),
-            Some("git".to_string()),
-        );
-        app.permission_request = Some(pr);
-
-        // Simulate pressing 'P' (prefix-allow key).
-        let key = KeyEvent {
-            code: KeyCode::Char('P'),
-            modifiers: KeyModifiers::SHIFT,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        };
-        app.handle_permission_key(key);
-
-        // Dialog should be dismissed and "git" added to the allowlist.
-        assert!(app.permission_request.is_none());
-        assert!(app.bash_command_allowed_by_prefix("git status"));
-        assert!(app.bash_command_allowed_by_prefix("git push origin main"));
-        // Other commands should NOT be allowed.
-        assert!(!app.bash_command_allowed_by_prefix("rm -rf /tmp"));
-    }
-
-    #[test]
-    fn test_bash_prefix_allowlist_via_enter_on_p_option() {
-        use crate::dialogs::PermissionRequest;
-        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-
-        let mut app = make_app();
-        let mut pr = PermissionRequest::bash(
-            "tu-2".to_string(),
-            "Bash".to_string(),
-            "This will execute a shell command.".to_string(),
-            "cargo build".to_string(),
-            Some("cargo".to_string()),
-        );
-        // Navigate to the prefix option (index 3 in a 5-option dialog).
-        pr.selected_option = 3;
-        app.permission_request = Some(pr);
-
-        // Press Enter to confirm the currently selected (prefix) option.
-        let key = KeyEvent {
-            code: KeyCode::Enter,
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        };
-        app.handle_permission_key(key);
-
-        assert!(app.permission_request.is_none());
-        assert!(app.bash_command_allowed_by_prefix("cargo test"));
-        assert!(!app.bash_command_allowed_by_prefix("make build"));
-    }
-
-    #[test]
-    fn test_bash_prefix_allowlist_non_prefix_option_does_not_add() {
-        use crate::dialogs::PermissionRequest;
-        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-
-        let mut app = make_app();
-        let pr = PermissionRequest::bash(
-            "tu-3".to_string(),
-            "Bash".to_string(),
-            "This will execute a shell command.".to_string(),
-            "npm install".to_string(),
-            Some("npm".to_string()),
-        );
-        app.permission_request = Some(pr);
-
-        // Press 'y' (allow-once) — should NOT add to allowlist.
-        let key = KeyEvent {
-            code: KeyCode::Char('y'),
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        };
-        app.handle_permission_key(key);
-
-        assert!(app.permission_request.is_none());
-        assert!(!app.bash_command_allowed_by_prefix("npm test"));
-    }
-
     // ---- issue #47: shortcuts on non-English (Cyrillic) keyboard layouts ----
 
     #[test]
@@ -1205,6 +1103,72 @@ use super::types::{ContextMenuItem, ContextMenuState};
         let pin = models.iter().find(|m| &*m.id == model).unwrap();
         assert_eq!(u64::from(pin.context_window), app.context_window_size);
         assert_eq!(pin.max_output_tokens, 131_072);
+    }
+
+    // ---- context meter (#444) ----
+
+    fn request_done(input: u64, output: u64, cache_write: u64, cache_read: u64) -> claurst_query::QueryEvent {
+        claurst_query::QueryEvent::TurnComplete {
+            turn: 1,
+            stop_reason: "tool_use".to_string(),
+            usage: Some(claurst_core::types::UsageInfo {
+                input_tokens: input,
+                output_tokens: output,
+                cache_creation_input_tokens: cache_write,
+                cache_read_input_tokens: cache_read,
+            }),
+        }
+    }
+
+    #[test]
+    fn context_meter_shows_the_last_request_prompt_not_a_running_sum() {
+        let mut app = make_app();
+        // A ten-request tool turn at ~50k context: each request resends the
+        // whole history, so the meter must stay near 50k, not reach 500k.
+        for step in 0..10u64 {
+            app.handle_query_event(request_done(1_000 + step, 300, 2_000, 47_000 + step * 100));
+        }
+        assert_eq!(app.context_used_tokens, 1_009 + 2_000 + 47_900);
+
+        // Output tokens are not part of the prompt that was sent.
+        app.handle_query_event(request_done(10, 9_999, 0, 0));
+        assert_eq!(app.context_used_tokens, 10);
+
+        // A provider that reports no input usage keeps the last reading.
+        app.handle_query_event(request_done(0, 50, 0, 0));
+        assert_eq!(app.context_used_tokens, 10);
+        app.handle_query_event(claurst_query::QueryEvent::TurnComplete {
+            turn: 2,
+            stop_reason: "end_turn".to_string(),
+            usage: None,
+        });
+        assert_eq!(app.context_used_tokens, 10);
+    }
+
+    #[test]
+    fn compaction_resets_the_meter_baseline() {
+        use claurst_core::history::{CompactionRecord, CompactionTrigger};
+        let mut app = make_app();
+        app.handle_query_event(request_done(500, 100, 10_000, 170_000));
+        assert_eq!(app.context_used_tokens, 180_500);
+        app.token_warning_threshold_shown = 95;
+
+        app.handle_query_event(claurst_query::QueryEvent::Compacted(CompactionRecord {
+            at: chrono::Utc::now(),
+            trigger: CompactionTrigger::Threshold,
+            summary_uuid: "s".to_string(),
+            messages_before: 40,
+            messages_after: 3,
+            tokens_before: 180_500,
+            tokens_after: 12_000,
+            summarised: true,
+        }));
+        assert_eq!(app.context_used_tokens, 12_000);
+        assert_eq!(app.token_warning_threshold_shown, 0);
+
+        // The next request's real prompt size replaces the estimate.
+        app.handle_query_event(request_done(800, 40, 11_000, 0));
+        assert_eq!(app.context_used_tokens, 11_800);
     }
 
     // ---- explicit rewind instead of display-list history sync (issue #484) ----

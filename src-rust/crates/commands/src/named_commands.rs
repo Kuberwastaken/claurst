@@ -1143,6 +1143,7 @@ mod tests {
             remote_session_url: None,
             mcp_manager: None,
             mcp_auth_runner: None,
+            permission_manager: None,
         }
     }
 

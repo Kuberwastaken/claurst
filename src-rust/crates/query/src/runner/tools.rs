@@ -44,6 +44,16 @@ pub(crate) async fn execute_tool(
 ) -> ToolResult {
     let tool = tools.iter().find(|t| t.name() == name);
 
+    // A tool-wide deny rule refuses the call whatever the tool's own
+    // permission level, read-only tools included.
+    if tool.is_some() && ctx.tool_is_disallowed(name) {
+        warn!(tool = name, "Tool call refused: tool is disallowed by permission rules");
+        return ToolResult::error(format!(
+            "Tool '{}' is disallowed by the permission rules (disallowed_tools).",
+            name
+        ));
+    }
+
     match tool {
         Some(tool) => {
             debug!(tool = name, "Executing tool");
@@ -68,6 +78,21 @@ pub(crate) async fn execute_tool(
             ToolResult::error(format!("Unknown tool: {}", name))
         }
     }
+}
+
+/// Execute one call of a tool batch, unless the user already denied another
+/// call in it: then the call is rejected without running (reject cascade,
+/// #445). `ctx.batch_rejection` must be the batch's own.
+pub(crate) async fn execute_batch_call(
+    name: &str,
+    input: &Value,
+    tools: &[Box<dyn Tool>],
+    ctx: &ToolContext,
+) -> ToolResult {
+    if ctx.batch_rejection.is_rejected() {
+        return ToolResult::error(claurst_tools::BATCH_REJECTED_MSG);
+    }
+    execute_tool(name, input, tools, ctx).await
 }
 
 /// Run a batch of tool-execution futures concurrently, abandoning them promptly

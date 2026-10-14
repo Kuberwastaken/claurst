@@ -172,6 +172,10 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // Message submission
         ("enter", "submit", KeyContext::Chat),
 
+        // Stop the running turn, like Ctrl+C. Ignored while idle, so Esc keeps
+        // its vim / transcript-focus meanings there.
+        ("escape", "cancelTurn", KeyContext::Chat),
+
         // Newline insertion (Shift+Enter / Ctrl+J for multi-line composing)
         ("shift+enter", "newline", KeyContext::Chat),
         // Fallback for terminals that do not support the kitty keyboard protocol
@@ -234,8 +238,14 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("ctrl+[", "findPrev", KeyContext::Chat),
         ("ctrl+g", "goToLine", KeyContext::Chat),
 
-        // Indentation
+        // Indentation. While a turn runs, Tab queues the prompt for after
+        // the turn instead (Enter steers it into the running turn).
         ("tab", "indent", KeyContext::Chat),
+
+        // Queued-prompt dock: pull the last pending prompt back into the
+        // prompt for editing, or drop it.
+        ("alt+up", "editQueued", KeyContext::Chat),
+        ("alt+x", "removeQueued", KeyContext::Chat),
         ("shift+tab", "reverseIndent", KeyContext::Chat),
 
         // Paste placeholders — expand `[Pasted text #N ...]` back into the

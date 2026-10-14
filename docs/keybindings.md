@@ -47,12 +47,15 @@ These bindings are active when focus is in the chat input field.
 
 | Key | Action | Description |
 |-----|--------|-------------|
-| `Enter` | submit | Submit the current message to the model |
+| `Enter` | submit | Submit the current message to the model. While a turn runs it steers the turn instead (see [Typing while a turn runs](./commands.md#typing-while-a-turn-runs)) |
+| `Escape` | cancelTurn | Cancel the running turn, like `Ctrl+C`. Ignored while idle |
 | `Shift+Enter` | newline | Insert a literal newline without submitting |
 | `Ctrl+J` | newline | Newline (fallback for terminals without CSI-u protocol) |
 | `Up` / `Ctrl+O` | historyPrev | Navigate to the previous message in input history |
 | `Down` / `Ctrl+I` | historyNext | Navigate to the next message in input history |
-| `Tab` | indent | Insert indentation (or cycle completions if open) |
+| `Tab` | indent | Insert indentation (or cycle completions if open). While a turn runs it queues the message for after the turn |
+| `Alt+Up` | editQueued | Pull the last pending (steered or queued) message back into the empty prompt. Scrolls up when nothing is pending |
+| `Alt+X` | removeQueued | Drop the last pending message |
 | `Shift+Tab` | reverseIndent | Remove one level of indentation |
 | `Page Up` | scrollUp | Scroll the transcript up 10 lines |
 | `Page Down` | scrollDown | Scroll the transcript down 10 lines |
@@ -292,9 +295,9 @@ In vim insert mode, `Enter` also submits. Use `Shift+Enter` for newlines in vim 
 
 ### ESC During Streaming
 
-Pressing `Escape` while the model is streaming a response interrupts the stream. The partial response is preserved in the conversation history and the model stops generating. The input field regains focus and you can send a follow-up message.
+Pressing `Escape` while a turn runs cancels it exactly like `Ctrl+C`: the turn's cancellation token stops the model request and any running tools (and background sub-agents started by the turn). The output streamed so far stays in the transcript, the Reconnecting pill clears, and steers that were not yet delivered and Tab-queued messages return to the prompt; background completion notices are still delivered afterwards. A turn counts as running until its task ends, so `Escape` also works while tools run between model requests.
 
-This is equivalent to pressing `Ctrl+C` during streaming, except that `Ctrl+C` also signals any tool calls in progress to abort (via `AbortController`), while `Escape` only stops the stream and allows running tools to finish.
+On an idle prompt `Escape` keeps its other meanings (vim normal mode, leaving transcript focus); pressing it twice does nothing.
 
 ---
 

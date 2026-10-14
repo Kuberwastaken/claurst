@@ -430,7 +430,7 @@ async fn write_new(path: &std::path::Path, content: &str) -> std::io::Result<()>
 /// Apply `patch` (an envelope patch or a unified diff) with relative paths
 /// resolved against `base_dir`.
 ///
-/// Every file the patch touches is permission-checked as an Edit of that
+/// Every file the patch touches is permission-checked as an ApplyPatch of that
 /// path, locked for the whole call (#443), opened once and re-checked where
 /// the handle really points, and written through that handle (#415, #433).
 /// All changes are computed before anything is written.
@@ -526,9 +526,9 @@ pub(crate) async fn apply_patch_text(
         }
     }
 
-    // Each path is checked like an Edit of that path, so Edit rules and the
+    // Each path is checked as an ApplyPatch of that path, so ApplyPatch rules and the
     // accept-edits mode govern patches too. Dry runs only read.
-    let edit_tool = claurst_core::constants::TOOL_NAME_FILE_EDIT;
+    let edit_tool = claurst_core::constants::TOOL_NAME_APPLY_PATCH;
     let mut grants = Vec::with_capacity(changes.len());
     for (change, (path, dest)) in changes.iter().zip(&targets) {
         if dry_run {
@@ -1305,9 +1305,9 @@ mod tests {
     }
 
     /// Every path the patch writes, the move destination included, is
-    /// checked as an Edit of that path.
+    /// checked as an ApplyPatch of that path.
     #[tokio::test]
-    async fn every_path_is_checked_as_an_edit() {
+    async fn every_path_is_checked_as_an_apply_patch() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("src.txt"), "a\n").unwrap();
         let handler = std::sync::Arc::new(RecordingHandler(parking_lot::Mutex::new(Vec::new())));
@@ -1317,7 +1317,7 @@ mod tests {
         assert!(!res.is_error, "{}", res.content);
 
         let requests = handler.0.lock();
-        assert!(requests.iter().all(|(tool, _)| tool == claurst_core::constants::TOOL_NAME_FILE_EDIT));
+        assert!(requests.iter().all(|(tool, _)| tool == claurst_core::constants::TOOL_NAME_APPLY_PATCH));
         for name in ["src.txt", "dst.txt", "new.txt"] {
             let path = dir.path().join(name).display().to_string();
             assert!(
@@ -1440,6 +1440,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "new\n");
         let requests = handler.0.lock();
         assert!(!requests.is_empty());
-        assert!(requests.iter().all(|(tool, _)| tool == claurst_core::constants::TOOL_NAME_FILE_EDIT));
+        assert!(requests.iter().all(|(tool, _)| tool == claurst_core::constants::TOOL_NAME_APPLY_PATCH));
     }
 }

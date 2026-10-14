@@ -26,12 +26,6 @@ pub(crate) struct UiSettings {
     pub statusline_show_time: Option<bool>,
     #[serde(default)]
     pub prompt_color: Option<String>,
-    #[serde(default)]
-    pub sandbox_mode: Option<bool>,
-    /// Shell command patterns excluded from sandboxing (glob-style strings).
-    /// Mirrors TS `excludedCommands` in settings.local.json.
-    #[serde(default)]
-    pub sandbox_excluded_commands: Vec<String>,
 }
 
 pub(crate) fn ui_settings_path() -> std::path::PathBuf {

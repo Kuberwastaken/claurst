@@ -60,10 +60,11 @@ project file sets them:
 | `skills.urls` (top-level and `config.skills.urls`) | Clones the URL with git |
 | `providers` / `config.provider_configs` | Can point the API base URL, and your API key, at another host |
 | `workspace_paths`, `additional_dirs` | Widen the auto-allowed read set |
-| `permission_mode`, `permissionRules`, `allowedBashPrefixes`, `skipDangerousModePermissionPrompt` | Grant or pre-approve permissions |
+| `permission_mode`, `permissionRules`, `allowedBashPrefixes`, `allowed_tools`, `skipDangerousModePermissionPrompt` | Grant or pre-approve permissions |
 | `trustProjectMcpServers` | Bypasses the project MCP server approval prompt |
 | `enabledPlugins` | Enables plugins, which can ship hooks and servers |
 | `remoteControlAtStartup` | Exposes the session over the remote-control bridge |
+| `sandbox` (every field) | Turning the shell sandbox off, opening its network or exempting commands removes the containment for everything a project can make the agent run |
 
 Project-defined MCP servers are still read from the project file, but they do
 not launch until you approve them for that project (or set
@@ -121,6 +122,24 @@ OSC 7501 reports use the root record with `app=claurst`:
 
 On a normal exit Claurst sends `state=clear` to remove its record. If it crashes it reports `state=error` instead, so the tab still shows that something went wrong.
 
+### Attention notifications
+
+`notifications` (top-level, default `true`, also in `/config`) rings the terminal bell and sends a desktop notification when a turn finishes, fails, or waits on you (tool permission, question, sign-in) while the terminal window is in the background. Focus comes from the terminal's focus reporting; terminals without it count as always focused and never alert.
+
+| Terminal | Sequence |
+|----------|----------|
+| iTerm2, WezTerm, Ghostty, kitty | OSC 9 |
+| Others | OSC 777 (`notify`), ignored where unsupported |
+| Inside tmux | The OSC wrapped in a DCS passthrough; needs `set -g allow-passthrough on`, and `set -g focus-events on` so tmux forwards focus changes |
+
+The bell is sent in every case.
+
+```json
+{
+  "notifications": false
+}
+```
+
 ```json
 {
   "terminalProgressBar": true,
@@ -144,6 +163,7 @@ The `config` object holds runtime behaviour options.
 | `provider` | string \| null | `"anthropic"` | Active provider. See the [Providers](#providers) section. |
 | `effort` | string \| null | unset | Reasoning effort for new turns: `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`, or `"ultracode"`. When unset, no thinking-budget or temperature override is applied at all — this is not the same as `"medium"`, which has its own explicit values. |
 | `maxRetries` | integer \| null | null (5) | Retries after a model request fails transiently: HTTP 408/409/425/429/5xx, dropped connections, and streams that stall or end before completion. Waits follow the server's `retry-after-ms` / `Retry-After` header, otherwise exponential back-off with jitter, each capped at 60 s. Auth, quota/billing and invalid-request errors are never retried. `0` disables retrying. Note the camelCase key. |
+| `completionWakeups` | object \| null | null | Which background completions are delivered to the session as `<subagent …>` / `<background-shell …>` messages: at the next step of a running turn, or as a new turn when idle. `{"subagents": bool, "shell": bool}`; unset keys keep the defaults: sub-agents `true`, shell `false`. With `shell` unset or `true`, a Bash call's own `notify: true` / `false` decides for that command; `"shell": false` is a hard off that `notify: true` cannot override. Cancelled tasks never report. Global settings only: a project settings file cannot set it. Note the camelCase key. |
 | `degradationSummaryEnabled` | boolean \| null | null (on) | When set to `false`, exceeding `max_turns` returns the last assistant message immediately instead of running one final tool-less degradation summary turn. Applies to sub-agents as well. Unset means enabled. Note the camelCase key. |
 
 ### Permission mode
@@ -184,12 +204,21 @@ See [Auto-compaction](advanced.md#auto-compaction) for when compaction runs.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `allowed_tools` | array of strings | [] (all) | Restrict the tool set to this explicit list. An empty array means all tools are available. |
-| `disallowed_tools` | array of strings | [] | Always deny these tools, regardless of other settings. |
+| `allowed_tools` | array of rule specs | [] | Allow these without prompting. Global-only: ignored in a project settings file. |
+| `disallowed_tools` | array of rule specs | [] | Deny these in every permission mode, `bypassPermissions` included. A tool-wide entry (`Write`) also hides the tool from the model. A project settings file may add entries. |
 
-Tool names match the internal names: `Bash`, `Read`, `Write`, `Edit`, `Glob`,
-`Grep`, `WebSearch`, `WebFetch`, `TodoWrite`, `TodoRead`, and MCP tool names
-in the form `mcp__<server>__<tool>` (see [MCP tool names](mcp.md#mcp-tool-names)).
+Each entry is a rule spec: `Tool` (every use), `Tool(pattern)`, or `*` (every
+tool). For `Bash` the pattern is a shell rule matched per command
+(`Bash(git status *)`, `Bash(npm run test:*)`); for other tools it is a path
+glob (`Edit(/repo/src/**)`). Tool names match the internal names: `Bash`,
+`Read`, `Write`, `Edit`, `NotebookEdit`, `BatchEdit`, `ApplyPatch`, `Glob`,
+`Grep`, `WebSearch`, `WebFetch`, and MCP tool names in the form
+`mcp__<server>__<tool>` (see [MCP tool names](mcp.md#mcp-tool-names));
+`mcp__<server>` or `mcp__<server>__*` covers every tool of that server, so
+`disallowed_tools: ["mcp__github"]` hides all of them. The
+`--allowed-tools` / `--disallowed-tools` flags
+and `/permissions allow|deny` use the same syntax. See
+[Permission Rules and Approvals](#permission-rules-and-approvals).
 
 ### Directory access
 
@@ -323,15 +352,19 @@ continues (see [Headless mode](advanced.md#headless-mode)).
 
 ### `acceptEdits`
 
-All tool calls — reads, writes, and shell commands — are automatically
-accepted without prompting. This is useful for trusted automation pipelines
-where you want maximum throughput.
+File edits and writes (`Edit`, `Write`, `NotebookEdit`, `BatchEdit`,
+`ApplyPatch`) whose targets lie inside the workspace (the working directory,
+`workspace_paths` and `--add-dir` directories) are accepted without
+prompting. A target outside the workspace, including one reached through a
+symlink, still asks. Shell commands and network access keep the `default`
+behaviour.
 
 ### `bypassPermissions`
 
-All permission checks are skipped entirely. Every tool call is allowed
-unconditionally. This mode cannot be used when running as root or via `sudo`
-on Unix systems (Claurst blocks it).
+Permission prompts are skipped and every tool call is allowed, except calls
+covered by a deny rule (`disallowed_tools`, `--disallowed-tools`,
+`/permissions deny`), which are refused in every mode. This mode cannot be
+used when running as root or via `sudo` on Unix systems (Claurst blocks it).
 
 Use with caution: the model can read and modify any file reachable from the
 current working directory without any user confirmation.
@@ -349,6 +382,193 @@ The permission mode can also be overridden per-session on the command line:
 claurst --permission-mode acceptEdits "refactor the auth module"
 claurst --dangerously-skip-permissions "..."  # equivalent to bypassPermissions
 ```
+
+---
+
+## Permission Rules and Approvals
+
+Rules refine the permission mode per tool. Each rule allows or denies a tool,
+optionally restricted to a pattern.
+
+### Evaluation order
+
+1. A matching **deny** rule refuses the call, in every mode.
+2. `bypassPermissions` allows everything else.
+3. A matching **allow** rule allows the call without prompting.
+4. Otherwise the mode decides (see [Permission Modes](#permission-modes)):
+   reads inside the workspace run, `acceptEdits` covers workspace edits,
+   `plan` refuses writes, and everything else asks (headless runs refuse
+   instead of asking).
+
+Rules come from four places, all evaluated together:
+
+| Source | Where it lives | Scope |
+|--------|----------------|-------|
+| `allowed_tools` / `disallowed_tools`, `--allowed-tools` / `--disallowed-tools`, `/permissions allow\|deny` | settings `config` block (flags: this session only) | configured |
+| "Always allow in this project" | `<claurst home>/projects/<encoded project root>/permissions.json` | the current project (repository root, or the working directory outside a repository) |
+| "Always allow everywhere" | `permissionRules` in the global settings file | every project |
+| "Allow this session" | memory | this session |
+
+Saved approvals never live inside the repository, so a repository cannot grant
+itself permissions. `allowed_tools`, `permissionRules` and `allowedBashPrefixes`
+are read only from the global settings file; a project settings file can add
+`disallowed_tools` entries. Each `allowedBashPrefixes` entry `git` acts as the
+rule `Bash(git *)`. Bash rules saved by earlier versions as `<command>*` (a
+prefix of the raw line) are read as the per-command rule `<command> *`.
+
+### Shell commands
+
+Bash rules are matched per command, not against the raw command line.
+Claurst splits the line at `;`, `&&`, `||`, `|`, `|&`, `&` and newlines,
+removes quotes, and drops redirections. A line is auto-allowed only when
+**every** command in it is allowed, and denied when **any** command matches a
+deny rule (also after stripping leading `NAME=value` assignments and the
+command's directory, so `FOO=1 /bin/rm x` still matches `Bash(rm *)`). For
+deny rules an argument the shell would expand (it contains `$`, `{`, `}`, `*`,
+`?` or `[`) matches any word of the pattern, so `git $X -f` and
+`git {push,-f}` are denied by `Bash(git push *)`.
+
+A Bash pattern is a command with an optional trailing ` *`, which matches
+whole words: `Bash(npm run test:*)` is read as `npm run test *` and covers
+`npm run test` and `npm run test -- --watch`, but not `npm run test:unit`.
+
+| Pattern | Matches | Does not match |
+|---------|---------|----------------|
+| `git status *` | `git status`, `git status --short` | `git push`, `git status && rm -rf ~` |
+| `npm run *` | `npm run build`, `npm run test -- --watch` | `npm install` |
+| `git diff` | `git diff` | `git diff HEAD` |
+
+Some lines cannot be judged from their text and always need an explicit
+approval; patterns never cover them (only a rule equal to the whole line, as
+recorded by "Allow this session", does):
+
+- command or process substitution: `$(...)`, backticks, `<(...)`, `>(...)`
+- heredocs (`<<`)
+- subshells, groups and compound commands: `( ... )`, `{ ...; }`, `if`, `for`, `while`, `case`, functions
+- commands that run other commands: `eval`, `exec`, `source`, `.`, `bash -c`,
+  `sh -c` (and other shells with `-c`), `xargs`, `sudo`, `doas`, `su`, `env`,
+  `command`, `builtin`, `nohup`, `nice`, `time`, `timeout`, `watch`,
+  `parallel`, `export`, `find -exec`, interpreters running inline code
+  (`python -c`, `node -e`, `perl -e`, `ruby -e`, ...), and a command name the
+  shell would expand (`$CMD`, `r{m,}`)
+
+A tool-wide `Bash` allow covers these lines too, unless a Bash deny pattern
+exists. Deny patterns are best effort for these lines: they are only matched
+against the whole line, so in `bypassPermissions` mode a denied command
+hidden inside one (`eval "rm -rf x"`) is not caught. Use a tool-wide deny, or
+another mode, when that matters. A command that redirects output to a file
+(`>`, `>>`, `&>`) is never covered by a pattern; redirection to `/dev/null`
+and `2>&1` are fine. "Allow this session" on such a line records the whole
+line, and `p`/`a` are not offered for it. Commands
+classified as Critical (`rm -rf /`, fork bombs, `dd if=...`, ...) are blocked
+in every mode, including when they appear later in a compound line.
+
+### The permission dialog
+
+| Key | Choice |
+|-----|--------|
+| `y` | Allow once |
+| `Y` | Allow this session (for Bash: exactly these commands) |
+| `p` | Always allow in this project |
+| `a` | Always allow everywhere |
+| `n` | Deny, with an optional reason |
+
+For Bash, `p` and `a` save one rule per command using its arity prefix
+(`git status *`, `npm run build *`, `cargo test *`); the option label shows
+the rules. A command shorter than its prefix (a bare `git`) or starting with
+an assignment is saved exactly. Opaque lines offer only `y`, `Y` and `n`. For
+file tools the saved rule covers the path (`<path>*`).
+
+After `n`, type a one-line reason and press Enter (or Esc to deny without
+one). The reason is returned to the model with the denial. A denial also
+rejects the rest of the model's current batch of tool calls: calls that have
+not started yet return an error instead of running, so the model stops and
+reads your reason.
+
+---
+
+## Shell Sandbox
+
+On macOS, every Bash tool command (foreground and `run_in_background`) runs
+under Seatbelt: `/usr/bin/sandbox-exec -p <profile> -DWRITABLE_ROOT_0=... --
+bash -c <command>`. The sandbox applies in every permission mode, including
+`bypassPermissions`; the permission prompts decide *whether* a command runs,
+the sandbox limits *what it can touch*. Other platforms have no OS sandbox yet
+(Linux Landlock is planned), so commands there run unsandboxed whatever the
+setting says. Only the Bash tool is sandboxed; PowerShell, REPL and MCP
+servers are not.
+
+The settings are a top-level `sandbox` block in the **global** settings file.
+They are global-only: a project `.claurst/settings.json` cannot change them.
+
+```json
+{
+  "sandbox": {
+    "mode": "workspace-write",
+    "network": false,
+    "unsandboxedPrefixes": []
+  }
+}
+```
+
+| Key | Values | Default | Description |
+|-----|--------|---------|-------------|
+| `mode` | `off`, `workspace-write`, `read-only` | `workspace-write` | `off` runs commands with your full privileges. |
+| `network` | boolean | `false` | Allow network access (outbound and inbound) from sandboxed commands. |
+| `unsandboxedPrefixes` | array of strings | `[]` | First words of commands that always run outside the sandbox. Filled by the "always" choice of the denial prompt; only matches simple commands (no `;`, `&`, `\|`, redirections or substitutions). |
+
+What the profile allows (adapted from OpenAI Codex's Apache-2.0 Seatbelt
+policies):
+
+- Reading any file.
+- `workspace-write`: writing beneath the working directory, `workspace_paths`,
+  `additional_dirs` / `--add-dir` directories, `$TMPDIR` and `/tmp`. Inside
+  every writable root, `.git`, `.claurst`, `.ssh`, `.aws` and `.gnupg` stay
+  read-only, so a sandboxed command can run `git status` or `git diff` but not
+  `git commit`.
+- `read-only`: no writes (only `/dev/null` and the terminal).
+- Network only with `network: true`.
+- Everything else is denied (`(deny default)`), including XPC services.
+
+What the sandbox does not protect against:
+
+- Every file stays readable, including `~/.ssh`, `~/.aws`, keychains, other
+  repositories and `~/.claurst/settings.json` (API keys). With `network: true`
+  nothing stops a command from sending them elsewhere.
+- Any binary can be executed; the profile only limits what it can write and
+  reach.
+- Only Bash commands are sandboxed. The file tools (Write, Edit, ApplyPatch),
+  PowerShell, REPL, MCP servers, hooks and the status line are not.
+- `.git` is read-only, so `git add`, `git commit` and `git stash` go through
+  the rerun prompt.
+- If Claurst itself already runs under Seatbelt (a sandboxed terminal or
+  agent), every command fails with `sandbox-exec: sandbox_apply: Operation not
+  permitted` (exit 71); set `mode` to `off` there.
+- Apple marks `sandbox-exec` as deprecated, but it ships and works on macOS 15
+  and 26.
+- Linux and Windows run commands unsandboxed.
+
+When a sandboxed command fails with a non-zero exit (other than 2, 126 or 127)
+and its output contains a denial message such as `Operation not permitted`,
+`Permission denied` or `Read-only file system` (or, with `network: false`,
+`Could not resolve host`, `Couldn't connect to server` or `Network is
+unreachable`), it is treated as a likely sandbox denial:
+
+- In the interactive TUI a **Sandbox Denied** dialog offers to rerun it
+  outside the sandbox **once**, **for this session**, or **always for commands
+  starting with the same word** (saved to `sandbox.unsandboxedPrefixes`; not
+  offered for launchers such as `bash`, `sh`, `env`, `xargs` or `python3`). The
+  dialog is never answered by permission rules or `allowedBashPrefixes`.
+- In headless (`--print`) and ACP sessions nobody is asked: the failed result
+  is returned with a `[sandbox]` note so the caller can decide.
+
+`/sandbox-toggle` (alias `/sandbox`) shows and changes the setting:
+`/sandbox status`, `/sandbox off`, `/sandbox workspace-write` (or `on`),
+`/sandbox read-only`, `/sandbox network on|off`; with no argument it toggles
+between `off` and `workspace-write`. Changes are saved to the global settings
+and apply to the next command. While the sandbox is active the footer shows
+`sandbox: <mode>` (`+net` with network) and the system prompt says which
+sandbox the model's commands run in.
 
 ---
 

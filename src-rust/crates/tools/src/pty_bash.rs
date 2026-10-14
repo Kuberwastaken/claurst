@@ -10,9 +10,11 @@
 //  Windows → falls back to the existing cmd.exe approach; ConPTY is available
 //             in portable_pty but adds complexity for minimal gain on Windows.
 
-use crate::{PermissionLevel, Tool, ToolContext, ToolResult, session_shell_state};
+use crate::sandbox::SeatbeltProfile;
+use crate::{CompletionNotifier, PermissionLevel, Tool, ToolContext, ToolResult, session_shell_state};
 use async_trait::async_trait;
 use claurst_core::bash_classifier::{BashRiskLevel, classify_bash_command};
+use claurst_core::sandbox::SEATBELT_EXECUTABLE;
 use claurst_core::tasks::{BackgroundTask, global_registry};
 use claurst_core::truncate::bound_head_tail;
 use crate::output_spill::{
@@ -71,6 +73,10 @@ struct BashInput {
     timeout: u64,
     #[serde(default)]
     run_in_background: bool,
+    /// Background only: whether finishing should notify the session (#444).
+    /// `None` follows the `completionWakeups.shell` setting (default off).
+    #[serde(default)]
+    notify: Option<bool>,
 }
 
 fn default_timeout() -> u64 {
@@ -194,6 +200,8 @@ async fn run_in_background(
     cwd: PathBuf,
     timeout_ms: u64,
     spill_dir: &Path,
+    sandbox: Option<SeatbeltProfile>,
+    notifier: Option<CompletionNotifier>,
 ) -> ToolResult {
     let task_name = format!("bg: {}", &command[..command.floor_char_boundary(60)]);
     let mut task = BackgroundTask::new(&task_name);
@@ -201,6 +209,7 @@ async fn run_in_background(
     let task_id = global_registry().register(task);
     let task_id_clone = task_id.clone();
     let command_clone = command.clone();
+    let notify = notifier.is_some();
     let spill_path = spill_dir.join(format!("{task_id}.txt"));
     let term = std::env::var_os("TERM").unwrap_or_else(|| DEFAULT_TERM.into());
 
@@ -220,8 +229,16 @@ async fn run_in_background(
                     .kill_on_drop(true)
                     .spawn()
             } else {
-                Command::new("bash")
-                    .arg("-c")
+                // Sandboxed: `sandbox-exec <profile args> -- bash -c <command>`.
+                let mut bash = match &sandbox {
+                    Some(profile) => {
+                        let mut cmd = Command::new(SEATBELT_EXECUTABLE);
+                        cmd.args(profile.args()).arg("bash");
+                        cmd
+                    }
+                    None => Command::new("bash"),
+                };
+                bash.arg("-c")
                     .arg(&command_clone)
                     .current_dir(&cwd)
                     .envs(CHILD_ENV)
@@ -323,11 +340,31 @@ async fn run_in_background(
                 )),
             );
         }
+
+        // Completion wake-up (#444). A task cancelled through the monitor
+        // tool was stopped on purpose and does not report back.
+        if let Some(notifier) = notifier {
+            if let Some(task) = global_registry().get(&task_id_clone) {
+                if task.status != claurst_core::tasks::TaskStatus::Cancelled {
+                    let state = task.status.to_string();
+                    notifier.notify(crate::completion_notice(
+                        "background-shell",
+                        &[("id", &task.id), ("state", &state), ("command", &command_clone)],
+                        &task.render_output(),
+                    ));
+                }
+            }
+        }
     });
 
+    let follow_up = if notify {
+        "You will be notified with its output when it finishes; do not poll or sleep for it."
+    } else {
+        "Check on it with the monitor tool."
+    };
     ToolResult::success(format!(
-        "Command started in background.\nTask ID: {}\nCommand: {}",
-        task_id, command
+        "Command started in background.\nTask ID: {}\nCommand: {}\n{}",
+        task_id, command, follow_up
     ))
 }
 
@@ -462,6 +499,7 @@ async fn run_in_pty(
     env_vars: &HashMap<String, String>,
     timeout: Duration,
     spill_path: PathBuf,
+    sandbox: Option<&SeatbeltProfile>,
 ) -> PtyOutcome {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
@@ -477,7 +515,17 @@ async fn run_in_pty(
         Err(e) => return PtyOutcome::Failed(format!("Failed to open PTY: {}", e)),
     };
 
-    let mut cmd = CommandBuilder::new("bash");
+    // Sandboxed (#470): `sandbox-exec -p <profile> -D... -- bash -c <script>`.
+    // The wrapper script, its sentinel and the child env are unchanged.
+    let mut cmd = match sandbox {
+        Some(profile) => {
+            let mut cmd = CommandBuilder::new(SEATBELT_EXECUTABLE);
+            cmd.args(profile.args());
+            cmd.arg("bash");
+            cmd
+        }
+        None => CommandBuilder::new("bash"),
+    };
     cmd.args(["-c", script]);
     cmd.cwd(working_dir);
     // Restored shell vars go through the child's ENVIRONMENT, never its argv (#211).
@@ -940,6 +988,10 @@ impl Tool for PtyBashTool {
                 "run_in_background": {
                     "type": "boolean",
                     "description": "Set to true to run command in the background"
+                },
+                "notify": {
+                    "type": "boolean",
+                    "description": "With run_in_background: set to true to be sent the command's output automatically when it finishes, instead of checking with the monitor tool. Use it for builds and tests you are waiting on; leave it off for servers and watchers."
                 }
             },
             "required": ["command"]
@@ -978,7 +1030,15 @@ impl Tool for PtyBashTool {
         }
 
         // Security classifier — block Critical-risk commands unconditionally.
-        if classify_bash_command(&params.command) == BashRiskLevel::Critical {
+        // Each simple command of a compound line is classified on its own so
+        // `ls; rm -rf /` is caught as well as `rm -rf /`.
+        let critical_segment = match claurst_core::shell_scan::scan(&params.command) {
+            claurst_core::shell_scan::Scan::Commands(commands) => commands
+                .iter()
+                .any(|c| classify_bash_command(&c.text()) == BashRiskLevel::Critical),
+            claurst_core::shell_scan::Scan::Opaque(_) => false,
+        };
+        if critical_segment || classify_bash_command(&params.command) == BashRiskLevel::Critical {
             return ToolResult::error(format!(
                 "Command blocked: classified as Critical risk by the bash security classifier.\n\
                  Refusing to execute: {}",
@@ -997,7 +1057,13 @@ impl Tool for PtyBashTool {
                 let state = shell_state_arc.lock();
                 state.cwd.clone().unwrap_or_else(|| ctx.working_dir.clone())
             };
-            return run_in_background(params.command, cwd, timeout_ms, &spill_dir).await;
+            let sandbox = crate::sandbox::profile_for(ctx, &params.command);
+            let notifier = if ctx.config.shell_completion_wakeups(params.notify) {
+                ctx.completion_notifier.clone()
+            } else {
+                None
+            };
+            return run_in_background(params.command, cwd, timeout_ms, &spill_dir, sandbox, notifier).await;
         }
 
         debug!(command = %params.command, "Executing bash command via PTY");
@@ -1022,30 +1088,57 @@ impl Tool for PtyBashTool {
         // ── Unix PTY path ────────────────────────────────────────────────────
         #[cfg(unix)]
         {
-            run_pty_foreground(
-                &params.command,
-                &shell_state_arc,
-                &ctx.working_dir,
-                timeout_dur,
-                timeout_ms,
-                &spill_dir,
-            )
-            .await
+            match crate::sandbox::profile_for(ctx, &params.command) {
+                Some(profile) => {
+                    run_pty_sandboxed(
+                        ctx,
+                        &profile,
+                        &params.command,
+                        &shell_state_arc,
+                        timeout_dur,
+                        timeout_ms,
+                        &spill_dir,
+                    )
+                    .await
+                }
+                None => {
+                    run_pty_foreground(
+                        &params.command,
+                        &shell_state_arc,
+                        &ctx.working_dir,
+                        timeout_dur,
+                        timeout_ms,
+                        &spill_dir,
+                    )
+                    .await
+                }
+            }
         }
     }
 }
 
-/// Run `command` in a PTY with the session's persisted shell state, fold the
-/// wrapper's state block back into that state, and render the bounded result.
+/// One finished PTY run, before its shell state is folded back.
 #[cfg(unix)]
-async fn run_pty_foreground(
+struct PtyRun {
+    output: String,
+    exit_code: i32,
+    state_lines: Vec<String>,
+}
+
+/// Run `command` once in a PTY with the session's persisted shell state and
+/// render the bounded output. With a `sandbox` profile the shell runs under
+/// Seatbelt (#470). The session's shell state is left untouched; timeouts and
+/// spawn failures come back as the finished error result.
+#[cfg(unix)]
+async fn run_pty_once(
     command: &str,
     shell_state: &parking_lot::Mutex<ShellState>,
     base_cwd: &PathBuf,
     timeout_dur: Duration,
     timeout_ms: u64,
     spill_dir: &Path,
-) -> ToolResult {
+    sandbox: Option<&SeatbeltProfile>,
+) -> Result<PtyRun, ToolResult> {
     // Build the wrapper script that restores cwd + captures shell state.
     // Restored env vars are cloned out and later injected into the child's
     // environment (never its argv) — see `apply_restored_env` (#211).
@@ -1060,42 +1153,153 @@ async fn run_pty_foreground(
     // run_in_pty owns the timeout so it can KILL the child when it fires
     // (a bare outer timeout would just drop the future and orphan it) (#220).
     let spill_path = spill_dir.join(format!("{}.txt", uuid::Uuid::new_v4()));
-    let outcome =
-        run_in_pty(&script, &working_dir_str, &restored_env, timeout_dur, spill_path.clone())
-            .await;
+    let outcome = run_in_pty(
+        &script,
+        &working_dir_str,
+        &restored_env,
+        timeout_dur,
+        spill_path.clone(),
+        sandbox,
+    )
+    .await;
 
     match outcome {
         PtyOutcome::Completed(captured, exit_code) => {
-            let (mut output, state_lines) = render_pty_output(captured, &spill_path);
-
-            // Update persistent shell state
-            if let Some((new_cwd, env_delta)) = parse_shell_state_block(&state_lines) {
-                let mut state = shell_state.lock();
-                state.cwd = Some(new_cwd);
-                for (k, v) in env_delta {
-                    state.env_vars.insert(k, v);
-                }
-            }
-
-            // Fast-path export capture
-            let exports = extract_exports_from_command(command);
-            if !exports.is_empty() {
-                let mut state = shell_state.lock();
-                for (k, v) in exports {
-                    state.env_vars.insert(k, v);
-                }
-            }
-
-            if output.is_empty() {
-                output = "(no output)".to_string();
-            }
-            shell_result(output, exit_code)
+            let (output, state_lines) = render_pty_output(captured, &spill_path);
+            Ok(PtyRun {
+                output,
+                exit_code,
+                state_lines,
+            })
         }
-        PtyOutcome::Failed(e) => ToolResult::error(format!("PTY execution failed: {}", e)),
-        PtyOutcome::TimedOut => {
-            ToolResult::error(format!("Command timed out after {}ms", timeout_ms))
+        PtyOutcome::Failed(e) => Err(ToolResult::error(format!("PTY execution failed: {}", e))),
+        PtyOutcome::TimedOut => Err(ToolResult::error(format!(
+            "Command timed out after {}ms",
+            timeout_ms
+        ))),
+    }
+}
+
+/// Fold a run's state block back into the session's shell state and turn it
+/// into the tool result.
+#[cfg(unix)]
+fn finish_pty_run(
+    run: PtyRun,
+    command: &str,
+    shell_state: &parking_lot::Mutex<ShellState>,
+) -> ToolResult {
+    let PtyRun {
+        mut output,
+        exit_code,
+        state_lines,
+    } = run;
+
+    // Update persistent shell state
+    if let Some((new_cwd, env_delta)) = parse_shell_state_block(&state_lines) {
+        let mut state = shell_state.lock();
+        state.cwd = Some(new_cwd);
+        for (k, v) in env_delta {
+            state.env_vars.insert(k, v);
         }
     }
+
+    // Fast-path export capture
+    let exports = extract_exports_from_command(command);
+    if !exports.is_empty() {
+        let mut state = shell_state.lock();
+        for (k, v) in exports {
+            state.env_vars.insert(k, v);
+        }
+    }
+
+    if output.is_empty() {
+        output = "(no output)".to_string();
+    }
+    shell_result(output, exit_code)
+}
+
+/// Run `command` unsandboxed in a PTY with the session's persisted shell
+/// state, fold the wrapper's state block back into that state, and render the
+/// bounded result.
+#[cfg(unix)]
+async fn run_pty_foreground(
+    command: &str,
+    shell_state: &parking_lot::Mutex<ShellState>,
+    base_cwd: &PathBuf,
+    timeout_dur: Duration,
+    timeout_ms: u64,
+    spill_dir: &Path,
+) -> ToolResult {
+    match run_pty_once(
+        command,
+        shell_state,
+        base_cwd,
+        timeout_dur,
+        timeout_ms,
+        spill_dir,
+        None,
+    )
+    .await
+    {
+        Ok(run) => finish_pty_run(run, command, shell_state),
+        Err(result) => result,
+    }
+}
+
+/// Run `command` under `profile`; when it fails like a sandbox denial, offer
+/// to rerun it outside the sandbox (#470). An approved rerun starts from the
+/// shell state the denied run started from, so a `cd` in the denied run is
+/// not applied twice. Otherwise the denied run's result is returned with a
+/// note about the sandbox.
+#[cfg(unix)]
+async fn run_pty_sandboxed(
+    ctx: &ToolContext,
+    profile: &SeatbeltProfile,
+    command: &str,
+    shell_state: &parking_lot::Mutex<ShellState>,
+    timeout_dur: Duration,
+    timeout_ms: u64,
+    spill_dir: &Path,
+) -> ToolResult {
+    let run = match run_pty_once(
+        command,
+        shell_state,
+        &ctx.working_dir,
+        timeout_dur,
+        timeout_ms,
+        spill_dir,
+        Some(profile),
+    )
+    .await
+    {
+        Ok(run) => run,
+        Err(result) => return result,
+    };
+    if !crate::sandbox::is_likely_sandbox_denied(
+        run.exit_code,
+        &run.output,
+        ctx.config.sandbox.network,
+    ) {
+        return finish_pty_run(run, command, shell_state);
+    }
+    let decision = crate::sandbox::request_unsandboxed_retry(ctx, command).await;
+    if decision == crate::sandbox::RetryDecision::Approved {
+        debug!(command, "Rerunning a sandbox-denied command outside the sandbox");
+        return run_pty_foreground(
+            command,
+            shell_state,
+            &ctx.working_dir,
+            timeout_dur,
+            timeout_ms,
+            spill_dir,
+        )
+        .await;
+    }
+    let mut result = finish_pty_run(run, command, shell_state);
+    result
+        .content
+        .push_str(&crate::sandbox::denial_note(&ctx.config.sandbox, decision));
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1374,7 +1578,20 @@ mod tests {
             permission_manager: None,
             user_question_tx: None,
             cancel_token: tokio_util::sync::CancellationToken::new(),
+            batch_rejection: Default::default(),
         }
+    }
+
+    /// #445: a Critical command behind a harmless first command is still
+    /// blocked before anything runs.
+    #[tokio::test]
+    async fn critical_segment_of_compound_command_is_blocked() {
+        let ctx = allow_all_context();
+        let result = PtyBashTool
+            .execute(json!({ "command": "ls; rm -rf /" }), &ctx)
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("Critical"), "{}", result.content);
     }
 
     /// #220: a command that exceeds its timeout must have its child KILLED, not
@@ -1488,7 +1705,8 @@ mod tests {
     /// Start `command` in the background and wait for its task to finish.
     async fn run_background_to_completion(command: &str, spill_dir: &Path) -> BackgroundTask {
         let started =
-            run_in_background(command.to_string(), std::env::temp_dir(), 60_000, spill_dir).await;
+            run_in_background(command.to_string(), std::env::temp_dir(), 60_000, spill_dir, None, None)
+                .await;
         let task_id = started
             .content
             .lines()
@@ -1504,6 +1722,35 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "background task never finished");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// #444: a background command started with a notifier reports back with
+    /// a `<background-shell>` notice carrying its state and output.
+    #[tokio::test]
+    async fn background_completion_sends_a_shell_notice() {
+        let spill_dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let notifier = CompletionNotifier::new(move |msg| {
+            let _ = tx.send(msg);
+        });
+        let started = run_in_background(
+            "echo done-marker".to_string(),
+            std::env::temp_dir(),
+            60_000,
+            spill_dir.path(),
+            None,
+            Some(notifier),
+        )
+        .await;
+        assert!(started.content.contains("You will be notified"), "{}", started.content);
+        let notice = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("notice within 30s")
+            .expect("notifier called");
+        assert!(notice.starts_with("<background-shell id=\""), "{notice}");
+        assert!(notice.contains(" state=\"completed\""), "{notice}");
+        assert!(notice.contains(" command=\"echo done-marker\">"), "{notice}");
+        assert!(notice.contains("\ndone-marker\n</background-shell>"), "{notice}");
     }
 
     /// #442 (Monitor path): a chatty background task keeps bounded windows in
@@ -1612,6 +1859,75 @@ mod tests {
             "execute should return promptly after the direct child exits, took {:?}",
             elapsed
         );
+    }
+
+    /// A context for the Seatbelt tests: the default settings (sandbox
+    /// `workspace-write`, network off) rooted at `workspace`, with its own
+    /// session so no other test's shell state (cwd) leaks in.
+    #[cfg(target_os = "macos")]
+    fn sandboxed_context(workspace: &Path) -> ToolContext {
+        let mut ctx = crate::test_support::allow_all_context(workspace.to_path_buf());
+        ctx.session_id = format!("sandbox-test-{}", uuid::Uuid::new_v4());
+        ctx
+    }
+
+    /// #470: under the default `workspace-write` sandbox a command writes
+    /// inside the workspace but not outside it or into `.git`, and `git
+    /// status` still works.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_confines_writes_to_the_workspace() {
+        assert!(claurst_core::sandbox::seatbelt_available());
+        let workspace = tempfile::tempdir().unwrap();
+        let ctx = sandboxed_context(workspace.path());
+        let tool = PtyBashTool;
+
+        let inside = tool
+            .execute(json!({ "command": "echo inside > inside.txt" }), &ctx)
+            .await;
+        assert!(!inside.is_error, "{}", inside.content);
+        assert!(workspace.path().join("inside.txt").exists());
+
+        // Outside the workspace, TMPDIR and /tmp, and writable without a sandbox.
+        let outside = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("sandbox-probe-{}", uuid::Uuid::new_v4()));
+        let denied = tool
+            .execute(
+                json!({ "command": format!("echo outside > '{}'", outside.display()) }),
+                &ctx,
+            )
+            .await;
+        let leaked = outside.exists();
+        let _ = std::fs::remove_file(&outside);
+        assert!(!leaked, "the sandbox let a write outside the workspace through");
+        assert!(denied.is_error, "{}", denied.content);
+        assert!(denied.content.contains("Operation not permitted"), "{}", denied.content);
+        // Detected as a denial; headless, so nobody is asked and the note explains.
+        assert!(denied.content.contains("[sandbox] This command ran in the macOS Seatbelt sandbox (workspace-write)"), "{}", denied.content);
+
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(workspace.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let status = tool
+            .execute(json!({ "command": "git status --short" }), &ctx)
+            .await;
+        assert!(!status.is_error, "{}", status.content);
+        assert!(status.content.contains("inside.txt"), "{}", status.content);
+
+        let git_write = tool
+            .execute(json!({ "command": "touch .git/probe" }), &ctx)
+            .await;
+        assert!(git_write.is_error, "{}", git_write.content);
+        assert!(git_write.content.contains("[sandbox]"), "{}", git_write.content);
+        assert!(!workspace.path().join(".git/probe").exists());
+
+        // An ordinary failure is not reported as a sandbox denial.
+        let failed = tool.execute(json!({ "command": "false" }), &ctx).await;
+        assert!(failed.is_error);
+        assert!(!failed.content.contains("[sandbox]"), "{}", failed.content);
     }
 }
 

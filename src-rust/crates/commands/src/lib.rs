@@ -32,6 +32,10 @@ pub struct CommandContext {
     pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
     /// Optional callback for starting an MCP OAuth flow in the background.
     pub mcp_auth_runner: Option<Arc<dyn Fn(claurst_mcp::oauth::McpAuthSession) + Send + Sync>>,
+    /// The session's permission manager, so `/permissions` can list every
+    /// rule in effect. `None` outside an interactive session.
+    pub permission_manager:
+        Option<Arc<std::sync::Mutex<claurst_core::permissions::PermissionManager>>>,
 }
 
 /// Result of running a slash command.
@@ -1598,6 +1602,7 @@ mod tests {
             remote_session_url: None,
             mcp_manager: None,
             mcp_auth_runner: None,
+            permission_manager: None,
         }
     }
 

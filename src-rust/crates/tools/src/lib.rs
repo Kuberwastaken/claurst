@@ -54,6 +54,7 @@ pub mod worktree;
 pub mod computer_use;
 pub mod mcp_auth_tool;
 pub mod repl_tool;
+pub mod sandbox;
 pub mod synthetic_output;
 pub mod team_tool;
 pub mod remote_trigger;
@@ -192,6 +193,33 @@ pub enum PermissionGrant {
     Policy,
     /// A human approved the request through an interactive prompt.
     User,
+}
+
+/// Error text when the user denies a permission prompt. A reason the user
+/// typed follows it (`<USER_DENIED_MSG>. The user said: <reason>`).
+pub const USER_DENIED_MSG: &str = "Permission denied by user";
+
+/// Result for a tool call that was not run because the user denied another
+/// call in the same parallel batch.
+pub const BATCH_REJECTED_MSG: &str = "Not run: the user denied another tool call in this batch. \
+     Wait for the user's direction before retrying.";
+
+/// Shared by the calls of one parallel tool batch: set when the user denies
+/// one of them, after which the batch's calls that have not started, or that
+/// would prompt, are rejected instead of run (reject cascade).
+#[derive(Debug, Clone, Default)]
+pub struct BatchRejection(Arc<std::sync::atomic::AtomicBool>);
+
+impl BatchRejection {
+    /// Mark the batch as rejected by the user.
+    pub fn reject(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the user denied a call in this batch.
+    pub fn is_rejected(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 
 #[derive(Debug)]
@@ -514,7 +542,8 @@ fn opened_file_location(
 
 
 /// A cloneable handle for injecting notification messages into the next agent turn.
-/// Used by background tasks with `notify_on_complete` to signal completion without polling.
+/// Background sub-agents and Bash commands call it when they finish (#444), so the
+/// model is told instead of having to poll.
 #[derive(Clone)]
 pub struct CompletionNotifier(Arc<dyn Fn(String) + Send + Sync>);
 
@@ -525,6 +554,26 @@ impl CompletionNotifier {
     pub fn notify(&self, msg: String) {
         (self.0)(msg);
     }
+}
+
+/// The message a finished background task sends through its
+/// [`CompletionNotifier`] (#444): `<tag k="v" …>\nbody\n</tag>`, e.g.
+/// `<background-shell id="…" state="completed" command="…">`. Attribute values are
+/// escaped and kept on one line.
+pub fn completion_notice(tag: &str, attrs: &[(&str, &str)], body: &str) -> String {
+    let mut out = format!("<{tag}");
+    for (key, value) in attrs {
+        let value: String = value
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>()
+            .replace('&', "&amp;")
+            .replace('"', "&quot;")
+            .replace('<', "&lt;");
+        out.push_str(&format!(" {key}=\"{value}\""));
+    }
+    out.push_str(&format!(">\n{}\n</{tag}>", body.trim_end()));
+    out
 }
 
 /// Shared context passed to every tool invocation.
@@ -561,6 +610,9 @@ pub struct ToolContext {
     /// to a fresh disconnected token; `run_query_loop` rebinds it to the loop's
     /// actual token so cancellation propagates into tools and sub-agents.
     pub cancel_token: tokio_util::sync::CancellationToken,
+    /// Reject cascade for the parallel batch this call belongs to. The query
+    /// loop gives every batch a fresh one.
+    pub batch_rejection: BatchRejection,
 }
 
 impl ToolContext {
@@ -629,6 +681,11 @@ impl ToolContext {
                     interactive_reason.unwrap_or(reason)
                 )),
             ),
+            // The user already denied another call in this batch: reject
+            // instead of asking again (reject cascade).
+            PermissionDecision::Ask { .. } if self.batch_rejection.is_rejected() => Err(
+                claurst_core::error::ClaudeError::PermissionDenied(BATCH_REJECTED_MSG.to_string()),
+            ),
             PermissionDecision::Ask { reason } => {
                 let Some(queue) = &self.pending_permissions else {
                     return Err(claurst_core::error::ClaudeError::PermissionDenied(format!(
@@ -660,8 +717,21 @@ impl ToolContext {
                 let decision = tokio::task::block_in_place(|| rx.blocking_recv());
                 match decision {
                     Ok(PermissionDecision::Allow | PermissionDecision::AllowPermanently) => Ok(PermissionGrant::User),
+                    Ok(PermissionDecision::DenyWithFeedback(feedback)) => {
+                        self.batch_rejection.reject();
+                        Err(claurst_core::error::ClaudeError::PermissionDenied(format!(
+                            "{}. The user said: {}",
+                            USER_DENIED_MSG, feedback
+                        )))
+                    }
+                    Ok(PermissionDecision::Deny | PermissionDecision::DenyPermanently) => {
+                        self.batch_rejection.reject();
+                        Err(claurst_core::error::ClaudeError::PermissionDenied(
+                            USER_DENIED_MSG.to_string(),
+                        ))
+                    }
                     _ => Err(claurst_core::error::ClaudeError::PermissionDenied(
-                        "Permission denied by user".to_string(),
+                        USER_DENIED_MSG.to_string(),
                     )),
                 }
             }
@@ -683,6 +753,13 @@ impl ToolContext {
     ) -> claurst_core::error::ClaudeError {
         if self.non_interactive {
             return error;
+        }
+        // Keep the user's own denial (and any reason they gave) and the
+        // batch rejection as they are; they are what the model needs.
+        if let claurst_core::error::ClaudeError::PermissionDenied(msg) = &error {
+            if msg.starts_with(USER_DENIED_MSG) || msg == BATCH_REJECTED_MSG {
+                return error;
+            }
         }
         claurst_core::error::ClaudeError::PermissionDenied(format!(
             "Permission denied for tool '{}': {}",
@@ -710,6 +787,44 @@ impl ToolContext {
     ) -> Result<PermissionGrant, claurst_core::error::ClaudeError> {
         let request = self.build_permission_request(tool_name, description, None, is_read_only, Some(path));
         self.request_permission_inner(request)
+    }
+
+    /// Check one write call that touches several files (BatchEdit). The
+    /// call is allowed without asking when every file is allowed on its own
+    /// (AcceptEdits inside the workspace, or path rules covering each file)
+    /// and refused when any file is refused; otherwise the user is asked
+    /// once, about the first file that needs approval.
+    pub fn check_permission_for_paths(
+        &self,
+        tool_name: &str,
+        description: &str,
+        paths: &[PathBuf],
+    ) -> Result<(), claurst_core::error::ClaudeError> {
+        let mut needs_approval: Option<&PathBuf> = None;
+        for path in paths {
+            let request =
+                self.build_permission_request(tool_name, description, None, false, Some(path.clone()));
+            match self.permission_handler.check_permission(&request) {
+                PermissionDecision::Allow | PermissionDecision::AllowPermanently => {}
+                PermissionDecision::Ask { .. } => {
+                    needs_approval.get_or_insert(path);
+                }
+                _ => {
+                    return Err(claurst_core::error::ClaudeError::PermissionDenied(format!(
+                        "Permission denied for tool '{}': {}",
+                        tool_name,
+                        path.display()
+                    )))
+                }
+            }
+        }
+        match needs_approval {
+            Some(path) => self
+                .check_permission_for_path(tool_name, description, path.clone(), false)
+                .map(|_| ()),
+            None if paths.is_empty() => self.check_permission(tool_name, description, false),
+            None => Ok(()),
+        }
     }
 
     /// Bind a path-scoped permission check to the file that was actually
@@ -782,6 +897,16 @@ impl ToolContext {
         self.request_permission_inner(request)
             .map(|_| ())
             .map_err(|e| self.denial_with_details(e, tool_name, details))
+    }
+
+    /// Whether a tool-wide deny rule (`disallowed_tools`, `--disallowed-tools`,
+    /// `/permissions deny`) covers `tool_name`. Such tools are not offered to
+    /// the model and calls to them are refused before they run.
+    pub fn tool_is_disallowed(&self, tool_name: &str) -> bool {
+        self.permission_manager
+            .as_ref()
+            .and_then(|manager| manager.lock().ok())
+            .is_some_and(|manager| manager.denies_tool(tool_name))
     }
 
     pub fn path_is_within_workspace(&self, path: &std::path::Path) -> bool {
@@ -1044,6 +1169,7 @@ mod tests {
             permission_manager: None,
             user_question_tx: None,
             cancel_token: tokio_util::sync::CancellationToken::new(),
+            batch_rejection: Default::default(),
         }
     }
 
@@ -1352,5 +1478,18 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o755, "executable bit preserved");
         assert_eq!(count_atomic_tmp_files(dir.path()), 0);
+    }
+
+    #[test]
+    fn completion_notice_escapes_attributes_and_wraps_the_body() {
+        let notice = completion_notice(
+            "background-shell",
+            &[("id", "t1"), ("command", "echo \"a\" && cat <x\nmore")],
+            "line 1\nline 2\n",
+        );
+        assert_eq!(
+            notice,
+            "<background-shell id=\"t1\" command=\"echo &quot;a&quot; &amp;&amp; cat &lt;x more\">\nline 1\nline 2\n</background-shell>"
+        );
     }
 }

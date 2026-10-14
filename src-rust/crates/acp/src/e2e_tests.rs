@@ -504,15 +504,16 @@ async fn write_asks_once_then_allow_always_is_remembered_and_saved() {
     );
     assert_eq!(std::fs::read_to_string(&target).expect("written"), "two");
 
-    let saved = claurst_core::config::Settings::load_sync().expect("settings readable");
-    assert!(
-        saved
-            .permission_rules
-            .iter()
-            .any(|rule| rule.tool_name.as_deref() == Some("Write")),
-        "allow-always must be saved like the TUI does: {:?}",
-        saved.permission_rules
+    // Saved like the TUI's "always allow in this project": in the project
+    // store under the claurst home, not in the global settings.
+    let store = claurst_core::permissions::project_approvals_path(
+        &claurst_core::config::Settings::config_dir(),
+        &claurst_core::permissions::approvals_project_root(&cwd),
     );
+    let saved = std::fs::read_to_string(&store).expect("project approvals saved");
+    assert!(saved.contains("\"Write\""), "allow-always must be saved for the project: {saved}");
+    let global = claurst_core::config::Settings::load_sync().expect("settings readable");
+    assert!(global.permission_rules.is_empty(), "{:?}", global.permission_rules);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

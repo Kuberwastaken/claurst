@@ -102,9 +102,10 @@ impl Tool for NotebookEditTool {
         }
 
         // Permission check
-        if let Err(e) = ctx.check_permission(
+        if let Err(e) = ctx.check_permission_for_path(
             self.name(),
             &format!("Edit notebook {}", path.display()),
+            path.clone(),
             false,
         ) {
             return ToolResult::error(e.to_string());

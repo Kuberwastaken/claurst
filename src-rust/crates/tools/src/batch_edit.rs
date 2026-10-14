@@ -95,9 +95,13 @@ impl Tool for BatchEditTool {
 
         // Permission check (one check covers the whole batch).
         let description = params.description.as_deref().unwrap_or("batch file edits");
-        if let Err(e) =
-            ctx.check_permission(self.name(), &format!("BatchEdit: {}", description), false)
-        {
+        let targets: Vec<std::path::PathBuf> =
+            params.edits.iter().map(|edit| ctx.resolve_path(&edit.file_path)).collect();
+        if let Err(e) = ctx.check_permission_for_paths(
+            self.name(),
+            &format!("BatchEdit: {}", description),
+            &targets,
+        ) {
             return ToolResult::error(e.to_string());
         }
 

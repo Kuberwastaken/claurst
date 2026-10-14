@@ -595,23 +595,32 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         .status_line_override
         .as_deref()
         .map_or(0, |text| u16::try_from(text.lines().count().max(1)).unwrap_or(u16::MAX));
+    let dock_lines = queued_dock_lines(app);
+    let dock_height = u16::try_from(dock_lines.len()).unwrap_or(u16::MAX);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(separator_height),
             Constraint::Length(status_height),
+            Constraint::Length(dock_height),
             Constraint::Length(prompt_height),
             Constraint::Length(suggestions_height),
             Constraint::Length(status_line_height),
             Constraint::Length(1),
         ])
         .split(size);
+    // Take the dock slot out so the indices below keep naming the same rows.
+    let dock_area = chunks[3];
+    let chunks = [chunks[0], chunks[1], chunks[2], chunks[4], chunks[5], chunks[6], chunks[7]];
 
     render_messages(frame, app, chunks[0]);
     // chunks[1] is the blank separator — intentionally left empty
     if status_height > 0 {
         render_status_row(frame, app, chunks[2]);
+    }
+    if dock_height > 0 {
+        frame.render_widget(Paragraph::new(dock_lines), dock_area);
     }
     // The `/effort` selector replaces the prompt box while open: render it into
     // the input area (full width) and SKIP the prompt input. The prompt returns
@@ -2181,6 +2190,51 @@ fn render_todo_block(
 }
 
 // -----------------------------------------------------------------------
+// Queued-prompt dock (#444)
+// -----------------------------------------------------------------------
+
+/// Rows of the dock above the prompt: undelivered steers and Tab-queued
+/// prompts (first line of each), then the key hint. Empty when nothing waits.
+fn queued_dock_lines(app: &App) -> Vec<Line<'static>> {
+    const MAX_ITEMS: usize = 4;
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines = Vec::new();
+    let mut total = 0usize;
+    for (kind, text) in app.pending_prompts() {
+        total += 1;
+        if total > MAX_ITEMS {
+            continue;
+        }
+        let (label, color) = match kind {
+            crate::app::PendingKind::Steer => ("steer ", Color::Cyan),
+            crate::app::PendingKind::Queued => ("queued", Color::Yellow),
+        };
+        let mut shown = text.lines().next().unwrap_or_default().to_string();
+        if text.lines().nth(1).is_some() {
+            shown.push_str(" \u{2026}");
+        }
+        lines.push(Line::from(vec![
+            Span::styled(format!("  \u{21b3} {label} "), Style::default().fg(color)),
+            Span::raw(shown),
+        ]));
+    }
+    if total == 0 {
+        return lines;
+    }
+    if total > MAX_ITEMS {
+        lines.push(Line::from(Span::styled(
+            format!("    +{} more", total - MAX_ITEMS),
+            dim,
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "    enter steers \u{00b7} tab queues \u{00b7} alt+up edits \u{00b7} alt+x removes",
+        dim,
+    )));
+    lines
+}
+
+// -----------------------------------------------------------------------
 // Input pane
 // -----------------------------------------------------------------------
 
@@ -2467,6 +2521,17 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
+        // Output rate of the streaming request (#444).
+        if let Some(rate) = app.stream_tokens_per_sec() {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(
+                format!("~{rate:.0} tok/s"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
         // Agent type badge (shown when running as subagent / coordinator)
         if let Some(ref badge) = app.agent_type_badge {
             if !spans.is_empty() {
@@ -2598,6 +2663,14 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 "esc interrupt",
                 Style::default().fg(Color::DarkGray),
             ));
+        }
+
+        // OS sandbox badge (#470): shown while Bash commands run sandboxed.
+        if let Some(label) = claurst_core::sandbox::status_label(&app.config.sandbox) {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
         }
 
         spans
@@ -4172,6 +4245,56 @@ mod status_line_tests {
             "footer: {:?}",
             rows(&terminal)[0]
         );
+    }
+
+    #[test]
+    fn footer_shows_tokens_per_second_while_streaming() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        let mut terminal = Terminal::new(TestBackend::new(120, 1)).unwrap();
+        app.is_streaming = true;
+        app.request_output_bytes = 800;
+        // Under half a second the rate is noise and stays hidden.
+        app.request_output_started = Some(std::time::Instant::now());
+        terminal.draw(|f| render_footer(f, &app, f.area())).unwrap();
+        assert!(!rows(&terminal)[0].contains("tok/s"));
+
+        // 800 bytes ~ 200 tokens over ~2 s.
+        app.request_output_started =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(2));
+        let rate = app.stream_tokens_per_sec().expect("rate while streaming");
+        assert!((95.0..=100.0).contains(&rate), "{rate}");
+        terminal.draw(|f| render_footer(f, &app, f.area())).unwrap();
+        assert!(rows(&terminal)[0].contains(" tok/s"), "{:?}", rows(&terminal)[0]);
+
+        // The request ends: the window closes and the rate disappears.
+        app.handle_query_event(claurst_query::QueryEvent::TurnComplete {
+            turn: 1,
+            stop_reason: "end_turn".to_string(),
+            usage: None,
+        });
+        assert_eq!(app.request_output_bytes, 0);
+        assert!(app.stream_tokens_per_sec().is_none());
+        terminal.draw(|f| render_footer(f, &app, f.area())).unwrap();
+        assert!(!rows(&terminal)[0].contains("tok/s"));
+    }
+
+    #[test]
+    fn queued_dock_lists_steers_and_queued_prompts_above_the_input() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.command_queue = Some(claurst_query::CommandQueue::new());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render_app(f, &app)).unwrap();
+        assert!(!rows(&terminal).iter().any(|r| r.contains("alt+x removes")));
+
+        app.steer("check the error path".to_string());
+        app.queued_messages.push_back("then write the docs\nsecond line".to_string());
+        terminal.draw(|f| render_app(f, &app)).unwrap();
+        let rows = rows(&terminal);
+        let steer = rows.iter().position(|r| r.contains("steer  check the error path"));
+        let queued = rows.iter().position(|r| r.contains("queued then write the docs \u{2026}"));
+        let hint = rows.iter().position(|r| r.contains("alt+x removes"));
+        assert!(steer.is_some() && queued.is_some() && hint.is_some(), "{rows:#?}");
+        assert!(steer < queued && queued < hint, "{rows:#?}");
     }
 
     #[test]

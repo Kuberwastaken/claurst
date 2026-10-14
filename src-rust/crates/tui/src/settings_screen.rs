@@ -280,7 +280,7 @@ fn all_entries(screen: &SettingsScreen) -> Vec<SettingsEntry> {
         SettingsEntry {
             key: "notifications",
             label: "Desktop notifications",
-            description: "Notify when a turn completes.",
+            description: "Bell and desktop notification when a turn finishes or waits on you while the terminal is in the background.",
             kind: SettingKind::Bool,
             value: if screen.notifications { "true" } else { "false" }.to_string(),
         },

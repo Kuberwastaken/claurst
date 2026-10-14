@@ -1,11 +1,15 @@
-// `/sandbox-toggle` command.
-//
-// Extracted from lib.rs (issue #232). Behavior-preserving move.
+// `/sandbox-toggle` (alias `/sandbox`): show or change the OS sandbox that
+// Bash commands run in (#470). The state lives in the `sandbox` block of the
+// global settings file and reaches the Bash tool through `Config::sandbox`.
 
 use super::*;
 use async_trait::async_trait;
+use claurst_core::sandbox::{seatbelt_available, SandboxMode, SandboxSettings};
 
 pub struct SandboxToggleCommand;
+
+const USAGE: &str =
+    "Usage: /sandbox-toggle [status|on|off|workspace-write|read-only|network on|network off]";
 
 // ---- /sandbox-toggle -----------------------------------------------------
 
@@ -13,137 +17,128 @@ pub struct SandboxToggleCommand;
 impl SlashCommand for SandboxToggleCommand {
     fn name(&self) -> &str { "sandbox-toggle" }
     fn aliases(&self) -> Vec<&str> { vec!["sandbox"] }
-    fn description(&self) -> &str { "Enable or disable sandboxed execution of shell commands" }
+    fn description(&self) -> &str { "Show or change the OS sandbox for Bash commands" }
     fn help(&self) -> &str {
-        "Usage: /sandbox-toggle [on|off|exclude <pattern>|status]\n\n\
-         Toggles sandboxed execution of bash/shell commands.\n\
-         When sandbox mode is enabled, shell commands run in an isolated\n\
-         environment to prevent unintended side effects.\n\n\
-         Subcommands:\n\
-           /sandbox-toggle           — toggle the current state\n\
-           /sandbox-toggle on        — enable sandbox mode\n\
-           /sandbox-toggle off       — disable sandbox mode\n\
-           /sandbox-toggle status    — show current state and excluded patterns\n\
-           /sandbox-toggle exclude <pattern>  — add a command pattern to exclusions\n\n\
-         Sandbox is supported on macOS, Linux, and WSL2.\n\
-         Note: A restart is recommended for full effect."
+        "Usage: /sandbox-toggle [status|on|off|workspace-write|read-only|network on|network off]\n\n\
+         On macOS, Bash commands run under Seatbelt (sandbox-exec) unless the sandbox is off.\n\
+           workspace-write  writes only inside the workspace, --add-dir directories and the\n\
+                            temp directories; .git and .claurst stay read-only (default)\n\
+           read-only        no writes\n\
+           network on|off   network access for sandboxed commands (default off)\n\n\
+         With no argument, toggles between off and workspace-write. Changes are saved to the\n\
+         `sandbox` block of the global settings file and apply to the next command.\n\
+         Other platforms have no OS sandbox yet: the setting is kept but has no effect."
     }
 
-    async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
-        let args = args.trim();
-
-        // Platform support check: sandbox requires macOS or Linux (not Windows native).
-        let platform = std::env::consts::OS;
-        let is_wsl = std::env::var("WSL_DISTRO_NAME").is_ok()
-            || std::env::var("WSL_INTEROP").is_ok();
-        let is_supported = matches!(platform, "linux" | "macos") || is_wsl;
-
-        // Handle subcommand: status
-        if args == "status" {
-            let ui = load_ui_settings();
-            let mode = if ui.sandbox_mode.unwrap_or(false) { "enabled" } else { "disabled" };
-            let excl = if ui.sandbox_excluded_commands.is_empty() {
-                "(none)".to_string()
-            } else {
-                ui.sandbox_excluded_commands
-                    .iter()
-                    .map(|p| format!("  - {}", p))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            let platform_note = if is_supported {
-                format!("\u{2713} Supported on this platform ({})", platform)
-            } else {
-                format!("\u{2717} Not supported on this platform ({}). Requires macOS, Linux, or WSL2.", platform)
-            };
-            return CommandResult::Message(format!(
-                "Sandbox mode: {}\n\
-                 Platform:     {}\n\
-                 Excluded command patterns:\n{}\n\n\
-                 Use /sandbox-toggle [on|off] to change mode.\n\
-                 Use /sandbox-toggle exclude <pattern> to add exclusions.",
-                mode, platform_note, excl
-            ));
-        }
-
-        // Handle subcommand: exclude <pattern>
-        if let Some(rest) = args.strip_prefix("exclude").map(str::trim) {
-            if rest.is_empty() {
-                return CommandResult::Error(
-                    "Usage: /sandbox-toggle exclude <command-pattern>\n\
-                     Example: /sandbox-toggle exclude \"npm run test:*\"".to_string()
-                );
-            }
-            // Strip surrounding quotes if present
-            let pattern = rest.trim_matches(|c| c == '"' || c == '\'').to_string();
-            if pattern.is_empty() {
-                return CommandResult::Error("Pattern cannot be empty.".to_string());
-            }
-            match mutate_ui_settings(|s| {
-                if !s.sandbox_excluded_commands.contains(&pattern) {
-                    s.sandbox_excluded_commands.push(pattern.clone());
-                }
-            }) {
-                Ok(_) => {
-                    let settings_path = ui_settings_path();
-                    return CommandResult::Message(format!(
-                        "Added \"{}\" to sandbox excluded commands.\n\
-                         Saved to: {}",
-                        pattern,
-                        settings_path.display()
-                    ));
-                }
-                Err(e) => return CommandResult::Error(format!("Failed to save exclusion: {}", e)),
-            }
-        }
-
-        // Platform guard for toggling on/off
-        if !is_supported && (args == "on" || args == "enable" || args == "enabled"
-            || args == "true" || args == "1" || args.is_empty())
-        {
-            let msg = if is_wsl {
-                "Error: Sandboxing requires WSL2. WSL1 is not supported.".to_string()
-            } else {
-                format!(
-                    "Error: Sandboxing is currently only supported on macOS, Linux, and WSL2.\n\
-                     Current platform: {}",
-                    platform
-                )
-            };
-            // Only hard-block enabling; allow off/status even on unsupported platforms.
-            if args != "off" && args != "disable" && args != "disabled"
-                && args != "false" && args != "0"
-            {
-                return CommandResult::Error(msg);
-            }
-        }
-
-        // Read current sandbox state from ui-settings
-        let current_ui = load_ui_settings();
-        let currently_enabled = current_ui.sandbox_mode.unwrap_or(false);
-
-        let enable = match args {
-            "on" | "enable" | "enabled" | "true" | "1" => true,
-            "off" | "disable" | "disabled" | "false" | "0" => false,
-            "" => !currently_enabled,
-            other => {
-                return CommandResult::Error(format!(
-                    "Unknown argument '{}'. Use: /sandbox-toggle [on|off|status|exclude <pattern>]",
-                    other
-                ))
-            }
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        let next = match next_settings(args.trim(), &ctx.config.sandbox) {
+            Ok(Some(next)) => next,
+            Ok(None) => return CommandResult::Message(describe(&ctx.config.sandbox)),
+            Err(e) => return CommandResult::Error(e),
         };
-
-        match mutate_ui_settings(|s| s.sandbox_mode = Some(enable)) {
-            Ok(_) => {
-                let state = if enable { "enabled" } else { "disabled" };
-                CommandResult::Message(format!(
-                    "Sandbox mode {}. Restart recommended for full effect.\n\
-                     Use /sandbox-toggle exclude <pattern> to bypass sandboxing for specific commands.",
-                    state
-                ))
-            }
-            Err(e) => CommandResult::Error(format!("Failed to save sandbox setting: {}", e)),
+        let mut settings = match Settings::load_sync() {
+            Ok(settings) => settings,
+            Err(e) => return CommandResult::Error(format!("Failed to load settings: {}", e)),
+        };
+        settings.sandbox.mode = next.mode;
+        settings.sandbox.network = next.network;
+        if let Err(e) = settings.save_sync() {
+            return CommandResult::Error(format!("Failed to save sandbox setting: {}", e));
         }
+        let mut config = ctx.config.clone();
+        config.sandbox = next;
+        let message = describe(&config.sandbox);
+        CommandResult::ConfigChangeMessage(config, message)
+    }
+}
+
+/// The settings `args` asks for, or `None` for a status query.
+fn next_settings(args: &str, current: &SandboxSettings) -> Result<Option<SandboxSettings>, String> {
+    let mut next = current.clone();
+    match args {
+        "status" => return Ok(None),
+        "" => {
+            next.mode = if current.mode == SandboxMode::Off {
+                SandboxMode::WorkspaceWrite
+            } else {
+                SandboxMode::Off
+            };
+        }
+        "on" | "workspace-write" => next.mode = SandboxMode::WorkspaceWrite,
+        "off" => next.mode = SandboxMode::Off,
+        "read-only" => next.mode = SandboxMode::ReadOnly,
+        "network on" => next.network = true,
+        "network off" => next.network = false,
+        other => return Err(format!("Unknown argument '{}'. {}", other, USAGE)),
+    }
+    Ok(Some(next))
+}
+
+fn describe(settings: &SandboxSettings) -> String {
+    let mode = settings.mode.as_str();
+    let state = if settings.mode == SandboxMode::Off {
+        "off: Bash commands run with your full privileges".to_string()
+    } else if seatbelt_available() {
+        format!("{} (macOS Seatbelt)", mode)
+    } else {
+        format!(
+            "{} (inactive: no OS sandbox on {} yet)",
+            mode,
+            std::env::consts::OS
+        )
+    };
+    let prefixes = if settings.unsandboxed_prefixes.is_empty() {
+        "(none)".to_string()
+    } else {
+        settings.unsandboxed_prefixes.join(", ")
+    };
+    format!(
+        "Sandbox: {}\nNetwork: {}\nAlways run outside the sandbox: {}",
+        state,
+        if settings.network { "on" } else { "off" },
+        prefixes
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arguments_map_to_settings() {
+        let default = SandboxSettings::default();
+        assert_eq!(next_settings("status", &default), Ok(None));
+        let off = next_settings("", &default).unwrap().unwrap();
+        assert_eq!(off.mode, SandboxMode::Off);
+        assert_eq!(
+            next_settings("", &off).unwrap().unwrap().mode,
+            SandboxMode::WorkspaceWrite
+        );
+        assert_eq!(
+            next_settings("read-only", &default).unwrap().unwrap().mode,
+            SandboxMode::ReadOnly
+        );
+        assert_eq!(
+            next_settings("on", &off).unwrap().unwrap().mode,
+            SandboxMode::WorkspaceWrite
+        );
+        let network = next_settings("network on", &default).unwrap().unwrap();
+        assert!(network.network);
+        assert_eq!(network.mode, SandboxMode::WorkspaceWrite);
+        assert!(!next_settings("network off", &network).unwrap().unwrap().network);
+        assert!(next_settings("exclude npm", &default).is_err());
+    }
+
+    #[test]
+    fn status_names_mode_network_and_prefixes() {
+        let settings = SandboxSettings {
+            mode: SandboxMode::Off,
+            network: true,
+            unsandboxed_prefixes: vec!["cargo".to_string(), "npm".to_string()],
+        };
+        let text = describe(&settings);
+        assert!(text.contains("Sandbox: off"));
+        assert!(text.contains("Network: on"));
+        assert!(text.contains("cargo, npm"));
     }
 }

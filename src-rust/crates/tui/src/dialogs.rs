@@ -17,21 +17,25 @@ use ratatui::Frame;
 #[derive(Debug, Clone, PartialEq)]
 #[derive(Default)]
 pub enum PermissionDialogKind {
-    /// Generic four-option dialog (the previous default).
+    /// Generic dialog with the default options.
     #[default]
     Generic,
-    /// Bash command execution — optionally carries a suggested prefix for a
-    /// 5th "allow prefix*" option.
+    /// Bash command execution. `suggested_rules` are the per-command rules
+    /// (`git status *`) an "always allow" choice saves; empty for an opaque
+    /// command, which then offers no "always" options.
     Bash {
         command: String,
-        suggested_prefix: Option<String>,
+        suggested_rules: Vec<String>,
     },
     /// PowerShell command execution — rendered like Bash without prefix rules.
     PowerShell { command: String },
-    /// File read — three options: once / session / deny.
+    /// File read.
     FileRead { path: String },
-    /// File write — four options: once / session / project / deny.
+    /// File write.
     FileWrite { path: String },
+    /// A sandboxed Bash command was likely blocked by the OS sandbox (#470):
+    /// rerun it outside the sandbox once / for the session / for its prefix.
+    SandboxEscalation { command: String },
 }
 
 
@@ -65,14 +69,17 @@ pub struct PermissionRequest {
     pub kind: PermissionDialogKind,
     pub options: Vec<PermissionOption>,
     pub selected_option: usize,
+    /// `Some` while the user types the optional one-line reason for a deny;
+    /// the reason is returned to the model with the denial.
+    pub feedback: Option<String>,
 }
 
+/// Longest deny reason accepted in the permission dialog, in characters.
+const MAX_FEEDBACK_CHARS: usize = 200;
+
 impl PermissionRequest {
-    /// Create a standard four-option dialog matching the TS dialog options:
-    ///   `y` — Yes, allow once
-    ///   `Y` — Yes, allow this session
-    ///   `p` — Yes, always allow (persistent)
-    ///   `n` — No, deny
+    /// Create a dialog with the default options (see
+    /// [`Self::default_options`]).
     pub fn standard(tool_use_id: String, tool_name: String, description: String) -> Self {
         Self {
             tool_use_id,
@@ -82,6 +89,7 @@ impl PermissionRequest {
             input_preview: None,
             kind: PermissionDialogKind::Generic,
             selected_option: 0,
+            feedback: None,
             options: Self::default_options(),
         }
     }
@@ -108,23 +116,24 @@ impl PermissionRequest {
             input_preview,
             kind: PermissionDialogKind::Generic,
             selected_option: 0,
+            feedback: None,
             options: Self::default_options(),
         }
     }
 
-    /// Build a Bash-specific dialog, computing the options set based on whether
-    /// a `suggested_prefix` is available (5 options) or not (4 options).
+    /// Build a Bash-specific dialog. The "always allow" options are offered
+    /// only when `suggested_rules` is non-empty.
     pub fn bash(
         tool_use_id: String,
         tool_name: String,
         reason: String,
         command: String,
-        suggested_prefix: Option<String>,
+        suggested_rules: Vec<String>,
     ) -> Self {
-        let options = Self::bash_options(suggested_prefix.as_deref());
+        let options = Self::bash_options(&suggested_rules);
         let kind = PermissionDialogKind::Bash {
             command: command.clone(),
-            suggested_prefix,
+            suggested_rules,
         };
 
         Self {
@@ -135,6 +144,7 @@ impl PermissionRequest {
             input_preview: Some(command),
             kind,
             selected_option: 0,
+            feedback: None,
             options,
         }
     }
@@ -153,11 +163,54 @@ impl PermissionRequest {
             input_preview: Some(command.clone()),
             kind: PermissionDialogKind::PowerShell { command },
             selected_option: 0,
+            feedback: None,
             options: Self::default_options(),
         }
     }
 
-    /// Build a FileRead-specific dialog (4 options: once / session / persistent / deny).
+    /// Build the "retry outside the sandbox?" dialog for a command the OS
+    /// sandbox likely blocked (#470). `prefix` is the first word a "for this
+    /// command prefix" approval would cover; `None` hides that option.
+    pub fn sandbox_escalation(
+        tool_use_id: String,
+        reason: String,
+        command: String,
+        prefix: Option<&str>,
+    ) -> Self {
+        let mut options = vec![
+            PermissionOption {
+                label: "Yes, rerun outside the sandbox once".to_string(),
+                key: 'y',
+            },
+            PermissionOption {
+                label: "Yes, run outside the sandbox for this session".to_string(),
+                key: 'Y',
+            },
+        ];
+        if let Some(prefix) = prefix {
+            options.push(PermissionOption {
+                label: format!("Yes, always run `{}` commands outside the sandbox", prefix),
+                key: 'P',
+            });
+        }
+        options.push(PermissionOption {
+            label: "No, keep the sandbox denial".to_string(),
+            key: 'n',
+        });
+        Self {
+            tool_use_id,
+            tool_name: "Bash (sandboxed)".to_string(),
+            description: String::new(),
+            danger_explanation: reason,
+            input_preview: Some(command.clone()),
+            kind: PermissionDialogKind::SandboxEscalation { command },
+            selected_option: 0,
+            feedback: None,
+            options,
+        }
+    }
+
+    /// Build a FileRead-specific dialog with the default options.
     pub fn file_read(
         tool_use_id: String,
         tool_name: String,
@@ -181,11 +234,12 @@ impl PermissionRequest {
             input_preview: Some(preview),
             kind,
             selected_option: 0,
-            options: Self::file_read_options(),
+            feedback: None,
+            options: Self::default_options(),
         }
     }
 
-    /// Build a FileWrite-specific dialog (4 options: once / session / project / deny).
+    /// Build a FileWrite-specific dialog with the default options.
     pub fn file_write(
         tool_use_id: String,
         tool_name: String,
@@ -209,7 +263,8 @@ impl PermissionRequest {
             input_preview: Some(preview),
             kind,
             selected_option: 0,
-            options: Self::file_write_options(),
+            feedback: None,
+            options: Self::default_options(),
         }
     }
 
@@ -217,49 +272,39 @@ impl PermissionRequest {
     // Option sets
     // ------------------------------------------------------------------
 
-    /// The four canonical options (matches TS interactive permission dialog).
+    /// The default options: once / session / always in this project /
+    /// always everywhere / deny. 'p' saves the approval for the current
+    /// project only; 'a' saves it in the global settings.
     pub fn default_options() -> Vec<PermissionOption> {
         vec![
             PermissionOption { label: "Yes, allow once".to_string(), key: 'y' },
             PermissionOption { label: "Yes, allow this session".to_string(), key: 'Y' },
-            PermissionOption { label: "Yes, always allow (persistent)".to_string(), key: 'p' },
+            PermissionOption { label: "Yes, always allow in this project".to_string(), key: 'p' },
+            PermissionOption { label: "Yes, always allow everywhere".to_string(), key: 'a' },
             PermissionOption { label: "No, deny".to_string(), key: 'n' },
         ]
     }
 
-    /// Bash options: 4 standard + optional 5th prefix-based rule.
-    pub fn bash_options(suggested_prefix: Option<&str>) -> Vec<PermissionOption> {
-        let mut opts = Self::default_options();
-        if let Some(prefix) = suggested_prefix {
-            // Insert before the deny option (last item).
-            let deny = opts.pop().unwrap();
+    /// Bash options. The "always" options name the per-command rules they
+    /// save and are left out when there are none (opaque commands).
+    pub fn bash_options(suggested_rules: &[String]) -> Vec<PermissionOption> {
+        let mut opts = vec![
+            PermissionOption { label: "Yes, allow once".to_string(), key: 'y' },
+            PermissionOption { label: "Yes, allow this session".to_string(), key: 'Y' },
+        ];
+        if !suggested_rules.is_empty() {
+            let rules = suggested_rules.join(", ");
             opts.push(PermissionOption {
-                label: format!("Allow commands matching {}*", prefix),
-                key: 'P',
+                label: format!("Yes, always allow `{}` in this project", rules),
+                key: 'p',
             });
-            opts.push(deny);
+            opts.push(PermissionOption {
+                label: format!("Yes, always allow `{}` everywhere", rules),
+                key: 'a',
+            });
         }
+        opts.push(PermissionOption { label: "No, deny".to_string(), key: 'n' });
         opts
-    }
-
-    /// FileRead options (4): once / session / persistent / deny.
-    pub fn file_read_options() -> Vec<PermissionOption> {
-        vec![
-            PermissionOption { label: "Yes, allow once".to_string(), key: 'y' },
-            PermissionOption { label: "Yes, allow this session".to_string(), key: 'Y' },
-            PermissionOption { label: "Yes, always allow (persistent)".to_string(), key: 'p' },
-            PermissionOption { label: "No, deny".to_string(), key: 'n' },
-        ]
-    }
-
-    /// FileWrite options (4): once / session / project / deny.
-    pub fn file_write_options() -> Vec<PermissionOption> {
-        vec![
-            PermissionOption { label: "Yes, allow once".to_string(), key: 'y' },
-            PermissionOption { label: "Yes, allow this session".to_string(), key: 'Y' },
-            PermissionOption { label: "Yes, always allow for this project".to_string(), key: 'p' },
-            PermissionOption { label: "No, deny".to_string(), key: 'n' },
-        ]
     }
 }
 
@@ -401,17 +446,15 @@ fn word_wrap(text: &str, width: usize) -> Vec<String> {
 ///   │  This will execute a shell command.             │
 ///   │  This may modify system-wide security policy.   │
 ///   │                                                │
-///   │  [1] Yes, allow once                           │
-///   │  [2] Yes, allow this session                   │
-///   │▶ [3] Yes, always allow (persistent)            │
-///   │  [4] No, deny                                  │
+///   │  [y] Yes, allow once                           │
+///   │  [Y] Yes, allow this session                   │
+///   │▶ [p] Yes, always allow in this project         │
+///   │  [a] Yes, always allow everywhere              │
+///   │  [n] No, deny                                  │
 ///   └────────────────────────────────────────────────┘
 ///
-/// For `Bash` with a `suggested_prefix`, a 5th option is shown:
-///   │  [5] Allow commands matching git*              │
-///
-/// For `FileRead`, 4 options (once / session / persistent / deny).
-/// For `FileWrite`, 4 options (once / session / project / deny).
+/// For `Bash` the "always" options name the rules they save
+/// (`git status *`) and are omitted for opaque commands.
 pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area: Rect) {
     // Scale dialog width with the terminal: minimum 40 cols for narrow screens,
     // maximum 80 cols on wide ones, otherwise leave a 4-col margin on each side.
@@ -431,7 +474,8 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
     // without the prompt-arrow repeating on every row.
     let bash_command_lines: Option<Vec<Line>> = match &pr.kind {
         PermissionDialogKind::Bash { command, .. }
-        | PermissionDialogKind::PowerShell { command } => {
+        | PermissionDialogKind::PowerShell { command }
+        | PermissionDialogKind::SandboxEscalation { command } => {
             let cmd_indent = "    ";
             let wrap_width = text_width.saturating_sub(cmd_indent.len());
             let wrapped = word_wrap(command, wrap_width);
@@ -476,7 +520,9 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
 
     // preview line count (used for non-Bash kinds; Bash uses its own block above)
     let preview_line_count: u16 = match &pr.kind {
-        PermissionDialogKind::Bash { .. } | PermissionDialogKind::PowerShell { .. } => 0,
+        PermissionDialogKind::Bash { .. }
+        | PermissionDialogKind::PowerShell { .. }
+        | PermissionDialogKind::SandboxEscalation { .. } => 0,
         _ => {
             if pr.input_preview.is_some() { 3 } else { 0 }
         }
@@ -487,6 +533,18 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
         .map(|lines| lines.len() as u16 + 2) // lines + blank before + blank after
         .unwrap_or(0);
 
+    // Deny-reason prompt (shown after choosing deny), with a text cursor.
+    let feedback_lines: Vec<String> = pr
+        .feedback
+        .as_ref()
+        .map(|reason| {
+            word_wrap(
+                &format!("Reason for the model (optional): {}\u{258F}", reason),
+                text_width.saturating_sub(2),
+            )
+        })
+        .unwrap_or_default();
+
     let content_lines: u16 = 2 // "  Tool: <name>"  +  blank
         + bash_block_height
         + desc_lines.len() as u16
@@ -494,6 +552,7 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
         + preview_line_count
         + 1 // blank before options
         + pr.options.len() as u16
+        + if feedback_lines.is_empty() { 0 } else { feedback_lines.len() as u16 + 2 } // blank + prompt + hint
         + 1; // trailing blank
 
     let dialog_height = (content_lines + 2) // +2 for top/bottom border
@@ -528,7 +587,9 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
     // ---- Input preview for non-Bash kinds -----------------------------------
     if !matches!(
         pr.kind,
-        PermissionDialogKind::Bash { .. } | PermissionDialogKind::PowerShell { .. }
+        PermissionDialogKind::Bash { .. }
+            | PermissionDialogKind::PowerShell { .. }
+            | PermissionDialogKind::SandboxEscalation { .. }
     ) {
         if let Some(ref preview) = pr.input_preview {
             lines.push(Line::from(vec![
@@ -594,6 +655,21 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
         ]));
     }
 
+    // ---- Deny reason prompt -------------------------------------------------
+    if !feedback_lines.is_empty() {
+        lines.push(Line::from(""));
+        for feedback_line in feedback_lines {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(feedback_line, Style::default().fg(Color::Yellow)),
+            ]));
+        }
+        lines.push(Line::from(Span::styled(
+            "  Enter: deny with this reason   Esc: deny without a reason",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
     let (border_color, title_text) = match &pr.kind {
         PermissionDialogKind::Bash { .. } | PermissionDialogKind::PowerShell { .. } => {
             (Color::Yellow, " Permission Required ")
@@ -601,6 +677,7 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
         PermissionDialogKind::FileRead { .. } => (Color::Cyan, " File Read Permission "),
         PermissionDialogKind::FileWrite { .. } => (Color::Yellow, " File Write Permission "),
         PermissionDialogKind::Generic => (Color::Yellow, " Permission Required "),
+        PermissionDialogKind::SandboxEscalation { .. } => (Color::Red, " Sandbox Denied "),
     };
 
     let block = Block::default()
@@ -631,51 +708,73 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
 ///
 /// Returns `true` if the dialog was confirmed/dismissed (caller should clear it).
 ///
-/// Behaviour by option count:
-/// - 3-option dialog (FileRead): digits 1–3 valid, 4/5 rejected.
-/// - 4-option dialog (Generic / FileWrite / Bash without prefix): digits 1–4 valid.
-/// - 5-option dialog (Bash with prefix): digits 1–5 valid.
+/// Digits select by position (1-based); digits beyond the option count are
+/// ignored. Option keys (`y`, `Y`, `p`, `a`, `n`) select. Choosing an allow
+/// option confirms at once. Choosing deny (`n`, its digit, or Enter on it)
+/// opens a one-line reason prompt instead: typed text goes into
+/// `feedback`, Enter denies with that reason, Esc denies without one. Esc
+/// outside the prompt denies without a reason.
 pub fn handle_permission_key(pr: &mut PermissionRequest, key: KeyEvent) -> bool {
+    use crossterm::event::KeyModifiers;
+
+    if let Some(feedback) = pr.feedback.as_mut() {
+        match key.code {
+            KeyCode::Enter => return true,
+            KeyCode::Esc => {
+                feedback.clear();
+                return true;
+            }
+            KeyCode::Backspace => {
+                feedback.pop();
+            }
+            KeyCode::Char(c)
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && feedback.chars().count() < MAX_FEEDBACK_CHARS =>
+            {
+                feedback.push(c);
+            }
+            _ => {}
+        }
+        return false;
+    }
+
     let option_count = pr.options.len();
-    match key.code {
-        KeyCode::Char(c) => {
-            if let Some(digit) = c.to_digit(10) {
-                let idx = (digit as usize).saturating_sub(1);
-                if idx < option_count {
-                    pr.selected_option = idx;
-                    return true; // confirmed via digit shortcut
-                }
-                // Reject digits beyond the option count silently.
-            } else {
-                for (i, opt) in pr.options.iter().enumerate() {
-                    if opt.key == c {
-                        pr.selected_option = i;
-                        return true;
-                    }
-                }
-            }
-        }
-        KeyCode::Enter => {
-            return true;
-        }
+    let chosen = match key.code {
+        KeyCode::Char(c) => match c.to_digit(10) {
+            Some(digit) => Some((digit as usize).saturating_sub(1)).filter(|&i| i < option_count),
+            None => pr.options.iter().position(|opt| opt.key == c),
+        },
+        KeyCode::Enter => Some(pr.selected_option),
         KeyCode::Up => {
-            if pr.selected_option > 0 {
-                pr.selected_option -= 1;
-            }
+            pr.selected_option = pr.selected_option.saturating_sub(1);
+            None
         }
         KeyCode::Down => {
             if pr.selected_option + 1 < option_count {
                 pr.selected_option += 1;
             }
+            None
         }
         KeyCode::Esc => {
-            // Move selection to the last option (deny) without confirming.
+            // Deny without a reason.
             pr.selected_option = option_count.saturating_sub(1);
             return true;
         }
-        _ => {}
+        _ => None,
+    };
+    let Some(index) = chosen else {
+        return false;
+    };
+    pr.selected_option = index;
+    // The sandbox-escalation dialog's 'n' keeps the sandbox denial; there is
+    // no tool call to give a reason for.
+    if pr.options.get(index).is_some_and(|opt| opt.key == 'n')
+        && !matches!(pr.kind, PermissionDialogKind::SandboxEscalation { .. })
+    {
+        pr.feedback = Some(String::new());
+        return false;
     }
-    false
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1293,17 +1392,16 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn standard_permission_request_has_four_options() {
+    fn standard_permission_request_has_project_and_global_options() {
         let pr = PermissionRequest::standard(
             "id1".to_string(),
             "Bash".to_string(),
             "Run a shell command".to_string(),
         );
-        assert_eq!(pr.options.len(), 4);
-        assert_eq!(pr.options[0].key, 'y');
-        assert_eq!(pr.options[1].key, 'Y');
-        assert_eq!(pr.options[2].key, 'p');
-        assert_eq!(pr.options[3].key, 'n');
+        let keys: Vec<char> = pr.options.iter().map(|o| o.key).collect();
+        assert_eq!(keys, vec!['y', 'Y', 'p', 'a', 'n']);
+        assert!(pr.options[2].label.contains("this project"));
+        assert!(pr.options[3].label.contains("everywhere"));
     }
 
     #[test]
@@ -1438,68 +1536,86 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn bash_without_prefix_has_four_options() {
+    fn opaque_bash_command_offers_no_always_options() {
         let pr = PermissionRequest::bash(
             "id-bash-1".to_string(),
             "Bash".to_string(),
             "Wants to run a command".to_string(),
-            "ls -la".to_string(),
-            None,
+            "echo $(id)".to_string(),
+            Vec::new(),
         );
-        assert_eq!(pr.options.len(), 4);
+        let keys: Vec<char> = pr.options.iter().map(|o| o.key).collect();
+        assert_eq!(keys, vec!['y', 'Y', 'n']);
         assert_eq!(pr.kind, PermissionDialogKind::Bash {
-            command: "ls -la".to_string(),
-            suggested_prefix: None,
+            command: "echo $(id)".to_string(),
+            suggested_rules: Vec::new(),
         });
         // input_preview is set to the command
-        assert_eq!(pr.input_preview.as_deref(), Some("ls -la"));
+        assert_eq!(pr.input_preview.as_deref(), Some("echo $(id)"));
     }
 
     #[test]
-    fn bash_with_prefix_has_five_options() {
+    fn sandbox_escalation_offers_once_session_prefix_and_deny() {
+        let pr = PermissionRequest::sandbox_escalation(
+            "id".to_string(),
+            "The sandbox likely blocked this command.".to_string(),
+            "git commit -m x".to_string(),
+            Some("git"),
+        );
+        let keys: Vec<char> = pr.options.iter().map(|o| o.key).collect();
+        assert_eq!(keys, vec!['y', 'Y', 'P', 'n']);
+        assert!(pr.options[2].label.contains("`git`"));
+        assert_eq!(
+            pr.kind,
+            PermissionDialogKind::SandboxEscalation { command: "git commit -m x".to_string() }
+        );
+
+        let chained = PermissionRequest::sandbox_escalation(
+            "id".to_string(),
+            String::new(),
+            "git log; rm x".to_string(),
+            None,
+        );
+        let keys: Vec<char> = chained.options.iter().map(|o| o.key).collect();
+        assert_eq!(keys, vec!['y', 'Y', 'n']);
+    }
+
+    #[test]
+    fn bash_always_options_name_the_saved_rules() {
         let pr = PermissionRequest::bash(
             "id-bash-2".to_string(),
             "Bash".to_string(),
             "Wants to run git command".to_string(),
-            "git status".to_string(),
-            Some("git ".to_string()),
+            "git status && cargo test".to_string(),
+            vec!["git status *".to_string(), "cargo test *".to_string()],
         );
-        assert_eq!(pr.options.len(), 5);
-        // 5th option (index 3 before deny) carries the prefix label
-        assert!(pr.options[3].label.contains("git "), "Expected prefix in label: {:?}", pr.options[3].label);
-        assert!(pr.options[3].label.ends_with('*'), "Expected * suffix: {:?}", pr.options[3].label);
-        // Deny is still the last option
-        assert_eq!(pr.options[4].key, 'n');
+        let keys: Vec<char> = pr.options.iter().map(|o| o.key).collect();
+        assert_eq!(keys, vec!['y', 'Y', 'p', 'a', 'n']);
+        assert!(pr.options[2].label.contains("`git status *, cargo test *`"), "{:?}", pr.options[2].label);
+        assert!(pr.options[2].label.ends_with("in this project"), "{:?}", pr.options[2].label);
+        assert!(pr.options[3].label.ends_with("everywhere"), "{:?}", pr.options[3].label);
     }
 
     #[test]
-    fn file_read_has_four_options() {
-        let pr = PermissionRequest::file_read(
+    fn file_dialogs_have_default_options() {
+        let read = PermissionRequest::file_read(
             "id-fr".to_string(),
             "ReadFile".to_string(),
             "Wants to read /etc/hosts".to_string(),
             "/etc/hosts".to_string(),
         );
-        assert_eq!(pr.options.len(), 4);
-        assert_eq!(pr.options[0].key, 'y');
-        assert_eq!(pr.options[1].key, 'Y');
-        assert_eq!(pr.options[2].key, 'p'); // persistent allow
-        assert_eq!(pr.options[3].key, 'n');
-        assert!(matches!(pr.kind, PermissionDialogKind::FileRead { .. }));
-    }
-
-    #[test]
-    fn file_write_has_four_options() {
-        let pr = PermissionRequest::file_write(
+        assert!(matches!(read.kind, PermissionDialogKind::FileRead { .. }));
+        let write = PermissionRequest::file_write(
             "id-fw".to_string(),
             "WriteFile".to_string(),
             "Wants to write /tmp/out.txt".to_string(),
             "/tmp/out.txt".to_string(),
         );
-        assert_eq!(pr.options.len(), 4);
-        assert_eq!(pr.options[2].key, 'p'); // project-level allow
-        assert_eq!(pr.options[3].key, 'n');
-        assert!(matches!(pr.kind, PermissionDialogKind::FileWrite { .. }));
+        assert!(matches!(write.kind, PermissionDialogKind::FileWrite { .. }));
+        for pr in [read, write] {
+            let keys: Vec<char> = pr.options.iter().map(|o| o.key).collect();
+            assert_eq!(keys, vec!['y', 'Y', 'p', 'a', 'n']);
+        }
     }
 
     #[test]
@@ -1516,49 +1632,123 @@ mod tests {
     }
 
     #[test]
-    fn permission_key_digit_out_of_range_ignored_for_four_option_dialog() {
-        let mut pr = PermissionRequest::file_read(
-            "id".to_string(),
-            "ReadFile".to_string(),
-            "desc".to_string(),
-            "/foo".to_string(),
-        );
-        assert_eq!(pr.options.len(), 4);
-        // Press '5' — out of range for a 4-option dialog, should NOT confirm.
-        let confirmed = handle_permission_key(&mut pr, key(KeyCode::Char('5')));
-        assert!(!confirmed);
-        // Press '6' — also out of range.
-        let confirmed = handle_permission_key(&mut pr, key(KeyCode::Char('6')));
-        assert!(!confirmed);
-    }
-
-    #[test]
-    fn permission_key_digit_5_valid_for_five_option_bash_dialog() {
+    fn permission_key_digit_out_of_range_ignored() {
         let mut pr = PermissionRequest::bash(
             "id".to_string(),
             "Bash".to_string(),
             "desc".to_string(),
-            "git push".to_string(),
-            Some("git ".to_string()),
+            "echo $(id)".to_string(),
+            Vec::new(),
         );
-        assert_eq!(pr.options.len(), 5);
-        // '5' should select the 5th option (deny) and confirm.
-        let confirmed = handle_permission_key(&mut pr, key(KeyCode::Char('5')));
-        assert!(confirmed);
-        assert_eq!(pr.selected_option, 4);
+        assert_eq!(pr.options.len(), 3);
+        // Press '4' — out of range for a 3-option dialog, should NOT confirm.
+        let confirmed = handle_permission_key(&mut pr, key(KeyCode::Char('4')));
+        assert!(!confirmed);
+        // Press '9' — also out of range.
+        let confirmed = handle_permission_key(&mut pr, key(KeyCode::Char('9')));
+        assert!(!confirmed);
     }
 
     #[test]
-    fn permission_key_char_shortcut_confirms() {
+    fn permission_key_char_selects_global_option() {
         let mut pr = PermissionRequest::standard(
             "id".to_string(),
             "Bash".to_string(),
             "desc".to_string(),
         );
-        // Press 'n' → deny (index 3).
-        let confirmed = handle_permission_key(&mut pr, key(KeyCode::Char('n')));
+        let confirmed = handle_permission_key(&mut pr, key(KeyCode::Char('a')));
         assert!(confirmed);
-        assert_eq!(pr.selected_option, 3);
+        assert_eq!(pr.options[pr.selected_option].key, 'a');
+    }
+
+    /// #445: choosing deny opens a one-line reason prompt; Enter denies with
+    /// the typed reason.
+    #[test]
+    fn deny_takes_an_optional_reason() {
+        let mut pr = PermissionRequest::standard(
+            "id".to_string(),
+            "Bash".to_string(),
+            "desc".to_string(),
+        );
+        // 'n' selects deny and opens the prompt without confirming.
+        assert!(!handle_permission_key(&mut pr, key(KeyCode::Char('n'))));
+        assert_eq!(pr.selected_option, 4);
+        assert_eq!(pr.feedback.as_deref(), Some(""));
+        // Option keys are now text, not shortcuts.
+        for c in "use rgx".chars() {
+            assert!(!handle_permission_key(&mut pr, key(KeyCode::Char(c))));
+        }
+        assert!(!handle_permission_key(&mut pr, key(KeyCode::Backspace)));
+        assert!(!handle_permission_key(&mut pr, key(KeyCode::Backspace)));
+        for c in "g".chars() {
+            assert!(!handle_permission_key(&mut pr, key(KeyCode::Char(c))));
+        }
+        assert!(handle_permission_key(&mut pr, key(KeyCode::Enter)));
+        assert_eq!(pr.feedback.as_deref(), Some("use rg"));
+        assert_eq!(pr.options[pr.selected_option].key, 'n');
+    }
+
+    #[test]
+    fn deny_reason_prompt_is_rendered() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut pr = PermissionRequest::standard(
+            "id".to_string(),
+            "Bash".to_string(),
+            "desc".to_string(),
+        );
+        handle_permission_key(&mut pr, key(KeyCode::Char('n')));
+        for c in "too slow".chars() {
+            handle_permission_key(&mut pr, key(KeyCode::Char(c)));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        terminal
+            .draw(|frame| render_permission_dialog(frame, &pr, frame.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(text.contains("Reason for the model (optional): too slow"), "{text}");
+        assert!(text.contains("Esc: deny without a reason"), "{text}");
+    }
+
+    #[test]
+    fn deny_reason_prompt_esc_denies_without_reason() {
+        let mut pr = PermissionRequest::standard(
+            "id".to_string(),
+            "Bash".to_string(),
+            "desc".to_string(),
+        );
+        // Enter on the deny option opens the prompt as well.
+        pr.selected_option = 4;
+        assert!(!handle_permission_key(&mut pr, key(KeyCode::Enter)));
+        handle_permission_key(&mut pr, key(KeyCode::Char('x')));
+        assert!(handle_permission_key(&mut pr, key(KeyCode::Esc)));
+        assert_eq!(pr.feedback.as_deref(), Some(""));
+        assert_eq!(pr.options[pr.selected_option].key, 'n');
+    }
+
+    #[test]
+    fn deny_reason_is_capped_and_ignores_control_keys() {
+        let mut pr = PermissionRequest::standard(
+            "id".to_string(),
+            "Bash".to_string(),
+            "desc".to_string(),
+        );
+        handle_permission_key(&mut pr, key(KeyCode::Char('5')));
+        assert_eq!(pr.feedback.as_deref(), Some(""));
+        for _ in 0..MAX_FEEDBACK_CHARS + 20 {
+            handle_permission_key(&mut pr, key(KeyCode::Char('a')));
+        }
+        handle_permission_key(
+            &mut pr,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(pr.feedback.as_ref().map(|f| f.chars().count()), Some(MAX_FEEDBACK_CHARS));
+        assert!(pr.feedback.as_ref().is_some_and(|f| !f.contains('c')));
     }
 
     #[test]

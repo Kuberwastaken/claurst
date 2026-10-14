@@ -39,7 +39,7 @@ impl BlockedKind {
         }
     }
 
-    fn message(self) -> &'static str {
+    pub(crate) fn message(self) -> &'static str {
         match self {
             BlockedKind::Permission => "Permission required",
             BlockedKind::Question => "Question needs your answer",

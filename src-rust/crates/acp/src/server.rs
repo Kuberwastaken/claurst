@@ -183,8 +183,8 @@ impl AgentServer {
         }
         let runtime = self.runtime_for(&req.cwd).await?;
         let session_id = acp::SessionId::new(format!("acp-{}", uuid::Uuid::new_v4()));
-        // Permission rules live only in the global settings; read them fresh
-        // so "Allow always" answers from earlier sessions apply here too.
+        // Read the global rules fresh so approvals saved by earlier sessions
+        // apply here too.
         let mode = runtime.config.permission_mode.clone();
         let permission_manager = match Settings::load_sync() {
             Ok(settings) => PermissionManager::new(mode, &settings),
@@ -193,6 +193,14 @@ impl AgentServer {
                 PermissionManager::new(mode, &runtime.settings)
             }
         };
+        // Project approvals for this cwd, and the configured allow/deny lists.
+        let mut permission_manager = permission_manager.with_project_store(
+            claurst_core::permissions::project_approvals_path(
+                &Settings::config_dir(),
+                &claurst_core::permissions::approvals_project_root(&req.cwd),
+            ),
+        );
+        permission_manager.sync_config(&runtime.config);
         let state = SessionState::new(session_id.clone(), runtime, permission_manager);
         info!(session_id = %session_id, cwd = %req.cwd.display(), "ACP: new session");
 

@@ -94,6 +94,50 @@ impl App {
         }
     }
 
+    /// Count streamed output toward the current request's tok/s.
+    pub(super) fn note_request_output(&mut self, bytes: usize) {
+        self.request_output_started.get_or_insert_with(std::time::Instant::now);
+        self.request_output_bytes += bytes;
+    }
+
+    /// Output rate of the request streaming now, in approximate tokens per
+    /// second (about four bytes per token). `None` while idle or during the
+    /// first half second, when the figure is mostly noise.
+    pub fn stream_tokens_per_sec(&self) -> Option<f64> {
+        if !self.is_streaming {
+            return None;
+        }
+        let elapsed = self.request_output_started?.elapsed().as_secs_f64();
+        (elapsed >= 0.5 && self.request_output_bytes > 0)
+            .then(|| self.request_output_bytes as f64 / 4.0 / elapsed)
+    }
+
+    /// Whether a turn is running: the model is streaming, or the query task
+    /// is between requests (tools running, retry back-off).
+    pub(super) fn turn_running(&self) -> bool {
+        self.is_streaming || self.query_in_flight
+    }
+
+    /// Esc / Ctrl+C during a turn (#444): stop it the same way from either
+    /// key. What streamed so far stays in the transcript, the retry pill is
+    /// cleared, undelivered steers go back to the prompt, and the interactive
+    /// loop cancels the turn's token (stopping the model and running tools).
+    pub(super) fn interrupt_turn(&mut self) {
+        self.is_streaming = false;
+        self.spinner_verb = None;
+        self.stall_start = None;
+        self.retry_status = None;
+        self.request_output_started = None;
+        self.request_output_bytes = 0;
+        self.flush_streamed_assistant_message();
+        self.tool_use_blocks.retain(|b| b.status != super::types::ToolStatus::Running);
+        self.status_message = Some("Cancelled.".to_string());
+        self.complete_current_turn_snapshot(true);
+        self.restore_pending_steers();
+        self.cancel_requested = true;
+        self.invalidate_transcript();
+    }
+
     pub(super) fn flush_streamed_assistant_message(&mut self) {
         if self.streaming_text.trim().is_empty() && self.streaming_thinking.trim().is_empty() {
             self.streaming_text.clear();
