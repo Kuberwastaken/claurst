@@ -600,6 +600,7 @@ async fn main() -> anyhow::Result<()> {
         api_key: api_key.clone(),
         api_base: config.resolve_anthropic_api_base(),
         use_bearer_auth,
+        retry: claurst_api::RetryConfig::with_max_retries(config.max_retries),
         ..Default::default()
     };
     let client = Arc::new(
@@ -680,7 +681,16 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
-    let mcp_manager_arc = connect_mcp_manager_arc(&mcp_decision.allowed).await;
+    // Servers connect concurrently in the background; the TUI draws
+    // immediately and picks up tools as servers finish. Headless runs have no
+    // later turn to pick them up, so they wait (bounded by the per-server
+    // connect/catalog timeouts) before the tool list is built.
+    let mcp_manager_arc = start_mcp_manager(&mcp_decision.allowed);
+    if is_headless {
+        if let Some(manager) = mcp_manager_arc.as_ref() {
+            manager.wait_until_settled().await;
+        }
+    }
 
     let pending_permissions = Arc::new(ParkingMutex::new(claurst_tools::PendingPermissionStore::default()));
 
@@ -808,6 +818,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref fb) = cli.fallback_model {
         query_config.fallback_model = Some(fb.clone());
     }
+    query_config.auto_compact = !cli.no_auto_compact;
     // Wire in the provider registry so non-Anthropic providers can be dispatched.
     let provider_registry = std::sync::Arc::new(provider_registry);
     query_config.provider_registry = Some(provider_registry.clone());
@@ -887,7 +898,7 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
-async fn connect_mcp_manager_arc(
+fn start_mcp_manager(
     servers: &[claurst_core::config::McpServerConfig],
 ) -> Option<Arc<claurst_mcp::McpManager>> {
     if servers.is_empty() {
@@ -895,9 +906,20 @@ async fn connect_mcp_manager_arc(
     }
 
     info!(count = servers.len(), "Connecting to MCP servers");
-    let mcp_manager = Arc::new(claurst_mcp::McpManager::connect_all(servers).await);
-    mcp_manager.clone().spawn_notification_poll_loop();
-    Some(mcp_manager)
+    Some(claurst_mcp::McpManager::start(servers))
+}
+
+/// The session tool list: built-ins, Agent and every connected MCP tool,
+/// narrowed by the active agent's access level.
+fn tools_for_session(
+    mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
+    query_config: &claurst_query::QueryConfig,
+) -> Arc<Vec<Box<dyn claurst_tools::Tool>>> {
+    let tools = build_tools_with_mcp(mcp_manager);
+    match query_config.agent_definition.as_ref() {
+        Some(def) => filter_tools_for_agent(tools, &def.access),
+        None => tools,
+    }
 }
 
 fn build_tools_with_mcp(
@@ -1310,6 +1332,7 @@ async fn refresh_provider_runtime_state(
         api_key,
         api_base: config.resolve_anthropic_api_base(),
         use_bearer_auth,
+        retry: claurst_api::RetryConfig::with_max_retries(config.max_retries),
         ..Default::default()
     };
     let client = Arc::new(
@@ -1355,6 +1378,7 @@ async fn reload_provider_runtime_state(
         api_key,
         api_base: config.resolve_anthropic_api_base(),
         use_bearer_auth,
+        retry: claurst_api::RetryConfig::with_max_retries(config.max_retries),
         ..Default::default()
     };
     let client = Arc::new(
@@ -1577,6 +1601,29 @@ async fn run_headless(
                     eprintln!("{}", ev);
                 } else {
                     eprintln!("\nError: {}", msg);
+                }
+            }
+            QueryEvent::Retry { attempt, max_attempts, delay_ms, reason } => {
+                let ev = serde_json::json!({
+                    "type": "retry",
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "delay_ms": delay_ms,
+                    "reason": reason,
+                });
+                if is_stream_json {
+                    println!("{}", ev);
+                } else if is_json_output {
+                    // `json` keeps stdout for the final result object.
+                    eprintln!("{}", ev);
+                } else {
+                    eprintln!(
+                        "\n[Reconnecting {}/{} in {:.1}s: {}]",
+                        attempt,
+                        max_attempts,
+                        *delay_ms as f64 / 1000.0,
+                        reason
+                    );
                 }
             }
             _ => {}
@@ -1937,7 +1984,6 @@ async fn run_interactive(
     }
     app.provider_registry = base_query_config.provider_registry.clone();
     app.refresh_context_window_size();
-    app.auto_compact_enabled = live_config.auto_compact;
 
     // Background: keep the model registry fresh from models.dev for the whole
     // TUI session (opencode-style: refresh now, then every ~60 min, gated by a
@@ -2146,10 +2192,14 @@ async fn run_interactive(
     };
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
-    // Keep the full unfiltered tool set so agent-mode switching can re-filter.
-    let all_tools_arc: Arc<Vec<Box<dyn claurst_tools::Tool>>> =
-        Arc::new(claurst_tools::all_tools());
+    // Agent-mode switches and MCP catalog changes rebuild it via `tools_for_session`.
     let mut tools_arc = tools;
+    // MCP manager generation the current `tools_arc` was built from; `None`
+    // forces a rebuild on the first idle pass.
+    let mut mcp_seen_generation: Option<u64> = None;
+    // Servers whose startup failure was already reported in the status line.
+    let mut mcp_reported_failures: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     // Current cancel token (replaced each turn)
     let mut cancel: Option<CancellationToken> = None;
@@ -2573,6 +2623,20 @@ async fn run_interactive(
                                         removed,
                                         if removed == 1 { "" } else { "s" }
                                     ));
+                                }
+                                Some(CommandResult::Compacted {
+                                    messages: new_msgs,
+                                    record,
+                                    report,
+                                }) => {
+                                    messages = new_msgs.clone();
+                                    app.replace_messages(new_msgs);
+                                    app.context_used_tokens = record.tokens_after;
+                                    session.messages = messages.clone();
+                                    session.compactions.push(record);
+                                    session.updated_at = chrono::Utc::now();
+                                    let _ = claurst_core::history::save_session(&session).await;
+                                    app.status_message = Some(report);
                                 }
                                 Some(CommandResult::OpenRewindOverlay) => {
                                     app.replace_messages(messages.clone());
@@ -3214,13 +3278,12 @@ async fn run_interactive(
                             if let Some(turns) = def.max_turns {
                                 base_query_config.max_turns = turns;
                             }
-                            tools_arc = filter_tools_for_agent(all_tools_arc.clone(), &def.access);
                         } else {
                             // "build" with no explicit definition = full access, no agent
                             base_query_config.agent_name = None;
                             base_query_config.agent_definition = None;
-                            tools_arc = all_tools_arc.clone();
                         }
+                        tools_arc = tools_for_session(tool_ctx.mcp_manager.clone(), &base_query_config);
                     }
                     if !app.is_streaming && app.messages.len() < messages.len() {
                         messages = app.messages.clone();
@@ -3313,6 +3376,10 @@ async fn run_interactive(
 
         // Drain query events — also forward relevant ones to the bridge as outbound.
         while let Ok(evt) = event_rx.try_recv() {
+            // Record loop compactions in the session (issue #441).
+            if let QueryEvent::Compacted(record) = &evt {
+                session.compactions.push(record.clone());
+            }
             // Forward to bridge before consuming (clone only what we need).
             if let Some(ref runtime) = bridge_runtime {
                 let outbound: Option<BridgeOutbound> = match &evt {
@@ -3388,72 +3455,6 @@ async fn run_interactive(
                 }
             }
             app.handle_query_event(evt);
-        }
-
-        // Auto-compact: when context usage hits 99% and no query is running,
-        // automatically submit a compact request.
-        if app.context_window_size > 0
-            && !app.is_streaming
-            && current_query.is_none()
-            && !app.auto_compact_running
-        {
-            let used_pct = (app.context_used_tokens as f64 / app.context_window_size as f64 * 100.0) as u64;
-            if used_pct >= 99 {
-                app.auto_compact_running = true;
-                let msg_count = messages.len();
-                let compact_msg = format!(
-                    "[Auto-compact triggered ({} messages, {}% context used). \
-                     Provide a detailed summary of our conversation so far, \
-                     preserving all key technical details, decisions made, \
-                     file paths mentioned, and current task status.]",
-                    msg_count, used_pct
-                );
-                app.status_message = Some("Context 99% full — auto-compacting…".to_string());
-                let user_msg = claurst_core::types::Message::user(compact_msg);
-                messages.push(user_msg.clone());
-                app.push_message(user_msg);
-                session.messages = messages.clone();
-                session.updated_at = chrono::Utc::now();
-
-                // Dispatch the compact query immediately.
-                let ct = CancellationToken::new();
-                cancel = Some(ct.clone());
-                let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
-                let msgs_arc_clone = msgs_arc.clone();
-                let tools_arc_clone = tools_arc.clone();
-                let ctx_clone = tool_ctx.clone();
-                let mut qcfg = base_query_config.clone();
-                qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
-                qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
-                // Session-local /turns override wins over agent and config caps.
-                qcfg.max_turns_override = app.max_turns_override;
-                // Auto-compact is a maintenance turn, not a goal turn: never let
-                // it trigger in-loop goal continuation.
-                qcfg.continuation = claurst_query::ContinuationMode::Default;
-                let tracker = cost_tracker.clone();
-                let tx = event_tx.clone();
-                let client_clone = client.clone();
-                app.is_streaming = true;
-
-                let handle = tokio::spawn(async move {
-                    let mut msgs = msgs_arc_clone.lock().await.clone();
-                    let outcome = claurst_query::run_query_loop(
-                        client_clone.as_ref(),
-                        &mut msgs,
-                        tools_arc_clone.as_slice(),
-                        &ctx_clone,
-                        &qcfg,
-                        tracker,
-                        Some(tx),
-                        ct,
-                        None,
-                    )
-                    .await;
-                    *msgs_arc_clone.lock().await = msgs;
-                    outcome
-                });
-                current_query = Some((handle, msgs_arc));
-            }
         }
 
         // Drain TUI-facing bridge events.
@@ -4172,12 +4173,6 @@ async fn run_interactive(
                     app.prompt_input.cursor = app.prompt_input.text.len();
                     app.pending_auto_submit = true;
                 }
-                if app.auto_compact_running {
-                    app.auto_compact_running = false;
-                    // After auto-compact the context was summarised — reset usage.
-                    app.context_used_tokens = 0;
-                    app.status_message = Some("Auto-compact complete.".to_string());
-                }
 
                 // Save session to JSONL (primary storage)
                 let _ = claurst_core::history::save_session(&session).await;
@@ -4324,27 +4319,53 @@ async fn run_interactive(
                 &app.mcp_session_trusted,
                 &store,
             );
-            let new_mcp_manager = connect_mcp_manager_arc(&decision.allowed).await;
+            let new_mcp_manager = start_mcp_manager(&decision.allowed);
             tool_ctx.mcp_manager = new_mcp_manager.clone();
             app.mcp_manager = new_mcp_manager.clone();
-            tools_arc = build_tools_with_mcp(new_mcp_manager.clone());
+            // Read the generation before building: a connect task that bumps
+            // it in between then still triggers a rebuild in the idle block.
+            mcp_seen_generation = new_mcp_manager.as_ref().map(|manager| manager.generation());
+            tools_arc = tools_for_session(new_mcp_manager.clone(), &base_query_config);
+            mcp_reported_failures.clear();
             if app.mcp_view.visible {
                 app.refresh_mcp_view();
             }
 
-            let connected = new_mcp_manager
-                .as_ref()
-                .map(|manager| manager.server_count())
-                .unwrap_or(0);
             app.status_message = Some(if cmd_ctx.config.mcp_servers.is_empty() {
                 "No MCP servers configured.".to_string()
             } else {
+                let starting = decision.allowed.len();
                 format!(
-                    "Reconnected MCP runtime ({} connected server{}).",
-                    connected,
-                    if connected == 1 { "" } else { "s" }
+                    "Reconnecting MCP runtime ({} server{})...",
+                    starting,
+                    if starting == 1 { "" } else { "s" }
                 )
             });
+        }
+
+        // MCP servers connect in the background and may change their tool
+        // lists at runtime (`tools/list_changed`). Rebuild the tool list
+        // between turns whenever the manager reports a change, and surface
+        // servers that failed to start.
+        if !app.is_streaming && current_query.is_none() {
+            if let Some(manager) = tool_ctx.mcp_manager.clone() {
+                let generation = manager.generation();
+                if mcp_seen_generation != Some(generation) {
+                    mcp_seen_generation = Some(generation);
+                    tools_arc = tools_for_session(Some(manager.clone()), &base_query_config);
+                    if app.mcp_view.visible {
+                        app.refresh_mcp_view();
+                    }
+                    for (server, error) in manager.failed_servers() {
+                        if mcp_reported_failures.insert(server.clone()) {
+                            app.status_message = Some(format!(
+                                "MCP server '{}' failed to start: {} (see /mcp)",
+                                server, error
+                            ));
+                        }
+                    }
+                }
+            }
         }
 
         // Prompt for any project-defined MCP servers awaiting approval (#123).

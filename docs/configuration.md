@@ -128,6 +128,7 @@ The `config` object holds runtime behaviour options.
 | `max_tokens` | integer \| null | 8192 | Maximum tokens per model response. |
 | `provider` | string \| null | `"anthropic"` | Active provider. See the [Providers](#providers) section. |
 | `effort` | string \| null | unset | Reasoning effort for new turns: `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`, or `"ultracode"`. When unset, no thinking-budget or temperature override is applied at all — this is not the same as `"medium"`, which has its own explicit values. |
+| `maxRetries` | integer \| null | null (5) | Retries after a model request fails transiently: HTTP 408/409/425/429/5xx, dropped connections, and streams that stall or end before completion. Waits follow the server's `retry-after-ms` / `Retry-After` header, otherwise exponential back-off with jitter, each capped at 60 s. Auth, quota/billing and invalid-request errors are never retried. `0` disables retrying. Note the camelCase key. |
 | `degradationSummaryEnabled` | boolean \| null | null (on) | When set to `false`, exceeding `max_turns` returns the last assistant message immediately instead of running one final tool-less degradation summary turn. Applies to sub-agents as well. Unset means enabled. Note the camelCase key. |
 
 ### Permission mode
@@ -171,7 +172,7 @@ See [Permission Modes](#permission-modes) for a full description of each value.
 
 Tool names match the internal names: `Bash`, `Read`, `Write`, `Edit`, `Glob`,
 `Grep`, `WebSearch`, `WebFetch`, `TodoWrite`, `TodoRead`, and MCP tool names
-prefixed with their server name (`myserver_toolname`).
+in the form `mcp__<server>__<tool>` (see [MCP tool names](mcp.md#mcp-tool-names)).
 
 ### Directory access
 

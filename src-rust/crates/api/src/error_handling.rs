@@ -7,9 +7,8 @@
 //  - `parse_error_response`: converts an HTTP status + body into the correct
 //    `ProviderError` variant, including overflow detection and JSON code
 //    extraction.
-//  - `RetryConfig`: exponential back-off configuration with jitter.
-
-use std::time::Duration;
+//
+// Retry policy (classification, back-off, Retry-After) lives in `retry.rs`.
 
 use claurst_core::provider_id::ProviderId;
 
@@ -27,6 +26,7 @@ static OVERFLOW_PATTERNS: &[&str] = &[
     "exceeds the context window",
     "maximum context length",
     "input token count.*exceeds the maximum",
+    "exceeds the maximum number of tokens allowed",
     "maximum prompt length is",
     "reduce the length of the messages",
     "maximum context length is.*tokens",
@@ -63,6 +63,10 @@ static OVERFLOW_PATTERNS: &[&str] = &[
 /// simple substring matching is sufficient.
 pub fn is_context_overflow(message: &str) -> bool {
     let lower = message.to_lowercase();
+    // Rate limits ("too many tokens per minute") are transient, not overflow.
+    if lower.contains("rate limit") || lower.contains("rate_limit") || lower.contains("per minute") {
+        return false;
+    }
     OVERFLOW_PATTERNS
         .iter()
         .any(|pattern| lower.contains(&pattern.to_lowercase()))
@@ -140,6 +144,12 @@ pub fn parse_error_response(status: u16, body: &str, provider: &ProviderId) -> P
             model: "unknown".to_string(),
             suggestions: vec![],
         },
+        // A 429 that names quota / billing exhaustion is not a transient
+        // throttle; classify it so it is never retried.
+        429 if crate::retry::is_fatal_message(&message) => ProviderError::QuotaExceeded {
+            provider: provider.clone(),
+            message,
+        },
         429 => ProviderError::RateLimited {
             provider: provider.clone(),
             retry_after: None,
@@ -149,11 +159,12 @@ pub fn parse_error_response(status: u16, body: &str, provider: &ProviderId) -> P
             message: "Request too large (413)".to_string(),
             max_tokens: None,
         },
-        500..=599 => ProviderError::ServerError {
+        408 | 409 | 425 | 500..=599 => ProviderError::ServerError {
             provider: provider.clone(),
             status: Some(status),
             message,
-            is_retryable: true,
+            is_retryable: crate::retry::is_retryable_status(status),
+            retry_after: None,
         },
         _ => ProviderError::Other {
             provider: provider.clone(),
@@ -229,57 +240,6 @@ fn extract_token_limit(text: &str) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
-// RetryConfig
-// ---------------------------------------------------------------------------
-
-/// Exponential back-off configuration for provider retries.
-#[derive(Debug, Clone)]
-pub struct RetryConfig {
-    /// Maximum number of retry attempts.
-    pub max_retries: u32,
-    /// Delay before the first retry.
-    pub initial_delay: Duration,
-    /// Upper bound on per-attempt delay.
-    pub max_delay: Duration,
-    /// Multiplicative factor applied at each attempt.
-    pub backoff_multiplier: f64,
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            max_retries: 5,
-            initial_delay: Duration::from_secs(1),
-            max_delay: Duration::from_secs(60),
-            backoff_multiplier: 2.0,
-        }
-    }
-}
-
-impl RetryConfig {
-    /// Compute the delay for a given `attempt` number (0-indexed).
-    ///
-    /// Applies exponential back-off with ±10 % jitter derived from the
-    /// current system time (no external `rand` dependency required).
-    pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
-        let base = self.initial_delay.as_secs_f64()
-            * self.backoff_multiplier.powi(attempt as i32);
-        let jitter = base * 0.1 * time_jitter_f64();
-        Duration::from_secs_f64((base + jitter).min(self.max_delay.as_secs_f64()))
-    }
-}
-
-/// Returns a deterministic-ish value in `[0, 1)` derived from the current
-/// system time nanoseconds.  Used for retry jitter without pulling in `rand`.
-fn time_jitter_f64() -> f64 {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    (nanos % 100) as f64 / 100.0
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -290,6 +250,18 @@ mod tests {
     #[test]
     fn test_is_context_overflow_basic() {
         assert!(is_context_overflow("prompt is too long for this model"));
+        // Google Gemini.
+        assert!(is_context_overflow(
+            "The input token count (1200000) exceeds the maximum number of tokens allowed (1048576)."
+        ));
+        // OpenAI-compatible.
+        assert!(is_context_overflow(
+            "This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens."
+        ));
+        // A rate limit that mentions tokens is not an overflow.
+        assert!(!is_context_overflow(
+            "Rate limit reached: too many tokens per minute (TPM)"
+        ));
         assert!(is_context_overflow("This exceeds the context window"));
         assert!(is_context_overflow("Maximum context length exceeded"));
         assert!(!is_context_overflow("something else went wrong"));
@@ -317,20 +289,38 @@ mod tests {
     }
 
     #[test]
-    fn test_retry_config_delay_increases() {
-        let cfg = RetryConfig::default();
-        let d0 = cfg.delay_for_attempt(0);
-        let d1 = cfg.delay_for_attempt(1);
-        let d2 = cfg.delay_for_attempt(2);
-        // Each attempt should be strictly larger than the previous.
-        assert!(d1 >= d0, "d1={:?} should be >= d0={:?}", d1, d0);
-        assert!(d2 >= d1, "d2={:?} should be >= d1={:?}", d2, d1);
+    fn test_parse_error_response_quota_429_is_not_rate_limit() {
+        let pid = ProviderId::new("openai");
+        let err = parse_error_response(
+            429,
+            r#"{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}"#,
+            &pid,
+        );
+        assert!(matches!(err, ProviderError::QuotaExceeded { .. }));
     }
 
     #[test]
-    fn test_retry_config_respects_max_delay() {
-        let cfg = RetryConfig::default();
-        let d10 = cfg.delay_for_attempt(10);
-        assert!(d10 <= cfg.max_delay + Duration::from_millis(1));
+    fn test_parse_error_response_throttle_mentioning_billing_is_rate_limit() {
+        let pid = ProviderId::new("google");
+        let err = parse_error_response(
+            429,
+            r#"{"error":{"message":"Resource has been exhausted. Please check your plan and billing details."}}"#,
+            &pid,
+        );
+        assert!(matches!(err, ProviderError::RateLimited { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn test_parse_error_response_transient_statuses() {
+        let pid = ProviderId::new("openai");
+        for status in [408, 409, 425, 500, 502, 503, 504] {
+            let err = parse_error_response(status, "try later", &pid);
+            assert!(
+                matches!(err, ProviderError::ServerError { is_retryable: true, .. }),
+                "{status} should map to a retryable ServerError, got {err:?}"
+            );
+        }
+        let err = parse_error_response(501, "not implemented", &pid);
+        assert!(matches!(err, ProviderError::ServerError { is_retryable: false, .. }));
     }
 }

@@ -121,7 +121,12 @@ pub mod error {
         Api(String),
 
         #[error("API error {status}: {message}")]
-        ApiStatus { status: u16, message: String },
+        ApiStatus {
+            status: u16,
+            message: String,
+            /// Server-requested wait (`retry-after-ms` / `Retry-After`), if any.
+            retry_after: Option<std::time::Duration>,
+        },
 
         #[error("Authentication error: {0}")]
         Auth(String),
@@ -167,16 +172,6 @@ pub mod error {
     pub type Result<T> = std::result::Result<T, ClaudeError>;
 
     impl ClaudeError {
-        /// Return `true` when the caller should retry the request.
-        pub fn is_retryable(&self) -> bool {
-            matches!(
-                self,
-                ClaudeError::RateLimit
-                    | ClaudeError::ApiStatus { status: 429, .. }
-                    | ClaudeError::ApiStatus { status: 529, .. }
-            )
-        }
-
         /// Return `true` for errors that mean the conversation cannot continue
         /// without intervention (e.g. compaction or context-window reset).
         pub fn is_context_limit(&self) -> bool {
@@ -1120,6 +1115,16 @@ pub mod config {
             skip_serializing_if = "Option::is_none"
         )]
         pub request_timeout_secs: Option<u64>,
+        /// Retries allowed after a model request fails transiently (HTTP
+        /// 408/409/425/429/5xx, dropped connections, truncated streams).
+        /// `None` uses the default of 5; `0` disables retrying.
+        #[serde(
+            default,
+            rename = "maxRetries",
+            alias = "max_retries",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub max_retries: Option<u32>,
         /// Whether app-level mouse capture is enabled. `None` (default) or
         /// `Some(true)` means claurst captures the mouse for scroll / right-click
         /// context menu / middle-click paste / drag text-selection. Set
@@ -1299,6 +1304,19 @@ pub mod config {
         pub url: Option<String>,
         #[serde(rename = "type", default = "default_mcp_type")]
         pub server_type: String,
+        /// Extra HTTP headers sent with every request to an `http`/`sse`
+        /// server. Values support `${VAR}` expansion. An `Authorization`
+        /// header here replaces the stored OAuth token.
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        pub headers: HashMap<String, String>,
+        /// Bound on spawning/opening the transport and the `initialize`
+        /// handshake, in milliseconds. `None` uses the 10 s default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub connect_timeout_ms: Option<u64>,
+        /// Bound on each catalog request (`tools/list`, `resources/list`,
+        /// `prompts/list`), in milliseconds. `None` uses the 30 s default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub catalog_timeout_ms: Option<u64>,
         /// Origin of this definition. Never read from JSON (always `User` on
         /// deserialize); set to `Project` in `find_project_settings` for
         /// servers loaded from a repo. See [`McpServerOrigin`].
@@ -2156,6 +2174,7 @@ pub mod config {
                 file_injection_enabled: over.config.file_injection_enabled || base.config.file_injection_enabled,
                 file_injection_max_size: if over.config.file_injection_max_size != 0 { over.config.file_injection_max_size } else { base.config.file_injection_max_size },
                 request_timeout_secs: over.config.request_timeout_secs.or(base.config.request_timeout_secs),
+                max_retries: over.config.max_retries.or(base.config.max_retries),
                 // SECURITY: only the user's global settings may define a status_line
                 // command. A project's settings file must NOT be able to inject an
                 // arbitrary shell command — otherwise cloning a malicious repo would
@@ -2951,8 +2970,10 @@ pub mod permissions {
     /// A single permission rule.
     ///
     /// Matches requests where:
-    ///   - `tool_name` is `None` (applies to every tool) OR equals the
-    ///     request tool name.
+    ///   - `tool_name` is `None` (applies to every tool), equals the request
+    ///     tool name, or is a server-wide MCP rule (`mcp__<server>` or
+    ///     `mcp__<server>__*`) and the request is one of that server's
+    ///     `mcp__<server>__<tool>` tools.
     ///   - `path_pattern` is `None` OR the glob pattern matches the
     ///     request path.
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2971,7 +2992,7 @@ pub mod permissions {
         pub fn matches(&self, tool_name: &str, path: Option<&str>) -> bool {
             // Tool name check
             if let Some(ref rule_tool) = self.tool_name {
-                if rule_tool != tool_name {
+                if rule_tool != tool_name && !mcp_server_rule_matches(rule_tool, tool_name) {
                     return false;
                 }
             }
@@ -2991,6 +3012,24 @@ pub mod permissions {
             }
             true
         }
+    }
+
+    /// `true` when `rule_tool` is a server-wide MCP rule (`mcp__<server>` or
+    /// `mcp__<server>__*`) and `tool_name` is one of that server's exposed
+    /// `mcp__<server>__<tool>` names. `<server>` is the sanitized server name
+    /// as it appears in the exposed tool names.
+    fn mcp_server_rule_matches(rule_tool: &str, tool_name: &str) -> bool {
+        let Some(rule_server) = rule_tool.strip_prefix("mcp__") else {
+            return false;
+        };
+        let rule_server = rule_server.strip_suffix("__*").unwrap_or(rule_server);
+        if rule_server.is_empty() || rule_server.contains("__") {
+            return false;
+        }
+        tool_name
+            .strip_prefix("mcp__")
+            .and_then(|rest| rest.strip_prefix(rule_server))
+            .is_some_and(|rest| rest.starts_with("__") && rest.len() > 2)
     }
 
     /// The canonical form of an absolute glob whose literal directory prefix
@@ -3737,6 +3776,29 @@ pub mod permissions {
         }
 
         #[test]
+        fn mcp_server_wide_rules_match_that_servers_tools_only() {
+            let rule = |tool: &str| PermissionRule {
+                tool_name: Some(tool.to_string()),
+                path_pattern: None,
+                action: PermissionAction::Allow,
+                scope: PermissionScope::Session,
+            };
+            for server_rule in ["mcp__git", "mcp__git__*"] {
+                let r = rule(server_rule);
+                assert!(r.matches("mcp__git__status", None), "{server_rule}");
+                assert!(r.matches("mcp__git__lab_status", None), "{server_rule}");
+                assert!(!r.matches("mcp__git_lab__status", None), "{server_rule}");
+                assert!(!r.matches("mcp__git__", None), "{server_rule}");
+                assert!(!r.matches("git_status", None), "{server_rule}");
+                assert!(!r.matches("Bash", None), "{server_rule}");
+            }
+            // An exact tool rule still matches only that tool.
+            let exact = rule("mcp__git__status");
+            assert!(exact.matches("mcp__git__status", None));
+            assert!(!exact.matches("mcp__git__diff", None));
+        }
+
+        #[test]
         fn plan_denies_writes() {
             let m = mgr(PermissionMode::Plan);
             assert_eq!(
@@ -3903,6 +3965,37 @@ pub mod history {
         pub snapshot: Vec<Message>,
     }
 
+    /// What started a compaction of the session history.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum CompactionTrigger {
+        /// The projected context crossed the auto-compact threshold.
+        Threshold,
+        /// The provider rejected a request for exceeding the context window.
+        Overflow,
+        /// The user ran `/compact`.
+        Manual,
+    }
+
+    /// One compaction of the session history (issue #441). The head of the
+    /// history was replaced by the summary message whose uuid is
+    /// `summary_uuid`; this entry records when, why and how much it saved.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct CompactionRecord {
+        pub at: chrono::DateTime<chrono::Utc>,
+        pub trigger: CompactionTrigger,
+        /// uuid of the summary message now at the head of the history.
+        pub summary_uuid: String,
+        pub messages_before: usize,
+        pub messages_after: usize,
+        /// Estimated context tokens before and after (chars / 4 heuristic).
+        pub tokens_before: u64,
+        pub tokens_after: u64,
+        /// `false` when the summariser failed and the head was dropped to
+        /// recover from a context-window error, keeping only the untouched tail.
+        pub summarised: bool,
+    }
+
     /// A single persisted conversation session.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ConversationSession {
@@ -3940,6 +4033,9 @@ pub mod history {
         /// Message index in the parent session at which this fork was created.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub fork_point_message_index: Option<usize>,
+        /// Compactions applied to `messages`, oldest first.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub compactions: Vec<CompactionRecord>,
     }
 
     impl ConversationSession {
@@ -3962,6 +4058,7 @@ pub mod history {
                 checkpoints: vec![],
                 parent_session_id: None,
                 fork_point_message_index: None,
+                compactions: vec![],
             }
         }
 
@@ -4143,6 +4240,7 @@ pub mod history {
             checkpoints: vec![],
             parent_session_id: None,
             fork_point_message_index: None,
+            compactions: vec![],
         };
         save_session(&branched).await?;
         Ok(branched)
@@ -5226,6 +5324,9 @@ mod tests {
             env: std::collections::HashMap::new(),
             url: None,
             server_type: "stdio".to_string(),
+            headers: Default::default(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
             origin: McpServerOrigin::User,
         });
         let json = serde_json::to_string_pretty(&project).unwrap();
@@ -5256,17 +5357,6 @@ mod tests {
         assert_eq!(tracker.input_tokens(), 1000);
         assert_eq!(tracker.output_tokens(), 500);
         assert!(tracker.total_cost_usd() > 0.0);
-    }
-
-    #[test]
-    fn test_error_retryable() {
-        assert!(ClaudeError::RateLimit.is_retryable());
-        assert!(ClaudeError::ApiStatus {
-            status: 429,
-            message: "rate limited".into()
-        }
-        .is_retryable());
-        assert!(!ClaudeError::Auth("bad key".into()).is_retryable());
     }
 
     // ---- Config tests -------------------------------------------------------

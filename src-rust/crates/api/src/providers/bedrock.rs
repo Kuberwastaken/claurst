@@ -458,8 +458,9 @@ impl BedrockProvider {
 
         let status = resp.status().as_u16();
         if !(200..300).contains(&(status as usize)) {
+            let retry_after = crate::retry::retry_after(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            return Err(self.map_http_error(status, &text));
+            return Err(self.map_http_error(status, &text).with_retry_after(retry_after));
         }
 
         Ok(resp)
@@ -947,12 +948,25 @@ fn parse_bedrock_event(
         return events;
     }
 
-    // internalServerException / throttlingException
+    // validationException: the request itself is invalid; never retried.
+    if let Some(err) = val.get("validationException") {
+        let message = err
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown Bedrock validation error")
+            .to_string();
+        events.push(Err(ProviderError::InvalidRequest {
+            provider: provider_id.clone(),
+            message,
+        }));
+        return events;
+    }
+
+    // internalServerException / throttlingException / modelStreamErrorException
     if let Some(err) = val
         .get("internalServerException")
         .or_else(|| val.get("throttlingException"))
         .or_else(|| val.get("modelStreamErrorException"))
-        .or_else(|| val.get("validationException"))
     {
         let message = err
             .get("message")

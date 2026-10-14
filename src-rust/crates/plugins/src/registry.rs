@@ -195,6 +195,9 @@ impl PluginRegistry {
                     env: mcp.env.clone(),
                     url: mcp.url.clone(),
                     server_type: mcp.server_type.clone(),
+                    headers: Default::default(),
+                    connect_timeout_ms: None,
+                    catalog_timeout_ms: None,
                     // Plugins are enabled explicitly by the user: trusted.
                     origin: Default::default(),
                 });

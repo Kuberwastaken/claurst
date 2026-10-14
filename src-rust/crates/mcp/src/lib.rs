@@ -11,26 +11,26 @@
 // - Prompt templates (prompts/list, prompts/get)
 // - Transport: stdio (subprocess) and HTTP/SSE
 // - Environment variable expansion in server configs
-// - Connection manager with exponential-backoff reconnection
+// - Concurrent startup with per-server connect/catalog timeouts and a bounded
+//   retry for remote transports
 
 use async_trait::async_trait;
 use claurst_core::config::McpServerConfig;
 use claurst_core::mcp_templates::TemplateRenderer;
-use claurst_core::types::ToolDefinition;
+use claurst_core::types::{ContentBlock, ImageSource, ToolDefinition};
 use dashmap::DashMap;
 use futures::stream::{BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 pub use client::McpClient;
 pub use types::*;
-pub use connection_manager::{McpConnectionManager, McpServerStatus};
 
 pub mod backend;
-pub mod connection_manager;
 pub mod registry;
 pub mod oauth;
 pub mod rmcp_backend;
@@ -102,10 +102,221 @@ pub fn expand_server_config(config: &McpServerConfig) -> McpServerConfig {
             .collect(),
         url: config.url.as_deref().map(expand_env_vars),
         server_type: config.server_type.clone(),
+        headers: config
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), expand_env_vars(v)))
+            .collect(),
+        connect_timeout_ms: config.connect_timeout_ms,
+        catalog_timeout_ms: config.catalog_timeout_ms,
         // Preserve origin: expansion must not launder a project server into
         // a trusted one.
         origin: config.origin,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Timeouts and connection status
+// ---------------------------------------------------------------------------
+
+/// Per-server bounds on startup work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpTimeouts {
+    /// Spawning/opening the transport plus the `initialize` handshake. Every
+    /// connect attempt for a server (including protocol-version fallbacks)
+    /// shares this one deadline.
+    pub connect: Duration,
+    /// Each catalog request (`tools/list`, `resources/list`, `prompts/list`).
+    pub catalog: Duration,
+}
+
+impl McpTimeouts {
+    pub const DEFAULT_CONNECT: Duration = Duration::from_secs(10);
+    pub const DEFAULT_CATALOG: Duration = Duration::from_secs(30);
+
+    pub fn for_config(config: &McpServerConfig) -> Self {
+        Self {
+            connect: config
+                .connect_timeout_ms
+                .map(Duration::from_millis)
+                .unwrap_or(Self::DEFAULT_CONNECT),
+            catalog: config
+                .catalog_timeout_ms
+                .map(Duration::from_millis)
+                .unwrap_or(Self::DEFAULT_CATALOG),
+        }
+    }
+}
+
+impl Default for McpTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Self::DEFAULT_CONNECT,
+            catalog: Self::DEFAULT_CATALOG,
+        }
+    }
+}
+
+/// A startup step that did not finish within its [`McpTimeouts`] bound.
+#[derive(Debug, thiserror::Error)]
+#[error("MCP server '{server}': {phase} timed out after {}s", .after.as_secs_f32())]
+pub struct McpTimeoutError {
+    pub server: String,
+    pub phase: &'static str,
+    pub after: Duration,
+}
+
+/// Live connection status for a single MCP server.
+#[derive(Debug, Clone)]
+pub enum McpServerStatus {
+    /// Successfully connected; reports how many tools were discovered.
+    Connected { tool_count: usize },
+    /// Connection attempt in progress.
+    Connecting,
+    /// Not connected. `last_error` is set when the final connect attempt failed.
+    Disconnected { last_error: Option<String> },
+    /// A connect attempt failed and another attempt is scheduled at `retry_at`.
+    Failed { error: String, retry_at: Instant },
+}
+
+impl McpServerStatus {
+    /// Human-readable one-liner for display in `/mcp status`.
+    pub fn display(&self) -> String {
+        match self {
+            McpServerStatus::Connected { tool_count } => {
+                format!("connected ({} tool{})", tool_count, if *tool_count == 1 { "" } else { "s" })
+            }
+            McpServerStatus::Connecting => "connecting…".to_string(),
+            McpServerStatus::Disconnected { last_error: None } => "disconnected".to_string(),
+            McpServerStatus::Disconnected { last_error: Some(e) } => {
+                format!("failed ({})", e)
+            }
+            McpServerStatus::Failed { error, retry_at } => {
+                let secs = retry_at.saturating_duration_since(Instant::now()).as_secs();
+                format!("failed – {} (retry in {}s)", error, secs)
+            }
+        }
+    }
+
+    /// `true` while the server's startup outcome is still open.
+    pub fn is_pending(&self) -> bool {
+        matches!(self, McpServerStatus::Connecting | McpServerStatus::Failed { .. })
+    }
+}
+
+/// Counts of servers still starting and servers that failed for good.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct McpStatusSummary {
+    pub connecting: usize,
+    pub failed: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Tool naming and routing
+// ---------------------------------------------------------------------------
+
+/// Prefix of every MCP tool name exposed to the model: `mcp__<server>__<tool>`.
+pub const MCP_TOOL_PREFIX: &str = "mcp__";
+
+/// Longest exposed tool name. OpenAI-compatible and Gemini APIs cap function
+/// names at 64 characters; Anthropic allows 128.
+pub const MAX_MCP_TOOL_NAME_LEN: usize = 64;
+
+/// One MCP tool as exposed to the model.
+#[derive(Debug, Clone)]
+pub struct McpToolEntry {
+    pub server_name: String,
+    /// The tool's own name on its server.
+    pub tool_name: String,
+    /// Definition under the exposed `mcp__<server>__<tool>` name.
+    pub definition: ToolDefinition,
+}
+
+/// Replace every character outside `[A-Za-z0-9_-]` (the set every provider
+/// accepts in a tool name) with `_`. An empty input becomes `_`.
+pub fn sanitize_tool_name_part(raw: &str) -> String {
+    let sanitized: String = raw
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    if sanitized.is_empty() {
+        "_".to_string()
+    } else {
+        sanitized
+    }
+}
+
+/// The exposed name for `tool` on `server`, unique within `used`.
+///
+/// Normally `mcp__<server>__<tool>` with both parts sanitized. When that is
+/// longer than [`MAX_MCP_TOOL_NAME_LEN`], already taken, or `force_hash` is
+/// set (the server's sanitized name is shared with another configured
+/// server), it is truncated and suffixed with a hash of the raw
+/// `(server, tool)` pair. Calls are routed through the manager's map from
+/// exposed name to `(server, tool)`, never by parsing the name back.
+fn exposed_tool_name(
+    server: &str,
+    tool: &str,
+    force_hash: bool,
+    used: &mut std::collections::HashSet<String>,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let base = format!(
+        "{}{}__{}",
+        MCP_TOOL_PREFIX,
+        sanitize_tool_name_part(server),
+        sanitize_tool_name_part(tool)
+    );
+    if !force_hash && base.len() <= MAX_MCP_TOOL_NAME_LEN && used.insert(base.clone()) {
+        return base;
+    }
+    let mut attempt: u32 = 0;
+    loop {
+        let mut hasher = Sha256::new();
+        hasher.update(server.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(tool.as_bytes());
+        if attempt > 0 {
+            hasher.update(attempt.to_le_bytes());
+        }
+        let digest = hasher.finalize();
+        let suffix: String = digest[..4].iter().map(|b| format!("{:02x}", b)).collect();
+        // `base` is ASCII after sanitization, so byte truncation is char-safe.
+        let keep = (MAX_MCP_TOOL_NAME_LEN - suffix.len() - 1).min(base.len());
+        let candidate = format!("{}_{}", &base[..keep], suffix);
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+        attempt += 1;
+    }
+}
+
+/// Exposed tool entries for `clients` (sorted by server name), in a stable
+/// order: servers by name, tools in server order. Servers in
+/// `ambiguous_servers` always get hashed names.
+fn build_tool_entries(
+    clients: &[(String, Arc<McpClient>)],
+    ambiguous_servers: &std::collections::HashSet<String>,
+) -> Vec<McpToolEntry> {
+    let mut used = std::collections::HashSet::new();
+    let mut entries = Vec::new();
+    for (server_name, client) in clients {
+        let force_hash = ambiguous_servers.contains(server_name);
+        for tool in &client.tools {
+            let name = exposed_tool_name(server_name, &tool.name, force_hash, &mut used);
+            entries.push(McpToolEntry {
+                server_name: server_name.clone(),
+                tool_name: tool.name.clone(),
+                definition: ToolDefinition {
+                    name,
+                    description: tool.description.clone().unwrap_or_default(),
+                    input_schema: tool.input_schema.clone(),
+                },
+            });
+        }
+    }
+    entries
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +462,10 @@ pub mod types {
     #[serde(rename_all = "camelCase")]
     pub struct CallToolResult {
         pub content: Vec<McpContent>,
+        /// Structured result (`structuredContent`). Per the MCP spec, any text
+        /// content alongside it is a serialization of the same value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub structured_content: Option<Value>,
         #[serde(default)]
         pub is_error: bool,
     }
@@ -588,13 +803,37 @@ pub mod client {
                 .ok_or_else(|| anyhow::anyhow!("MCP client backend missing"))
         }
 
-        pub async fn connect(config: &McpServerConfig, auth_token: Option<String>) -> anyhow::Result<Self> {
+        /// Connect and load the catalog. The transport and handshake share one
+        /// deadline of `timeouts.connect`; each catalog request is bounded by
+        /// `timeouts.catalog`. The `config` should already have env vars
+        /// expanded via `expand_server_config`.
+        pub async fn connect(
+            config: &McpServerConfig,
+            auth_token: Option<String>,
+            timeouts: McpTimeouts,
+        ) -> anyhow::Result<Self> {
+            let deadline = tokio::time::Instant::now() + timeouts.connect;
+            // An explicit `Authorization` header wins over the stored token.
+            let auth_token = auth_token.filter(|_| {
+                !config
+                    .headers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case("authorization"))
+            });
             match config.server_type.as_str() {
-                "stdio" => Self::connect_stdio(config).await,
+                "stdio" => {
+                    let backend = crate::rmcp_backend::RmcpClientBackend::connect_stdio(
+                        config, deadline, timeouts,
+                    )
+                    .await?;
+                    Ok(Self::from_backend(Arc::new(backend)))
+                }
                 "sse" => {
                     let backend = crate::rmcp_backend::RmcpClientBackend::connect_legacy_sse(
                         config,
                         auth_token,
+                        deadline,
+                        timeouts,
                     )
                     .await?;
                     Ok(Self::from_backend(Arc::new(backend)))
@@ -618,6 +857,8 @@ pub mod client {
                             config,
                             auth_token.clone(),
                             protocol_version,
+                            deadline,
+                            timeouts,
                         )
                         .await
                         {
@@ -662,13 +903,6 @@ pub mod client {
                 || lower.contains("unsupported mcp-protocol-version")
                 || (lower.contains("protocol version") && lower.contains("unsupported"))
                 || (lower.contains("mcp-protocol-version") && lower.contains("bad request"))
-        }
-
-        /// Connect to an MCP server using stdio transport. The `config` should
-        /// already have env vars expanded via `expand_server_config`.
-        pub async fn connect_stdio(config: &McpServerConfig) -> anyhow::Result<Self> {
-            let backend = crate::rmcp_backend::RmcpClientBackend::connect_stdio(config).await?;
-            Ok(Self::from_backend(Arc::new(backend)))
         }
 
         // ---- High-level API -----------------------------------------------
@@ -732,71 +966,24 @@ pub mod client {
         }
 
         /// Subscribe to raw JSON notifications from the active backend.
-        pub fn subscribe_to_notifications(&self) -> BoxStream<'static, anyhow::Result<serde_json::Value>> {
-            self.backend()
-                .expect("MCP client backend missing")
-                .subscribe_to_notifications()
+        pub fn subscribe_to_notifications(
+            &self,
+        ) -> anyhow::Result<BoxStream<'static, anyhow::Result<serde_json::Value>>> {
+            Ok(self.backend()?.subscribe_to_notifications())
         }
 
-        // ---- Notification dispatch ----------------------------------------
-
-        /// Process a single notification message from the transport stream.
-        /// Routes resource updates to subscribers and logs other notifications.
-        pub(crate) async fn process_notification(
-            &self,
-            raw: serde_json::Value,
-            resource_subscriptions: &dashmap::DashMap<
-                (String, String),
-                tokio::sync::mpsc::Sender<ResourceChangedEvent>,
-            >,
-        ) {
-            // Only process server-initiated notifications (have "method", no non-null "id")
-            let has_method = raw.get("method").is_some();
-            let has_id = raw.get("id").map(|v| !v.is_null()).unwrap_or(false);
-            if !has_method || has_id {
-                // This is an RPC response, not a notification — skip it.
-                debug!(
-                    server = %self.server_name,
-                    "process_notification: skipping non-notification message"
-                );
-                return;
-            }
-
-            let method = raw["method"].as_str().unwrap_or("");
-            match method {
-                "notifications/resources/updated" => {
-                    let uri = raw["params"]["uri"].as_str().unwrap_or("").to_string();
-                    let key = (self.server_name.clone(), uri.clone());
-                    if let Some(tx) = resource_subscriptions.get(&key) {
-                        let event = ResourceChangedEvent {
-                            server_name: self.server_name.clone(),
-                            uri,
-                        };
-                        if let Err(e) = tx.send(event).await {
-                            debug!(
-                                server = %self.server_name,
-                                error = %e,
-                                "process_notification: resource subscription receiver dropped"
-                            );
-                        }
-                    } else {
-                        debug!(
-                            server = %self.server_name,
-                            uri = %raw["params"]["uri"],
-                            "process_notification: no subscriber for resource update"
-                        );
-                    }
-                }
-                "notifications/tools/list_changed" => {
-                    info!(server = %self.server_name, "MCP tools list changed");
-                }
-                other => {
-                    debug!(
-                        server = %self.server_name,
-                        method = %other,
-                        "Unhandled MCP notification"
-                    );
-                }
+        /// A copy of this client with a refreshed tool list, sharing the same
+        /// live backend session.
+        pub(crate) fn with_tools(&self, tools: Vec<McpTool>) -> Self {
+            Self {
+                server_name: self.server_name.clone(),
+                server_info: self.server_info.clone(),
+                capabilities: self.capabilities.clone(),
+                tools,
+                resources: self.resources.clone(),
+                prompts: self.prompts.clone(),
+                instructions: self.instructions.clone(),
+                backend: self.backend.clone(),
             }
         }
 
@@ -857,14 +1044,53 @@ pub enum McpAuthState {
 // ---------------------------------------------------------------------------
 
 /// Manages a pool of MCP server connections.
+///
+/// [`McpManager::start`] registers every server as connecting and connects
+/// them concurrently in background tasks, so callers (the TUI) never wait on
+/// a slow or hung server. Status and catalog changes bump a generation
+/// counter that callers poll ([`McpManager::generation`]) to rebuild the
+/// tool list; headless callers await [`McpManager::wait_until_settled`].
 pub struct McpManager {
-    clients: HashMap<String, Arc<McpClient>>,
-    /// Servers that failed to connect during `connect_all`.
-    failed_servers: Vec<(String, String)>, // (name, error)
     /// Original (unexpanded) server configs — needed for OAuth initiation.
     server_configs: HashMap<String, McpServerConfig>,
+    state: parking_lot::RwLock<ManagerState>,
+    /// Generation counter, bumped on every status or catalog change.
+    changes: tokio::sync::watch::Sender<u64>,
     /// Active resource subscriptions: (server_name, uri) → change event sender.
     pub resource_subscriptions: DashMap<(String, String), tokio::sync::mpsc::Sender<ResourceChangedEvent>>,
+}
+
+/// Mutable connection state. The lock is never held across an `.await`.
+#[derive(Default)]
+struct ManagerState {
+    clients: HashMap<String, Arc<McpClient>>,
+    statuses: HashMap<String, McpServerStatus>,
+    /// Exposed tools, rebuilt whenever a client or its tool list changes.
+    tools: Vec<McpToolEntry>,
+    /// Exposed tool name → index into `tools`.
+    routes: HashMap<String, usize>,
+    /// Configured servers whose sanitized name collides with another
+    /// configured server's. Fixed at start so exposed names do not depend on
+    /// which of them connected first.
+    ambiguous_servers: std::collections::HashSet<String>,
+}
+
+impl ManagerState {
+    fn rebuild_tools(&mut self) {
+        let mut clients: Vec<(String, Arc<McpClient>)> = self
+            .clients
+            .iter()
+            .map(|(name, client)| (name.clone(), Arc::clone(client)))
+            .collect();
+        clients.sort_by(|a, b| a.0.cmp(&b.0));
+        self.tools = build_tool_entries(&clients, &self.ambiguous_servers);
+        self.routes = self
+            .tools
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.definition.name.clone(), index))
+            .collect();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -876,132 +1102,370 @@ pub struct McpServerCatalog {
     pub prompts: Vec<String>,
 }
 
+/// Remote (`http`/`sse`) connects get this many attempts in total. Stdio
+/// servers get one: a process that fails to start is not a transient fault.
+const MAX_REMOTE_CONNECT_ATTEMPTS: u32 = 3;
+/// Delay before the second remote attempt; doubled for each later attempt.
+const REMOTE_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+
 impl McpManager {
     pub fn new() -> Self {
         Self {
-            clients: HashMap::new(),
-            failed_servers: Vec::new(),
             server_configs: HashMap::new(),
+            state: parking_lot::RwLock::new(ManagerState::default()),
+            changes: tokio::sync::watch::Sender::new(0),
             resource_subscriptions: DashMap::new(),
         }
     }
 
-    /// Connect to all configured MCP servers.
-    ///
-    /// - Expands env vars in each config before connecting.
-    /// - Logs success/failure clearly.
-    /// - Continues on failure (does not bail out on first error).
-    /// - Tracks failed servers in `failed_servers()`.
-    pub async fn connect_all(configs: &[McpServerConfig]) -> Self {
+    /// Register `configs` and connect to every server concurrently in the
+    /// background. Returns immediately; every supported server starts out
+    /// [`McpServerStatus::Connecting`]. Must be called inside a Tokio runtime.
+    pub fn start(configs: &[McpServerConfig]) -> Arc<Self> {
         let mut manager = Self::new();
         for config in configs {
-            // Store original config for later OAuth use
-            manager.server_configs.insert(config.name.clone(), config.clone());
-            // Expand env vars before using the config
-            let expanded = expand_server_config(config);
-
-            match expanded.server_type.as_str() {
-                "stdio" | "sse" | "http" => {
-                    let auth_token = if matches!(expanded.server_type.as_str(), "sse" | "http") {
-                        manager.load_token(&expanded.name).await
-                    } else {
-                        None
-                    };
-                    match client::McpClient::connect(&expanded, auth_token).await {
-                        Ok(client) => {
-                            info!(
-                                server = %expanded.name,
-                                transport = %expanded.server_type,
-                                tools = client.tools.len(),
-                                resources = client.resources.len(),
-                                "MCP server connected"
-                            );
-                            manager.clients.insert(expanded.name.clone(), Arc::new(client));
-                        }
-                        Err(e) => {
-                            error!(
-                                server = %expanded.name,
-                                transport = %expanded.server_type,
-                                error = %e,
-                                "Failed to connect to MCP server"
-                            );
-                            manager
-                                .failed_servers
-                                .push((expanded.name.clone(), e.to_string()));
-                        }
-                    }
-                }
+            let status = match config.server_type.as_str() {
+                "stdio" | "sse" | "http" => McpServerStatus::Connecting,
                 other => {
                     warn!(
-                        server = %expanded.name,
+                        server = %config.name,
                         transport = other,
                         "Unsupported MCP transport type; skipping server"
                     );
-                    manager.failed_servers.push((
-                        expanded.name.clone(),
-                        format!("unsupported transport: {}", other),
-                    ));
+                    McpServerStatus::Disconnected {
+                        last_error: Some(format!("unsupported transport: {}", other)),
+                    }
                 }
-            }
+            };
+            manager.state.get_mut().statuses.insert(config.name.clone(), status);
+            manager.server_configs.insert(config.name.clone(), config.clone());
+        }
+        let mut by_sanitized: HashMap<String, Vec<&String>> = HashMap::new();
+        for name in manager.server_configs.keys() {
+            by_sanitized.entry(sanitize_tool_name_part(name)).or_default().push(name);
+        }
+        let ambiguous: std::collections::HashSet<String> = by_sanitized
+            .into_values()
+            .filter(|names| names.len() > 1)
+            .flatten()
+            .cloned()
+            .collect();
+        manager.state.get_mut().ambiguous_servers = ambiguous;
+
+        let manager = Arc::new(manager);
+        let pending: Vec<McpServerConfig> = manager
+            .server_configs
+            .values()
+            .filter(|config| matches!(config.server_type.as_str(), "stdio" | "sse" | "http"))
+            .cloned()
+            .collect();
+        for config in pending {
+            tokio::spawn(Self::connect_server(Arc::downgrade(&manager), config));
         }
         manager
     }
 
+    /// Connect to all configured MCP servers and wait until each one has
+    /// either connected or failed (bounded by the per-server timeouts).
+    pub async fn connect_all(configs: &[McpServerConfig]) -> Arc<Self> {
+        let manager = Self::start(configs);
+        manager.wait_until_settled().await;
+        manager
+    }
+
+    /// Connect one server: env expansion, connect/catalog timeouts and, for
+    /// remote transports, a bounded retry with backoff. Holds only a weak
+    /// reference so dropping the manager is never delayed by a slow server.
+    async fn connect_server(manager: Weak<Self>, config: McpServerConfig) {
+        let name = config.name.clone();
+        let expanded = expand_server_config(&config);
+        for (header, value) in &expanded.headers {
+            if value.contains("${") {
+                warn!(
+                    server = %name,
+                    header = %header,
+                    "MCP header value still contains an unexpanded ${{VAR}} after expansion"
+                );
+            }
+        }
+        let timeouts = McpTimeouts::for_config(&expanded);
+        let remote = matches!(expanded.server_type.as_str(), "sse" | "http");
+        debug!(server = %name, transport = %expanded.server_type, "Connecting to MCP server");
+
+        let mut attempt = 1;
+        let result = loop {
+            let auth_token = match config.url.as_deref() {
+                Some(server_url) if remote => {
+                    oauth::get_valid_mcp_access_token(&name, server_url)
+                        .await
+                        .ok()
+                        .flatten()
+                }
+                _ => None,
+            };
+            let error = match client::McpClient::connect(&expanded, auth_token, timeouts).await {
+                Ok(client) => break Ok(client),
+                Err(error) => error,
+            };
+            // A timed-out attempt already spent the whole connect budget.
+            let retry = remote
+                && attempt < MAX_REMOTE_CONNECT_ATTEMPTS
+                && error.downcast_ref::<McpTimeoutError>().is_none();
+            if !retry {
+                break Err(error);
+            }
+            let delay = REMOTE_RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
+            warn!(
+                server = %name,
+                attempt,
+                retry_in_ms = delay.as_millis() as u64,
+                error = %error,
+                "MCP connect attempt failed; retrying"
+            );
+            let Some(strong) = manager.upgrade() else { return };
+            strong.set_status(
+                &name,
+                McpServerStatus::Failed {
+                    error: error.to_string(),
+                    retry_at: Instant::now() + delay,
+                },
+            );
+            drop(strong);
+            tokio::time::sleep(delay).await;
+            let Some(strong) = manager.upgrade() else { return };
+            strong.set_status(&name, McpServerStatus::Connecting);
+            attempt += 1;
+        };
+
+        let Some(manager) = manager.upgrade() else { return };
+        match result {
+            Ok(client) => {
+                info!(
+                    server = %name,
+                    transport = %expanded.server_type,
+                    tools = client.tools.len(),
+                    resources = client.resources.len(),
+                    "MCP server connected"
+                );
+                manager.install_client(client);
+            }
+            Err(e) => {
+                error!(
+                    server = %name,
+                    transport = %expanded.server_type,
+                    error = %e,
+                    "Failed to connect to MCP server"
+                );
+                manager.set_status(
+                    &name,
+                    McpServerStatus::Disconnected {
+                        last_error: Some(e.to_string()),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Record a connected client and start listening for its notifications.
+    fn install_client(self: &Arc<Self>, client: McpClient) {
+        let name = client.server_name.clone();
+        let notifications = client.subscribe_to_notifications();
+        let tool_count = client.tools.len();
+        {
+            let mut state = self.state.write();
+            state.clients.insert(name.clone(), Arc::new(client));
+            state
+                .statuses
+                .insert(name.clone(), McpServerStatus::Connected { tool_count });
+            state.rebuild_tools();
+        }
+        self.bump();
+        match notifications {
+            Ok(stream) => {
+                tokio::spawn(Self::listen_for_notifications(Arc::downgrade(self), name, stream));
+            }
+            Err(e) => warn!(server = %name, error = %e, "MCP notifications unavailable"),
+        }
+    }
+
+    /// Route server-initiated notifications until the transport closes or
+    /// the manager is dropped.
+    async fn listen_for_notifications(
+        manager: Weak<Self>,
+        server_name: String,
+        mut stream: BoxStream<'static, anyhow::Result<serde_json::Value>>,
+    ) {
+        while let Some(item) = stream.next().await {
+            let Some(manager) = manager.upgrade() else { break };
+            match item {
+                Ok(raw) => {
+                    let effect =
+                        process_notification(&server_name, raw, &manager.resource_subscriptions).await;
+                    if effect == NotificationEffect::ToolsChanged {
+                        manager.refresh_tools(&server_name).await;
+                    }
+                }
+                Err(e) => {
+                    debug!(server = %server_name, error = %e, "notification stream error");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Re-list a server's tools after `notifications/tools/list_changed`.
+    pub async fn refresh_tools(&self, server_name: &str) {
+        let Some(client) = self.client(server_name) else { return };
+        let catalog = self
+            .server_configs
+            .get(server_name)
+            .map(McpTimeouts::for_config)
+            .unwrap_or_default()
+            .catalog;
+        let tools = match tokio::time::timeout(catalog, client.list_tools()).await {
+            Ok(Ok(tools)) => tools,
+            Ok(Err(e)) => {
+                warn!(server = %server_name, error = %e, "MCP tools refresh failed");
+                return;
+            }
+            Err(_) => {
+                warn!(
+                    server = %server_name,
+                    timeout_secs = catalog.as_secs_f32(),
+                    "MCP tools refresh timed out"
+                );
+                return;
+            }
+        };
+        let tool_count = tools.len();
+        let updated = Arc::new(client.with_tools(tools));
+        {
+            let mut state = self.state.write();
+            // A reconnect may have replaced the client while we were listing.
+            match state.clients.get(server_name) {
+                Some(current) if Arc::ptr_eq(current, &client) => {}
+                _ => return,
+            }
+            state.clients.insert(server_name.to_string(), updated);
+            state
+                .statuses
+                .insert(server_name.to_string(), McpServerStatus::Connected { tool_count });
+            state.rebuild_tools();
+        }
+        self.bump();
+        info!(server = %server_name, tools = tool_count, "MCP tool list refreshed");
+    }
+
+    fn set_status(&self, name: &str, status: McpServerStatus) {
+        self.state.write().statuses.insert(name.to_string(), status);
+        self.bump();
+    }
+
+    fn bump(&self) {
+        self.changes.send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    fn client(&self, name: &str) -> Option<Arc<McpClient>> {
+        self.state.read().clients.get(name).cloned()
+    }
+
+    /// Connected clients, sorted by server name.
+    fn clients_sorted(&self) -> Vec<(String, Arc<McpClient>)> {
+        let mut clients: Vec<(String, Arc<McpClient>)> = self
+            .state
+            .read()
+            .clients
+            .iter()
+            .map(|(name, client)| (name.clone(), Arc::clone(client)))
+            .collect();
+        clients.sort_by(|a, b| a.0.cmp(&b.0));
+        clients
+    }
+
+    /// Changes whenever a server's status or tool catalog changes. Callers
+    /// that cache the tool list rebuild it when this differs from the value
+    /// they last saw.
+    pub fn generation(&self) -> u64 {
+        *self.changes.borrow()
+    }
+
+    /// Wait until no server is connecting or waiting to retry. Bounded by
+    /// the per-server connect and catalog timeouts.
+    pub async fn wait_until_settled(&self) {
+        let mut changes = self.changes.subscribe();
+        loop {
+            if !self.state.read().statuses.values().any(McpServerStatus::is_pending) {
+                return;
+            }
+            if changes.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Number of servers still starting and servers whose startup failed.
+    pub fn status_summary(&self) -> McpStatusSummary {
+        let state = self.state.read();
+        let mut summary = McpStatusSummary::default();
+        for status in state.statuses.values() {
+            match status {
+                McpServerStatus::Connecting | McpServerStatus::Failed { .. } => {
+                    summary.connecting += 1
+                }
+                McpServerStatus::Disconnected { last_error: Some(_) } => summary.failed += 1,
+                _ => {}
+            }
+        }
+        summary
+    }
+
     // -----------------------------------------------------------------------
-    // Status / query API (used by /mcp command and McpConnectionManager)
+    // Status / query API (used by /mcp command and the TUI)
     // -----------------------------------------------------------------------
 
-    /// Return all connected server names.
+    /// Return all connected server names, sorted.
     pub fn server_names(&self) -> Vec<String> {
-        self.clients.keys().cloned().collect()
+        let mut names: Vec<String> = self.state.read().clients.keys().cloned().collect();
+        names.sort();
+        names
     }
 
     /// Return status for a single server.
     pub fn server_status(&self, name: &str) -> McpServerStatus {
-        if let Some(client) = self.clients.get(name) {
-            McpServerStatus::Connected {
-                tool_count: client.tools.len(),
-            }
-        } else if let Some((_, err)) = self.failed_servers.iter().find(|(n, _)| n == name) {
-            McpServerStatus::Disconnected {
-                last_error: Some(err.clone()),
-            }
-        } else {
-            McpServerStatus::Disconnected { last_error: None }
-        }
+        self.state
+            .read()
+            .statuses
+            .get(name)
+            .cloned()
+            .unwrap_or(McpServerStatus::Disconnected { last_error: None })
     }
 
-    /// Return status for every configured server (connected + failed).
+    /// Return status for every configured server.
     pub fn all_statuses(&self) -> HashMap<String, McpServerStatus> {
-        let mut map = HashMap::new();
-        for (name, client) in &self.clients {
-            map.insert(
-                name.clone(),
-                McpServerStatus::Connected {
-                    tool_count: client.tools.len(),
-                },
-            );
-        }
-        for (name, err) in &self.failed_servers {
-            map.insert(
-                name.clone(),
-                McpServerStatus::Disconnected {
-                    last_error: Some(err.clone()),
-                },
-            );
-        }
-        map
+        self.state.read().statuses.clone()
     }
 
-    /// Servers that failed to connect during `connect_all`.
-    /// Each entry is `(server_name, error_message)`.
-    pub fn failed_servers(&self) -> &[(String, String)] {
-        &self.failed_servers
+    /// Servers whose startup failed for good, as `(server_name, error)`.
+    pub fn failed_servers(&self) -> Vec<(String, String)> {
+        let mut failed: Vec<(String, String)> = self
+            .state
+            .read()
+            .statuses
+            .iter()
+            .filter_map(|(name, status)| match status {
+                McpServerStatus::Disconnected { last_error: Some(e) } => {
+                    Some((name.clone(), e.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        failed.sort();
+        failed
     }
 
     /// Return counts and names for tools/resources/prompts on connected servers.
     pub fn server_catalog(&self, name: &str) -> Option<McpServerCatalog> {
-        let client = self.clients.get(name)?;
+        let client = self.client(name)?;
         Some(McpServerCatalog {
             tool_count: client.tools.len(),
             resource_count: client.resources.len(),
@@ -1015,56 +1479,84 @@ impl McpManager {
     // Tool / resource helpers
     // -----------------------------------------------------------------------
 
-    /// Get all tool definitions from all connected servers.
-    pub fn all_tool_definitions(&self) -> Vec<(String, ToolDefinition)> {
-        let mut defs = vec![];
-        for (server_name, client) in &self.clients {
-            for td in client.tool_definitions() {
-                // Prefix tool name with server name to avoid conflicts
-                let prefixed = ToolDefinition {
-                    name: format!("{}_{}", server_name, td.name),
-                    description: format!("[{}] {}", server_name, td.description),
-                    input_schema: td.input_schema.clone(),
-                };
-                defs.push((server_name.clone(), prefixed));
-            }
-        }
-        defs
+    /// Every tool of every connected server under its exposed
+    /// `mcp__<server>__<tool>` name, in a stable order.
+    pub fn all_tool_definitions(&self) -> Vec<McpToolEntry> {
+        self.state.read().tools.clone()
     }
 
-    /// Execute a tool call, routing to the correct server.
-    /// Tool name format: `<server_name>_<tool_name>`.
+    /// Execute a tool call by its exposed name, routed through the
+    /// exposed-name map to the owning server.
     pub async fn call_tool(
         &self,
-        prefixed_name: &str,
+        exposed_name: &str,
         arguments: Option<Value>,
     ) -> anyhow::Result<CallToolResult> {
-        // Find the server name by matching prefix
-        for (server_name, client) in &self.clients {
-            let prefix = format!("{}_", server_name);
-            if let Some(tool_name) = prefixed_name.strip_prefix(&prefix) {
-                return client.call_tool(tool_name, arguments).await;
-            }
-        }
-        Err(anyhow::anyhow!(
-            "No MCP server found for tool '{}'. Connected servers: [{}]",
-            prefixed_name,
-            self.clients.keys().cloned().collect::<Vec<_>>().join(", ")
-        ))
+        let (client, tool_name) = {
+            let state = self.state.read();
+            let entry = state
+                .routes
+                .get(exposed_name)
+                .and_then(|&index| state.tools.get(index))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Unknown MCP tool '{}' (its server may have disconnected or removed it)",
+                        exposed_name
+                    )
+                })?;
+            let client = state.clients.get(&entry.server_name).cloned().ok_or_else(|| {
+                anyhow::anyhow!("MCP server '{}' is not connected", entry.server_name)
+            })?;
+            (client, entry.tool_name.clone())
+        };
+        client.call_tool(&tool_name, arguments).await
     }
 
     /// Number of connected servers.
     pub fn server_count(&self) -> usize {
-        self.clients.len()
+        self.state.read().clients.len()
+    }
+
+    /// The system-prompt section carrying server instructions (from the
+    /// `initialize` response) for every connected server with at least one
+    /// tool for which `is_active` returns `true` (checked against exposed
+    /// `mcp__<server>__<tool>` names). `None` when no server qualifies.
+    ///
+    /// Recomputed per request, so it belongs in the dynamic (uncached) part
+    /// of the system prompt: servers connect, disconnect and change tools
+    /// during a session.
+    pub fn instructions_prompt_section(&self, is_active: impl Fn(&str) -> bool) -> Option<String> {
+        let state = self.state.read();
+        let mut servers: Vec<(&String, &Arc<McpClient>)> = state.clients.iter().collect();
+        servers.sort_by(|a, b| a.0.cmp(b.0));
+        let sections: Vec<String> = servers
+            .into_iter()
+            .filter_map(|(name, client)| {
+                let instructions = client.instructions.as_deref()?.trim();
+                if instructions.is_empty() {
+                    return None;
+                }
+                let has_active_tool = state
+                    .tools
+                    .iter()
+                    .any(|entry| &entry.server_name == name && is_active(&entry.definition.name));
+                has_active_tool.then(|| format!("## {}\n{}", name, instructions))
+            })
+            .collect();
+        if sections.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "# MCP Server Instructions\n\nThe following MCP servers have provided instructions for how to use their tools and resources:\n\n{}",
+            sections.join("\n\n")
+        ))
     }
 
     /// Get server instructions (from initialize response).
     pub fn server_instructions(&self) -> Vec<(String, String)> {
-        self.clients
-            .iter()
-            .filter_map(|(name, client)| {
-                client.instructions.as_ref().map(|instr| (name.clone(), instr.clone()))
-            })
+        self.clients_sorted()
+            .into_iter()
+            .filter_map(|(name, client)| client.instructions.clone().map(|instr| (name, instr)))
             .collect()
     }
 
@@ -1074,7 +1566,7 @@ impl McpManager {
         server_filter: Option<&str>,
     ) -> Vec<serde_json::Value> {
         let mut all = vec![];
-        for (name, client) in &self.clients {
+        for (name, client) in self.clients_sorted() {
             if let Some(filter) = server_filter {
                 if name != filter {
                     continue;
@@ -1107,8 +1599,7 @@ impl McpManager {
         uri: &str,
     ) -> anyhow::Result<serde_json::Value> {
         let client = self
-            .clients
-            .get(server_name)
+            .client(server_name)
             .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found or not connected", server_name))?;
 
         let contents = client.read_resource(uri).await?;
@@ -1121,7 +1612,7 @@ impl McpManager {
         server_filter: Option<&str>,
     ) -> Vec<serde_json::Value> {
         let mut all = vec![];
-        for (name, client) in &self.clients {
+        for (name, client) in self.clients_sorted() {
             if let Some(filter) = server_filter {
                 if name != filter {
                     continue;
@@ -1157,8 +1648,7 @@ impl McpManager {
         arguments: Option<std::collections::HashMap<String, String>>,
     ) -> anyhow::Result<GetPromptResult> {
         let client = self
-            .clients
-            .get(server_name)
+            .client(server_name)
             .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found or not connected", server_name))?;
         client.get_prompt(prompt_name, arguments).await
     }
@@ -1292,60 +1782,6 @@ impl McpManager {
             .ok()
             .flatten()
     }
-
-    // -----------------------------------------------------------------------
-    // Notification dispatch loop
-    // -----------------------------------------------------------------------
-
-    /// Spawn background Tokio tasks for each connected MCP client to handle
-    /// server-initiated notifications via async streams. Uses native push notifications
-    /// when available (e.g., WebSocket) and falls back to polling for other transports (e.g., stdio).
-    ///
-    /// Routes `notifications/resources/updated` events to the appropriate sender in
-    /// `self.resource_subscriptions`.
-    ///
-    /// Call this once after constructing an `Arc<McpManager>` (e.g. immediately
-    /// after `McpManager::connect_all`).  Each notification handler task exits
-    /// when the transport closes or the manager is dropped.
-    pub fn spawn_notification_poll_loop(self: Arc<Self>) {
-        let clients = self.clients.clone();
-
-        // Spawn a task for each client to handle notifications via the stream
-        for client in clients.values() {
-            let client_clone = Arc::clone(client);
-            let manager_weak = Arc::downgrade(&self);
-
-            tokio::spawn(async move {
-                // Subscribe to the transport's notification stream
-                let mut notification_stream = client_clone.subscribe_to_notifications();
-
-                // Process notifications from the stream
-                while let Some(result) = notification_stream.next().await {
-                    // Check if the manager is still alive
-                    let manager = match manager_weak.upgrade() {
-                        Some(m) => m,
-                        None => break, // Manager dropped — shut down
-                    };
-
-                    match result {
-                        Ok(raw) => {
-                            client_clone
-                                .process_notification(raw, &manager.resource_subscriptions)
-                                .await;
-                        }
-                        Err(e) => {
-                            debug!(
-                                server = %client_clone.server_name,
-                                error = %e,
-                                "notification stream error"
-                            );
-                            break;
-                        }
-                    }
-                }
-            });
-        }
-    }
 }
 
 impl Default for McpManager {
@@ -1355,52 +1791,151 @@ impl Default for McpManager {
 }
 
 // ---------------------------------------------------------------------------
-// MCP result → string conversion
+// MCP result → model output conversion
 // ---------------------------------------------------------------------------
 
-/// Convert an MCP tool call result to a string for the model.
+/// Image types every image-capable provider accepts.
+const ATTACHABLE_IMAGE_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// Largest decoded image passed through to the model (the Anthropic API's
+/// per-image limit).
+const MAX_ATTACHED_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+
+/// An MCP tool result converted for the model.
+#[derive(Debug, Clone, Default)]
+pub struct McpToolOutput {
+    /// Text of the tool result. Each image is represented by a placeholder
+    /// line with its type and size, so a provider that drops images from
+    /// tool results still tells the model what came back.
+    pub text: String,
+    /// Image blocks to send after `text` where the provider supports images
+    /// in tool results.
+    pub images: Vec<ContentBlock>,
+}
+
+/// Decoded size of a base64 payload, without decoding it.
+fn base64_decoded_len(data: &str) -> usize {
+    let trimmed = data.trim_end_matches('=');
+    trimmed.len() * 3 / 4
+}
+
+fn format_size(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b < KB {
+        format!("{} B", bytes)
+    } else if b < KB * KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{:.1} MB", b / (KB * KB))
+    }
+}
+
+/// Describe an image and, when it can be attached, push it to `images`.
+fn image_part(data: &str, mime_type: &str, images: &mut Vec<ContentBlock>) -> String {
+    let size = base64_decoded_len(data);
+    let size_label = format_size(size);
+    if !ATTACHABLE_IMAGE_TYPES.contains(&mime_type) {
+        return format!("[Image: {}, {}; not attached: unsupported image type]", mime_type, size_label);
+    }
+    if size > MAX_ATTACHED_IMAGE_BYTES {
+        return format!(
+            "[Image: {}, {}; not attached: larger than {}]",
+            mime_type,
+            size_label,
+            format_size(MAX_ATTACHED_IMAGE_BYTES)
+        );
+    }
+    // An image block the provider rejects stays in the history and fails
+    // every later request, so only attach data that decodes and whose
+    // signature matches the declared type.
+    use base64::Engine as _;
+    let decoded = match base64::engine::general_purpose::STANDARD.decode(data) {
+        Ok(decoded) => decoded,
+        Err(_) => {
+            return format!("[Image: {}, {}; not attached: invalid base64 data]", mime_type, size_label)
+        }
+    };
+    let signature_matches = match mime_type {
+        "image/png" => decoded.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => decoded.starts_with(&[0xFF, 0xD8, 0xFF]),
+        "image/gif" => decoded.starts_with(b"GIF87a") || decoded.starts_with(b"GIF89a"),
+        "image/webp" => decoded.len() >= 12 && decoded.starts_with(b"RIFF") && &decoded[8..12] == b"WEBP",
+        _ => false,
+    };
+    if !signature_matches {
+        return format!(
+            "[Image: {}, {}; not attached: data is not a valid {} image]",
+            mime_type, size_label, mime_type
+        );
+    }
+    images.push(ContentBlock::Image {
+        source: ImageSource {
+            source_type: "base64".to_string(),
+            media_type: Some(mime_type.to_string()),
+            data: Some(data.to_string()),
+            url: None,
+        },
+    });
+    format!("[Image: {}, {}]", mime_type, size_label)
+}
+
+/// Convert an MCP tool call result into model output.
 ///
-/// Content type handling:
-/// - `text`     → the text itself
-/// - `image`    → `[Image: <mime_type>]` with a short base64 preview
-/// - `resource` → `[Resource: <uri>]` plus text content if present
+/// - `structuredContent`, when present, is used as the text (compact JSON)
+///   and plain text blocks are skipped: the spec makes them a serialization
+///   of the same value.
+/// - `text` → the text itself.
+/// - `image` → a `[Image: <mime>, <size>]` placeholder line plus an image
+///   block (PNG/JPEG/GIF/WebP up to 5 MB; otherwise the placeholder says why
+///   it was not attached).
+/// - `resource` → `[Resource: <uri>]` plus its text; image blobs are handled
+///   like images, other blobs become `[Binary resource: <mime>, <size>]`.
 ///
-/// Mixed content is joined with newlines.
-/// If all content is empty, returns an empty string.
-pub fn mcp_result_to_string(result: &CallToolResult) -> String {
-    let parts: Vec<String> = result
-        .content
-        .iter()
-        .map(|c| match c {
-            McpContent::Text { text } => text.clone(),
+/// Parts are joined with newlines.
+pub fn mcp_result_to_output(result: &CallToolResult) -> McpToolOutput {
+    let mut images = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(structured) = &result.structured_content {
+        parts.push(structured.to_string());
+    }
+    for content in &result.content {
+        match content {
+            McpContent::Text { text } => {
+                if result.structured_content.is_none() {
+                    parts.push(text.clone());
+                }
+            }
             McpContent::Image { data, mime_type } => {
-                // Show a short preview (first 32 chars of base64) so the model
-                // knows an image was returned without embedding the full blob.
-                let preview_len = data.len().min(32);
-                let preview = &data[..preview_len];
-                let ellipsis = if data.len() > 32 { "…" } else { "" };
-                format!(
-                    "[Image: {} | base64 preview: {}{}]",
-                    mime_type, preview, ellipsis
-                )
+                parts.push(image_part(data, mime_type, &mut images));
             }
             McpContent::Resource { resource } => {
-                let mut parts = vec![format!("[Resource: {}]", resource.uri)];
-                if let Some(ref text) = resource.text {
+                parts.push(format!("[Resource: {}]", resource.uri));
+                if let Some(text) = &resource.text {
                     parts.push(text.clone());
-                } else if resource.blob.is_some() {
+                } else if let Some(blob) = &resource.blob {
                     let mime = resource
                         .mime_type
                         .as_deref()
                         .unwrap_or("application/octet-stream");
-                    parts.push(format!("[Binary resource: {}]", mime));
+                    if mime.starts_with("image/") {
+                        parts.push(image_part(blob, mime, &mut images));
+                    } else {
+                        parts.push(format!(
+                            "[Binary resource: {}, {}]",
+                            mime,
+                            format_size(base64_decoded_len(blob))
+                        ));
+                    }
                 }
-                parts.join("\n")
             }
-        })
-        .collect();
+        }
+    }
 
-    parts.join("\n")
+    McpToolOutput {
+        text: parts.join("\n"),
+        images,
+    }
 }
 
 #[cfg(test)]
@@ -1461,12 +1996,20 @@ mod tests {
             },
             url: None,
             server_type: "stdio".to_string(),
+            headers: {
+                let mut m = HashMap::new();
+                m.insert("X-Home".to_string(), "${_CC_TEST_HOME}".to_string());
+                m
+            },
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
             origin: Default::default(),
         };
         let expanded = expand_server_config(&cfg);
         assert_eq!(expanded.command.as_deref(), Some("/home/user/bin/server"));
         assert_eq!(expanded.args[1], "/home/user");
         assert_eq!(expanded.env.get("PATH").map(|s| s.as_str()), Some("/home/user/bin"));
+        assert_eq!(expanded.headers.get("X-Home").map(|s| s.as_str()), Some("/home/user"));
         std::env::remove_var("_CC_TEST_HOME");
     }
 
@@ -1507,84 +2050,159 @@ mod tests {
         assert_eq!(def.description, "Search the web");
     }
 
-    // ---- mcp_result_to_string ----------------------------------------------
+    // ---- mcp_result_to_output ----------------------------------------------
 
-    #[test]
-    fn test_result_to_string_text() {
-        let result = CallToolResult {
-            content: vec![McpContent::Text {
-                text: "hello".to_string(),
-            }],
+    fn result(content: Vec<McpContent>) -> CallToolResult {
+        CallToolResult {
+            content,
+            structured_content: None,
             is_error: false,
-        };
-        assert_eq!(mcp_result_to_string(&result), "hello");
+        }
     }
 
     #[test]
-    fn test_result_to_string_image() {
-        let result = CallToolResult {
-            content: vec![McpContent::Image {
-                data: "abc123".to_string(),
+    fn test_result_output_text() {
+        let out = mcp_result_to_output(&result(vec![McpContent::Text {
+            text: "hello".to_string(),
+        }]));
+        assert_eq!(out.text, "hello");
+        assert!(out.images.is_empty());
+    }
+
+    #[test]
+    fn test_result_output_image_is_attached_with_placeholder() {
+        // The 8-byte PNG signature.
+        let out = mcp_result_to_output(&result(vec![McpContent::Image {
+            data: "iVBORw0KGgo=".to_string(),
+            mime_type: "image/png".to_string(),
+        }]));
+        assert_eq!(out.text, "[Image: image/png, 8 B]");
+        assert_eq!(out.images.len(), 1);
+        match &out.images[0] {
+            ContentBlock::Image { source } => {
+                assert_eq!(source.source_type, "base64");
+                assert_eq!(source.media_type.as_deref(), Some("image/png"));
+                assert_eq!(source.data.as_deref(), Some("iVBORw0KGgo="));
+            }
+            other => panic!("expected an image block, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_result_output_unsupported_or_huge_image_is_not_attached() {
+        let svg = mcp_result_to_output(&result(vec![McpContent::Image {
+            data: "PHN2Zz4=".to_string(),
+            mime_type: "image/svg+xml".to_string(),
+        }]));
+        assert!(svg.images.is_empty());
+        assert!(svg.text.contains("not attached: unsupported image type"), "{}", svg.text);
+
+        let huge = "A".repeat(8 * 1024 * 1024);
+        let big = mcp_result_to_output(&result(vec![McpContent::Image {
+            data: huge,
+            mime_type: "image/png".to_string(),
+        }]));
+        assert!(big.images.is_empty());
+        assert!(big.text.contains("6.0 MB; not attached: larger than 5.0 MB"), "{}", big.text);
+    }
+
+    #[test]
+    fn test_result_output_invalid_image_data_is_not_attached() {
+        // Not base64 at all: attaching it would get every later request
+        // rejected by the provider.
+        let garbage = mcp_result_to_output(&result(vec![McpContent::Image {
+            data: "not base64!!".to_string(),
+            mime_type: "image/png".to_string(),
+        }]));
+        assert!(garbage.images.is_empty());
+        assert!(garbage.text.contains("not attached: invalid base64 data"), "{}", garbage.text);
+
+        // Valid base64, but a JPEG signature declared as PNG.
+        let mismatched = mcp_result_to_output(&result(vec![McpContent::Image {
+            data: "/9j/4AAQ".to_string(),
+            mime_type: "image/png".to_string(),
+        }]));
+        assert!(mismatched.images.is_empty());
+        assert!(
+            mismatched.text.contains("not attached: data is not a valid image/png image"),
+            "{}",
+            mismatched.text
+        );
+
+        // The same bytes declared as JPEG are attached.
+        let jpeg = mcp_result_to_output(&result(vec![McpContent::Image {
+            data: "/9j/4AAQ".to_string(),
+            mime_type: "image/jpeg".to_string(),
+        }]));
+        assert_eq!(jpeg.images.len(), 1);
+    }
+
+    #[test]
+    fn test_result_output_prefers_structured_content() {
+        let mut r = result(vec![
+            McpContent::Text {
+                text: "{\"temperature\": 22}".to_string(),
+            },
+            McpContent::Image {
+                data: "iVBORw0KGgo=".to_string(),
                 mime_type: "image/png".to_string(),
-            }],
-            is_error: false,
-        };
-        let s = mcp_result_to_string(&result);
-        assert!(s.contains("Image:"));
-        assert!(s.contains("image/png"));
-        assert!(s.contains("abc123"));
+            },
+        ]);
+        r.structured_content = Some(serde_json::json!({ "temperature": 22 }));
+        let out = mcp_result_to_output(&r);
+        assert_eq!(out.text, "{\"temperature\":22}\n[Image: image/png, 8 B]");
+        assert_eq!(out.images.len(), 1);
     }
 
     #[test]
-    fn test_result_to_string_resource_with_text() {
-        let result = CallToolResult {
-            content: vec![McpContent::Resource {
-                resource: ResourceContents {
-                    uri: "file:///foo.txt".to_string(),
-                    mime_type: Some("text/plain".to_string()),
-                    text: Some("file contents".to_string()),
-                    blob: None,
-                },
-            }],
-            is_error: false,
-        };
-        let s = mcp_result_to_string(&result);
-        assert!(s.contains("[Resource: file:///foo.txt]"));
-        assert!(s.contains("file contents"));
+    fn test_result_output_resource_with_text() {
+        let out = mcp_result_to_output(&result(vec![McpContent::Resource {
+            resource: ResourceContents {
+                uri: "file:///foo.txt".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                text: Some("file contents".to_string()),
+                blob: None,
+            },
+        }]));
+        assert_eq!(out.text, "[Resource: file:///foo.txt]\nfile contents");
     }
 
     #[test]
-    fn test_result_to_string_resource_binary() {
-        let result = CallToolResult {
-            content: vec![McpContent::Resource {
+    fn test_result_output_resource_blobs() {
+        let out = mcp_result_to_output(&result(vec![
+            McpContent::Resource {
                 resource: ResourceContents {
                     uri: "file:///img.png".to_string(),
                     mime_type: Some("image/png".to_string()),
                     text: None,
-                    blob: Some("BASE64==".to_string()),
+                    blob: Some("iVBORw0KGgo=".to_string()),
                 },
-            }],
-            is_error: false,
-        };
-        let s = mcp_result_to_string(&result);
-        assert!(s.contains("[Resource: file:///img.png]"));
-        assert!(s.contains("[Binary resource: image/png]"));
+            },
+            McpContent::Resource {
+                resource: ResourceContents {
+                    uri: "file:///data.bin".to_string(),
+                    mime_type: None,
+                    text: None,
+                    blob: Some("AAAA".to_string()),
+                },
+            },
+        ]));
+        assert!(out.text.contains("[Resource: file:///img.png]\n[Image: image/png, 8 B]"), "{}", out.text);
+        assert!(out.text.contains("[Binary resource: application/octet-stream, 3 B]"), "{}", out.text);
+        assert_eq!(out.images.len(), 1);
     }
 
     #[test]
-    fn test_result_to_string_mixed() {
-        let result = CallToolResult {
-            content: vec![
-                McpContent::Text {
-                    text: "line one".to_string(),
-                },
-                McpContent::Text {
-                    text: "line two".to_string(),
-                },
-            ],
-            is_error: false,
-        };
-        assert_eq!(mcp_result_to_string(&result), "line one\nline two");
+    fn test_result_output_mixed_text() {
+        let out = mcp_result_to_output(&result(vec![
+            McpContent::Text {
+                text: "line one".to_string(),
+            },
+            McpContent::Text {
+                text: "line two".to_string(),
+            },
+        ]));
+        assert_eq!(out.text, "line one\nline two");
     }
 
     // ---- McpManager --------------------------------------------------------
@@ -1607,6 +2225,189 @@ mod tests {
         assert!(mgr.failed_servers().is_empty());
     }
 
+    #[tokio::test]
+    async fn test_start_reports_unsupported_transport_without_connecting() {
+        let cfg = McpServerConfig {
+            name: "odd".to_string(),
+            command: None,
+            args: vec![],
+            env: HashMap::new(),
+            url: None,
+            server_type: "carrier-pigeon".to_string(),
+            headers: Default::default(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
+            origin: Default::default(),
+        };
+        let mgr = McpManager::start(&[cfg]);
+        mgr.wait_until_settled().await;
+        assert_eq!(mgr.status_summary(), McpStatusSummary { connecting: 0, failed: 1 });
+        let failed = mgr.failed_servers();
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].1.contains("unsupported transport"));
+    }
+
+    fn test_client(server: &str, tools: &[&str]) -> McpClient {
+        let mut client = client::McpClient::new_for_test(server);
+        client.tools = tools
+            .iter()
+            .map(|name| McpTool {
+                name: (*name).to_string(),
+                description: Some(format!("{} tool", name)),
+                input_schema: serde_json::json!({ "type": "object" }),
+            })
+            .collect();
+        client
+    }
+
+    // ---- tool naming / routing ---------------------------------------------
+
+    #[test]
+    fn test_sanitize_tool_name_part() {
+        assert_eq!(sanitize_tool_name_part("github"), "github");
+        assert_eq!(sanitize_tool_name_part("my.server/v2"), "my_server_v2");
+        assert_eq!(sanitize_tool_name_part("kebab-case_ok"), "kebab-case_ok");
+        assert_eq!(sanitize_tool_name_part("über tool"), "_ber_tool");
+        assert_eq!(sanitize_tool_name_part(""), "_");
+    }
+
+    #[test]
+    fn test_exposed_names_do_not_collide_across_prefix_servers() {
+        // `{server}_{tool}` mapped both of these to `git_lab_status`.
+        let clients = vec![
+            ("git".to_string(), Arc::new(test_client("git", &["lab_status"]))),
+            ("git_lab".to_string(), Arc::new(test_client("git_lab", &["status"]))),
+        ];
+        let entries = build_tool_entries(&clients, &std::collections::HashSet::new());
+        let names: Vec<&str> = entries.iter().map(|e| e.definition.name.as_str()).collect();
+        assert_eq!(names, vec!["mcp__git__lab_status", "mcp__git_lab__status"]);
+        assert_eq!(entries[0].server_name, "git");
+        assert_eq!(entries[0].tool_name, "lab_status");
+        assert_eq!(entries[1].server_name, "git_lab");
+        assert_eq!(entries[1].tool_name, "status");
+    }
+
+    #[test]
+    fn test_exposed_names_disambiguate_sanitization_collisions() {
+        let clients = vec![
+            ("a.b".to_string(), Arc::new(test_client("a.b", &["t"]))),
+            ("a_b".to_string(), Arc::new(test_client("a_b", &["t"]))),
+        ];
+        let entries = build_tool_entries(&clients, &std::collections::HashSet::new());
+        assert_eq!(entries[0].definition.name, "mcp__a_b__t");
+        assert_ne!(entries[1].definition.name, entries[0].definition.name);
+        assert!(entries[1].definition.name.starts_with("mcp__a_b__t_"));
+        assert!(entries
+            .iter()
+            .all(|e| e.definition.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')));
+    }
+
+    #[test]
+    fn test_ambiguous_servers_keep_their_names_across_connect_order() {
+        let ambiguous: std::collections::HashSet<String> =
+            ["a.b".to_string(), "a_b".to_string()].into_iter().collect();
+        let a_dot = ("a.b".to_string(), Arc::new(test_client("a.b", &["t"])));
+        let a_under = ("a_b".to_string(), Arc::new(test_client("a_b", &["t"])));
+
+        // Only `a_b` connected so far.
+        let early = build_tool_entries(std::slice::from_ref(&a_under), &ambiguous);
+        // Both connected.
+        let late = build_tool_entries(&[a_dot, a_under], &ambiguous);
+        let name_of = |entries: &[McpToolEntry], server: &str| {
+            entries
+                .iter()
+                .find(|e| e.server_name == server)
+                .map(|e| e.definition.name.clone())
+                .expect("server entry")
+        };
+        assert_eq!(name_of(&early, "a_b"), name_of(&late, "a_b"));
+        // Neither gets the clean name, so no exact rule can switch servers.
+        assert_ne!(name_of(&late, "a_b"), "mcp__a_b__t");
+        assert_ne!(name_of(&late, "a.b"), "mcp__a_b__t");
+        assert_ne!(name_of(&late, "a.b"), name_of(&late, "a_b"));
+    }
+
+    #[test]
+    fn test_exposed_names_are_capped_and_stable() {
+        let long_tool = "x".repeat(100);
+        let mut used = std::collections::HashSet::new();
+        let first = exposed_tool_name("server", &long_tool, false, &mut used);
+        assert!(first.len() <= MAX_MCP_TOOL_NAME_LEN, "{} chars", first.len());
+        assert!(first.starts_with("mcp__server__xxx"));
+        // Same raw identity → same name on a rebuild.
+        let again = exposed_tool_name("server", &long_tool, false, &mut std::collections::HashSet::new());
+        assert_eq!(first, again);
+    }
+
+    #[tokio::test]
+    async fn test_manager_routes_by_exposed_name() {
+        let mgr = Arc::new(McpManager::new());
+        mgr.install_client(test_client("git", &["lab_status"]));
+        mgr.install_client(test_client("git_lab", &["status"]));
+        let entries = mgr.all_tool_definitions();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].definition.name, "mcp__git_lab__status");
+        assert_eq!(entries[1].definition.description, "status tool");
+
+        // The legacy `{server}_{tool}` form is not routed.
+        let err = mgr
+            .call_tool("git_lab_status", None)
+            .await
+            .expect_err("legacy names are not routed");
+        assert!(err.to_string().contains("Unknown MCP tool"), "{}", err);
+        // A routed name reaches the owning client (whose test backend is absent).
+        let err = mgr
+            .call_tool("mcp__git_lab__status", None)
+            .await
+            .expect_err("test clients have no backend");
+        assert!(err.to_string().contains("backend missing"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn test_instructions_section_only_for_servers_with_active_tools() {
+        let mgr = Arc::new(McpManager::new());
+        let mut docs = test_client("docs", &["search"]);
+        docs.instructions = Some("  Always cite the page URL.  ".to_string());
+        mgr.install_client(docs);
+        let mut quiet = test_client("quiet", &["noop"]);
+        quiet.instructions = Some("Never shown.".to_string());
+        mgr.install_client(quiet);
+        let mut blank = test_client("blank", &["noop"]);
+        blank.instructions = Some("   ".to_string());
+        mgr.install_client(blank);
+
+        let section = mgr
+            .instructions_prompt_section(|name| name != "mcp__quiet__noop")
+            .expect("docs has an active tool and instructions");
+        assert!(section.starts_with("# MCP Server Instructions"));
+        assert!(section.contains("## docs\nAlways cite the page URL."), "{}", section);
+        assert!(!section.contains("quiet"), "{}", section);
+        assert!(!section.contains("## blank"), "{}", section);
+
+        assert!(mgr.instructions_prompt_section(|_| false).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_install_client_marks_connected_and_bumps_generation() {
+        let mgr = Arc::new(McpManager::new());
+        let before = mgr.generation();
+        let mut client = client::McpClient::new_for_test("srv");
+        client.tools.push(McpTool {
+            name: "ping".to_string(),
+            description: None,
+            input_schema: serde_json::json!({ "type": "object" }),
+        });
+        mgr.install_client(client);
+        assert_ne!(mgr.generation(), before);
+        assert!(matches!(
+            mgr.server_status("srv"),
+            McpServerStatus::Connected { tool_count: 1 }
+        ));
+        assert_eq!(mgr.server_names(), vec!["srv".to_string()]);
+        // Nothing is pending, so waiting returns immediately.
+        mgr.wait_until_settled().await;
+    }
+
     #[test]
     fn test_auth_state_uses_token_expiry_datetime() {
         // Redirect the on-disk token store into a tempdir so this test never
@@ -1626,6 +2427,9 @@ mod tests {
                 env: HashMap::new(),
                 url: Some("https://example.com/mcp".to_string()),
                 server_type: "http".to_string(),
+                headers: Default::default(),
+                connect_timeout_ms: None,
+                catalog_timeout_ms: None,
                 origin: Default::default(),
             },
         );
@@ -1673,6 +2477,76 @@ pub struct ResourceChangedEvent {
     pub uri: String,
 }
 
+/// What the manager must do after a notification was processed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotificationEffect {
+    None,
+    /// `notifications/tools/list_changed`: re-list the server's tools.
+    ToolsChanged,
+}
+
+/// Process a single server-initiated notification from `server_name`.
+/// Routes resource updates to subscribers and reports tool-list changes.
+pub(crate) async fn process_notification(
+    server_name: &str,
+    raw: serde_json::Value,
+    resource_subscriptions: &DashMap<(String, String), tokio_mpsc::Sender<ResourceChangedEvent>>,
+) -> NotificationEffect {
+    // Only process server-initiated notifications (have "method", no non-null "id")
+    let has_method = raw.get("method").is_some();
+    let has_id = raw.get("id").map(|v| !v.is_null()).unwrap_or(false);
+    if !has_method || has_id {
+        debug!(
+            server = %server_name,
+            "process_notification: skipping non-notification message"
+        );
+        return NotificationEffect::None;
+    }
+
+    let method = raw["method"].as_str().unwrap_or("");
+    match method {
+        "notifications/resources/updated" => {
+            let uri = raw["params"]["uri"].as_str().unwrap_or("").to_string();
+            let key = (server_name.to_string(), uri);
+            // Clone the sender out so no map guard is held across the send.
+            let sender = resource_subscriptions.get(&key).map(|tx| tx.value().clone());
+            match sender {
+                Some(tx) => {
+                    let event = ResourceChangedEvent {
+                        server_name: key.0,
+                        uri: key.1,
+                    };
+                    if let Err(e) = tx.send(event).await {
+                        debug!(
+                            server = %server_name,
+                            error = %e,
+                            "process_notification: resource subscription receiver dropped"
+                        );
+                    }
+                }
+                None => debug!(
+                    server = %server_name,
+                    uri = %key.1,
+                    "process_notification: no subscriber for resource update"
+                ),
+            }
+            NotificationEffect::None
+        }
+        "notifications/tools/list_changed" => {
+            info!(server = %server_name, "MCP tools list changed");
+            NotificationEffect::ToolsChanged
+        }
+        other => {
+            debug!(
+                server = %server_name,
+                method = %other,
+                "Unhandled MCP notification"
+            );
+            NotificationEffect::None
+        }
+    }
+}
+
 /// Subscription handle for a single MCP resource URI.
 pub struct ResourceSubscription {
     pub server_name: String,
@@ -1699,7 +2573,7 @@ pub async fn subscribe_resource(
         rx
     };
 
-    let client = match manager.clients.get(server_name) {
+    let client = match manager.client(server_name) {
         Some(c) => c,
         None => {
             tracing::warn!(server_name, uri, "subscribe_resource: server not connected");
@@ -1731,8 +2605,7 @@ pub async fn unsubscribe_resource(
     uri: &str,
 ) -> Result<(), String> {
     let client = manager
-        .clients
-        .get(server_name)
+        .client(server_name)
         .ok_or_else(|| format!("unsubscribe_resource: server '{}' not connected", server_name))?;
 
     client
@@ -1830,7 +2703,6 @@ mod notification_tests {
             "params": { "uri": "file:///foo.txt" }
         });
 
-        let client = client::McpClient::new_for_test("myserver");
 
         let subscriptions: DashMap<
             (String, String),
@@ -1839,7 +2711,7 @@ mod notification_tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ResourceChangedEvent>(4);
         subscriptions.insert(("myserver".to_string(), "file:///foo.txt".to_string()), tx);
 
-        client.process_notification(notification, &subscriptions).await;
+        process_notification("myserver", notification, &subscriptions).await;
 
         let event = rx.try_recv().expect("expected a ResourceChangedEvent");
         assert_eq!(event.server_name, "myserver");
@@ -1855,12 +2727,11 @@ mod notification_tests {
             "params": { "uri": "file:///unsubscribed.txt" }
         });
 
-        let client = client::McpClient::new_for_test("myserver");
         let subscriptions: DashMap<
             (String, String),
             tokio::sync::mpsc::Sender<ResourceChangedEvent>,
         > = DashMap::new();
-        client.process_notification(notification, &subscriptions).await;
+        process_notification("myserver", notification, &subscriptions).await;
     }
 
     #[tokio::test]
@@ -1871,12 +2742,12 @@ mod notification_tests {
             "params": {}
         });
 
-        let client = client::McpClient::new_for_test("myserver");
         let subscriptions: DashMap<
             (String, String),
             tokio::sync::mpsc::Sender<ResourceChangedEvent>,
         > = DashMap::new();
-        client.process_notification(notification, &subscriptions).await;
+        let effect = process_notification("myserver", notification, &subscriptions).await;
+        assert_eq!(effect, NotificationEffect::ToolsChanged);
     }
 
     #[tokio::test]
@@ -1892,7 +2763,6 @@ mod notification_tests {
             "params": { "uri": "file:///b.txt" }
         });
 
-        let client = client::McpClient::new_for_test("s1");
 
         let subscriptions: DashMap<
             (String, String),
@@ -1903,8 +2773,8 @@ mod notification_tests {
         subscriptions.insert(("s1".to_string(), "file:///a.txt".to_string()), tx_a);
         subscriptions.insert(("s1".to_string(), "file:///b.txt".to_string()), tx_b);
 
-        client.process_notification(n1, &subscriptions).await;
-        client.process_notification(n2, &subscriptions).await;
+        process_notification("s1", n1, &subscriptions).await;
+        process_notification("s1", n2, &subscriptions).await;
 
         let ev_a = rx_a.try_recv().expect("expected event for a.txt");
         assert_eq!(ev_a.uri, "file:///a.txt");
@@ -1922,7 +2792,6 @@ mod notification_tests {
             "params": { "uri": "file:///foo.txt" }
         });
 
-        let client = client::McpClient::new_for_test("myserver");
 
         let subscriptions: DashMap<
             (String, String),
@@ -1931,7 +2800,7 @@ mod notification_tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ResourceChangedEvent>(4);
         subscriptions.insert(("myserver".to_string(), "file:///foo.txt".to_string()), tx);
 
-        client.process_notification(response, &subscriptions).await;
+        process_notification("myserver", response, &subscriptions).await;
 
         assert!(
             rx.try_recv().is_err(),

@@ -1,85 +1,32 @@
-// Tool-result budgeting helpers used when trimming/compacting the transcript.
-// Extracted from lib.rs (issue #232). Behavior-preserving move.
+// Tool-result sizing and compaction-result helpers used by the query loop.
+// Extracted from lib.rs (issue #232); per-item tool-result cap from #441.
 
 use crate::*;
 
-/// Return the combined character count of all tool-result content blocks found
-/// in `messages`.  Only user messages are examined (tool results always live
-/// in user turns).
-pub(crate) fn total_tool_result_chars(messages: &[Message]) -> usize {
-    messages
-        .iter()
-        .filter(|m| m.role == claurst_core::types::Role::User)
-        .flat_map(|m| match &m.content {
-            claurst_core::types::MessageContent::Blocks(blocks) => blocks.as_slice(),
-            _ => &[],
-        })
-        .filter_map(|b| {
-            if let ContentBlock::ToolResult { content, .. } = b {
-                Some(match content {
-                    ToolResultContent::Text(t) => t.len(),
-                    ToolResultContent::Blocks(blocks) => blocks.iter().map(|b| {
-                        if let ContentBlock::Text { text } = b { text.len() } else { 0 }
-                    }).sum(),
-                })
-            } else {
-                None
-            }
-        })
-        .sum()
-}
-
-/// When the cumulative tool-result content exceeds `budget` characters, walk
-/// the message list from oldest to newest and replace individual
-/// `ToolResult` content with a placeholder until the running total is back
-/// under budget.  Returns the (possibly modified) message list and the
-/// number of results that were truncated.
+/// Wrap a tool's output for the history, capped at `max_bytes` with the head
+/// and tail kept and the omitted size noted (issue #441). Applied once when the
+/// result is appended, so later requests never rewrite history.
+/// `max_bytes == 0` disables the cap.
 ///
-/// Mirrors the spirit of the TypeScript `applyToolResultBudget` /
-/// `enforceToolResultBudget` logic, simplified to a straightforward
-/// oldest-first eviction without the session-persistence layer.
-pub(crate) fn apply_tool_result_budget(messages: Vec<Message>, budget: usize) -> (Vec<Message>, usize) {
-    let total = total_tool_result_chars(&messages);
-    if total <= budget {
-        return (messages, 0);
+/// `images` (e.g. from MCP results, #451) follow the text as image blocks.
+/// The cap applies to the text only: an image is never cut or stringified.
+pub(crate) fn tool_result_for_history(
+    content: String,
+    images: Vec<ContentBlock>,
+    max_bytes: usize,
+) -> ToolResultContent {
+    let text = if max_bytes == 0 || content.len() <= max_bytes {
+        content
+    } else {
+        claurst_core::truncate::truncate_tool_output(&content, max_bytes).into_owned()
+    };
+    if images.is_empty() {
+        return ToolResultContent::Text(text);
     }
-
-    let mut to_shed = total - budget;
-    let mut truncated = 0usize;
-    let mut result = messages;
-
-    'outer: for msg in result.iter_mut() {
-        if msg.role != claurst_core::types::Role::User {
-            continue;
-        }
-        let blocks = match &mut msg.content {
-            claurst_core::types::MessageContent::Blocks(b) => b,
-            _ => continue,
-        };
-        for block in blocks.iter_mut() {
-            if let ContentBlock::ToolResult { content, .. } = block {
-                let size = match &*content {
-                    ToolResultContent::Text(t) => t.len(),
-                    ToolResultContent::Blocks(inner) => inner.iter().map(|b| {
-                        if let ContentBlock::Text { text } = b { text.len() } else { 0 }
-                    }).sum(),
-                };
-                if size == 0 {
-                    continue;
-                }
-                *content = ToolResultContent::Text(
-                    "[tool result truncated to save context]".to_string(),
-                );
-                truncated += 1;
-                if size > to_shed {
-                    break 'outer;
-                }
-                to_shed -= size;
-            }
-        }
-    }
-
-    (result, truncated)
+    let mut blocks = Vec::with_capacity(images.len() + 1);
+    blocks.push(ContentBlock::Text { text });
+    blocks.extend(images);
+    ToolResultContent::Blocks(blocks)
 }
 
 /// Apply the outcome of a reactive-compact / context-collapse call to the live
@@ -106,5 +53,54 @@ pub(crate) fn apply_compact_result<E>(
         }
         // Failure: leave `*messages` untouched so the conversation survives.
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claurst_core::types::ImageSource;
+
+    fn image() -> ContentBlock {
+        ContentBlock::Image {
+            source: ImageSource {
+                source_type: "base64".to_string(),
+                media_type: Some("image/png".to_string()),
+                data: Some("iVBORw0KGgo=".repeat(100)),
+                url: None,
+            },
+        }
+    }
+
+    #[test]
+    fn history_result_caps_text_and_keeps_images_whole() {
+        let text = format!("HEAD{}TAIL", "x".repeat(10_000));
+        match tool_result_for_history(text, vec![image()], 1_000) {
+            ToolResultContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 2);
+                match &blocks[0] {
+                    ContentBlock::Text { text } => {
+                        assert!(text.len() < 2_000, "text must be capped");
+                        assert!(text.starts_with("HEAD") && text.ends_with("TAIL"));
+                    }
+                    other => panic!("expected text first, got {:?}", other),
+                }
+                match &blocks[1] {
+                    ContentBlock::Image { source } => {
+                        assert_eq!(source.data.as_deref().map(str::len), Some(1_200));
+                    }
+                    other => panic!("expected the image block, got {:?}", other),
+                }
+            }
+            other => panic!("expected blocks, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn history_result_without_images_stays_text() {
+        assert!(matches!(
+            tool_result_for_history("ok".to_string(), Vec::new(), 1_000),
+            ToolResultContent::Text(t) if t == "ok"
+        ));
     }
 }

@@ -160,6 +160,45 @@ impl AnthropicProvider {
     }
 }
 
+/// Map an `AnthropicClient` error onto the provider error taxonomy, keeping the
+/// HTTP status and server-requested wait so the retry policy can see them.
+fn client_error_to_provider_error(
+    provider: &ProviderId,
+    err: claurst_core::error::ClaudeError,
+) -> ProviderError {
+    use claurst_core::error::ClaudeError;
+    match err {
+        ClaudeError::ApiStatus { status: 429, message, retry_after }
+            if !crate::retry::is_fatal_message(&message) =>
+        {
+            ProviderError::RateLimited { provider: provider.clone(), retry_after }
+        }
+        ClaudeError::ApiStatus { status, message, retry_after } => ProviderError::ServerError {
+            provider: provider.clone(),
+            status: Some(status),
+            is_retryable: crate::retry::is_retryable_status(status)
+                && !crate::retry::is_fatal_message(&message),
+            message,
+            retry_after,
+        },
+        ClaudeError::Auth(message) => ProviderError::AuthFailed {
+            provider: provider.clone(),
+            message,
+        },
+        ClaudeError::ContextWindowExceeded => ProviderError::ContextOverflow {
+            provider: provider.clone(),
+            message: "context window exceeded".to_string(),
+            max_tokens: None,
+        },
+        other => ProviderError::Other {
+            provider: provider.clone(),
+            message: other.to_string(),
+            status: None,
+            body: None,
+        },
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LlmProvider impl
 // ---------------------------------------------------------------------------
@@ -267,16 +306,13 @@ impl LlmProvider for AnthropicProvider {
 
         let provider_id = self.id.clone();
 
+        // One HTTP attempt: retries are owned by the caller (the query loop)
+        // so they are reported and cancellable (#439).
         let mut rx = self
             .client
-            .create_message_stream(api_request, handler)
+            .create_message_stream_once(api_request, handler)
             .await
-            .map_err(|e| ProviderError::Other {
-                provider: provider_id.clone(),
-                message: e.to_string(),
-                status: None,
-                body: None,
-            })?;
+            .map_err(|e| client_error_to_provider_error(&provider_id, e))?;
 
         let s = stream! {
             while let Some(anthropic_evt) = rx.recv().await {

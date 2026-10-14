@@ -633,6 +633,7 @@ impl LlmProvider for GoogleProvider {
                 status: None,
                 message: e.to_string(),
                 is_retryable: true,
+                retry_after: None,
             })?;
 
         let status = resp.status().as_u16();
@@ -641,6 +642,7 @@ impl LlmProvider for GoogleProvider {
             status: Some(status),
             message: e.to_string(),
             is_retryable: true,
+            retry_after: None,
         })?;
 
         if status >= 400 {
@@ -684,15 +686,17 @@ impl LlmProvider for GoogleProvider {
                 status: None,
                 message: e.to_string(),
                 is_retryable: true,
+                retry_after: None,
             })?;
 
         let status = resp.status().as_u16();
         if status >= 400 {
+            let retry_after = crate::retry::retry_after(resp.headers());
             let resp_body =
                 resp.text()
                     .await
                     .unwrap_or_else(|_| "<unreadable>".to_string());
-            return Err(self.parse_error_response(status, &resp_body));
+            return Err(self.parse_error_response(status, &resp_body).with_retry_after(retry_after));
         }
 
         // Wrap the byte stream in a line-based SSE parser.

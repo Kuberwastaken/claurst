@@ -2,8 +2,9 @@
 //
 // The model uses this to find the right tool for a task, or to look up a
 // tool it half-remembers. The catalog is built from the *actually registered*
-// tools (`all_tools()`), so it always reflects real tool names and their
-// one-line descriptions instead of a hand-maintained list that can drift.
+// tools (`all_tools()`) plus every tool of every connected MCP server, so it
+// always reflects real tool names and their one-line descriptions instead of
+// a hand-maintained list that can drift.
 //
 // Supports two query modes:
 //   - "select:ToolName[,Other]" → direct lookup by exact name(s)
@@ -81,8 +82,9 @@ fn one_line(desc: &str) -> String {
     }
 }
 
-/// Build the searchable catalog from the live tool registry plus supplements.
-fn build_catalog() -> Vec<CatalogEntry> {
+/// Build the searchable catalog from the live tool registry, the
+/// supplements, and the connected MCP servers' tools (`mcp_tools`).
+fn build_catalog(mcp_tools: &[claurst_mcp::McpToolEntry]) -> Vec<CatalogEntry> {
     let mut entries: Vec<CatalogEntry> = all_tools()
         .iter()
         .map(|t| CatalogEntry {
@@ -100,6 +102,19 @@ fn build_catalog() -> Vec<CatalogEntry> {
                 keywords: keywords_for(name),
             });
         }
+    }
+
+    // MCP tools: the server name leads the description so a query naming the
+    // server (e.g. "github") finds its tools.
+    for tool in mcp_tools {
+        entries.push(CatalogEntry {
+            name: tool.definition.name.clone(),
+            description: one_line(&format!(
+                "[{}] {}",
+                tool.server_name, tool.definition.description
+            )),
+            keywords: &[],
+        });
     }
 
     entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -172,7 +187,7 @@ impl Tool for ToolSearchTool {
         })
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
         let params: ToolSearchInput = match serde_json::from_value(input) {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
@@ -180,7 +195,12 @@ impl Tool for ToolSearchTool {
 
         let query = params.query.trim();
         let max = params.max_results.clamp(1, 20);
-        let catalog = build_catalog();
+        let mcp_tools = ctx
+            .mcp_manager
+            .as_ref()
+            .map(|manager| manager.all_tool_definitions())
+            .unwrap_or_default();
+        let catalog = build_catalog(&mcp_tools);
 
         // ---- select: prefix — direct lookup by exact name(s) ----------------
         if let Some(names_str) = query.strip_prefix("select:").map(str::trim) {
@@ -324,6 +344,40 @@ mod tests {
             out.contains("Not found: DoesNotExist"),
             "should report the missing tool:\n{out}"
         );
+    }
+
+    fn mcp_entry(server: &str, tool: &str, description: &str) -> claurst_mcp::McpToolEntry {
+        claurst_mcp::McpToolEntry {
+            server_name: server.to_string(),
+            tool_name: tool.to_string(),
+            definition: claurst_core::types::ToolDefinition {
+                name: format!("mcp__{server}__{tool}"),
+                description: description.to_string(),
+                input_schema: json!({ "type": "object" }),
+            },
+        }
+    }
+
+    #[test]
+    fn mcp_tools_are_indexed_and_searchable() {
+        let catalog = build_catalog(&[
+            mcp_entry("github", "create_issue", "Create a new issue in a repository."),
+            mcp_entry("linear", "list_projects", "List projects in the workspace."),
+        ]);
+        let issue = catalog
+            .iter()
+            .find(|e| e.name == "mcp__github__create_issue")
+            .expect("MCP tool must be in the catalog");
+        assert_eq!(issue.description, "[github] Create a new issue in a repository");
+
+        // A natural-language query and a server-name query both find it.
+        assert!(score_entry(issue, &["issue"]) > 0);
+        assert!(score_entry(issue, &["github"]) > 0);
+        let projects = catalog
+            .iter()
+            .find(|e| e.name == "mcp__linear__list_projects")
+            .expect("second MCP tool");
+        assert_eq!(score_entry(projects, &["issue"]), 0);
     }
 
     #[tokio::test]

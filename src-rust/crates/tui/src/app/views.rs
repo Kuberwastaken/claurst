@@ -141,16 +141,12 @@ impl App {
 
                     let tools: Vec<McpToolView> = tool_defs
                         .iter()
-                        .filter(|(server_name, _)| server_name == &server.name)
-                        .map(|(_, tool_def)| McpToolView {
-                            name: tool_def
-                                .name
-                                .strip_prefix(&format!("{}_", server.name))
-                                .unwrap_or(&tool_def.name)
-                                .to_string(),
+                        .filter(|entry| entry.server_name == server.name)
+                        .map(|entry| McpToolView {
+                            name: entry.tool_name.clone(),
                             server: server.name.clone(),
-                            description: tool_def.description.clone(),
-                            input_schema: Some(tool_def.input_schema.to_string()),
+                            description: entry.definition.description.clone(),
+                            input_schema: Some(entry.definition.input_schema.to_string()),
                         })
                         .collect();
 

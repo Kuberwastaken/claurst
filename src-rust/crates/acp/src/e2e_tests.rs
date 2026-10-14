@@ -574,6 +574,9 @@ fn sh_server(
         env: std::collections::HashMap::new(),
         url: None,
         server_type: "stdio".to_string(),
+        headers: Default::default(),
+        connect_timeout_ms: None,
+        catalog_timeout_ms: None,
         origin,
     }
 }
@@ -604,14 +607,14 @@ async fn trusted_mcp_tools_are_attached_and_callable() {
         .iter()
         .map(|tool| tool.name().to_string())
         .collect();
-    assert_eq!(names, vec!["fake_ping"]);
+    assert_eq!(names, vec!["mcp__fake__ping"]);
     assert!(
         !marker.exists(),
         "an untrusted project server must not be launched"
     );
 
     let provider = ScriptedProvider::new(vec![
-        Step::Tool("fake_ping", json!({})),
+        Step::Tool("mcp__fake__ping", json!({})),
         Step::Text("got pong"),
     ]);
     let mut runtime = scripted_runtime(&cwd, provider);
