@@ -890,10 +890,19 @@ async fn main() -> anyhow::Result<()> {
             if !plugin_decision.pending.is_empty() {
                 let names: Vec<&str> =
                     plugin_decision.pending.iter().map(|s| s.name.as_str()).collect();
-                info!(
-                    servers = ?names,
-                    "MCP server(s) from project plugins require approval before launching."
-                );
+                if is_headless {
+                    warn!(
+                        servers = ?names,
+                        "Skipping MCP server(s) from project plugins pending approval. \
+                         Approve them in the interactive TUI, or pass --trust-project-mcp \
+                         (or set trustProjectMcpServers) to launch them in headless mode."
+                    );
+                } else {
+                    info!(
+                        servers = ?names,
+                        "MCP server(s) from project plugins require approval before launching."
+                    );
+                }
             }
             pending_project_mcp.extend(plugin_decision.pending);
         }
