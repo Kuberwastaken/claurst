@@ -508,3 +508,103 @@ async fn rejected_write_fails_the_tool_and_asks_again_next_time() {
     assert!(!target.exists(), "a rejected write must not touch the file");
     assert_eq!(tool_statuses(&client), vec!["failed", "failed"]);
 }
+
+/// A minimal stdio MCP server: answers `initialize`, lists one `ping` tool,
+/// and returns "pong" for every call.
+#[cfg(unix)]
+const FAKE_MCP_SERVER: &str = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | grep -o '"id":[0-9]*' | head -n 1 | cut -d: -f2)
+  [ -z "$id" ] && continue
+  case "$line" in
+    *'"method":"initialize"'*)
+      version=$(printf '%s' "$line" | grep -o '"protocolVersion":"[^"]*"' | head -n 1 | cut -d'"' -f4)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"%s","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1.0.0"}}}\n' "$id" "$version" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"ping","description":"Reply with pong","inputSchema":{"type":"object","properties":{}}}]}}\n' "$id" ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"pong"}],"isError":false}}\n' "$id" ;;
+    *)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"method not found"}}\n' "$id" ;;
+  esac
+done
+"#;
+
+#[cfg(unix)]
+fn sh_server(
+    name: &str,
+    script: &str,
+    origin: claurst_core::config::McpServerOrigin,
+) -> claurst_core::config::McpServerConfig {
+    claurst_core::config::McpServerConfig {
+        name: name.to_string(),
+        command: Some("sh".to_string()),
+        args: vec!["-c".to_string(), script.to_string()],
+        env: std::collections::HashMap::new(),
+        url: None,
+        server_type: "stdio".to_string(),
+        origin,
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trusted_mcp_tools_are_attached_and_callable() {
+    use claurst_core::config::{McpServerOrigin, Settings};
+
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("mcp");
+    let marker = cwd.join("project-server-ran");
+    let settings = Settings::default();
+    let mut config = settings.effective_config();
+    config.mcp_servers = vec![
+        sh_server("fake", FAKE_MCP_SERVER, McpServerOrigin::User),
+        sh_server(
+            "repo",
+            &format!("touch '{}'", marker.display()),
+            McpServerOrigin::Project,
+        ),
+    ];
+
+    let manager = crate::runtime::build_mcp_manager(&config, &settings, &cwd)
+        .await
+        .expect("the user-defined server is trusted");
+    let names: Vec<String> = claurst_tools::mcp_tools(&manager)
+        .iter()
+        .map(|tool| tool.name().to_string())
+        .collect();
+    assert_eq!(names, vec!["fake_ping"]);
+    assert!(
+        !marker.exists(),
+        "an untrusted project server must not be launched"
+    );
+
+    let provider = ScriptedProvider::new(vec![
+        Step::Tool("fake_ping", json!({})),
+        Step::Text("got pong"),
+    ]);
+    let mut runtime = scripted_runtime(&cwd, provider);
+    let mut tools = claurst_tools::all_tools();
+    tools.extend(claurst_tools::mcp_tools(&manager));
+    runtime.tools = Arc::new(tools);
+    runtime.mcp_manager = Some(manager);
+
+    let client = Client::start(runtime);
+    client.permission_answers.lock().push_back("allow_once");
+    let session_id = client.new_session(&cwd).await;
+    let response = client.prompt(&session_id, "ping the server").await;
+    assert_eq!(stop_reason(&response), acp::StopReason::EndTurn);
+    assert_eq!(
+        client.permission_requests.lock().len(),
+        1,
+        "an MCP tool asks once (no double prompt from the central backstop)"
+    );
+    let outputs: Vec<Value> = client
+        .updates
+        .lock()
+        .iter()
+        .filter(|u| u["update"]["sessionUpdate"] == "tool_call_update")
+        .map(|u| u["update"]["rawOutput"].clone())
+        .collect();
+    assert_eq!(outputs, vec![json!("pong")]);
+}

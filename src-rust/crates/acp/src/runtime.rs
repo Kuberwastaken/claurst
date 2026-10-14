@@ -72,12 +72,13 @@ impl AgentRuntime {
         // tracked in plan/migration-todo).
         let mcp_manager = build_mcp_manager(&config, &settings, &working_dir).await;
 
-        // Build tools: built-ins + AgentTool. MCP tool wrappers are NOT
-        // attached here — the wrapper type lives in the CLI crate today and
-        // adding it would create a circular dep. Built-in tools (Bash, Read,
-        // Edit, Glob, Grep, WebFetch, …) cover the common ACP-editor flows.
+        // Build tools: built-ins + AgentTool + the tools of every MCP server
+        // that passed the trust gate.
         let mut tools: Vec<Box<dyn Tool>> = claurst_tools::all_tools();
         tools.push(Box::new(claurst_query::AgentTool));
+        if let Some(manager) = &mcp_manager {
+            tools.extend(claurst_tools::mcp_tools(manager));
+        }
         let tools = Arc::new(tools);
 
         let mut query_config = QueryConfig::from_config(&config);
@@ -98,7 +99,7 @@ impl AgentRuntime {
     }
 }
 
-async fn build_mcp_manager(
+pub(crate) async fn build_mcp_manager(
     config: &Config,
     settings: &Settings,
     working_dir: &std::path::Path,
