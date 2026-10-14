@@ -1,15 +1,19 @@
 //! Skill discovery: load custom prompt-template skills from markdown files
-//! on disk and (optionally) from git URLs.
+//! on disk and (optionally) from git URLs, and assemble them with the bundled
+//! skills into the session [`SkillRegistry`].
 //!
 //! Search priority (first match wins for a given skill name):
-//!   1. Project `.claurst/skills/` — walk up from `cwd`
-//!   2. Project `.agents/skills/`  — walk up from `cwd`
-//!   3. Global `~/.claurst/skills/`
-//!   4. Global `~/.agents/skills/` (unless already reached by step 2)
-//!   5. Configured extra paths from `SkillsConfig.paths`
-//!   6. Git-URL repos from `SkillsConfig.urls` (cloned once, then cached)
+//!   1. Project `.claurst/skills/`, `.agents/skills/`, `.claude/skills/` in
+//!      each directory from `cwd` up to the git root (see
+//!      [`project_search_dirs`]); nearer directories win
+//!   2. Global `<claurst home>/skills/`, `~/.agents/skills/`, `~/.claude/skills/`
+//!   3. Configured extra paths from `SkillsConfig.paths`
+//!   4. Git-URL repos from `SkillsConfig.urls` (cloned once, then cached)
+//!
+//! Bundled skills (`crate::bundled_skills`) come last: a discovered skill with
+//! the same name replaces the bundled one.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -226,6 +230,31 @@ fn resolve_path(path_str: &str, cwd: &Path) -> PathBuf {
 // Top-level discovery
 // ---------------------------------------------------------------------------
 
+/// Maximum number of directories [`project_search_dirs`] climbs from `cwd`
+/// while looking for the git root.
+const MAX_PROJECT_DEPTH: usize = 16;
+
+/// Directories searched for project-scoped files, innermost (`cwd`) first.
+///
+/// Climbs from `cwd` to the nearest ancestor containing `.git` (inclusive).
+/// When no `.git` is found within [`MAX_PROJECT_DEPTH`] levels, only `cwd`
+/// itself is returned, so a stray file in `$HOME` or `/` is never picked up.
+pub fn project_search_dirs(cwd: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut dir = Some(cwd);
+    while let Some(d) = dir {
+        if dirs.len() >= MAX_PROJECT_DEPTH {
+            break;
+        }
+        dirs.push(d.to_path_buf());
+        if d.join(".git").exists() {
+            return dirs;
+        }
+        dir = d.parent();
+    }
+    vec![cwd.to_path_buf()]
+}
+
 /// Discover all skills from all configured sources.
 ///
 /// Returns a `HashMap` of `skill_name → DiscoveredSkill` (first match wins;
@@ -236,10 +265,16 @@ pub fn discover_skills(
 ) -> HashMap<String, DiscoveredSkill> {
     let mut all: HashMap<String, DiscoveredSkill> = HashMap::new();
     let mut warn_duplicates: Vec<String> = Vec::new();
+    // A directory reachable twice (e.g. cwd is `$HOME`, so `.agents/skills`
+    // is both a project and a global dir) is scanned once.
+    let mut scanned: HashSet<PathBuf> = HashSet::new();
 
-    // Inline closure: insert a batch, warning on duplicates.
-    let mut add = |skills: Vec<DiscoveredSkill>| {
-        for skill in skills {
+    let mut add_dir = |dir: &Path| {
+        let key = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        if !scanned.insert(key) {
+            return;
+        }
+        for skill in scan_dir(dir) {
             if let Some(existing) = all.get(&skill.name) {
                 warn_duplicates.push(format!(
                     "Duplicate skill '{}' found at {} (keeping {})",
@@ -253,41 +288,30 @@ pub fn discover_skills(
         }
     };
 
-    // ---- 1. Project skills: walk up from cwd --------------------------------
-    {
-        let mut dir: &Path = cwd;
-        loop {
-            add(scan_dir(&dir.join(".claurst").join("skills")));
-            add(scan_dir(&dir.join(".agents").join("skills")));
-            match dir.parent() {
-                Some(parent) if parent != dir => dir = parent,
-                _ => break,
-            }
+    // ---- 1. Project skills: cwd up to the git root --------------------------
+    for dir in project_search_dirs(cwd) {
+        for root in [".claurst", ".agents", ".claude"] {
+            add_dir(&dir.join(root).join("skills"));
         }
     }
 
-    // ---- 2. Global skills: <claurst home>/skills/ ---------------------------
-    add(scan_dir(
-        &crate::config::Settings::config_dir().join("skills"),
-    ));
-
-    // ---- 3. Global .agents skills: ~/.agents/skills/ -------------------------
-    // Skipped when cwd is under $HOME: the walk-up in step 1 already scanned
-    // it, and scanning again would report every skill there as a duplicate.
-    if let Some(home) = dirs::home_dir().filter(|home| !cwd.starts_with(home)) {
-        add(scan_dir(&home.join(".agents").join("skills")));
+    // ---- 2. Global skills ---------------------------------------------------
+    add_dir(&crate::config::Settings::config_dir().join("skills"));
+    if let Some(home) = dirs::home_dir() {
+        add_dir(&home.join(".agents").join("skills"));
+        add_dir(&home.join(".claude").join("skills"));
     }
 
-    // ---- 4. Configured extra paths (with ~ expansion) -----------------------
+    // ---- 3. Configured extra paths (with ~ expansion) -----------------------
     for path_str in &config_skills.paths {
-        let path = resolve_path(path_str, cwd);
-        add(scan_dir(&path));
+        add_dir(&resolve_path(path_str, cwd));
     }
 
-    // ---- 5. Git URL skills (cached) -----------------------------------------
+    // ---- 4. Git URL skills (cached) -----------------------------------------
     for url in &config_skills.urls {
-        if let Some(git_skills) = fetch_git_skills(url) {
-            add(git_skills);
+        if let Some(repo_dir) = fetch_git_skills(url) {
+            add_dir(&repo_dir);
+            add_dir(&repo_dir.join("skills"));
         }
     }
 
@@ -300,15 +324,129 @@ pub fn discover_skills(
 }
 
 // ---------------------------------------------------------------------------
+// Session skill registry
+// ---------------------------------------------------------------------------
+
+/// One skill in the [`SkillRegistry`].
+#[derive(Debug, Clone)]
+pub enum RegisteredSkill {
+    /// Compiled into the binary (`crate::bundled_skills`).
+    Bundled(&'static crate::bundled_skills::BundledSkill),
+    /// Loaded from a markdown file on disk or from a cloned skills repo.
+    Discovered(DiscoveredSkill),
+}
+
+impl RegisteredSkill {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Bundled(b) => b.name,
+            Self::Discovered(d) => &d.name,
+        }
+    }
+
+    pub fn description(&self) -> &str {
+        match self {
+            Self::Bundled(b) => b.description,
+            Self::Discovered(d) => &d.description,
+        }
+    }
+
+    /// The markdown file the skill was loaded from; `None` for bundled skills.
+    pub fn source_path(&self) -> Option<&Path> {
+        match self {
+            Self::Bundled(_) => None,
+            Self::Discovered(d) => Some(&d.source_path),
+        }
+    }
+
+    /// The directory relative paths inside the skill resolve against: the
+    /// folder holding the skill file. `None` for bundled skills.
+    pub fn base_dir(&self) -> Option<&Path> {
+        self.source_path().and_then(Path::parent)
+    }
+
+    /// The skill body with `$ARGUMENTS` substituted.
+    pub fn expand(&self, args: &str) -> String {
+        match self {
+            Self::Bundled(b) => crate::bundled_skills::expand_prompt(b, args),
+            Self::Discovered(d) => d.template.replace("$ARGUMENTS", args),
+        }
+    }
+}
+
+/// Every skill available to a session, sorted by name.
+///
+/// The single source for the Skill tool, the `/skills` listing, skill slash
+/// commands and the `<available_skills>` block in the system prompt. Built
+/// from [`discover_skills`] plus the user-invocable bundled skills; a
+/// discovered skill replaces a bundled one with the same name.
+#[derive(Debug, Clone, Default)]
+pub struct SkillRegistry {
+    skills: Vec<RegisteredSkill>,
+}
+
+impl SkillRegistry {
+    /// Discover skills for `cwd` and merge in the bundled ones.
+    ///
+    /// May `git clone` configured skill URLs: call it off the UI thread.
+    pub fn discover(cwd: &Path, config_skills: &crate::config::SkillsConfig) -> Self {
+        Self::from_discovered(discover_skills(cwd, config_skills))
+    }
+
+    fn from_discovered(discovered: HashMap<String, DiscoveredSkill>) -> Self {
+        let bundled = crate::bundled_skills::BUNDLED_SKILLS
+            .iter()
+            .filter(|b| b.user_invocable && !discovered.contains_key(b.name))
+            .map(RegisteredSkill::Bundled)
+            .collect::<Vec<_>>();
+        let mut skills: Vec<RegisteredSkill> = discovered
+            .into_values()
+            .map(RegisteredSkill::Discovered)
+            .chain(bundled)
+            .collect();
+        skills.sort_by(|a, b| a.name().cmp(b.name()));
+        Self { skills }
+    }
+
+    /// All skills, sorted by name.
+    pub fn skills(&self) -> &[RegisteredSkill] {
+        &self.skills
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.skills.is_empty()
+    }
+
+    /// Look a skill up by exact name, or by a bundled skill's alias.
+    pub fn get(&self, name: &str) -> Option<&RegisteredSkill> {
+        self.skills.iter().find(|s| s.name() == name).or_else(|| {
+            self.skills.iter().find(|s| match s {
+                RegisteredSkill::Bundled(b) => b.aliases.contains(&name),
+                RegisteredSkill::Discovered(_) => false,
+            })
+        })
+    }
+
+    /// The skills loaded from disk or a skills repo (not bundled).
+    pub fn discovered(&self) -> impl Iterator<Item = &DiscoveredSkill> {
+        self.skills.iter().filter_map(|s| match s {
+            RegisteredSkill::Discovered(d) => Some(d),
+            RegisteredSkill::Bundled(_) => None,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Git URL support
 // ---------------------------------------------------------------------------
 
-/// Clone or reuse a cached git repo and return skills found in it.
+/// Clone or reuse a cached git repo and return its local directory. Skills
+/// are read from the repo root and its optional `skills/` subdirectory.
 ///
 /// Cache location: `<system-cache>/claurst/skills/<repo-name>/`
 /// On first access the repo is cloned with `--depth=1`.
 /// Subsequent calls use the already-cloned cache directory as-is.
-fn fetch_git_skills(url: &str) -> Option<Vec<DiscoveredSkill>> {
+fn fetch_git_skills(url: &str) -> Option<PathBuf> {
     let cache_dir = dirs::cache_dir()?.join("claurst").join("skills");
 
     // Use the last path segment of the URL as the local directory name.
@@ -363,10 +501,7 @@ fn fetch_git_skills(url: &str) -> Option<Vec<DiscoveredSkill>> {
         }
     }
 
-    // Scan repo root and optional `skills/` subdirectory.
-    let mut skills = scan_dir(&repo_dir);
-    skills.extend(scan_dir(&repo_dir.join("skills")));
-    Some(skills)
+    Some(repo_dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -620,5 +755,92 @@ mod tests {
         let discovered = discover_skills(tmp.path(), &config);
         assert!(discovered.contains_key("sub-skill"));
         assert_eq!(discovered["sub-skill"].description, "Sub agent skill");
+    }
+
+    // ---- project_search_dirs ------------------------------------------------
+
+    #[test]
+    fn project_search_dirs_stop_at_git_root() {
+        let tmp = make_temp_dir();
+        let repo = tmp.path().join("repo");
+        let nested = repo.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        let dirs = project_search_dirs(&nested);
+        assert_eq!(dirs, vec![nested.clone(), repo.join("a"), repo.clone()]);
+        assert!(!dirs.contains(&tmp.path().to_path_buf()));
+    }
+
+    #[test]
+    fn project_search_dirs_without_git_is_cwd_only() {
+        let tmp = make_temp_dir();
+        let nested = tmp.path().join("x").join("y");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(project_search_dirs(&nested), vec![nested]);
+    }
+
+    #[test]
+    fn test_discover_project_roots_up_to_git_root_only() {
+        let tmp = make_temp_dir();
+        let repo = tmp.path().join("repo");
+        let cwd = repo.join("pkg");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        write_file(
+            &repo.join(".claude").join("skills").join("from-claude-446"),
+            "SKILL.md",
+            "---\ndescription: claude dir\n---\nBody.",
+        );
+        write_file(&cwd.join(".agents").join("skills"), "near-446.md", "Near.");
+        // Above the git root: must not be discovered.
+        write_file(&tmp.path().join(".claurst").join("skills"), "outside-446.md", "Outside.");
+
+        let discovered = discover_skills(&cwd, &crate::config::SkillsConfig::default());
+        assert_eq!(discovered["from-claude-446"].description, "claude dir");
+        assert!(discovered.contains_key("near-446"));
+        assert!(!discovered.contains_key("outside-446"));
+    }
+
+    // ---- SkillRegistry ------------------------------------------------------
+
+    #[test]
+    fn registry_merges_bundled_and_discovered_sorted() {
+        // Built from fixtures directly so skills in the real global dirs of
+        // the machine running the test cannot interfere.
+        let tmp = make_temp_dir();
+        let skills_dir = tmp.path().join("skills");
+        write_file(&skills_dir.join("zeta"), "SKILL.md", "---\ndescription: Z\n---\nZ body $ARGUMENTS");
+        // Same name as a bundled skill: the file replaces it.
+        write_file(&skills_dir, "simplify.md", "---\nname: simplify\ndescription: mine\n---\nMine.");
+        let discovered: HashMap<String, DiscoveredSkill> = scan_dir(&skills_dir)
+            .into_iter()
+            .map(|skill| (skill.name.clone(), skill))
+            .collect();
+        let registry = SkillRegistry::from_discovered(discovered);
+
+        let names: Vec<&str> = registry.skills().iter().map(RegisteredSkill::name).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "registry must be sorted by name");
+        assert_eq!(names.iter().filter(|n| **n == "simplify").count(), 1);
+
+        let simplify = registry.get("simplify").unwrap();
+        assert_eq!(simplify.description(), "mine");
+        assert!(matches!(simplify, RegisteredSkill::Discovered(_)));
+
+        let zeta = registry.get("zeta").unwrap();
+        assert_eq!(zeta.base_dir(), Some(skills_dir.join("zeta").as_path()));
+        assert_eq!(zeta.expand("now"), "Z body now");
+
+        let debug = registry.get("debug").unwrap();
+        assert!(matches!(debug, RegisteredSkill::Bundled(_)));
+        assert!(debug.base_dir().is_none());
+        // Bundled aliases resolve to the bundled skill.
+        assert_eq!(registry.get("mem").map(RegisteredSkill::name), Some("remember"));
+
+        let from_disk: Vec<&str> = registry.discovered().map(|d| d.name.as_str()).collect();
+        assert!(from_disk.contains(&"zeta"));
+        assert!(!from_disk.contains(&"debug"));
     }
 }

@@ -1487,21 +1487,15 @@ impl SlashCommand for SkillCommand {
     }
 }
 
-/// Build slash commands from skill markdown files discovered on the filesystem
-/// and from configured git URLs.
+/// Build slash commands from the skills in `registry` that were loaded from
+/// disk or a skills repo (bundled skills are reached through the Skill tool).
 ///
-/// Pass the project `cwd` and the `skills` section of the effective config.
-/// Bundled skills take precedence — any discovered skill whose name clashes
-/// with a built-in command name or alias will be silently skipped. Only the
-/// skills are returned, never the built-ins themselves.
-///
-/// Discovery walks the filesystem and may `git clone` configured skill URLs,
-/// so call this off the UI thread.
-pub fn commands_from_discovered_skills(
-    cwd: &std::path::Path,
-    skills_config: &claurst_core::SkillsConfig,
+/// Built-in commands take precedence — any skill whose name clashes with a
+/// built-in command name or alias is skipped. Only the skills are returned,
+/// never the built-ins themselves.
+pub fn commands_from_skill_registry(
+    registry: &claurst_core::SkillRegistry,
 ) -> Vec<Box<dyn SlashCommand>> {
-    let discovered = claurst_core::discover_skills(cwd, skills_config);
     // Build a set of built-in command names and aliases to skip collisions.
     let all_cmds = all_commands();
     let builtin_names: std::collections::HashSet<&str> = all_cmds
@@ -1509,14 +1503,14 @@ pub fn commands_from_discovered_skills(
         .flat_map(|c| std::iter::once(c.name()).chain(c.aliases()))
         .collect();
 
-    discovered
-        .into_values()
+    registry
+        .discovered()
         .filter(|skill| !builtin_names.contains(skill.name.as_str()))
         .map(|skill| {
             Box::new(SkillCommand {
-                name: skill.name,
-                description: skill.description,
-                template: skill.template,
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+                template: skill.template.clone(),
             }) as Box<dyn SlashCommand>
         })
         .collect()
@@ -1543,16 +1537,16 @@ pub async fn execute_command(
     }
 
     // Check discovered skill commands (from .claurst/skills/, git URLs, etc.).
-    {
-        let discovered = claurst_core::discover_skills(&ctx.working_dir, &ctx.config.skills);
-        if let Some(skill) = discovered.get(cmd_name) {
-            let sc = SkillCommand {
-                name: skill.name.clone(),
-                description: skill.description.clone(),
-                template: skill.template.clone(),
-            };
-            return Some(sc.execute(args, ctx).await);
-        }
+    let skill_command = claurst_core::SkillRegistry::discover(&ctx.working_dir, &ctx.config.skills)
+        .discovered()
+        .find(|skill| skill.name == cmd_name)
+        .map(|skill| SkillCommand {
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+            template: skill.template.clone(),
+        });
+    if let Some(sc) = skill_command {
+        return Some(sc.execute(args, ctx).await);
     }
 
     // Then check plugin-defined slash commands.

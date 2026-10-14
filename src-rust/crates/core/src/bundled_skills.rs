@@ -1,13 +1,9 @@
-//! Bundled skill definitions for the Skill tool.
+//! Bundled skill definitions.
 //!
 //! Each entry in `BUNDLED_SKILLS` mirrors one of the TypeScript
-//! `registerXxxSkill()` calls under `src/skills/bundled/`.  Only publicly
-//! invocable, user-facing skills are included; internal or ANT-only skills
-//! (stuck, remember, verify) are omitted from the user-visible list but are
-//! still present as documentation stubs so callers can discover them.
-//!
-//! The `SkillTool` checks bundled skills *before* scanning disk directories,
-//! so bundled names take precedence over same-named `.md` files.
+//! `registerXxxSkill()` calls under `src/skills/bundled/`. They are one source
+//! of the session skill registry (`skill_discovery::SkillRegistry`); a skill
+//! discovered on disk with the same name replaces the bundled one.
 
 /// A single bundled skill definition.
 #[derive(Debug, Clone)]
@@ -420,15 +416,6 @@ pub fn find_bundled_skill(name: &str) -> Option<&'static BundledSkill> {
     })
 }
 
-/// Return `(name, description)` pairs for all user-invocable bundled skills.
-pub fn user_invocable_skills() -> Vec<(&'static str, &'static str)> {
-    BUNDLED_SKILLS
-        .iter()
-        .filter(|s| s.user_invocable)
-        .map(|s| (s.name, s.description))
-        .collect()
-}
-
 /// Expand a skill's prompt template, substituting `$ARGUMENTS` and
 /// `$ARGUMENTS_SUFFIX`.
 ///
@@ -552,24 +539,6 @@ mod tests {
         // $ARGUMENTS_SUFFIX should expand to "" so "stuck" is not followed by ": "
         assert!(!expanded.contains("stuck: "));
         assert!(!expanded.contains("$ARGUMENTS_SUFFIX"));
-    }
-
-    #[test]
-    fn user_invocable_skills_non_empty() {
-        let skills = user_invocable_skills();
-        assert!(!skills.is_empty());
-    }
-
-    #[test]
-    fn user_invocable_skills_all_marked_true() {
-        for (name, _) in user_invocable_skills() {
-            let skill = find_bundled_skill(name).unwrap();
-            assert!(
-                skill.user_invocable,
-                "skill '{}' returned by user_invocable_skills() but user_invocable=false",
-                name
-            );
-        }
     }
 
 }

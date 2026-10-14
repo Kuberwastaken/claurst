@@ -1970,7 +1970,8 @@ async fn run_interactive(
         let cwd = tool_ctx.working_dir.clone();
         let skills_config = live_config.skills.clone();
         tokio::task::spawn_blocking(move || {
-            let commands = claurst_commands::commands_from_discovered_skills(&cwd, &skills_config)
+            let registry = claurst_core::SkillRegistry::discover(&cwd, &skills_config);
+            let commands = claurst_commands::commands_from_skill_registry(&registry)
                 .iter()
                 .map(|c| (c.name().to_string(), c.description().to_string()))
                 .collect();

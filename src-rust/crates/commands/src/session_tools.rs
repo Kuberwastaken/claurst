@@ -20,103 +20,36 @@ pub struct CommitCommand;
 impl SlashCommand for SkillsCommand {
     fn name(&self) -> &str { "skills" }
     fn aliases(&self) -> Vec<&str> { vec!["skill"] }
-    fn description(&self) -> &str { "List available skills in .claurst/commands/" }
+    fn description(&self) -> &str { "List the skills available to this session" }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
-        let mut found: Vec<String> = Vec::new();
-        let dirs = [
-            ctx.working_dir.join(".claurst").join("commands"),
-            claurst_core::config::Settings::config_dir().join("commands"),
-        ];
-
-        for dir in &dirs {
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.extension().is_some_and(|e| e == "md") {
-                        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                            let name = stem.to_string();
-                            if !found.contains(&name) {
-                                found.push(name);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Include skills contributed by installed plugins.
-        if let Some(registry) = claurst_plugins::global_plugin_registry() {
-            for skill_dir in registry.all_skill_paths() {
-                if let Ok(entries) = std::fs::read_dir(&skill_dir) {
-                    for entry in entries.flatten() {
-                        let p = entry.path();
-                        // Skills can be individual .md files or subdirs with SKILL.md.
-                        if p.is_dir() {
-                            if p.join("SKILL.md").exists() || p.join("skill.md").exists() {
-                                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                                    let skill_name = name.to_string();
-                                    if !found.contains(&skill_name) {
-                                        found.push(skill_name);
-                                    }
-                                }
-                            }
-                        } else if p.extension().is_some_and(|e| e == "md") {
-                            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                                let name = stem.to_string();
-                                if !found.contains(&name) {
-                                    found.push(name);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Include discovered skills from .claurst/skills/ and configured paths/URLs.
-        let discovered = claurst_core::discover_skills(
-            &ctx.working_dir,
-            &ctx.config.skills,
-        );
-
-        let mut output = if found.is_empty() && discovered.is_empty() {
-            return CommandResult::Message(
-                "No skills found.\nCreate .md files in .claurst/commands/ to define skills.\n\
-                 Example: .claurst/commands/review.md".to_string(),
-            );
-        } else if found.is_empty() {
-            String::new()
-        } else {
-            found.sort();
-            format!(
-                "Available skills ({}):\n{}",
-                found.len(),
-                found.iter().map(|s| format!("  /{}", s)).collect::<Vec<_>>().join("\n")
-            )
-        };
-
-        if !discovered.is_empty() {
-            let mut disc_list: Vec<(&String, &claurst_core::DiscoveredSkill)> =
-                discovered.iter().collect();
-            disc_list.sort_by_key(|(name, _)| name.as_str());
-
-            if !output.is_empty() {
-                output.push('\n');
-            }
-            output.push_str(&format!("\nDiscovered skills ({}):\n", disc_list.len()));
-            for (name, skill) in disc_list {
-                output.push_str(&format!(
-                    "  /{} — {} ({})\n",
-                    name,
-                    skill.description,
-                    skill.source_path.display()
-                ));
-            }
-        }
-
-        CommandResult::Message(output.trim_end().to_string())
+        let registry =
+            claurst_core::SkillRegistry::discover(&ctx.working_dir, &ctx.config.skills);
+        CommandResult::Message(format_skill_list(&registry))
     }
+}
+
+/// Render the `/skills` listing: one line per skill with its source.
+fn format_skill_list(registry: &claurst_core::SkillRegistry) -> String {
+    if registry.is_empty() {
+        return "No skills found.\n\
+                Add a skill as .claurst/skills/<name>/SKILL.md (or .agents/skills/, \
+                .claude/skills/, ~/.claurst/skills/)."
+            .to_string();
+    }
+    let mut output = format!("Available skills ({}):", registry.skills().len());
+    for skill in registry.skills() {
+        let source = skill
+            .source_path()
+            .map_or_else(|| "bundled".to_string(), |p| p.display().to_string());
+        output.push_str(&format!(
+            "\n  {} — {} ({})",
+            skill.name(),
+            skill.description(),
+            source
+        ));
+    }
+    output
 }
 
 // ---- /rewind -------------------------------------------------------------

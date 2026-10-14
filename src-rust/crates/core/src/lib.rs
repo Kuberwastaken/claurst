@@ -94,7 +94,10 @@ pub use import_config::{ClaudeMdPreview, ImportExecutionResult, ImportPaths, Imp
 
 // Skill discovery: filesystem and git URL skill loading.
 pub mod skill_discovery;
-pub use skill_discovery::{DiscoveredSkill, discover_skills, parse_skill_file};
+pub use skill_discovery::{DiscoveredSkill, RegisteredSkill, SkillRegistry, discover_skills, parse_skill_file};
+
+// Skills compiled into the binary; one source of the skill registry.
+pub mod bundled_skills;
 pub use cost::CostTracker;
 pub use history::ConversationSession;
 pub use feature_flags::FeatureFlagManager;

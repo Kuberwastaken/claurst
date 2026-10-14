@@ -362,7 +362,6 @@ impl Tool for AgentTool {
             tool_result_max_bytes: crate::DEFAULT_TOOL_RESULT_MAX_BYTES,
             effort_level: None,
             command_queue: None,
-            skill_index: None,
             max_budget_usd: None,
             fallback_model: None,
             provider_registry: Some(Arc::new(provider_registry)),

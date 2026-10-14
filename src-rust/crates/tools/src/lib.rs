@@ -44,7 +44,6 @@ pub mod todo_write;
 pub mod notebook_edit;
 pub mod powershell;
 pub mod send_message;
-pub mod bundled_skills;
 pub mod skill_tool;
 pub mod sleep;
 pub mod tasks;

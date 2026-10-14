@@ -25,7 +25,6 @@ pub mod coordinator;
 pub mod cron_scheduler;
 pub mod sanitize;
 pub mod session_memory;
-pub mod skill_prefetch;
 
 mod runner;
 pub use runner::*;
@@ -38,9 +37,6 @@ pub use cron_scheduler::start_cron_scheduler;
 pub use goal_loop::{
     GoalContinuation, StopReason, check_and_continue_goal, decide_goal_continuation,
     mark_goal_complete,
-};
-pub use skill_prefetch::{
-    SkillDefinition, SkillIndex, SharedSkillIndex, prefetch_skills, format_skill_listing,
 };
 pub use sanitize::sanitize_history;
 pub use compact::{
@@ -133,12 +129,6 @@ pub struct QueryConfig {
     /// shared (Arc-backed) so the TUI input thread can push commands while the
     /// loop is waiting for a model response.
     pub command_queue: Option<CommandQueue>,
-    /// T1-5: Optional shared skill index.
-    ///
-    /// When set, `prefetch_skills` is spawned once before the loop begins and
-    /// the resulting index is used to inject a skill listing attachment into
-    /// the conversation context.
-    pub skill_index: Option<SharedSkillIndex>,
     /// Optional USD spend cap. The query loop checks accumulated cost after
     /// each turn and aborts with `QueryOutcome::BudgetExceeded` when exceeded.
     pub max_budget_usd: Option<f64>,
@@ -217,7 +207,6 @@ impl Default for QueryConfig {
             tool_result_max_bytes: DEFAULT_TOOL_RESULT_MAX_BYTES,
             effort_level: None,
             command_queue: None,
-            skill_index: None,
             max_budget_usd: None,
             fallback_model: None,
             provider_registry: None,
@@ -2334,7 +2323,6 @@ mod tests {
             tool_result_max_bytes: DEFAULT_TOOL_RESULT_MAX_BYTES,
             effort_level: None,
             command_queue: None,
-            skill_index: None,
             max_budget_usd: None,
             fallback_model: None,
             provider_registry: None,
