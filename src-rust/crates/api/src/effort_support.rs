@@ -223,11 +223,12 @@ impl AnthropicReasoning {
     }
 }
 
-/// `opus-4-8`, `sonnet-4-6`, `fable-5`, `haiku-5-5`, ... A minor version must
-/// be one or two digits followed by a non-digit, so the date suffix in
-/// `claude-sonnet-4-20250514` is not read as a minor version.
+/// `opus-4-8`, `sonnet-4-6`, `fable-5`, `haiku-5-5`, ... Version parts must be
+/// one or two digits followed by a non-digit, so the date suffix in
+/// `claude-sonnet-4-20250514` is not read as a minor version and the one in
+/// `claude-3-7-sonnet-20250219` is not read as a major version.
 static CLAUDE_FAMILY_FIRST: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)(?:opus|sonnet|haiku|fable|mythos)-(\d+)(?:[.-](\d{1,2})(?:\D|$))?").unwrap()
+    Regex::new(r"(?i)(?:opus|sonnet|haiku|fable|mythos)-(\d{1,2})(?:[.-](\d{1,2}))?(?:\D|$)").unwrap()
 });
 /// `claude-3-7-sonnet`, `claude-3-opus`.
 static CLAUDE_VERSION_FIRST: Lazy<Regex> = Lazy::new(|| {
