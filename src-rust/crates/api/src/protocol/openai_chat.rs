@@ -50,6 +50,9 @@ pub struct OpenAiChatDecoder {
     dsml: Option<DsmlStreamParser>,
     /// Number of tool calls lifted out of DSML envelopes in this stream.
     dsml_tool_calls: usize,
+    /// Set once a `finish_reason` or `[DONE]` arrived: the response is
+    /// complete. A byte stream that ends without it was truncated (#439).
+    complete: bool,
 }
 
 impl OpenAiChatDecoder {
@@ -63,6 +66,7 @@ impl OpenAiChatDecoder {
             tool_blocks: BTreeSet::new(),
             dsml: None,
             dsml_tool_calls: 0,
+            complete: false,
         }
     }
 
@@ -129,6 +133,7 @@ impl OpenAiChatDecoder {
         };
 
         if data == "[DONE]" {
+            self.complete = true;
             self.flush_dsml(out);
             out.push(StreamEvent::MessageStop);
             return true;
@@ -321,6 +326,7 @@ impl OpenAiChatDecoder {
         // finish_reason.
         if let Some(finish_reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
             if !finish_reason.is_empty() && finish_reason != "null" {
+                self.complete = true;
                 // Flush any still-open thinking block first so it is finalized
                 // into the assistant message.
                 if self.thinking_open {
@@ -354,13 +360,20 @@ impl OpenAiChatDecoder {
         false
     }
 
-    /// Flush a trailing `MessageStop` if the stream produced any content but
-    /// ended without an explicit `[DONE]` sentinel.
+    /// Flush a trailing `MessageStop` when the response completed (a
+    /// `finish_reason` arrived) but no explicit `[DONE]` sentinel followed.
+    /// A truncated stream gets no `MessageStop`; check
+    /// [`is_complete`](Self::is_complete) to report it.
     pub fn finish(&mut self, out: &mut Vec<StreamEvent>) {
-        if self.message_started {
+        if self.complete && self.message_started {
             self.flush_dsml(out);
             out.push(StreamEvent::MessageStop);
         }
+    }
+
+    /// Whether a `finish_reason` or `[DONE]` has been seen.
+    pub fn is_complete(&self) -> bool {
+        self.complete
     }
 }
 
@@ -454,6 +467,21 @@ mod tests {
         );
         assert!(done, "[DONE] must stop the stream");
         assert!(matches!(events.last(), Some(StreamEvent::MessageStop)));
+    }
+
+    #[test]
+    fn truncated_stream_is_not_complete_and_gets_no_message_stop() {
+        let mut d = OpenAiChatDecoder::new(None);
+        let (events, done) = drain(&mut d, &[r#"data: {"choices":[{"delta":{"content":"Hel"}}]}"#]);
+        assert!(!done);
+        assert!(!events.is_empty());
+        let mut tail = Vec::new();
+        d.finish(&mut tail);
+        assert!(!d.is_complete(), "no finish_reason / [DONE] arrived");
+        assert!(
+            !tail.iter().any(|e| matches!(e, StreamEvent::MessageStop)),
+            "a truncated stream must not be closed as if complete"
+        );
     }
 
     #[test]

@@ -1390,6 +1390,7 @@ impl App {
                 self.streaming_text.clear();
                 self.streaming_thinking.clear();
                 self.tool_use_blocks.clear();
+                self.retry_status = None;
                 self.status_message = Some("Cancelled.".to_string());
                 self.complete_current_turn_snapshot(true);
             }

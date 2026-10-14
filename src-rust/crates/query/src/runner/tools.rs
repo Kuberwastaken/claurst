@@ -4,21 +4,13 @@
 
 use crate::*;
 
-/// Parse the accumulated JSON arguments of a streamed tool call.
-///
-/// Providers stream a tool call's arguments as a sequence of partial-JSON
-/// deltas which we concatenate into a single buffer. A well-behaved
-/// no-argument call yields an empty (or whitespace-only) buffer, which we
-/// map to an empty object. Any *non-empty* buffer that fails to parse is
-/// returned as an error rather than being silently replaced with `{}` — a
-/// truncated stream must never cause a tool (e.g. Edit/Write) to run with
-/// empty arguments (issue #215).
-pub(crate) fn parse_tool_args(json_str: &str) -> Result<Value, serde_json::Error> {
-    let trimmed = json_str.trim();
-    if trimmed.is_empty() {
-        return Ok(serde_json::json!({}));
-    }
-    serde_json::from_str(trimmed)
+/// Tool result returned instead of running a tool whose arguments were not
+/// valid JSON (and could not be repaired) (#215, #439).
+pub(crate) fn invalid_tool_input_result(tool_name: &str, error: &str) -> ToolResult {
+    ToolResult::error(format!(
+        "invalid JSON input for tool {}: {}. The tool was not run; retry the call with complete, valid JSON arguments.",
+        tool_name, error
+    ))
 }
 
 /// Whether a `PermissionLevel` must be gated by the central backstop.

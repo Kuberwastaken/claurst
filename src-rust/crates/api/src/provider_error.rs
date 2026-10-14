@@ -7,6 +7,7 @@
 use claurst_core::error::ClaudeError;
 use claurst_core::provider_id::ProviderId;
 use std::fmt;
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // ProviderError
@@ -26,8 +27,8 @@ pub enum ProviderError {
     /// The provider returned HTTP 429 or an equivalent rate-limit signal.
     RateLimited {
         provider: ProviderId,
-        /// How long to wait before retrying, in seconds (if provided).
-        retry_after: Option<u64>,
+        /// Server-requested wait (`retry-after-ms` / `Retry-After`), if any.
+        retry_after: Option<Duration>,
     },
 
     /// The API key or credentials were rejected by the provider.
@@ -58,6 +59,8 @@ pub enum ProviderError {
         message: String,
         /// Whether the caller should retry this request.
         is_retryable: bool,
+        /// Server-requested wait (`retry-after-ms` / `Retry-After`), if any.
+        retry_after: Option<Duration>,
     },
 
     /// The request itself was malformed or contained invalid parameters.
@@ -97,13 +100,22 @@ pub enum ProviderError {
 
 impl ProviderError {
     /// Returns `true` if the caller should retry the request after a delay.
+    /// Delegates to the shared policy in [`crate::retry`].
     pub fn is_retryable(&self) -> bool {
-        match self {
-            ProviderError::RateLimited { .. } => true,
-            ProviderError::ServerError { is_retryable, .. } => *is_retryable,
-            ProviderError::StreamError { .. } => true,
-            _ => false,
+        crate::retry::classify_provider_error(self).is_retry()
+    }
+
+    /// Attach the server-requested wait parsed from the response headers to a
+    /// rate-limit or server error. Other variants are returned unchanged.
+    pub fn with_retry_after(mut self, after: Option<Duration>) -> Self {
+        if after.is_some() {
+            if let ProviderError::RateLimited { retry_after, .. }
+            | ProviderError::ServerError { retry_after, .. } = &mut self
+            {
+                *retry_after = after;
+            }
         }
+        self
     }
 
     /// Returns the `ProviderId` of the provider that produced this error.
@@ -139,8 +151,8 @@ impl fmt::Display for ProviderError {
             }
             ProviderError::RateLimited { provider, retry_after } => {
                 write!(f, "[{}] Rate limited", provider)?;
-                if let Some(secs) = retry_after {
-                    write!(f, "; retry after {}s", secs)?;
+                if let Some(wait) = retry_after {
+                    write!(f, "; retry after {:.1}s", wait.as_secs_f64())?;
                 }
                 Ok(())
             }
@@ -198,10 +210,11 @@ impl From<ProviderError> for ClaudeError {
             ProviderError::ContextOverflow { .. } => ClaudeError::ContextWindowExceeded,
             ProviderError::RateLimited { .. } => ClaudeError::RateLimit,
             ProviderError::AuthFailed { message, .. } => ClaudeError::Auth(message.clone()),
-            ProviderError::ServerError { status: Some(s), message, .. } => {
+            ProviderError::ServerError { status: Some(s), message, retry_after, .. } => {
                 ClaudeError::ApiStatus {
                     status: *s,
                     message: message.clone(),
+                    retry_after: *retry_after,
                 }
             }
             _ => ClaudeError::Api(err.to_string()),

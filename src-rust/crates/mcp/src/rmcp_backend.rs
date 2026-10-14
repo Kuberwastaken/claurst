@@ -1,5 +1,6 @@
 use crate::backend::{McpBackendKind, McpClientBackend, McpClientSnapshot};
 use crate::transport;
+use crate::{McpTimeoutError, McpTimeouts};
 use crate::types::{
     CallToolResult, GetPromptResult, McpContent, McpPrompt, McpPromptArgument,
     McpResource, McpTool, PromptMessage, PromptMessageContent, PromptsCapability,
@@ -20,6 +21,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
+use tokio::time::Instant as TokioInstant;
 use tokio_stream::wrappers::ReceiverStream;
 
 /// Lock a `std::sync::Mutex`, recovering from poisoning instead of panicking.
@@ -113,6 +115,8 @@ pub struct RmcpClientBackend {
 impl RmcpClientBackend {
     pub async fn connect_stdio(
         config: &claurst_core::config::McpServerConfig,
+        deadline: TokioInstant,
+        timeouts: McpTimeouts,
     ) -> anyhow::Result<Self> {
         let command = config
             .command
@@ -126,39 +130,49 @@ impl RmcpClientBackend {
         .map_err(|e| anyhow::anyhow!("failed to spawn rmcp stdio child for '{}': {}", config.name, e))?;
 
         let client_info = build_client_info(rmcp_model::ProtocolVersion::default());
-        Self::connect_with_transport(config, transport, client_info, "stdio").await
+        Self::connect_with_transport(config, transport, client_info, "stdio", deadline, timeouts).await
     }
 
     pub async fn connect_http(
         config: &claurst_core::config::McpServerConfig,
         auth_token: Option<String>,
         protocol_version: rmcp_model::ProtocolVersion,
+        deadline: TokioInstant,
+        timeouts: McpTimeouts,
     ) -> anyhow::Result<Self> {
         let endpoint = config
             .url
             .clone()
             .ok_or_else(|| anyhow::anyhow!("MCP server '{}' has no URL configured", config.name))?;
 
-        let mut transport_config = StreamableHttpClientTransportConfig::with_uri(endpoint);
+        let mut transport_config = StreamableHttpClientTransportConfig::with_uri(endpoint)
+            .custom_headers(configured_headers(config)?);
         if let Some(token) = auth_token {
             transport_config = transport_config.auth_header(token);
         }
 
         let transport = StreamableHttpClientTransport::from_config(transport_config);
         let client_info = build_client_info(protocol_version);
-        Self::connect_with_transport(config, transport, client_info, "http").await
+        Self::connect_with_transport(config, transport, client_info, "http", deadline, timeouts).await
     }
 
     pub async fn connect_legacy_sse(
         config: &claurst_core::config::McpServerConfig,
         auth_token: Option<String>,
+        deadline: TokioInstant,
+        timeouts: McpTimeouts,
     ) -> anyhow::Result<Self> {
         // Legacy SSE servers still expose the real POST endpoint via
         // `event: endpoint`; keep a thin compatibility shim here and hand the
         // session and capability flow back to rmcp once connected.
-        let transport = LegacySseRmcpTransport::connect(config, auth_token).await?;
+        let transport = tokio::time::timeout_at(
+            deadline,
+            LegacySseRmcpTransport::connect(config, auth_token),
+        )
+        .await
+        .map_err(|_| connect_timeout(config, "opening the SSE stream", timeouts))??;
         let client_info = build_client_info(rmcp_model::ProtocolVersion::V_2024_11_05);
-        Self::connect_with_transport(config, transport, client_info, "sse").await
+        Self::connect_with_transport(config, transport, client_info, "sse", deadline, timeouts).await
     }
 
     async fn connect_with_transport<T, E, A>(
@@ -166,6 +180,8 @@ impl RmcpClientBackend {
         transport: T,
         client_info: rmcp_model::ClientInfo,
         transport_label: &str,
+        deadline: TokioInstant,
+        timeouts: McpTimeouts,
     ) -> anyhow::Result<Self>
     where
         T: rmcp::transport::IntoTransport<RoleClient, E, A>,
@@ -173,17 +189,22 @@ impl RmcpClientBackend {
     {
         let (notifications_tx, notifications_rx) = mpsc::unbounded_channel();
         let handler = RmcpNotificationClient::new(notifications_tx, client_info);
-        let running = handler.serve(transport).await.map_err(|e| {
-            anyhow::anyhow!(
-                "rmcp {} client '{}' failed to initialize: {}",
-                transport_label,
-                config.name,
-                e
-            )
-        })?;
+        // Dropping the pending handshake on timeout drops the transport,
+        // which kills a stdio child process.
+        let running = tokio::time::timeout_at(deadline, handler.serve(transport))
+            .await
+            .map_err(|_| connect_timeout(config, "initialize", timeouts))?
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "rmcp {} client '{}' failed to initialize: {}",
+                    transport_label,
+                    config.name,
+                    e
+                )
+            })?;
 
         let peer = running.peer().clone();
-        let snapshot = build_snapshot(config, &peer).await?;
+        let snapshot = build_snapshot(config, &peer, timeouts.catalog).await?;
 
         Ok(Self {
             snapshot,
@@ -192,6 +213,25 @@ impl RmcpClientBackend {
             notifications_rx: Arc::new(Mutex::new(notifications_rx)),
         })
     }
+}
+
+/// The server's configured `headers`, validated as HTTP header names/values.
+fn configured_headers(
+    config: &claurst_core::config::McpServerConfig,
+) -> anyhow::Result<HashMap<reqwest::header::HeaderName, reqwest::header::HeaderValue>> {
+    config
+        .headers
+        .iter()
+        .map(|(name, value)| {
+            let header_name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+                anyhow::anyhow!("MCP server '{}': invalid header name '{}': {}", config.name, name, e)
+            })?;
+            let header_value = reqwest::header::HeaderValue::from_str(value).map_err(|e| {
+                anyhow::anyhow!("MCP server '{}': invalid value for header '{}': {}", config.name, name, e)
+            })?;
+            Ok((header_name, header_value))
+        })
+        .collect()
 }
 
 fn build_client_info(protocol_version: rmcp_model::ProtocolVersion) -> rmcp_model::ClientInfo {
@@ -218,6 +258,7 @@ struct LegacySseRmcpTransport {
     sse_url: String,
     client: reqwest::Client,
     auth_token: Option<String>,
+    headers: HashMap<reqwest::header::HeaderName, reqwest::header::HeaderValue>,
     post_endpoint: Arc<StdMutex<Option<String>>>,
     incoming_tx: mpsc::UnboundedSender<rmcp::service::RxJsonRpcMessage<RoleClient>>,
     incoming_rx: Arc<Mutex<mpsc::UnboundedReceiver<rmcp::service::RxJsonRpcMessage<RoleClient>>>>,
@@ -240,6 +281,7 @@ impl LegacySseRmcpTransport {
             sse_url,
             client,
             auth_token,
+            headers: configured_headers(config)?,
             post_endpoint: Arc::new(StdMutex::new(None)),
             incoming_tx,
             incoming_rx: Arc::new(Mutex::new(incoming_rx)),
@@ -257,6 +299,9 @@ impl LegacySseRmcpTransport {
             .client
             .get(&self.sse_url)
             .header(reqwest::header::ACCEPT, "text/event-stream");
+        for (name, value) in &self.headers {
+            request = request.header(name, value);
+        }
         if let Some(token) = &self.auth_token {
             request = request.header(
                 reqwest::header::AUTHORIZATION,
@@ -362,6 +407,7 @@ impl rmcp::transport::Transport<RoleClient> for LegacySseRmcpTransport {
         let endpoint = lock_recover(&self.post_endpoint).clone();
         let client = self.client.clone();
         let auth_token = self.auth_token.clone();
+        let headers = self.headers.clone();
         let server_name = self.server_name.clone();
         let incoming_tx = self.incoming_tx.clone();
         let background_tasks = Arc::clone(&self.background_tasks);
@@ -377,6 +423,9 @@ impl rmcp::transport::Transport<RoleClient> for LegacySseRmcpTransport {
                 .post(endpoint)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .json(&item);
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
             if let Some(token) = &auth_token {
                 request = request.header(
                     reqwest::header::AUTHORIZATION,
@@ -616,9 +665,44 @@ impl McpClientBackend for RmcpClientBackend {
     }
 }
 
+fn connect_timeout(
+    config: &claurst_core::config::McpServerConfig,
+    phase: &'static str,
+    timeouts: McpTimeouts,
+) -> anyhow::Error {
+    McpTimeoutError {
+        server: config.name.clone(),
+        phase,
+        after: timeouts.connect,
+    }
+    .into()
+}
+
+/// Run one catalog request under the catalog timeout.
+async fn catalog_request<T, F>(
+    server: &str,
+    phase: &'static str,
+    catalog_timeout: std::time::Duration,
+    request: F,
+) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = Result<T, rmcp::ServiceError>>,
+{
+    match tokio::time::timeout(catalog_timeout, request).await {
+        Ok(result) => result.map_err(|e| anyhow::anyhow!("rmcp {} failed: {}", phase, e)),
+        Err(_) => Err(McpTimeoutError {
+            server: server.to_string(),
+            phase,
+            after: catalog_timeout,
+        }
+        .into()),
+    }
+}
+
 async fn build_snapshot(
     config: &claurst_core::config::McpServerConfig,
     peer: &rmcp::Peer<RoleClient>,
+    catalog_timeout: std::time::Duration,
 ) -> anyhow::Result<McpClientSnapshot> {
     let server_info = peer.peer_info().map(|info| (*info).clone());
 
@@ -634,10 +718,12 @@ async fn build_snapshot(
         None => (None, ServerCapabilities::default(), None),
     };
 
+    // Tools are what the server is for, so a failed `tools/list` fails the
+    // connect. Resources and prompts are optional extras: a failure there is
+    // logged and the server stays usable.
     let tools = if capabilities.tools.is_some() {
-        peer.list_all_tools()
-            .await
-            .map_err(|e| anyhow::anyhow!("rmcp list_all_tools failed: {}", e))?
+        catalog_request(&config.name, "tools/list", catalog_timeout, peer.list_all_tools())
+            .await?
             .into_iter()
             .map(convert_tool)
             .collect()
@@ -646,23 +732,25 @@ async fn build_snapshot(
     };
 
     let resources = if capabilities.resources.is_some() {
-        peer.list_all_resources()
-            .await
-            .map_err(|e| anyhow::anyhow!("rmcp list_all_resources failed: {}", e))?
-            .into_iter()
-            .map(convert_resource)
-            .collect()
+        match catalog_request(&config.name, "resources/list", catalog_timeout, peer.list_all_resources()).await {
+            Ok(resources) => resources.into_iter().map(convert_resource).collect(),
+            Err(e) => {
+                tracing::warn!(server = %config.name, error = %e, "MCP resources unavailable");
+                vec![]
+            }
+        }
     } else {
         vec![]
     };
 
     let prompts = if capabilities.prompts.is_some() {
-        peer.list_all_prompts()
-            .await
-            .map_err(|e| anyhow::anyhow!("rmcp list_all_prompts failed: {}", e))?
-            .into_iter()
-            .map(convert_prompt)
-            .collect()
+        match catalog_request(&config.name, "prompts/list", catalog_timeout, peer.list_all_prompts()).await {
+            Ok(prompts) => prompts.into_iter().map(convert_prompt).collect(),
+            Err(e) => {
+                tracing::warn!(server = %config.name, error = %e, "MCP prompts unavailable");
+                vec![]
+            }
+        }
     } else {
         vec![]
     };
@@ -799,6 +887,7 @@ fn convert_get_prompt_result(result: rmcp_model::GetPromptResult) -> GetPromptRe
 fn convert_call_tool_result(result: rmcp_model::CallToolResult) -> CallToolResult {
     CallToolResult {
         content: result.content.into_iter().map(convert_content).collect(),
+        structured_content: result.structured_content,
         is_error: result.is_error.unwrap_or(false),
     }
 }
@@ -854,6 +943,9 @@ mod tests {
             env: HashMap::new(),
             url: Some(url),
             server_type: "sse".to_string(),
+            headers: Default::default(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
             origin: Default::default(),
         }
     }
@@ -942,6 +1034,52 @@ mod tests {
         assert_eq!(endpoint.as_deref(), Some(expected.as_str()));
     }
 
+    #[test]
+    fn configured_headers_rejects_invalid_names() {
+        let mut config = test_sse_config("http://localhost/sse".to_string());
+        config.headers.insert("bad header".to_string(), "v".to_string());
+        let err = configured_headers(&config).expect_err("space is not a valid header name");
+        assert!(err.to_string().contains("invalid header name 'bad header'"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn legacy_sse_transport_sends_configured_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let (request_tx, request_rx) = oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept test connection");
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.expect("read request");
+            let _ = request_tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+            let body = "event: endpoint\ndata: /messages\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write test response");
+            let _ = stream.shutdown().await;
+        });
+
+        let mut config = test_sse_config(format!("http://{addr}"));
+        config.headers.insert("X-Api-Key".to_string(), "secret-123".to_string());
+        LegacySseRmcpTransport::connect(&config, None)
+            .await
+            .expect("connect legacy sse transport");
+
+        let request = timeout(Duration::from_secs(1), request_rx)
+            .await
+            .expect("request timeout")
+            .expect("request captured")
+            .to_ascii_lowercase();
+        assert!(request.contains("x-api-key: secret-123"), "{}", request);
+    }
+
     #[tokio::test]
     async fn handle_legacy_sse_http_response_queues_json_message() {
         let response = fetch_response(
@@ -999,6 +1137,7 @@ mod tests {
             sse_url: "http://localhost/sse".to_string(),
             client: reqwest::Client::new(),
             auth_token: None,
+            headers: HashMap::new(),
             post_endpoint: Arc::new(StdMutex::new(None)),
             incoming_tx: mpsc::unbounded_channel().0,
             incoming_rx: Arc::new(Mutex::new(mpsc::unbounded_channel().1)),

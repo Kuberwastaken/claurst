@@ -359,7 +359,7 @@ impl Tool for AgentTool {
             working_directory: Some(working_dir_str),
             thinking_budget: None,
             temperature: None,
-            tool_result_budget: 50_000,
+            tool_result_max_bytes: crate::DEFAULT_TOOL_RESULT_MAX_BYTES,
             effort_level: None,
             command_queue: None,
             skill_index: None,
@@ -380,6 +380,8 @@ impl Tool for AgentTool {
             // continuation — stop after one turn like every non-goal run.
             continuation: crate::continuation::ContinuationMode::Default,
             degradation_enabled: ctx.config.degradation_summary_enabled_or_default(),
+            retry: claurst_api::RetryConfig::with_max_retries(ctx.config.max_retries),
+            auto_compact: true,
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.
@@ -655,6 +657,7 @@ pub fn init_team_swarm_runner() {
                         agent_tools.iter().map(|t| t.name().to_string()).collect(),
                     ),
                     degradation_enabled: ctx.config.degradation_summary_enabled_or_default(),
+                    retry: claurst_api::RetryConfig::with_max_retries(ctx.config.max_retries),
                     ..Default::default()
                 };
 

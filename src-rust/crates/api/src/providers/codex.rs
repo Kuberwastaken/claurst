@@ -502,13 +502,14 @@ impl CodexProvider {
 
         let status = resp.status().as_u16();
         if !(200..300).contains(&(status as usize)) {
+            let retry_after = crate::retry::retry_after(resp.headers());
             let text = resp.text().await.map_err(|e| ProviderError::Other {
                 provider: self.id.clone(),
                 message: format!("Failed to read response body: {}", e),
                 status: Some(status),
                 body: None,
             })?;
-            return Err(parse_error_response(status, &text, &self.id));
+            return Err(parse_error_response(status, &text, &self.id).with_retry_after(retry_after));
         }
 
         Ok(resp)

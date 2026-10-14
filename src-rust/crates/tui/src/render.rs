@@ -2459,8 +2459,19 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         let mut spans: Vec<Span> = Vec::new();
 
+        // Retry pill (#439): a model request is being retried.
+        if let Some((attempt, max)) = app.retry_status {
+            spans.push(Span::styled(
+                format!("\u{27f3} Reconnecting {}/{}", attempt, max),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+        }
+
         // Agent type badge (shown when running as subagent / coordinator)
         if let Some(ref badge) = app.agent_type_badge {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
             spans.push(Span::styled(
                 format!("\u{2699} {}", badge),
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -2829,6 +2840,26 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 "MCP reconnecting",
                 Style::default().fg(Color::Yellow),
             ));
+        } else if let Some(manager) = app.mcp_manager.as_ref() {
+            // Servers connect in the background: show progress, then failures.
+            let summary = manager.status_summary();
+            if summary.connecting > 0 {
+                if !parts.is_empty() {
+                    parts.push(Span::raw("  "));
+                }
+                parts.push(Span::styled(
+                    format!("MCP connecting ({})", summary.connecting),
+                    Style::default().fg(Color::Yellow),
+                ));
+            } else if summary.failed > 0 {
+                if !parts.is_empty() {
+                    parts.push(Span::raw("  "));
+                }
+                parts.push(Span::styled(
+                    format!("MCP {} failed", summary.failed),
+                    Style::default().fg(Color::Red),
+                ));
+            }
         }
 
         parts
@@ -4150,5 +4181,29 @@ mod status_line_tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| render_app(f, &app)).unwrap();
         assert!(rows(&terminal).iter().any(|r| r.contains("ext-status-ok")));
+    }
+
+    #[test]
+    fn footer_shows_reconnecting_pill_during_retry() {
+        let mut app = app_with_status_line(None, None);
+        app.streaming_text = "partial output".to_string();
+        app.handle_query_event(claurst_query::QueryEvent::Retry {
+            attempt: 2,
+            max_attempts: 5,
+            delay_ms: 1500,
+            reason: "Server error 503".to_string(),
+        });
+        assert_eq!(app.retry_status, Some((2, 5)));
+        assert!(app.streaming_text.is_empty(), "failed attempt output is dropped");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render_app(f, &app)).unwrap();
+        assert!(rows(&terminal).iter().any(|r| r.contains("Reconnecting 2/5")));
+
+        app.handle_query_event(claurst_query::QueryEvent::TurnComplete {
+            turn: 1,
+            stop_reason: "end_turn".to_string(),
+            usage: None,
+        });
+        assert!(app.retry_status.is_none(), "a completed turn clears the pill");
     }
 }

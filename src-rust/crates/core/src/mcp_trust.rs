@@ -75,6 +75,19 @@ pub fn server_fingerprint(cfg: &McpServerConfig) -> String {
         feed(&mut hasher, k);
         feed(&mut hasher, v);
     }
+    // Headers are expanded from the environment like `env`, so an approved
+    // project could otherwise add e.g. `Authorization: Bearer ${SECRET}`
+    // later and send a local secret to its server. Only hashed when present
+    // so fingerprints of existing approvals stay valid.
+    if !cfg.headers.is_empty() {
+        let mut headers: Vec<(&String, &String)> = cfg.headers.iter().collect();
+        headers.sort();
+        hasher.update((headers.len() as u64).to_le_bytes());
+        for (k, v) in headers {
+            feed(&mut hasher, k);
+            feed(&mut hasher, v);
+        }
+    }
     hex::encode(hasher.finalize())
 }
 
@@ -223,6 +236,9 @@ mod tests {
             env: HashMap::new(),
             url: None,
             server_type: "stdio".to_string(),
+            headers: Default::default(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
             origin: McpServerOrigin::User,
         }
     }
@@ -235,6 +251,9 @@ mod tests {
             env: HashMap::new(),
             url: None,
             server_type: "stdio".to_string(),
+            headers: Default::default(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
             origin: McpServerOrigin::Project,
         }
     }
@@ -318,6 +337,24 @@ mod tests {
         y.env.insert("B".to_string(), "2".to_string());
         y.env.insert("A".to_string(), "1".to_string());
         assert_eq!(server_fingerprint(&x), server_fingerprint(&y));
+    }
+
+    #[test]
+    fn fingerprint_covers_headers_and_ignores_their_absence() {
+        // Headers expand `${VAR}`, so adding one to an approved project server
+        // (e.g. `Authorization: Bearer ${TOKEN}`) must re-prompt.
+        let base = project_server("srv", "cmd");
+        let mut with_header = project_server("srv", "cmd");
+        with_header
+            .headers
+            .insert("Authorization".to_string(), "Bearer ${TOKEN}".to_string());
+        assert_ne!(server_fingerprint(&base), server_fingerprint(&with_header));
+
+        let mut other_value = project_server("srv", "cmd");
+        other_value
+            .headers
+            .insert("Authorization".to_string(), "Bearer ${OTHER}".to_string());
+        assert_ne!(server_fingerprint(&with_header), server_fingerprint(&other_value));
     }
 
     #[test]

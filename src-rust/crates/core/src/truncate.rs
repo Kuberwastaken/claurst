@@ -26,20 +26,31 @@ pub fn truncate_lines(lines: &[String], max_lines: usize) -> (Vec<String>, bool)
     (out, true)
 }
 
-/// Truncate tool output to a safe display length.
-/// Returns `(truncated_text, was_truncated)`.
-pub fn truncate_tool_output(text: &str, max_chars: usize) -> (String, bool) {
-    if text.len() <= max_chars {
-        return (text.to_string(), false);
-    }
-    let mut end = max_chars;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
+/// Byte offsets `(head_end, tail_start)` that keep the first and last
+/// `max_bytes / 2` bytes of `text`, both on char boundaries (#442).
+fn middle_cut(text: &str, max_bytes: usize) -> (usize, usize) {
+    let half = max_bytes / 2;
     (
-        format!("{}… [{} chars truncated]", &text[..end], text.len() - end),
-        true,
+        text.floor_char_boundary(half),
+        text.ceil_char_boundary(text.len() - half),
     )
+}
+
+/// Cap tool output at about `max_bytes`, keeping the head and the tail (where
+/// commands print what they are doing and how they ended) and replacing the
+/// middle with a note giving the omitted size. Cuts land on char boundaries.
+/// Output within the cap is returned unchanged (borrowed).
+pub fn truncate_tool_output(text: &str, max_bytes: usize) -> std::borrow::Cow<'_, str> {
+    if text.len() <= max_bytes {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let (head_end, tail_start) = middle_cut(text, max_bytes);
+    std::borrow::Cow::Owned(format!(
+        "{}\n\n[... {} bytes omitted from the middle of this output ...]\n\n{}",
+        &text[..head_end],
+        tail_start - head_end,
+        &text[tail_start..]
+    ))
 }
 
 /// Keep the first and last `max_bytes / 2` bytes of `text` around a marker
@@ -50,9 +61,7 @@ pub fn truncate_middle(text: String, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text;
     }
-    let half = max_bytes / 2;
-    let head_end = text.floor_char_boundary(half);
-    let tail_start = text.ceil_char_boundary(text.len() - half);
+    let (head_end, tail_start) = middle_cut(&text, max_bytes);
     format!(
         "{}\n\n... ({} bytes truncated) ...\n\n{}",
         &text[..head_end],
@@ -150,6 +159,29 @@ mod tests {
         let t = truncate_text("hello world", 5);
         assert!(t.starts_with("hello"));
         assert!(t.contains("truncated"));
+    }
+
+    #[test]
+    fn truncate_tool_output_short_is_unchanged() {
+        assert!(matches!(truncate_tool_output("ok", 10), std::borrow::Cow::Borrowed("ok")));
+    }
+
+    #[test]
+    fn truncate_tool_output_keeps_head_and_tail() {
+        let text = format!("HEAD{}TAIL", "x".repeat(10_000));
+        let out = truncate_tool_output(&text, 1_000);
+        assert!(out.starts_with("HEAD"));
+        assert!(out.ends_with("TAIL"));
+        assert!(out.contains("9008 bytes omitted"), "{}", out);
+        assert!(out.len() < 1_100);
+    }
+
+    #[test]
+    fn truncate_tool_output_cuts_on_char_boundaries() {
+        // 3-byte chars: neither cut point may split one.
+        let text = "€".repeat(1_000);
+        let out = truncate_tool_output(&text, 101);
+        assert!(out.starts_with('€') && out.ends_with('€'));
     }
 
     #[test]

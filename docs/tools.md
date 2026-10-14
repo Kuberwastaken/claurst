@@ -301,7 +301,7 @@ Search file contents using regular expressions, powered by ripgrep. Supports mul
 
 **Permission level:** ReadOnly
 
-Search available tools by name or keyword to retrieve their full parameter schemas. Used internally by the model to discover deferred tools before calling them.
+Search available tools by name or keyword to retrieve their full parameter schemas. Used internally by the model to discover deferred tools before calling them. The catalog covers the built-in tools and every tool of every connected MCP server (listed as `mcp__<server>__<tool>`, matched on its name, server and description).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

@@ -12,7 +12,8 @@
 //   3. Replace the head of the conversation with a single synthetic
 //      <compact-summary> user message, followed by the recent tail.
 //
-// The summary is generated in a single non-agentic API call so it doesn't
+// The summary is generated in a single non-agentic, tool-less call through
+// the active `LlmProvider`, so compaction works on every provider and doesn't
 // trigger another compaction recursively.
 //
 // MicroCompact strategy (partial compaction):
@@ -21,12 +22,14 @@
 //   the most recent `keep_recent_messages` intact.  This is lighter than a
 //   full compaction and can fire proactively at 75 % capacity.
 
-use claurst_api::{AnthropicStreamEvent, ApiMessage, CreateMessageRequest, StreamAccumulator, StreamHandler, SystemPrompt};
+use claurst_api::provider_types::StopReason;
+use claurst_api::{LlmProvider, ProviderRequest, StreamEvent, SystemPrompt};
 use claurst_core::error::ClaudeError;
+pub use claurst_core::history::{CompactionRecord, CompactionTrigger};
 use claurst_core::types::{ContentBlock, Message, MessageContent, Role};
+use futures::StreamExt;
 use serde_json::Value;
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -265,7 +268,7 @@ impl Default for MicroCompactConfig {
 ///
 /// Returns `Some(new_messages)` when compaction occurred, `None` otherwise.
 pub async fn micro_compact_if_needed(
-    client: &claurst_api::AnthropicClient,
+    provider: &dyn LlmProvider,
     messages: &[Message],
     input_tokens: u64,
     model: &str,
@@ -294,7 +297,7 @@ pub async fn micro_compact_if_needed(
     );
 
     let target_tokens = config.summary_target_tokens as u32;
-    match summarise_head(client, messages, split_at, model, target_tokens).await {
+    match summarise_head(provider, model, messages, split_at, target_tokens).await {
         Ok(new_msgs) => {
             info!(
                 original = total,
@@ -328,184 +331,97 @@ const NO_TOOLS_TRAILER: &str = "\n\nREMINDER: Do NOT call any tools. Respond wit
 an <analysis> block followed by a <summary> block. \
 Tool calls will be rejected and you will fail the task.";
 
-/// The base compaction prompt (mirrors BASE_COMPACT_PROMPT from TypeScript prompt.ts).
-const BASE_COMPACT_PROMPT: &str = "Your task is to create a detailed summary of the conversation \
-so far, paying close attention to the user's explicit requests and your previous actions.\n\
-This summary should be thorough in capturing technical details, code patterns, and architectural \
-decisions that would be essential for continuing development work without losing context.\n\
-\n\
-Before providing your final summary, wrap your analysis in <analysis> tags to organize your \
-thoughts and ensure you've covered all necessary points. In your analysis process:\n\
-\n\
-1. Chronologically analyze each message and section of the conversation. For each section \
-thoroughly identify:\n\
-   - The user's explicit requests and intents\n\
-   - Your approach to addressing the user's requests\n\
-   - Key decisions, technical concepts and code patterns\n\
-   - Specific details like:\n\
-     - file names\n\
-     - full code snippets\n\
-     - function signatures\n\
-     - file edits\n\
-   - Errors that you ran into and how you fixed them\n\
-   - Pay special attention to specific user feedback that you received, especially if the user \
-told you to do something differently.\n\
-2. Double-check for technical accuracy and completeness, addressing each required element \
-thoroughly.\n\
-\n\
-Your summary should include the following sections:\n\
-\n\
-1. Primary Request and Intent: Capture all of the user's explicit requests and intents in detail\n\
-2. Key Technical Concepts: List all important technical concepts, technologies, and frameworks \
-discussed.\n\
-3. Files and Code Sections: Enumerate specific files and code sections examined, modified, or \
-created. Pay special attention to the most recent messages and include full code snippets where \
-applicable and include a summary of why this file read or edit is important.\n\
-4. Errors and fixes: List all errors that you ran into, and how you fixed them. Pay special \
-attention to specific user feedback that you received, especially if the user told you to do \
-something differently.\n\
-5. Problem Solving: Document problems solved and any ongoing troubleshooting efforts.\n\
-6. All user messages: List ALL user messages that are not tool results. These are critical for \
-understanding the users' feedback and changing intent.\n\
-7. Pending Tasks: Outline any pending tasks that you have explicitly been asked to work on.\n\
-8. Current Work: Describe in detail precisely what was being worked on immediately before this \
-summary request, paying special attention to the most recent messages from both user and \
-assistant. Include file names and code snippets where applicable.\n\
-9. Optional Next Step: List the next step that you will take that is related to the most recent \
-work you were doing. IMPORTANT: ensure that this step is DIRECTLY in line with the user's most \
-recent explicit requests, and the task you were working on immediately before this summary \
-request. If your last task was concluded, then only list next steps if they are explicitly in \
-line with the users request. Do not start on tangential requests or really old requests that \
-were already completed without confirming with the user first.\n\
-                       If there is a next step, include direct quotes from the most recent \
-conversation showing exactly what task you were working on and where you left off. This should \
-be verbatim to ensure there's no drift in task interpretation.\n\
-\n\
-Format your output as:\n\
-\n\
-<analysis>\n\
-[Your thought process, ensuring all points are covered thoroughly and accurately]\n\
-</analysis>\n\
-\n\
-<summary>\n\
-1. Primary Request and Intent:\n\
-   [Detailed description]\n\
-\n\
-2. Key Technical Concepts:\n\
-   - [Concept 1]\n\
-   - [Concept 2]\n\
-\n\
-3. Files and Code Sections:\n\
-   - [File Name 1]\n\
-      - [Summary of why this file is important]\n\
-      - [Summary of the changes made to this file, if any]\n\
-      - [Important Code Snippet]\n\
-\n\
-4. Errors and fixes:\n\
-    - [Detailed description of error 1]:\n\
-      - [How you fixed the error]\n\
-\n\
-5. Problem Solving:\n\
-   [Description of solved problems and ongoing troubleshooting]\n\
-\n\
-6. All user messages:\n\
-    - [Detailed non tool use user message]\n\
-\n\
-7. Pending Tasks:\n\
-   - [Task 1]\n\
-\n\
-8. Current Work:\n\
-   [Precise description of current work]\n\
-\n\
-9. Optional Next Step:\n\
-   [Optional Next step to take]\n\
-</summary>\n\
-\n\
-Please provide your summary based on the conversation so far, following this structure and \
-ensuring precision and thoroughness in your response.";
+/// Opening of a from-scratch compaction prompt.
+const BASE_COMPACT_INTRO: &str = "Your task is to summarize the conversation in the \
+<conversation_to_summarize> block into a structured summary that will be given to another agent \
+to resume the work.";
 
-/// The iterative UPDATE compaction prompt (mirrors UPDATE_SUMMARIZATION_PROMPT
-/// from the TypeScript reference). Used when a prior `<compact-summary>` already
-/// exists in the history: instead of re-summarising everything from scratch, the
-/// model folds the NEW activity into the PREVIOUS summary (provided in
-/// `<previous-summary>` tags), preserving the exact same structured sections.
-const UPDATE_COMPACT_PROMPT: &str = "Your task is to UPDATE an existing conversation summary by folding in \
-the new activity since it was written. The previous summary is provided in <previous-summary> tags; the new \
+/// Opening of an iterative UPDATE compaction prompt, used when a prior
+/// `<compact-summary>` already exists in the history: the model folds the new
+/// activity into the previous summary instead of re-summarising from scratch.
+/// Mirrors opencode's update prompt (packages/core/src/session/compaction.ts).
+const UPDATE_COMPACT_INTRO: &str = "Your task is to UPDATE an existing conversation summary into one \
+consolidated summary. The previous summary is provided in <previous-summary> tags; the newer \
 messages to incorporate are in the <conversation_to_summarize> block.\n\
 \n\
-Do NOT re-summarise from scratch. Instead:\n\
-- PRESERVE all still-relevant information from the previous summary verbatim (file names, code snippets, \
-function signatures, decisions, user messages, error fixes).\n\
-- ADD new progress, decisions, files, errors, and user messages from the new activity.\n\
-- UPDATE the state: move finished items out of Pending Tasks / Current Work; refresh Optional Next Step to \
-reflect what is happening NOW.\n\
-- You may drop something only if it is clearly no longer relevant.\n\
-- Preserve exact file paths, function names, and error messages.\n\
+Newer history always takes precedence over the existing summary. Preserve previous information \
+unless newer history clearly contradicts, supersedes, resolves, or makes it stale. If something is \
+no longer relevant to continuing the work, you may remove it.\n\
 \n\
-Before providing your final summary, wrap your reasoning in <analysis> tags: reconcile the previous summary \
-with the new messages, note what changed, what completed, and what is now pending.\n\
+Incorporate newer requirements, decisions, progress, and context. Reconcile Work State and Next \
+Move: move completed work out of Active, remove resolved blockers and answered questions, and \
+preserve unresolved or pending work.";
+
+/// What the summary covers (opencode's scope sentence: without it summaries
+/// restated conventions and grew on every update).
+const SUMMARY_SCOPE: &str = "Summarize only what the user and the assistant said and did. Leave out \
+instructions and setup the assistant was given rather than told by the user: repository \
+conventions, instruction files such as AGENTS.md, and environment details like the session ID. The \
+next agent receives current versions of all of these separately.";
+
+/// The terse summary template (opencode's SUMMARY_TEMPLATE).
+const SUMMARY_TEMPLATE: &str = "Use this format for the summary (you may omit sections that aren't \
+applicable):\n\
 \n\
-Your summary MUST use the SAME sections as before:\n\
+## Objective\n\
+- [one or two brief sentences describing what the user is trying to accomplish]\n\
 \n\
-1. Primary Request and Intent: Preserve existing intent; add new requests if the task expanded.\n\
-2. Key Technical Concepts: Preserve existing; add newly-introduced concepts.\n\
-3. Files and Code Sections: Preserve existing entries; add newly examined/modified/created files with full \
-code snippets where applicable and why each matters.\n\
-4. Errors and fixes: Preserve existing; add new errors and how they were fixed, plus any user feedback.\n\
-5. Problem Solving: Update with newly-solved problems and ongoing troubleshooting.\n\
-6. All user messages: Preserve the existing list AND append every new non-tool-result user message.\n\
-7. Pending Tasks: Update — remove completed tasks, add newly-requested ones.\n\
-8. Current Work: Replace with a precise description of what was being worked on immediately before this \
-summary request.\n\
-9. Optional Next Step: Update to the next step directly in line with the user's most recent explicit request. \
-Include verbatim quotes from the most recent conversation where applicable.\n\
+## Requirements\n\
+- [constraints, preferences, requirements, and scope boundaries stated by the user, or \"(none)\"]\n\
 \n\
-Format your output as:\n\
+## Decisions\n\
+- [decisions already made and why, or \"(none)\"]\n\
 \n\
-<analysis>\n\
-[Reconciliation of the previous summary with the new activity]\n\
-</analysis>\n\
+## Work State\n\
+Break the objective into smaller goals and report which are completed, which are being worked on, \
+and which are blocked.\n\
+### Completed\n\
+- [goals that have been completed; otherwise \"(none)\"]\n\
 \n\
-<summary>\n\
-1. Primary Request and Intent:\n\
-   [Detailed description]\n\
+### Active\n\
+- [goals currently being worked on; otherwise \"(none)\"]\n\
 \n\
-2. Key Technical Concepts:\n\
-   - [Concept 1]\n\
+### Blocked\n\
+- [anything blocking progress, and why; otherwise \"(none)\"]\n\
 \n\
-3. Files and Code Sections:\n\
-   - [File Name 1]\n\
-      - [Why important]\n\
-      - [Changes made, if any]\n\
-      - [Important Code Snippet]\n\
+## Next Move\n\
+1. [ordered list of next actions, or \"(none)\"]\n\
 \n\
-4. Errors and fixes:\n\
-    - [Error]: [How fixed]\n\
+## Relevant Files\n\
+List the files and directories, other than the current working directory, that another agent would \
+need to open to continue this work. Include at most 15, most important first. Do not list every \
+file that was read or changed. If none, write \"(none)\".\n\
+- `[file or directory path]`: [brief reason it matters]\n\
 \n\
-5. Problem Solving:\n\
-   [Solved problems and ongoing troubleshooting]\n\
-\n\
-6. All user messages:\n\
-    - [Non-tool-use user message]\n\
-\n\
-7. Pending Tasks:\n\
-   - [Task 1]\n\
-\n\
-8. Current Work:\n\
-   [Precise description of current work]\n\
-\n\
-9. Optional Next Step:\n\
-   [Optional next step]\n\
-</summary>\n\
-\n\
-Please provide the UPDATED summary now, following this structure and preserving the previous summary's content.";
+## Important Context\n\
+- [facts the next agent cannot continue without and cannot easily find on its own; or \"(none)\"]";
+
+/// Rules for the summary body (opencode's SUMMARY_RULES).
+const SUMMARY_RULES: &str = "Rules:\n\
+- Keep each section concise. Use terse, single-line bullets, not prose paragraphs or nested lists.\n\
+- Prefer short references over detailed restatement. It is fine to leave out information the next \
+agent can recover from the code or the files listed above.\n\
+- Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers.\n\
+- Carry forward only user questions or requests that remain unanswered or require further action. \
+Do not repeat ones that newer history has answered or resolved. Preserve exact wording when \
+carrying one forward.\n\
+- Preserve consequential workflow state, including whether changes are uncommitted, committed, \
+pushed, under review, or merged.\n\
+- Do not mention the summary process or that context was compacted.";
+
+/// Output framing: the <analysis> scratchpad is stripped by
+/// [`format_compact_summary`]; the summary itself goes in <summary> tags.
+const SUMMARY_OUTPUT_FORMAT: &str = "First think briefly inside <analysis> tags (this part is \
+discarded). Then return only the structured summary inside <summary> tags, with no preamble or \
+commentary. Do not continue the task.";
 
 /// Build the compaction prompt, optionally with custom instructions appended.
 ///
 /// When `previous_summary` is a non-empty prior summary, the iterative
-/// [`UPDATE_COMPACT_PROMPT`] variant is selected so the model folds the previous
-/// summary forward rather than re-summarising from scratch. Otherwise the
-/// from-scratch [`BASE_COMPACT_PROMPT`] is used.
+/// [`UPDATE_COMPACT_INTRO`] variant is selected so the model folds the
+/// previous summary forward rather than re-summarising from scratch.
+/// Otherwise the from-scratch [`BASE_COMPACT_INTRO`] is used. Both share the
+/// terse template, rules and scope sentence ported from opencode.
 pub fn get_compact_prompt(
     custom_instructions: Option<&str>,
     previous_summary: Option<&str>,
@@ -513,12 +429,15 @@ pub fn get_compact_prompt(
     let is_update = previous_summary
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
-    let base = if is_update {
-        UPDATE_COMPACT_PROMPT
+    let intro = if is_update {
+        UPDATE_COMPACT_INTRO
     } else {
-        BASE_COMPACT_PROMPT
+        BASE_COMPACT_INTRO
     };
-    let mut prompt = format!("{}{}", NO_TOOLS_PREAMBLE, base);
+    let mut prompt = format!(
+        "{}{}\n\n{}\n\n{}\n\n{}\n\n{}",
+        NO_TOOLS_PREAMBLE, intro, SUMMARY_SCOPE, SUMMARY_TEMPLATE, SUMMARY_RULES, SUMMARY_OUTPUT_FORMAT
+    );
 
     if let Some(instructions) = custom_instructions {
         let trimmed = instructions.trim();
@@ -843,22 +762,35 @@ pub fn resolve_context_window(
         )
 }
 
-/// Best-effort estimate of the CURRENT context size in tokens.
+/// Prompt-token count a provider reported for one request, plus how many
+/// messages that request carried. Anchors [`estimate_context_tokens`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageMark {
+    /// `UsageInfo::total_input()` of the request (input + cache-read +
+    /// cache-creation): what the model actually saw.
+    pub prompt_tokens: u64,
+    /// `messages.len()` when the request was sent.
+    pub message_count: usize,
+}
+
+/// Best-effort projection of the context size the NEXT request will carry.
 ///
-/// Prefers the REAL context-token count the provider reported for the last
-/// assistant turn (`last_real_usage`, typically `UsageInfo::total_input()` =
-/// input + cache-read + cache-creation), because that is what the model
-/// actually saw. The chars/4 heuristic can be off by a wide margin, and with
-/// prompt caching the bare `input_tokens` field massively *undercounts* — the
-/// bulk of the context is billed as cache reads. We fall back to the chars/4
-/// estimate ([`estimate_tokens_for_messages`]) only before the first response,
-/// or when the provider reported no usage (`None` / `0`).
+/// Anchors on the REAL prompt-token count the provider reported for the last
+/// request (`last_usage`), because that is what the model actually saw: the
+/// chars/4 heuristic can be off by a wide margin, and with prompt caching the
+/// bare `input_tokens` field massively *undercounts*. Everything appended since
+/// that request (the assistant reply, tool results, injected user turns) is
+/// added with the chars/4 estimate ([`estimate_tokens_for_messages`]). Without
+/// a usable anchor (before the first response, after a compaction, or when the
+/// provider reported no usage) the whole history is estimated.
 ///
-/// Mirrors pi's `estimateContextTokens`, which likewise prefers the last
-/// assistant usage and only estimates when it is absent.
-pub fn estimate_context_tokens(messages: &[Message], last_real_usage: Option<u64>) -> u64 {
-    match last_real_usage {
-        Some(tokens) if tokens > 0 => tokens,
+/// Mirrors pi's `estimateContextTokens` and codex's pre-request estimate.
+pub fn estimate_context_tokens(messages: &[Message], last_usage: Option<UsageMark>) -> u64 {
+    match last_usage {
+        Some(mark) if mark.prompt_tokens > 0 && mark.message_count <= messages.len() => {
+            mark.prompt_tokens
+                + estimate_tokens_for_messages(&messages[mark.message_count..]) as u64
+        }
         _ => estimate_tokens_for_messages(messages) as u64,
     }
 }
@@ -898,49 +830,131 @@ pub fn calculate_token_warning_state_for_window(
 /// Convenience wrapper that derives the window from the model-name heuristic.
 /// Prefer [`should_auto_compact_for_window`] with a resolved window.
 pub fn should_auto_compact(input_tokens: u64, model: &str, state: &AutoCompactState) -> bool {
-    should_auto_compact_for_window(input_tokens, context_window_for_model(model), state)
+    should_auto_compact_for_window(input_tokens, context_window_for_model(model), 0, state)
 }
 
-/// Return `true` when auto-compaction should fire, against an explicit window.
+/// Token count at which auto-compaction fires for `window`, leaving room for
+/// `output_reserve` tokens of model output.
+///
+/// The threshold is the lower of [`AUTOCOMPACT_TRIGGER_FRACTION`] of the window
+/// and the window minus the output reserve. The reserve is capped at a quarter
+/// of the window so a large `max_tokens` on a small local model can't push the
+/// threshold to zero.
+pub fn auto_compact_threshold(window: u64, output_reserve: u64) -> u64 {
+    let by_fraction = (window as f64 * AUTOCOMPACT_TRIGGER_FRACTION) as u64;
+    let by_reserve = window.saturating_sub(output_reserve.min(window / 4));
+    by_fraction.min(by_reserve)
+}
+
+/// Return `true` when auto-compaction should fire, against an explicit window
+/// and output reserve (see [`auto_compact_threshold`]).
 pub fn should_auto_compact_for_window(
     input_tokens: u64,
     window: u64,
+    output_reserve: u64,
     state: &AutoCompactState,
 ) -> bool {
     if state.disabled {
         return false;
     }
-    let threshold = (window as f64 * AUTOCOMPACT_TRIGGER_FRACTION) as u64;
-    input_tokens >= threshold
+    input_tokens >= auto_compact_threshold(window, output_reserve)
 }
 
 // ---------------------------------------------------------------------------
 // Core compaction logic
 // ---------------------------------------------------------------------------
 
-/// Summarise `messages[..split_at]` using the Anthropic API using the
-/// carefully crafted compaction prompt from TypeScript prompt.ts.
-/// Returns a new conversation: [summary user msg] + messages[split_at..].
-async fn summarise_head(
-    client: &claurst_api::AnthropicClient,
-    messages: &[Message],
-    split_at: usize,
+/// System prompt for every summarisation request.
+const SUMMARISER_SYSTEM_PROMPT: &str =
+    "You are a helpful assistant that creates concise yet thorough conversation summaries. \
+     Preserve all technical details, file names, code snippets, and decisions that would \
+     be important for continuing the work. Follow the structured format exactly.";
+
+/// Send one tool-less, non-agentic summarisation request through `provider`
+/// and return the generated text plus the reported stop reason.
+///
+/// The provider stream is drained into a string rather than forwarded to the
+/// UI. Streaming is the one request path every adapter implements (the Codex
+/// backend only accepts streamed requests, and some non-streaming paths are
+/// stubs), so this works wherever the main loop works.
+async fn request_summary(
+    provider: &dyn LlmProvider,
     model: &str,
-    max_summary_tokens: u32,
-) -> Result<Vec<Message>, ClaudeError> {
-    if split_at == 0 {
-        return Ok(messages.to_vec());
+    system: &str,
+    prompt: &str,
+    max_tokens: u32,
+) -> Result<(String, Option<StopReason>), ClaudeError> {
+    let request = ProviderRequest {
+        model: model.to_string(),
+        messages: vec![Message::user(prompt)],
+        system_prompt: Some(SystemPrompt::Text(system.to_string())),
+        tools: Vec::new(),
+        max_tokens,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: Vec::new(),
+        thinking: None,
+        provider_options: Value::Object(Default::default()),
+    };
+
+    let mut stream = provider.create_message_stream(request).await?;
+    let mut text = String::new();
+    let mut stop_reason = None;
+    while let Some(event) = stream.next().await {
+        match event? {
+            StreamEvent::TextDelta { text: delta, .. } => text.push_str(&delta),
+            StreamEvent::MessageDelta { stop_reason: Some(reason), .. } => {
+                stop_reason = Some(reason);
+            }
+            StreamEvent::MessageStop => break,
+            _ => {}
+        }
     }
+    Ok((text, stop_reason))
+}
 
-    let head = &messages[..split_at];
+/// Upper bound on summary output tokens (mirrors TypeScript
+/// MAX_OUTPUT_TOKENS_FOR_SUMMARY).
+pub const MAX_SUMMARY_TOKENS: u32 = 20_000;
 
-    // Iterative UPDATE mode: if a prior <compact-summary> already lives in the
-    // head, fold it forward instead of re-summarising from scratch. Keep the
-    // full previous summary (used later for the files-touched manifest) and a
-    // manifest-stripped copy for the prompt so the model doesn't echo it.
-    let previous_summary = extract_previous_summary(head);
+/// Summarisation attempts before a compaction fails (one retry).
+const SUMMARY_ATTEMPTS: u32 = 2;
 
-    // Build a transcript string for the summarisation prompt.
+/// Tool results are cut to this many bytes (head and tail kept) in the
+/// summariser transcript, so the summarisation request itself stays well
+/// inside the window even when compacting after an overflow (pi: 2,000).
+const TRANSCRIPT_TOOL_RESULT_CHARS: usize = 2_000;
+
+/// How many of the most recent user turns in the summarised head are carried
+/// verbatim into the summary message.
+const RECENT_USER_TURNS: usize = 3;
+
+/// Byte budget for those verbatim user turns; a turn that would exceed it is
+/// left to the summary.
+const RECENT_USER_TURNS_MAX_CHARS: usize = 16_000;
+
+/// Summary output budget for a model whose output cap is `max_output_tokens`:
+/// the cap itself, bounded by [`MAX_SUMMARY_TOKENS`], so small local models
+/// are never asked for more than they can emit.
+pub fn summary_token_budget(max_output_tokens: u32) -> u32 {
+    max_output_tokens.clamp(1, MAX_SUMMARY_TOKENS)
+}
+
+/// A compaction applied to a conversation: the new history plus the entry
+/// recorded in the session.
+#[derive(Debug, Clone)]
+pub struct Compaction {
+    pub messages: Vec<Message>,
+    pub record: CompactionRecord,
+}
+
+/// Render the summarisation prompt for `head`.
+fn summary_prompt(
+    head: &[Message],
+    previous_summary: Option<&str>,
+    custom_instructions: Option<&str>,
+) -> String {
     let mut transcript = String::new();
     let original_count = head.len();
     let original_token_estimate = estimate_tokens_for_messages(head);
@@ -968,7 +982,13 @@ async fn summarise_head(
                     }
                     ContentBlock::ToolResult { tool_use_id, content, is_error } => {
                         let result_text = match content {
-                            claurst_core::types::ToolResultContent::Text(t) => t.as_str().to_string(),
+                            claurst_core::types::ToolResultContent::Text(t) => {
+                                claurst_core::truncate::truncate_tool_output(
+                                    t,
+                                    TRANSCRIPT_TOOL_RESULT_CHARS,
+                                )
+                                .into_owned()
+                            }
                             claurst_core::types::ToolResultContent::Blocks(_) => "[complex content]".to_string(),
                         };
                         let error_flag = if is_error.unwrap_or(false) { " [ERROR]" } else { "" };
@@ -984,16 +1004,15 @@ async fn summarise_head(
     }
 
     // Feed the prior summary WITHOUT its files-touched manifest: the manifest is
-    // re-appended deterministically below (parsed + unioned), so echoing it in
-    // the prompt would only risk the model drifting the file list.
-    let previous_summary_for_prompt = previous_summary
-        .as_deref()
-        .map(strip_files_touched_section);
+    // re-appended deterministically (parsed + unioned), so echoing it in the
+    // prompt would only risk the model drifting the file list.
+    let previous_summary_for_prompt = previous_summary.map(strip_files_touched_section);
 
     // Select the UPDATE prompt variant when a prior summary is present.
-    let compact_prompt = get_compact_prompt(None, previous_summary_for_prompt.as_deref());
+    let compact_prompt =
+        get_compact_prompt(custom_instructions, previous_summary_for_prompt.as_deref());
 
-    let user_content = if let Some(prev) = previous_summary_for_prompt.as_deref() {
+    if let Some(prev) = previous_summary_for_prompt.as_deref() {
         format!(
             "{}\n\n<previous-summary>\n{}\n</previous-summary>\n\n<conversation_to_summarize original_messages=\"{}\" estimated_tokens=\"{}\">\n{}\n</conversation_to_summarize>",
             compact_prompt,
@@ -1010,43 +1029,70 @@ async fn summarise_head(
             original_token_estimate,
             transcript
         )
-    };
-
-    let api_msgs = vec![ApiMessage {
-        role: "user".to_string(),
-        content: Value::String(user_content),
-    }];
-
-    let request = CreateMessageRequest::builder(model, max_summary_tokens)
-        .messages(api_msgs)
-        .system(SystemPrompt::Text(
-            "You are a helpful assistant that creates concise yet thorough conversation summaries. \
-             Preserve all technical details, file names, code snippets, and decisions that would \
-             be important for continuing the work. Follow the structured format exactly."
-                .to_string(),
-        ))
-        .build();
-
-    // Use a null handler since we just want the final accumulated message.
-    let handler: Arc<dyn StreamHandler> = Arc::new(claurst_api::streaming::NullStreamHandler);
-    let mut rx = client.create_message_stream(request, handler).await?;
-    let mut acc = StreamAccumulator::new();
-
-    while let Some(evt) = rx.recv().await {
-        acc.on_event(&evt);
-        if matches!(evt, AnthropicStreamEvent::MessageStop) {
-            break;
-        }
     }
+}
 
-    let (summary_msg, _usage, _stop) = acc.finish();
-    let raw_summary = summary_msg.get_all_text();
-
-    if raw_summary.is_empty() {
+/// Format a raw summariser reply (dropping the discarded `<analysis>` block)
+/// and reject it when it is empty, was cut off by the output limit, or is not
+/// shorter than the messages it replaces.
+fn validate_summary(
+    raw: &str,
+    stop_reason: Option<StopReason>,
+    head_tokens: usize,
+) -> Result<String, ClaudeError> {
+    if matches!(stop_reason, Some(StopReason::MaxTokens)) {
+        return Err(ClaudeError::Other(
+            "Compact summary was cut off at the output limit".to_string(),
+        ));
+    }
+    let summary = format_compact_summary(raw);
+    if summary.trim().is_empty() {
         return Err(ClaudeError::Other("Compact summary was empty".to_string()));
     }
+    if (summary.len() / 4) * 4 / 3 >= head_tokens {
+        return Err(ClaudeError::Other(
+            "Compact summary is not shorter than the messages it replaces".to_string(),
+        ));
+    }
+    Ok(summary)
+}
 
-    let formatted_summary = format_compact_summary(&raw_summary);
+/// Summarise `head` through `provider`, retrying once when the call fails or
+/// the response is rejected by [`validate_summary`]. Returns the formatted
+/// summary with its files-touched manifest.
+async fn generate_summary(
+    provider: &dyn LlmProvider,
+    model: &str,
+    head: &[Message],
+    max_summary_tokens: u32,
+    custom_instructions: Option<&str>,
+) -> Result<String, ClaudeError> {
+    // Iterative UPDATE mode: if a prior <compact-summary> already lives in the
+    // head, fold it forward instead of re-summarising from scratch.
+    let previous_summary = extract_previous_summary(head);
+    let prompt = summary_prompt(head, previous_summary.as_deref(), custom_instructions);
+    let head_tokens = estimate_tokens_for_messages(head);
+
+    let mut attempt = 1;
+    let formatted_summary = loop {
+        let outcome = request_summary(
+            provider,
+            model,
+            SUMMARISER_SYSTEM_PROMPT,
+            &prompt,
+            max_summary_tokens,
+        )
+        .await
+        .and_then(|(raw, stop_reason)| validate_summary(&raw, stop_reason, head_tokens));
+        match outcome {
+            Ok(summary) => break summary,
+            Err(e) if attempt < SUMMARY_ATTEMPTS => {
+                warn!(attempt, error = %e, "Compaction summary failed; retrying");
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    };
 
     // Files-touched manifest: files this batch read/wrote/edited, unioned with
     // any manifest carried in the prior summary so the agent doesn't forget what
@@ -1056,27 +1102,95 @@ async fn summarise_head(
     if let Some(prev) = &previous_summary {
         file_ops.union(&parse_files_touched(prev));
     }
-    let formatted_summary = if file_ops.is_empty() {
+    Ok(if file_ops.is_empty() {
         formatted_summary
     } else {
         format!("{}{}", formatted_summary, format_files_touched(&file_ops))
-    };
+    })
+}
 
-    // Build the new conversation:
-    //   [user: compact summary preamble] [recent tail messages]
-    //
-    // The summary is wrapped in <compact-summary> tags so the NEXT compaction can
-    // detect it (via extract_previous_summary) and fold it forward in UPDATE mode.
-    let compact_notice = Message::user(format!(
+/// The most recent user-authored turns in `head` (oldest first), at most
+/// [`RECENT_USER_TURNS`] within [`RECENT_USER_TURNS_MAX_CHARS`]. Tool results
+/// and earlier compaction summaries are skipped.
+fn recent_user_turns(head: &[Message]) -> Vec<String> {
+    let mut turns = Vec::new();
+    let mut used = 0;
+    for msg in head.iter().rev() {
+        if turns.len() == RECENT_USER_TURNS {
+            break;
+        }
+        if msg.role != Role::User || message_has_tool_result(msg) {
+            continue;
+        }
+        let text = msg.get_all_text();
+        if text.trim().is_empty()
+            || text.contains("<compact-summary>")
+            || text.contains("<recent-user-messages>")
+        {
+            continue;
+        }
+        if used + text.len() > RECENT_USER_TURNS_MAX_CHARS {
+            break;
+        }
+        used += text.len();
+        turns.push(text);
+    }
+    turns.reverse();
+    turns
+}
+
+/// Build the synthetic user message that replaces `head`: `body` (the summary
+/// notice) followed by the most recent user turns verbatim. It gets a fresh
+/// uuid so the session's [`CompactionRecord`] can point at it.
+///
+/// The summary is wrapped in <compact-summary> tags by the callers so the NEXT
+/// compaction can detect it (via extract_previous_summary) and fold it forward
+/// in UPDATE mode.
+fn summary_message(mut body: String, head: &[Message]) -> Message {
+    let recent = recent_user_turns(head);
+    if !recent.is_empty() {
+        body.push_str(
+            "\n\n<recent-user-messages>\nThe user's most recent messages from that portion, verbatim:",
+        );
+        for turn in recent {
+            body.push_str("\n\n---\n");
+            body.push_str(&turn);
+        }
+        body.push_str("\n</recent-user-messages>");
+    }
+    let mut message = Message::user(body);
+    message.uuid = Some(uuid::Uuid::new_v4().to_string());
+    message
+}
+
+/// Notice for a head that was summarised into `summary`.
+fn summarised_notice(summary: &str, head: &[Message]) -> String {
+    format!(
         "This session is being continued from a previous conversation that ran out of context. \
          The summary below covers the earlier portion of the conversation (originally {} messages, \
          ~{} tokens).\n\n<compact-summary>\n{}\n</compact-summary>",
-        original_count, original_token_estimate, formatted_summary
-    ));
+        head.len(),
+        estimate_tokens_for_messages(head),
+        summary
+    )
+}
 
-    let mut new_messages = vec![compact_notice];
+/// Summarise `messages[..split_at]` through the active provider.
+/// Returns a new conversation: [summary user msg] + messages[split_at..].
+async fn summarise_head(
+    provider: &dyn LlmProvider,
+    model: &str,
+    messages: &[Message],
+    split_at: usize,
+    max_summary_tokens: u32,
+) -> Result<Vec<Message>, ClaudeError> {
+    if split_at == 0 {
+        return Ok(messages.to_vec());
+    }
+    let head = &messages[..split_at];
+    let summary = generate_summary(provider, model, head, max_summary_tokens, None).await?;
+    let mut new_messages = vec![summary_message(summarised_notice(&summary, head), head)];
     new_messages.extend_from_slice(&messages[split_at..]);
-
     Ok(new_messages)
 }
 
@@ -1121,25 +1235,45 @@ fn snap_to_pairing_boundary(messages: &[Message], idx: usize) -> usize {
 /// after it is kept verbatim. Larger `keep_recent_tokens` keeps more messages;
 /// smaller keeps fewer. The index is snapped to a tool_use↔tool_result-safe
 /// boundary so pairing is never broken.
+///
+/// When even the newest message alone exceeds the budget (typically the user
+/// message carrying a large tool batch, at the pre-request check), the whole
+/// last round — from the last assistant message on — is kept instead of
+/// summarising everything, so the results the model just asked for survive.
 fn compute_keep_split_index(messages: &[Message], keep_recent_tokens: u64) -> usize {
     if messages.is_empty() {
         return 0;
     }
-    let raw = calculate_messages_to_keep_index(messages, keep_recent_tokens);
+    let mut raw = calculate_messages_to_keep_index(messages, keep_recent_tokens);
+    if raw == messages.len() {
+        raw = messages
+            .iter()
+            .rposition(|m| m.role == Role::Assistant)
+            .unwrap_or(0);
+    }
     snap_to_pairing_boundary(messages, raw)
 }
 
-/// Compact `messages` in-place, replacing the head with a summary.
-/// Returns the new messages vector on success.
+/// Compact `messages`: summarise everything older than the most recent
+/// ~[`KEEP_RECENT_TOKENS`] (cut on a pairing-safe boundary) into one summary
+/// message that also carries the last few user turns verbatim, and return the
+/// new history with the compaction entry for the session.
+///
+/// Returns `Ok(None)` when the whole conversation already fits the keep-recent
+/// budget (nothing to summarise). When the summariser fails twice the error is
+/// returned and the caller keeps its history, except for
+/// [`CompactionTrigger::Overflow`]: the request cannot be sent as is, so the
+/// head is dropped and only the untouched tail is kept (with any previous
+/// summary carried over).
 pub async fn compact_conversation(
-    client: &claurst_api::AnthropicClient,
-    messages: &[Message],
+    provider: &dyn LlmProvider,
     model: &str,
-) -> Result<Vec<Message>, ClaudeError> {
+    messages: &[Message],
+    trigger: CompactionTrigger,
+    max_summary_tokens: u32,
+    custom_instructions: Option<&str>,
+) -> Result<Option<Compaction>, ClaudeError> {
     let total = messages.len();
-
-    // Token-budget keep: summarise everything older than the most recent
-    // ~KEEP_RECENT_TOKENS worth of messages, cut on a pairing-safe boundary.
     let split_at = compute_keep_split_index(messages, KEEP_RECENT_TOKENS);
 
     if split_at == 0 {
@@ -1148,35 +1282,83 @@ pub async fn compact_conversation(
             keep_recent_tokens = KEEP_RECENT_TOKENS,
             "Whole conversation fits the keep-recent budget – keeping everything"
         );
-        return Ok(messages.to_vec());
+        return Ok(None);
     }
 
     info!(
         total,
         split_at,
         keep_recent_tokens = KEEP_RECENT_TOKENS,
+        ?trigger,
         "Compacting conversation (token-budget keep)"
     );
 
-    // Use a generous token budget for the summary (20k mirrors TypeScript MAX_OUTPUT_TOKENS_FOR_SUMMARY)
-    summarise_head(client, messages, split_at, model, 20_000).await
+    let head = &messages[..split_at];
+    let (notice, summarised) =
+        match generate_summary(provider, model, head, max_summary_tokens, custom_instructions)
+            .await
+        {
+            Ok(summary) => (summarised_notice(&summary, head), true),
+            Err(e) if trigger == CompactionTrigger::Overflow => {
+                warn!(error = %e, "Summariser failed after a context-window error; keeping only the recent tail");
+                let mut notice = format!(
+                    "This session is being continued from a previous conversation that ran out of context. \
+                     The earlier portion of the conversation (originally {} messages, ~{} tokens) could not \
+                     be summarised and was dropped.",
+                    head.len(),
+                    estimate_tokens_for_messages(head)
+                );
+                if let Some(previous) = extract_previous_summary(head) {
+                    notice.push_str(&format!(
+                        "\n\nSummary carried over from an earlier compaction:\n\n<compact-summary>\n{}\n</compact-summary>",
+                        previous
+                    ));
+                }
+                (notice, false)
+            }
+            Err(e) => return Err(e),
+        };
+
+    let summary = summary_message(notice, head);
+    let summary_uuid = summary.uuid.clone().unwrap_or_default();
+    let mut new_messages = Vec::with_capacity(1 + total - split_at);
+    new_messages.push(summary);
+    new_messages.extend_from_slice(&messages[split_at..]);
+
+    let record = CompactionRecord {
+        at: chrono::Utc::now(),
+        trigger,
+        summary_uuid,
+        messages_before: total,
+        messages_after: new_messages.len(),
+        tokens_before: estimate_tokens_for_messages(messages) as u64,
+        tokens_after: estimate_tokens_for_messages(&new_messages) as u64,
+        summarised,
+    };
+    Ok(Some(Compaction { messages: new_messages, record }))
 }
 
 /// Auto-compact `messages` if needed.  Updates `state` in place.
-/// Returns `Some(new_messages)` if compaction ran, `None` otherwise.
+/// Returns the compaction if one ran, `None` otherwise.
 ///
 /// `context_window` is the effective window for the active provider+model
-/// (resolve it via [`resolve_context_window`]); `model` is still used for the
-/// summarisation API call.
+/// (resolve it via [`resolve_context_window`]); `provider` and `model` serve
+/// the summarisation call.
 pub async fn auto_compact_if_needed(
-    client: &claurst_api::AnthropicClient,
+    provider: &dyn LlmProvider,
+    model: &str,
     messages: &[Message],
     input_tokens: u64,
-    model: &str,
     context_window: u64,
+    max_output_tokens: u32,
     state: &mut AutoCompactState,
-) -> Option<Vec<Message>> {
-    if !should_auto_compact_for_window(input_tokens, context_window, state) {
+) -> Option<Compaction> {
+    if !should_auto_compact_for_window(
+        input_tokens,
+        context_window,
+        u64::from(max_output_tokens),
+        state,
+    ) {
         return None;
     }
 
@@ -1187,15 +1369,25 @@ pub async fn auto_compact_if_needed(
         "Auto-compact triggered"
     );
 
-    match compact_conversation(client, messages, model).await {
-        Ok(new_msgs) => {
+    match compact_conversation(
+        provider,
+        model,
+        messages,
+        CompactionTrigger::Threshold,
+        summary_token_budget(max_output_tokens),
+        None,
+    )
+    .await
+    {
+        Ok(None) => None,
+        Ok(Some(compaction)) => {
             state.on_success();
             info!(
                 original_count = messages.len(),
-                new_count = new_msgs.len(),
+                new_count = compaction.messages.len(),
                 "Auto-compact complete"
             );
-            Some(new_msgs)
+            Some(compaction)
         }
         Err(e) => {
             warn!(error = %e, "Auto-compact failed");
@@ -1364,8 +1556,8 @@ fn strip_images(messages: Vec<claurst_core::types::Message>) -> Vec<claurst_core
 /// a long-running compact.
 pub async fn reactive_compact(
     messages: Vec<claurst_core::types::Message>,
-    client: &claurst_api::AnthropicClient,
-    config: &crate::QueryConfig,
+    provider: &dyn LlmProvider,
+    model: &str,
     cancel: tokio_util::sync::CancellationToken,
     recently_modified: &[std::path::PathBuf],
 ) -> Result<CompactResult, claurst_core::error::ClaudeError> {
@@ -1402,7 +1594,7 @@ pub async fn reactive_compact(
         estimate_tokens_for_messages(&stripped[..split_at]) as u64;
 
     let mut new_messages =
-        summarise_head(client, &stripped, split_at, &config.model, 20_000).await?;
+        summarise_head(provider, model, &stripped, split_at, MAX_SUMMARY_TOKENS).await?;
 
     // The summary lives as the first message in new_messages.
     let summary_text = new_messages
@@ -1454,13 +1646,9 @@ pub async fn reactive_compact(
 /// to free enough space.
 pub async fn context_collapse(
     messages: Vec<claurst_core::types::Message>,
-    client: &claurst_api::AnthropicClient,
-    config: &crate::QueryConfig,
+    provider: &dyn LlmProvider,
+    model: &str,
 ) -> Result<CompactResult, claurst_core::error::ClaudeError> {
-    use claurst_api::{AnthropicStreamEvent, ApiMessage, CreateMessageRequest, StreamAccumulator, StreamHandler, SystemPrompt};
-    use serde_json::Value;
-    use std::sync::Arc;
-
     let total = messages.len();
     if total == 0 {
         return Ok(CompactResult {
@@ -1497,33 +1685,15 @@ pub async fn context_collapse(
         transcript
     );
 
-    let api_msgs = vec![ApiMessage {
-        role: "user".to_string(),
-        content: Value::String(collapse_prompt),
-    }];
-
-    let request = CreateMessageRequest::builder(&config.model, 1_000)
-        .messages(api_msgs)
-        .system(SystemPrompt::Text(
-            "You are a conversation summariser. Produce an emergency ultra-short \
-             summary as instructed. Plain text only."
-                .to_string(),
-        ))
-        .build();
-
-    let handler: Arc<dyn StreamHandler> = Arc::new(claurst_api::streaming::NullStreamHandler);
-    let mut rx = client.create_message_stream(request, handler).await?;
-    let mut acc = StreamAccumulator::new();
-
-    while let Some(evt) = rx.recv().await {
-        acc.on_event(&evt);
-        if matches!(evt, AnthropicStreamEvent::MessageStop) {
-            break;
-        }
-    }
-
-    let (summary_msg, _usage, _stop) = acc.finish();
-    let summary_text = summary_msg.get_all_text();
+    let (summary_text, _stop) = request_summary(
+        provider,
+        model,
+        "You are a conversation summariser. Produce an emergency ultra-short \
+         summary as instructed. Plain text only.",
+        &collapse_prompt,
+        1_000,
+    )
+    .await?;
 
     if summary_text.is_empty() {
         return Err(claurst_core::error::ClaudeError::Other(
@@ -1871,12 +2041,22 @@ mod tests {
     #[test]
     fn test_compact_prompt_contains_sections() {
         let prompt = get_compact_prompt(None, None);
-        assert!(prompt.contains("Primary Request and Intent"));
-        assert!(prompt.contains("Key Technical Concepts"));
-        assert!(prompt.contains("Files and Code Sections"));
-        assert!(prompt.contains("Errors and fixes"));
-        assert!(prompt.contains("Pending Tasks"));
-        assert!(prompt.contains("Current Work"));
+        for section in [
+            "## Objective",
+            "## Requirements",
+            "## Decisions",
+            "## Work State",
+            "## Next Move",
+            "## Relevant Files",
+            "## Important Context",
+        ] {
+            assert!(prompt.contains(section), "missing {section}");
+        }
+        assert!(prompt.contains("Include at most 15"));
+        assert!(prompt.contains("Leave out instructions and setup the assistant was given"));
+        assert!(prompt.contains("<analysis>") && prompt.contains("<summary>"));
+        // The long "full code snippets" template is gone.
+        assert!(!prompt.contains("full code snippets"));
     }
 
     #[test]
@@ -2098,14 +2278,33 @@ mod tests {
     fn context_tokens_prefer_real_usage_over_estimate() {
         let msgs = vec![Message::user(filler(4000))]; // ≈ 1333 estimated tokens
         let estimate = estimate_tokens_for_messages(&msgs) as u64;
+        let mark = |prompt_tokens, message_count| {
+            Some(UsageMark { prompt_tokens, message_count })
+        };
 
-        // Real usage present ⇒ used verbatim, ignoring the (much smaller) estimate.
-        assert_eq!(estimate_context_tokens(&msgs, Some(150_000)), 150_000);
-        assert_ne!(estimate_context_tokens(&msgs, Some(150_000)), estimate);
+        // Real usage covering every message ⇒ used verbatim.
+        assert_eq!(estimate_context_tokens(&msgs, mark(150_000, 1)), 150_000);
 
-        // No usage / zero usage ⇒ fall back to the chars/4 estimate.
+        // Messages appended after the anchored request are estimated on top.
+        assert_eq!(estimate_context_tokens(&msgs, mark(150_000, 0)), 150_000 + estimate);
+
+        // No usage / zero usage / stale anchor ⇒ fall back to the estimate.
         assert_eq!(estimate_context_tokens(&msgs, None), estimate);
-        assert_eq!(estimate_context_tokens(&msgs, Some(0)), estimate);
+        assert_eq!(estimate_context_tokens(&msgs, mark(0, 1)), estimate);
+        assert_eq!(estimate_context_tokens(&msgs, mark(150_000, 5)), estimate);
+    }
+
+    #[test]
+    fn threshold_leaves_room_for_the_output_reserve() {
+        // Small reserve: the 90 % fraction wins.
+        assert_eq!(auto_compact_threshold(200_000, 8_000), 180_000);
+        // Large reserve: window minus reserve wins.
+        assert_eq!(auto_compact_threshold(200_000, 32_000), 168_000);
+        // Reserve is capped at a quarter of the window.
+        assert_eq!(auto_compact_threshold(32_000, 64_000), 24_000);
+        let state = AutoCompactState::default();
+        assert!(should_auto_compact_for_window(170_000, 200_000, 32_000, &state));
+        assert!(!should_auto_compact_for_window(170_000, 200_000, 8_000, &state));
     }
 
     // ---- (3) iterative UPDATE prompt (#231) --------------------------------
@@ -2139,12 +2338,15 @@ mod tests {
         let blank = get_compact_prompt(None, Some("   "));
         assert_eq!(blank, base);
 
-        // Both variants preserve the structured sections.
+        // Newer history wins over the previous summary.
+        assert!(update.contains("Newer history always takes precedence"));
+
+        // Both variants share the terse template.
         for p in [&base, &update] {
-            assert!(p.contains("Primary Request and Intent"));
-            assert!(p.contains("Files and Code Sections"));
-            assert!(p.contains("Pending Tasks"));
-            assert!(p.contains("Optional Next Step"));
+            assert!(p.contains("## Objective"));
+            assert!(p.contains("## Work State"));
+            assert!(p.contains("## Next Move"));
+            assert!(p.contains("## Relevant Files"));
         }
     }
 
@@ -2247,5 +2449,245 @@ mod tests {
             .count()
             + 1;
         assert_eq!(listed, MAX_MANIFEST_FILES);
+    }
+
+    // ---- Issue #441: provider-agnostic, robust summariser --------------------
+
+    /// One scripted summariser reply: `Some((text, stop))`, or `None` for a
+    /// provider error.
+    type Reply = Option<(&'static str, StopReason)>;
+
+    /// A non-Anthropic provider that answers summarisation requests from a
+    /// script and counts them.
+    struct ScriptedSummariser {
+        id: claurst_core::provider_id::ProviderId,
+        replies: std::sync::Mutex<std::collections::VecDeque<Reply>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedSummariser {
+        fn new(replies: Vec<Reply>) -> Self {
+            Self {
+                id: claurst_core::provider_id::ProviderId::new("openai"),
+                replies: std::sync::Mutex::new(replies.into()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ScriptedSummariser {
+        fn id(&self) -> &claurst_core::provider_id::ProviderId {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            "scripted-summariser"
+        }
+
+        async fn create_message(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<claurst_api::ProviderResponse, claurst_api::ProviderError> {
+            unimplemented!("the summariser streams")
+        }
+
+        async fn create_message_stream(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<StreamEvent, claurst_api::ProviderError>> + Send>,
+            >,
+            claurst_api::ProviderError,
+        > {
+            assert!(request.tools.is_empty(), "the summariser must not offer tools");
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let reply = self.replies.lock().unwrap().pop_front().flatten();
+            let Some((text, stop)) = reply else {
+                return Err(claurst_api::ProviderError::ServerError {
+                    provider: self.id.clone(),
+                    status: Some(500),
+                    message: "boom".to_string(),
+                    is_retryable: true,
+                    retry_after: None,
+                });
+            };
+            let events = vec![
+                Ok(StreamEvent::TextDelta { index: 0, text: text.to_string() }),
+                Ok(StreamEvent::MessageDelta { stop_reason: Some(stop), usage: None }),
+                Ok(StreamEvent::MessageStop),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+
+        async fn health_check(
+            &self,
+        ) -> Result<claurst_api::ProviderStatus, claurst_api::ProviderError> {
+            Ok(claurst_api::ProviderStatus::Healthy)
+        }
+
+        fn capabilities(&self) -> claurst_api::ProviderCapabilities {
+            claurst_api::ProviderCapabilities {
+                streaming: true,
+                tool_calling: false,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: claurst_api::SystemPromptStyle::TopLevel,
+            }
+        }
+    }
+
+    const GOOD: Reply = Some(("<summary>Condensed history.</summary>", StopReason::EndTurn));
+
+    /// Short user turns between large assistant replies: the keep-recent cut
+    /// lands at index 8, leaving four user turns in the summarised head.
+    fn turns_history() -> Vec<Message> {
+        let users = ["alpha request", "beta request", "gamma request", "delta request", "epsilon request", "final request"];
+        let mut out = Vec::new();
+        for (i, user) in users.iter().enumerate() {
+            out.push(make_user(user));
+            if i + 1 < users.len() {
+                out.push(make_assistant(&filler(30_000)));
+            }
+        }
+        out
+    }
+
+    async fn compact(
+        provider: &ScriptedSummariser,
+        trigger: CompactionTrigger,
+    ) -> Result<Option<Compaction>, ClaudeError> {
+        compact_conversation(provider, "gpt-test", &turns_history(), trigger, 4_000, None).await
+    }
+
+    #[tokio::test]
+    async fn non_anthropic_provider_compacts_and_records_the_entry() {
+        let provider = ScriptedSummariser::new(vec![GOOD]);
+        let history = turns_history();
+        let compaction = compact(&provider, CompactionTrigger::Threshold)
+            .await
+            .unwrap()
+            .expect("history over the keep budget compacts");
+
+        assert_eq!(provider.calls(), 1);
+        let msgs = &compaction.messages;
+        let record = &compaction.record;
+        assert!(msgs[0].get_all_text().contains("Condensed history."));
+        assert_eq!(record.trigger, CompactionTrigger::Threshold);
+        assert_eq!(msgs[0].uuid.as_deref(), Some(record.summary_uuid.as_str()));
+        assert_eq!(record.messages_before, history.len());
+        assert_eq!(record.messages_after, msgs.len());
+        assert!(record.tokens_after < record.tokens_before);
+        assert!(record.summarised);
+        // The untouched tail follows the summary.
+        assert_eq!(msgs.last().unwrap().get_all_text(), "final request");
+    }
+
+    #[tokio::test]
+    async fn last_user_turns_are_kept_verbatim() {
+        let provider = ScriptedSummariser::new(vec![GOOD]);
+        let compaction = compact(&provider, CompactionTrigger::Threshold).await.unwrap().unwrap();
+        let summary = compaction.messages[0].get_all_text();
+        let recent = &summary[summary.find("<recent-user-messages>").expect("recent block")..];
+        for kept in ["beta request", "gamma request", "delta request"] {
+            assert!(recent.contains(kept), "missing {kept}: {recent}");
+        }
+        assert!(!recent.contains("alpha request"), "only the last {RECENT_USER_TURNS} turns");
+    }
+
+    #[tokio::test]
+    async fn summariser_retries_once_after_a_rejected_summary() {
+        // Empty, then good.
+        let provider = ScriptedSummariser::new(vec![Some(("  ", StopReason::EndTurn)), GOOD]);
+        assert!(compact(&provider, CompactionTrigger::Threshold).await.unwrap().is_some());
+        assert_eq!(provider.calls(), 2);
+
+        // Provider error, then good.
+        let provider = ScriptedSummariser::new(vec![None, GOOD]);
+        assert!(compact(&provider, CompactionTrigger::Manual).await.unwrap().is_some());
+        assert_eq!(provider.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn truncated_or_failing_summaries_fail_the_compaction() {
+        let truncated = Some(("<summary>cut off", StopReason::MaxTokens));
+        let provider = ScriptedSummariser::new(vec![truncated.clone(), truncated]);
+        assert!(compact(&provider, CompactionTrigger::Threshold).await.is_err());
+        assert_eq!(provider.calls(), 2, "one retry, then give up");
+    }
+
+    #[test]
+    fn over_long_summary_is_rejected() {
+        let head = vec![make_user(&filler(400))];
+        let head_tokens = estimate_tokens_for_messages(&head);
+        assert!(validate_summary(&filler(4_000), Some(StopReason::EndTurn), head_tokens).is_err());
+        assert!(validate_summary("short", Some(StopReason::EndTurn), head_tokens).is_ok());
+        // The discarded <analysis> block does not count against the summary.
+        let reply = format!("<analysis>{}</analysis><summary>short</summary>", filler(4_000));
+        assert_eq!(
+            validate_summary(&reply, Some(StopReason::EndTurn), head_tokens).unwrap().trim(),
+            format_compact_summary("<summary>short</summary>").trim()
+        );
+    }
+
+    /// At the pre-request check the newest message can be a tool batch larger
+    /// than the whole keep budget: the last round must survive compaction.
+    #[test]
+    fn keep_split_keeps_an_oversized_last_round() {
+        let mut msgs = plain_convo(5, 30_000);
+        msgs.push(assistant_tool_use("t1", "Read", serde_json::json!({"file_path": "a"})));
+        msgs.push(Message::user_blocks(
+            ["t1", "t2", "t3"]
+                .iter()
+                .map(|id| ContentBlock::ToolResult {
+                    tool_use_id: id.to_string(),
+                    content: ToolResultContent::Text(filler(40_000)),
+                    is_error: None,
+                })
+                .collect(),
+        ));
+        let split = compute_keep_split_index(&msgs, KEEP_RECENT_TOKENS);
+        assert_eq!(split, msgs.len() - 2, "tail keeps the tool_use and its results");
+    }
+
+    #[tokio::test]
+    async fn overflow_falls_back_to_the_untouched_tail_when_summaries_fail() {
+        let provider = ScriptedSummariser::new(vec![None, None]);
+        let history = turns_history();
+        let compaction = compact(&provider, CompactionTrigger::Overflow)
+            .await
+            .unwrap()
+            .expect("overflow recovery always yields a history");
+
+        assert!(!compaction.record.summarised);
+        assert_eq!(compaction.record.trigger, CompactionTrigger::Overflow);
+        let notice = compaction.messages[0].get_all_text();
+        assert!(notice.contains("could not be summarised"));
+        assert!(notice.contains("delta request"), "recent user turns survive the fallback");
+        // Everything after the notice is the original tail, untouched.
+        let tail = &history[history.len() - (compaction.messages.len() - 1)..];
+        let kept: Vec<String> = compaction.messages[1..].iter().map(|m| m.get_all_text()).collect();
+        let expected: Vec<String> = tail.iter().map(|m| m.get_all_text()).collect();
+        assert_eq!(kept, expected);
+    }
+
+    #[tokio::test]
+    async fn nothing_to_compact_returns_none() {
+        let provider = ScriptedSummariser::new(vec![GOOD]);
+        let small = vec![make_user("hi"), make_assistant("hello")];
+        let out = compact_conversation(&provider, "gpt-test", &small, CompactionTrigger::Manual, 4_000, None)
+            .await
+            .unwrap();
+        assert!(out.is_none());
+        assert_eq!(provider.calls(), 0);
     }
 }

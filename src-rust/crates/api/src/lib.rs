@@ -6,7 +6,7 @@
 // - SSE event parsing (message_start, content_block_start, content_block_delta,
 //   content_block_stop, message_delta, message_stop, error)
 // - Delta types: text_delta, input_json_delta, thinking_delta, signature_delta
-// - Rate-limit (429) and overloaded (529) retry with exponential back-off
+// - Transient-failure retry (429/529/5xx/connection) via the shared `retry` policy
 // - Authentication via API key from env or config
 
 use claurst_core::constants::{ANTHROPIC_API_VERSION, ANTHROPIC_BETA_HEADER};
@@ -58,6 +58,12 @@ pub mod variants;
 // Provider-aware error handling (Phase 6).
 pub mod error_handling;
 
+// Unified retry policy: classification, back-off, Retry-After (#439).
+pub mod retry;
+
+// Repair-then-reject parsing of streamed tool-call arguments (#439).
+pub mod tool_json;
+
 // Message transform layer — concrete transformers (Phase 4).
 pub mod transformers;
 
@@ -104,7 +110,8 @@ pub use variants::{
 };
 
 // Phase 6 re-exports — provider-aware error handling.
-pub use error_handling::{is_context_overflow, parse_error_response, RetryConfig};
+pub use error_handling::{is_context_overflow, parse_error_response};
+pub use retry::{RetryConfig, RetryDecision};
 
 // Phase 2E re-exports — Azure, Bedrock, and GitHub Copilot providers.
 pub use providers::AzureProvider;
@@ -531,9 +538,9 @@ pub mod client {
         pub api_base: String,
         pub api_version: String,
         pub beta_features: String,
-        pub max_retries: u32,
-        pub initial_retry_delay: Duration,
-        pub max_retry_delay: Duration,
+        /// Retry policy for `create_message` / `create_message_stream`.
+        /// `create_message_stream_once` ignores it (its caller retries).
+        pub retry: crate::retry::RetryConfig,
         pub request_timeout: Duration,
         /// When true, send `Authorization: Bearer <api_key>` instead of `x-api-key`.
         /// Used for Claude.ai subscription (OAuth user:inference scope) tokens.
@@ -549,9 +556,7 @@ pub mod client {
                 api_base: claurst_core::constants::ANTHROPIC_API_BASE.to_string(),
                 api_version: ANTHROPIC_API_VERSION.to_string(),
                 beta_features: ANTHROPIC_BETA_HEADER.to_string(),
-                max_retries: 5,
-                initial_retry_delay: Duration::from_secs(1),
-                max_retry_delay: Duration::from_secs(60),
+                retry: crate::retry::RetryConfig::default(),
                 // Honour the process-wide configured timeout (issue #175);
                 // falls back to DEFAULT_REQUEST_TIMEOUT_SECS when unset.
                 request_timeout: crate::request_timeout(),
@@ -561,7 +566,9 @@ pub mod client {
         }
     }
 
-    /// The main Anthropic API client.
+    /// The main Anthropic API client. Cloning is cheap: the HTTP client is
+    /// reference-counted and the clone keeps the same session id.
+    #[derive(Clone)]
     pub struct AnthropicClient {
         http: wreq::Client,
         config: ClientConfig,
@@ -773,12 +780,12 @@ pub mod client {
             self.apply_oauth_stealth(&mut request);
             let body = serde_json::to_value(&request).map_err(ClaudeError::Json)?;
 
-            let resp = self.send_with_retry(&body).await?;
+            let resp = self.send_with_retry(&body, self.config.retry.max_retries).await?;
             let status = resp.status();
             let text = resp.text().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
 
             if !status.is_success() {
-                return Err(self.parse_api_error(status.as_u16(), &text));
+                return Err(self.parse_api_error(status.as_u16(), &text, None));
             }
 
             serde_json::from_str(&text).map_err(ClaudeError::Json)
@@ -808,7 +815,7 @@ pub mod client {
             let text = resp.text().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
 
             if !status.is_success() {
-                return Err(self.parse_api_error(status.as_u16(), &text));
+                return Err(self.parse_api_error(status.as_u16(), &text, None));
             }
 
             // Parse OpenAI response and convert to Anthropic format
@@ -831,11 +838,32 @@ pub mod client {
 
         /// Send a streaming `POST /v1/messages`.  Events are dispatched to the
         /// provided `handler` in real time, and also forwarded into the returned
-        /// channel so the caller can drive a select loop.
+        /// channel so the caller can drive a select loop. Transient HTTP
+        /// failures are retried per `ClientConfig::retry`.
         pub async fn create_message_stream(
+            &self,
+            request: CreateMessageRequest,
+            handler: Arc<dyn StreamHandler>,
+        ) -> Result<mpsc::Receiver<streaming::AnthropicStreamEvent>, ClaudeError> {
+            self.open_stream(request, handler, self.config.retry.max_retries).await
+        }
+
+        /// Like [`create_message_stream`](Self::create_message_stream) but makes
+        /// exactly one HTTP attempt. The query loop uses this and owns the retry
+        /// loop itself so it can report progress and cancel the wait.
+        pub async fn create_message_stream_once(
+            &self,
+            request: CreateMessageRequest,
+            handler: Arc<dyn StreamHandler>,
+        ) -> Result<mpsc::Receiver<streaming::AnthropicStreamEvent>, ClaudeError> {
+            self.open_stream(request, handler, 0).await
+        }
+
+        async fn open_stream(
             &self,
             mut request: CreateMessageRequest,
             handler: Arc<dyn StreamHandler>,
+            max_retries: u32,
         ) -> Result<mpsc::Receiver<streaming::AnthropicStreamEvent>, ClaudeError> {
             // Deferred key validation
             if self.config.api_key.is_empty() && self.config.provider != Provider::Codex {
@@ -879,13 +907,7 @@ pub mod client {
             self.apply_oauth_stealth(&mut request);
             let body = serde_json::to_value(&request).map_err(ClaudeError::Json)?;
 
-            let resp = self.send_with_retry(&body).await?;
-            let status = resp.status();
-
-            if !status.is_success() {
-                let text = resp.text().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
-                return Err(self.parse_api_error(status.as_u16(), &text));
-            }
+            let resp = self.send_with_retry(&body, max_retries).await?;
 
             let (tx, rx) = mpsc::channel(256);
 
@@ -953,14 +975,16 @@ pub mod client {
 
         // ---- Internal helpers --------------------------------------------
 
-        /// Build the common request and execute with retry logic.
+        /// Build the common request and send it, retrying transient failures
+        /// up to `max_retries` times per the shared [`crate::retry`] policy.
+        /// Returns only successful (2xx) responses.
         async fn send_with_retry(
             &self,
             body: &Value,
+            max_retries: u32,
         ) -> Result<wreq::Response, ClaudeError> {
             let url = format!("{}/v1/messages", self.config.api_base);
             let mut attempts = 0u32;
-            let mut delay = self.config.initial_retry_delay;
 
             let use_oauth = self.config.use_bearer_auth;
             let session_id = self.session_id.clone();
@@ -1099,62 +1123,51 @@ pub mod client {
 
                 let req = req.body(body_str.clone());
 
-                let resp = req.send().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
-                let status = resp.status().as_u16();
+                let err = match req.send().await {
+                    Ok(resp) if resp.status().is_success() => return Ok(resp),
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        let retry_after = crate::retry::retry_after(resp.headers());
+                        let text = resp.text().await.unwrap_or_default();
+                        self.parse_api_error(status, &text, retry_after)
+                    }
+                    Err(e) => ClaudeError::Api(format!("connection error: {e}")),
+                };
 
-                // 200-299: success
-                if resp.status().is_success() {
-                    return Ok(resp);
+                match crate::retry::classify_claude_error(&err) {
+                    crate::retry::RetryDecision::Retry { after } if attempts <= max_retries => {
+                        let wait = self.config.retry.delay_for(attempts, after);
+                        warn!(
+                            attempt = attempts,
+                            max_retries,
+                            wait_ms = wait.as_millis() as u64,
+                            error = %err,
+                            "Retryable API error, backing off"
+                        );
+                        tokio::time::sleep(wait).await;
+                    }
+                    _ => return Err(err),
                 }
-
-                // 429 (rate limit) or 529 (overloaded): retry
-                if (status == 429 || status == 529) && attempts <= self.config.max_retries {
-                    // Honour Retry-After header if present
-                    let retry_after = resp
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .map(Duration::from_secs);
-
-                    let wait = retry_after.unwrap_or(delay);
-                    warn!(
-                        status,
-                        attempt = attempts,
-                        wait_secs = wait.as_secs(),
-                        "Retryable API error, backing off"
-                    );
-                    tokio::time::sleep(wait).await;
-                    delay = (delay * 2).min(self.config.max_retry_delay);
-                    continue;
-                }
-
-                // Non-retryable error – return immediately
-                let text = resp.text().await.unwrap_or_default();
-                return Err(self.parse_api_error(status, &text));
             }
         }
 
         /// Parse an API error body into a typed `ClaudeError`.
-        fn parse_api_error(&self, status: u16, body: &str) -> ClaudeError {
-            if let Ok(err) = serde_json::from_str::<ApiErrorResponse>(body) {
-                match status {
-                    401 => ClaudeError::Auth(err.error.message),
-                    429 => ClaudeError::RateLimit,
-                    529 => ClaudeError::ApiStatus {
-                        status,
-                        message: format!("Overloaded: {}", err.error.message),
-                    },
-                    _ => ClaudeError::ApiStatus {
-                        status,
-                        message: err.error.message,
-                    },
-                }
-            } else {
-                ClaudeError::ApiStatus {
-                    status,
-                    message: body.to_string(),
-                }
+        fn parse_api_error(
+            &self,
+            status: u16,
+            body: &str,
+            retry_after: Option<Duration>,
+        ) -> ClaudeError {
+            let message = match serde_json::from_str::<ApiErrorResponse>(body) {
+                Ok(err) if status == 401 => return ClaudeError::Auth(err.error.message),
+                Ok(err) if status == 529 => format!("Overloaded: {}", err.error.message),
+                Ok(err) => err.error.message,
+                Err(_) => body.to_string(),
+            };
+            ClaudeError::ApiStatus {
+                status,
+                message,
+                retry_after,
             }
         }
 
@@ -1183,9 +1196,13 @@ pub mod client {
             // network chunk boundary is never corrupted.
             let mut decoder = crate::SseByteDecoder::new();
             let mut byte_stream = resp.bytes_stream();
+            // Stream integrity (#439): only `message_stop` marks a complete
+            // response; anything else ending the byte stream is a truncation.
+            let mut saw_message_stop = false;
 
             while let Some(chunk_result) = byte_stream.next().await {
-                let chunk = chunk_result.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
+                let chunk = chunk_result
+                    .map_err(|e| ClaudeError::Api(format!("stream read error: {e}")))?;
 
                 for line in decoder.push(&chunk) {
                     let line = line.trim_end_matches('\r');
@@ -1193,6 +1210,8 @@ pub mod client {
                         if let Some(event) =
                             Self::frame_to_event(&frame.event, &frame.data)
                         {
+                            saw_message_stop |=
+                                matches!(event, streaming::AnthropicStreamEvent::MessageStop);
                             handler.on_event(&event);
                             if tx.send(event).await.is_err() {
                                 // Receiver dropped – stop reading.
@@ -1201,6 +1220,15 @@ pub mod client {
                         }
                     }
                 }
+            }
+
+            if !saw_message_stop {
+                let event = streaming::AnthropicStreamEvent::Error {
+                    error_type: "stream_incomplete".into(),
+                    message: "stream ended before message_stop".into(),
+                };
+                handler.on_event(&event);
+                let _ = tx.send(event).await;
             }
 
             Ok(())
@@ -1621,6 +1649,9 @@ pub struct StreamAccumulator {
     partials: std::collections::HashMap<usize, PartialBlock>,
     stop_reason: Option<String>,
     usage: UsageInfo,
+    /// Tool-use ids whose argument JSON could not be parsed or repaired,
+    /// with the parse error. These calls must not be executed (#439).
+    invalid_tool_inputs: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -1652,6 +1683,7 @@ impl StreamAccumulator {
             partials: Default::default(),
             stop_reason: None,
             usage: UsageInfo::default(),
+            invalid_tool_inputs: Default::default(),
         }
     }
 
@@ -1719,8 +1751,17 @@ impl StreamAccumulator {
                     let block = match partial {
                         PartialBlock::Text(text) => ContentBlock::Text { text },
                         PartialBlock::ToolUse { id, name, json_buf } => {
-                            let input = serde_json::from_str(&json_buf)
-                                .unwrap_or(Value::Object(Default::default()));
+                            // Repair-then-reject (#439): an unparseable call keeps
+                            // a `{}` placeholder so the history stays well-formed,
+                            // but is recorded so the caller never executes it.
+                            let input = match tool_json::parse_tool_input(&json_buf) {
+                                Ok(input) => input,
+                                Err(e) => {
+                                    warn!(tool = %name, tool_id = %id, error = %e, "Invalid tool-call JSON");
+                                    self.invalid_tool_inputs.insert(id.clone(), e.to_string());
+                                    Value::Object(Default::default())
+                                }
+                            };
                             ContentBlock::ToolUse { id, name, input, thought_signature: None }
                         }
                         PartialBlock::Thinking {
@@ -1750,6 +1791,12 @@ impl StreamAccumulator {
             AnthropicStreamEvent::Ping => {}
             AnthropicStreamEvent::Error { .. } => {}
         }
+    }
+
+    /// Tool-use ids (with the parse error) whose arguments were invalid JSON.
+    /// Callers must answer these with an error instead of running the tool.
+    pub fn take_invalid_tool_inputs(&mut self) -> std::collections::HashMap<String, String> {
+        std::mem::take(&mut self.invalid_tool_inputs)
     }
 
     /// Finalize and produce the accumulated `Message`.

@@ -68,6 +68,7 @@ impl AgentRuntime {
             api_key: api_key.clone(),
             api_base: config.resolve_anthropic_api_base(),
             use_bearer_auth,
+            retry: claurst_api::RetryConfig::with_max_retries(config.max_retries),
             ..Default::default()
         };
         let api_client = Arc::new(claurst_api::AnthropicClient::new(client_config.clone())?);
@@ -166,7 +167,5 @@ pub(crate) async fn build_mcp_manager(
     if decision.allowed.is_empty() {
         return None;
     }
-    let mgr = Arc::new(claurst_mcp::McpManager::connect_all(&decision.allowed).await);
-    mgr.clone().spawn_notification_poll_loop();
-    Some(mgr)
+    Some(claurst_mcp::McpManager::connect_all(&decision.allowed).await)
 }

@@ -10,8 +10,9 @@ use serde_json::Value;
 
 /// One tool exposed by a connected MCP server.
 pub struct McpToolWrapper {
+    /// Definition under the exposed `mcp__<server>__<tool>` name; the manager
+    /// routes calls by that name.
     tool_def: ToolDefinition,
-    server_name: String,
     manager: Arc<claurst_mcp::McpManager>,
 }
 
@@ -20,10 +21,9 @@ pub fn mcp_tools(manager: &Arc<claurst_mcp::McpManager>) -> Vec<Box<dyn Tool>> {
     manager
         .all_tool_definitions()
         .into_iter()
-        .map(|(server_name, tool_def)| {
+        .map(|entry| {
             Box::new(McpToolWrapper {
-                tool_def,
-                server_name,
+                tool_def: entry.definition,
                 manager: manager.clone(),
             }) as Box<dyn Tool>
         })
@@ -68,26 +68,18 @@ impl Tool for McpToolWrapper {
             return ToolResult::error(e.to_string());
         }
 
-        // Strip the server-name prefix to get the bare tool name.
-        let prefix = format!("{}_", self.server_name);
-        let bare_name = self
-            .tool_def
-            .name
-            .strip_prefix(&prefix)
-            .unwrap_or(&self.tool_def.name);
-
         let args = if input.is_null() { None } else { Some(input) };
 
         match self.manager.call_tool(&self.tool_def.name, args).await {
             Ok(result) => {
-                let text = claurst_mcp::mcp_result_to_string(&result);
+                let output = claurst_mcp::mcp_result_to_output(&result);
                 if result.is_error {
-                    ToolResult::error(text)
+                    ToolResult::error(output.text)
                 } else {
-                    ToolResult::success(text)
+                    ToolResult::success(output.text).with_images(output.images)
                 }
             }
-            Err(e) => ToolResult::error(format!("MCP tool '{}' failed: {}", bare_name, e)),
+            Err(e) => ToolResult::error(format!("MCP tool '{}' failed: {}", self.tool_def.name, e)),
         }
     }
 }

@@ -32,3 +32,8 @@ rmcp = { version = "1.4.0", default-features = false, features = ["client", "aut
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+# Spawns its own binary as a fake stdio MCP server, so it owns `main`.
+[[test]]
+name = "stdio_fixture"
+harness = false

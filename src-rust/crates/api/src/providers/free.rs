@@ -315,6 +315,7 @@ impl LlmProvider for FreeProvider {
             status: None,
             message: "all free-mode upstreams exhausted".to_string(),
             is_retryable: false,
+            retry_after: None,
         }))
     }
 
@@ -361,6 +362,7 @@ impl LlmProvider for FreeProvider {
             status: None,
             message: "all free-mode upstreams exhausted".to_string(),
             is_retryable: false,
+            retry_after: None,
         }))
     }
 
@@ -493,6 +495,7 @@ mod tests {
                 status: None,
                 message: "stub".into(),
                 is_retryable: false,
+                retry_after: None,
             })
         }
 
@@ -643,6 +646,7 @@ mod tests {
             status: Some(500),
             message: "boom".into(),
             is_retryable: true,
+            retry_after: None,
         }));
         assert!(!FreeProvider::should_fallback(
             &ProviderError::InvalidRequest {

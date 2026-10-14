@@ -436,17 +436,14 @@ pub struct App {
     pub git_branch: Option<String>,
     /// Count of in-progress background tasks (drives the footer pill).
     pub background_task_count: usize,
+    /// `(attempt, max)` while a model request is being retried (#439);
+    /// drives the "Reconnecting n/max" footer pill.
+    pub retry_status: Option<(u32, u32)>,
     /// Background task status text shown in footer pill.
     pub background_task_status: Option<String>,
     /// External status line output (`statusLine` / CLAUDE_STATUS_COMMAND),
     /// already stripped and line-capped by `set_status_line_output`.
     pub status_line_override: Option<String>,
-    /// Whether auto-compact is enabled (from settings).
-    pub auto_compact_enabled: bool,
-    /// Context threshold (0-100) at which to auto-compact.
-    pub auto_compact_threshold: u8,
-    /// Guard to prevent re-triggering auto-compact while one is in flight.
-    pub auto_compact_running: bool,
 
     // ---- Voice hold-to-talk ------------------------------------------------
 
@@ -762,11 +759,9 @@ impl App {
                 std::env::current_dir().as_deref().unwrap_or_else(|_| std::path::Path::new("."))
             ).map(|repo_root| claurst_core::git_utils::get_current_branch(&repo_root)),
             background_task_count: 0,
+            retry_status: None,
             background_task_status: None,
             status_line_override: None,
-            auto_compact_enabled: false,
-            auto_compact_threshold: 95,
-            auto_compact_running: false,
             voice_recorder: {
                 // Check whether voice input has been enabled via the /voice command
                 // (stored in ~/.claurst/ui-settings.json).  We also accept
