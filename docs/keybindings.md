@@ -9,6 +9,7 @@ This document covers all keyboard shortcuts in Claurst, how to customize them, v
 1. [Default Keybindings](#default-keybindings)
    - [Global Context](#global-context)
    - [Chat Context](#chat-context)
+   - [Fixed Keys](#fixed-keys)
    - [Confirmation Context](#confirmation-context)
 2. [Keybinding Contexts](#keybinding-contexts)
 3. [Customizing Keybindings](#customizing-keybindings)
@@ -33,12 +34,12 @@ These bindings are active in all contexts.
 
 | Key | Action | Description |
 |-----|--------|-------------|
-| `Ctrl+C` | interrupt | Interrupt the current operation (non-rebindable) |
-| `Ctrl+D` | exit | Exit Claurst (non-rebindable) |
-| `Ctrl+L` | redraw | Redraw the terminal screen |
-| `Ctrl+R` | historySearch | Open interactive history search |
-| `Ctrl+B` | createBranch | Create a new git branch |
-| `Alt+H` | openHelp | Open the help panel |
+| `Ctrl+C` | (fixed) | Copy the mouse selection if there is one; otherwise cancel the running turn; otherwise clear the prompt, and a second press within 2 seconds exits. Not rebindable |
+| `Ctrl+D` | (fixed) | On an empty prompt, a second press within 2 seconds exits. Not rebindable |
+| `Ctrl+L` | redraw | Does nothing; in the prompt, `clearLine` (below) takes precedence |
+| `Ctrl+R` | historySearch | Open prompt-history search |
+| `Ctrl+B` | createBranch | Bound by default but not implemented: the key does nothing |
+| `Alt+H` | openHelp | Toggle the help overlay |
 
 ### Chat Context
 
@@ -53,60 +54,76 @@ These bindings are active when focus is in the chat input field.
 | `Down` / `Ctrl+I` | historyNext | Navigate to the next message in input history |
 | `Tab` | indent | Insert indentation (or cycle completions if open) |
 | `Shift+Tab` | reverseIndent | Remove one level of indentation |
-| `Page Up` | scrollUp | Scroll the conversation view up one page |
-| `Page Down` | scrollDown | Scroll the conversation view down one page |
-| `Home` / `Cmd+Left` / `Ctrl+A` | goLineStart | Move cursor to beginning of line |
-| `End` / `Cmd+Right` / `Ctrl+E` | goLineEnd | Move cursor to end of line |
-| `Ctrl+Left` | moveWordBackward | Move one word left |
-| `Ctrl+Right` | moveWordForward | Move one word right |
-| `Alt+Left` | previousMessage | Jump to previous user/assistant message |
-| `Alt+Right` | nextMessage | Jump to next user/assistant message |
+| `Page Up` | scrollUp | Scroll the transcript up 10 lines |
+| `Page Down` | scrollDown | Scroll the transcript down 10 lines |
+| `Home` / `Cmd+Left` / `Ctrl+A` | goLineStart | Move the cursor to the start of the prompt |
+| `End` / `Cmd+Right` / `Ctrl+E` | goLineEnd | Move the cursor to the end of the prompt |
+| `Alt+Left` | previousMessage | Scroll the transcript up 5 lines |
+| `Alt+Right` | nextMessage | Scroll the transcript down 5 lines |
 | `Ctrl+Shift+A` | openModelPicker | Open the interactive model picker |
 | `Ctrl+K` | openCommandPalette | Open the slash command palette |
 | `Ctrl+U` | killToStart | Delete from cursor to beginning of line |
 | `Ctrl+W` / `Alt+Backspace` | killWord | Delete the word before the cursor |
 | `Alt+D` | deleteWord | Delete the word after the cursor |
 | `Ctrl+H` | deleteCharBefore | Delete character before cursor |
-| `Ctrl+L` | clearLine | Clear current input line |
-| `Ctrl+F` | findInMessage | Open inline search within the current conversation |
-| `Ctrl+Shift+F` | globalSearch | Open global codebase search |
-| `F3` / `Ctrl+]` | findNext | Jump to next search match |
-| `Shift+F3` / `Ctrl+[` | findPrev | Jump to previous search match |
-| `Ctrl+G` | goToLine | Jump to a specific line |
+| `Ctrl+L` | clearLine | Clear the prompt |
+| `Alt+Enter` | newline | Newline (another fallback for terminals without CSI-u) |
+| `Alt+E` | expandPaste | Expand the `[Pasted text #N ...]` placeholder at the cursor (or the first one) into the full pasted text |
 | `Ctrl+.` | jumpToNextError | Jump to next error / issue |
 | `Ctrl+Shift+.` | jumpToPreviousError | Jump to previous error / issue |
 
+`Shift+Tab` (`reverseIndent`) cycles the permission mode (Default, Accept edits, Bypass permissions, back to Default; Plan goes to Default); it does not remove indentation. Most terminals send `Ctrl+I` as `Tab`, so `historyNext` on `Ctrl+I` only fires when the terminal reports it separately (kitty keyboard protocol).
+
+The defaults also bind `Ctrl+Left` / `Ctrl+Right` (`moveWordBackward` / `moveWordForward`), `Ctrl+F` (`findInMessage`), `Ctrl+Shift+F` (`globalSearch`), `Ctrl+]` (`findNext`), `Ctrl+[` (`findPrev`) and `Ctrl+G` (`goToLine`), but these actions are not implemented, so the keys do nothing. `F3` / `Shift+F3` are listed too, but function keys never reach the binding table. Use `Alt+B` / `Alt+F` to move by word and `Ctrl+P` for project search.
+
 > `Ctrl+A` previously opened the model picker; it now moves the cursor to the line start (matching Emacs/readline). The model picker is now `Ctrl+Shift+A`. Old `keybindings.json` files are auto-migrated.
+
+### Fixed Keys
+
+These keys are hard-coded in the prompt and have no action names, so they cannot be remapped. A `keybindings.json` binding on the same key (other than `F1`) takes precedence over them.
+
+| Key | Effect |
+|-----|--------|
+| `F1`, or `?` on an empty prompt | Toggle the help overlay |
+| `Ctrl+T` | Toggle the tasks overlay |
+| `Ctrl+P` | Open the project search dialog (ripgrep) |
+| `Ctrl+Y` / `Alt+Y` | Yank the last killed text / cycle to an earlier kill |
+| `Alt+B` / `Alt+F` | Move one word left / right |
+| `Ctrl+Backspace` | Delete the word before the cursor |
+| `Alt+Delete` / `Ctrl+Delete` | Delete the word after the cursor |
+| `Alt+Up` / `Alt+Down` | Scroll the transcript 20 lines |
+| `Ctrl+V` / `Cmd+V` | Paste: an image from the clipboard if there is one, otherwise text |
+| `Shift+Insert` | Paste text |
+| `Alt+V` | Start / stop voice recording (when `/voice` is on) |
 
 ### Confirmation Context
 
-These bindings are active when Claurst is displaying a yes/no confirmation prompt (e.g., tool permission requests).
+Tool permission prompts handle their keys directly; these keys cannot be rebound.
 
-| Key | Action | Description |
-|-----|--------|-------------|
-| `Y` / `y` | confirm | Approve the pending action |
-| `N` / `n` | deny | Deny the pending action |
-| `A` / `a` | alwaysAllow | Approve and add a permanent allow rule |
-| `Enter` | defaultAction | Accept the highlighted default option |
-| `Escape` | cancel | Cancel the prompt and deny the action |
+| Key | Effect |
+|-----|--------|
+| `y` | Allow once |
+| `Y` | Allow for this session |
+| `p` | Always allow (saved; "for this project" on file-write prompts) |
+| `P` | Bash prompts with a suggested prefix: allow commands matching that prefix |
+| `n` | Deny |
+| `1`-`9` | Select the option with that number |
+| `Up` / `Down` | Move the selection |
+| `Enter` | Choose the selected option |
+| `Escape` | Close the prompt |
 
 ---
 
 ## Keybinding Contexts
 
-Claurst uses a context system so that the same key can have different effects depending on where focus is. A binding in a more specific context takes precedence over a binding in a broader context.
+Each binding belongs to a context. When a key is pressed, Claurst looks at bindings in the active context and in `Global`; when several match, the one defined last wins, so your `keybindings.json` entries override the defaults. Context names are PascalCase; an unknown or missing `context` falls back to `Global`.
 
-| Context | Description |
-|---------|-------------|
-| `global` | Always active regardless of focus |
-| `chat` | Active when the chat input field has focus |
-| `confirmation` | Active when a permission confirmation dialog is open |
-| `modelPicker` | Active inside the model selection overlay |
-| `commandPalette` | Active inside the slash command palette overlay |
-| `search` | Active while the inline search bar is open |
-| `vim.normal` | Active in vim normal mode (when vim mode is enabled) |
-| `vim.insert` | Active in vim insert mode (when vim mode is enabled) |
-| `vim.visual` | Active in vim visual mode (when vim mode is enabled) |
+| Context | Takes effect |
+|---------|--------------|
+| `Global` | Always |
+| `Chat` | When the prompt has focus and no dialog or overlay is open |
+
+In practice only `Global` and `Chat` bindings take effect. The other accepted names (`Autocomplete`, `Confirmation`, `Help`, `Transcript`, `HistorySearch`, `Task`, `ThemePicker`, `Settings`, `Tabs`, `Attachments`, `Footer`, `MessageSelector`, `DiffDialog`, `ModelPicker`, `Select`, `Plugin`) carry default bindings, but every dialog, picker and overlay handles its own keys before the binding table is consulted, so bindings in those contexts are never used.
 
 ---
 
@@ -114,17 +131,17 @@ Claurst uses a context system so that the same key can have different effects de
 
 ### Via /keybindings command
 
-The `/keybindings` command opens an interactive TUI keybinding editor:
+`/keybindings` opens `~/.claurst/keybindings.json` in your editor. If the file does not exist it is first created from the default bindings, grouped by context:
 
 ```
 /keybindings
 ```
 
-The editor lists all bindable actions grouped by context. Use arrow keys to navigate, press `Enter` on an action to enter rebind mode, then press the desired key combination. Press `Escape` to cancel a rebind. Changes are saved immediately to `~/.claurst/keybindings.json`.
+Bindings are read once at startup; restart Claurst after editing the file.
 
 ### Via keybindings.json
 
-For batch edits or scripted configuration, edit `~/.claurst/keybindings.json` directly. The file format is:
+Edit `~/.claurst/keybindings.json` directly. The file format is:
 
 ```json
 {
@@ -148,9 +165,21 @@ Each binding object has:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `context` | string | Keybinding context (see table above) |
+| `context` | string | Keybinding context, PascalCase (see table above). Optional; defaults to `Global` |
 | `action` | string \| null | Action identifier (or `null` to unbind) |
-| `chord` | string | Key combination in normalized form |
+| `chord` | string | Key combination, e.g. `ctrl+shift+a`; a multi-key chord separates keystrokes with spaces |
+
+The file written by `/keybindings` uses a grouped form, which is also accepted:
+
+```json
+{
+  "bindings": [
+    { "context": "Chat", "bindings": { "ctrl+k": "openCommandPalette", "ctrl+g": null } }
+  ]
+}
+```
+
+A grouped file has no `schema_version`, so it is migrated to the flat form above on the next start.
 
 ### Schema Versioning and Smart Merge
 
@@ -159,7 +188,7 @@ Each binding object has:
 1. Claurst reads the file and compares `schema_version` against the bundled `KEYBINDINGS_SCHEMA_VERSION`.
 2. If the file is older, Claurst runs a **smart merge**:
    - Your customizations (any binding whose `chord` you set explicitly) are preserved.
-   - Stale bindings that match an *old* default that has since changed are dropped — for example, the previous `ctrl+a → openModelPicker` binding is removed because `ctrl+a` is now reserved for select-all in the input.
+   - Stale bindings that match an *old* default that has since changed are dropped: `ctrl+a → openModelPicker` (`Ctrl+A` now moves to the start of the prompt) and `tab → togglePreview` in `Chat`.
    - Any new bindings present in the current defaults but not in your file are added.
 3. The migrated file is written back with the new `schema_version`.
 
@@ -171,38 +200,34 @@ Key notation uses lowercase letters, with modifier prefixes separated by `+`:
 
 | Prefix | Modifier key |
 |--------|-------------|
-| `ctrl+` | Control |
-| `alt+` | Alt / Option |
+| `ctrl+` (or `control+`) | Control |
+| `alt+` (or `opt+`, `option+`) | Alt / Option |
 | `shift+` | Shift |
-| `super+` | Super / Cmd |
+| `super+` (or `cmd+`, `meta+`, `win+`) | Super / Cmd |
 
-Special key names: `enter`, `escape`, `tab`, `backspace`, `delete`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `f1` through `f12`.
-
-After editing the file, run `/keybindings` and then exit to trigger a reload, or restart Claurst.
+Special key names: `enter`, `escape` (`esc`), `tab`, `backspace`, `delete`, `space`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`. Function keys can be written but never match, because they are not passed to the binding table.
 
 ### Chord Bindings
 
-Claurst supports chord bindings — multi-key sequences where you press a leader key and then a follow-up key. Chord bindings are defined with a `chord` array instead of a single `key`:
+A chord is a sequence of keystrokes written in one `chord` string, separated by spaces:
 
 ```json
 {
-  "context": "chat",
+  "context": "Chat",
   "action": "openModelPicker",
-  "chord": ["ctrl+x", "ctrl+m"]
+  "chord": "ctrl+x ctrl+o"
 }
 ```
 
-The first key in the chord acts as the leader. After pressing the leader key, Claurst enters a brief chord-wait state (500 ms by default). If the follow-up key arrives within that window, the chord fires. If the timeout expires or a different key is pressed, the leader key's default action (if any) fires instead.
+After the first keystroke of a chord, Claurst waits for the next one with no timeout. If the next key completes a binding, its action runs; if it matches nothing, it is discarded and the chord is reset. Use an unbound first key: if the first keystroke is itself bound in the same context or `Global`, that binding fires immediately and the chord never completes.
 
-Chords can be up to two keys deep. Three-key chords are not supported.
-
-Example — map `Ctrl+X Ctrl+C` to exit:
+Example — open help with `Ctrl+X H`:
 
 ```json
 {
-  "context": "global",
-  "action": "exit",
-  "chord": ["ctrl+x", "ctrl+c"]
+  "context": "Global",
+  "action": "openHelp",
+  "chord": "ctrl+x h"
 }
 ```
 
@@ -214,11 +239,11 @@ The following keys have fixed behavior and cannot be rebound:
 
 | Key | Fixed behavior |
 |-----|---------------|
-| `Ctrl+C` | Interrupt current operation / send SIGINT to foreground process |
-| `Ctrl+D` | Exit Claurst when input is empty; signal EOF when input has content |
+| `Ctrl+C` | Copy the selection, cancel the running turn, or clear the prompt; twice within 2 seconds exits |
+| `Ctrl+D` | On an empty prompt, twice within 2 seconds exits; otherwise does nothing |
 | `Ctrl+M` | Identical to `Enter` at the terminal level (terminals emit `CR` for both) |
 
-These keys are handled at the terminal input layer before the keybinding system processes events. If any of them appear as a `chord` in `keybindings.json`, Claurst:
+These keys are handled by fixed code in the TUI. If any of them appear as a `chord` in `keybindings.json`, Claurst:
 
 1. Logs a warning at startup (`Cannot rebind protected key '<chord>' in keybindings.json`).
 2. **Filters the binding out** of the loaded set before resolving any keystrokes.
@@ -229,7 +254,7 @@ So overriding a protected key is a no-op in behavior, but you also get a clear s
 
 ## Vim Mode
 
-Vim mode replaces the default line editor with a modal input field that mimics vim's normal, insert, and visual modes.
+The prompt editor contains a vim emulation with insert, normal, visual (`v`, `V`, `Ctrl+V`), command-line (`:`) and search (`/`) modes.
 
 ### Enabling Vim Mode
 
@@ -239,51 +264,19 @@ Vim mode replaces the default line editor with a modal input field that mimics v
 /vim off
 ```
 
-Or set it persistently:
+The setting lasts for the current session. There is no persistent setting: `/vim on|off` also writes `editor_mode` to `~/.claurst/ui-settings.json`, but nothing reads it at startup, and `/config` has no vim key.
 
-```
-/config set vim true
-```
+### Current Limitation
 
-### Vim Mode Keybindings
+Vim mode starts in insert mode, and the TUI does not pass `Escape` to the vim editor, so normal, visual and command-line modes cannot be reached from the keyboard. With vim mode on, the prompt behaves like the default editor.
 
-In vim mode the input field has three modes:
+### Implemented Commands
 
-**Insert mode** — behaves like the normal chat input; type freely, `Escape` returns to normal mode.
-
-**Normal mode** — movement and editing commands:
-
-| Key | Action |
-|-----|--------|
-| `h` / `l` | Move cursor left / right |
-| `j` / `k` | History prev / next |
-| `w` / `b` | Move forward / backward by word |
-| `0` / `$` | Move to line start / end |
-| `i` | Enter insert mode at cursor |
-| `a` | Enter insert mode after cursor |
-| `A` | Enter insert mode at end of line |
-| `I` | Enter insert mode at beginning of line |
-| `x` | Delete character under cursor |
-| `dd` | Delete entire line |
-| `u` | Undo last change |
-| `Ctrl+R` | Redo |
-| `yy` | Yank (copy) line |
-| `p` | Paste after cursor |
-| `Enter` | Submit message |
-| `/` | Enter inline search |
-| `Escape` | Clear pending command / return to normal |
-
-**Visual mode** — entered with `v` from normal mode; use movement keys to select text, then:
-
-| Key | Action |
-|-----|--------|
-| `y` | Yank selection |
-| `d` | Delete selection |
-| `Escape` | Exit visual mode |
+For reference, the editor implements: motions `h` `l` `w` `b` `e` `W` `B` `E` `0` `^` `$` `G` `gg` `f` `F` `t` `T` `;` `,`; operators `d` `c` `y` with motions plus `dd` `yy` `D` `C` `Y`; `x` `X` `s` `S` `r` `~` `J` `>` `<` `o` `O` `p` `P`; insert entries `i` `a` `I` `A`; `u` undo, `.` repeat, `n` / `N` search repeat; registers (`"`), marks (`m`, `'`) and macros (`q`, `@`); `:q`, `:set vim`, `:set novim`, `:noh`. There are no `j` / `k` history motions and no redo.
 
 ### Vim Mode Indicator
 
-When vim mode is active, a mode indicator (`NORMAL`, `INSERT`, `VISUAL`) is displayed in the status line.
+When vim mode is active, the prompt shows the mode (`-- INSERT --`, `-- NORMAL --`, ...).
 
 ---
 
@@ -368,32 +361,10 @@ On non-English keyboard layouts (Cyrillic, Arabic, Greek, CJK, etc.), the Latin 
 
 ### The Fix
 
-Claurst resolves this by mapping `Ctrl+<scancode>` events to their QWERTY positional equivalents before keybinding lookup. Concretely:
+When a `Ctrl` combination reports a non-Latin character, Claurst maps it to the Latin letter at the same physical position on a QWERTY keyboard before handling the key. For binding lookups the same mapping also applies to `Alt` combinations. The mapping covers the Russian and Ukrainian JCUKEN layouts (for example `Ctrl+Ф` becomes `Ctrl+A`); characters from other layouts are left unchanged.
 
-1. When a `Ctrl+<key>` event arrives, the physical scan position is extracted.
-2. That position is mapped to the corresponding QWERTY letter (e.g., physical position of the Cyrillic `Ф` key = QWERTY `A` position).
-3. The resulting `Ctrl+A` event is passed to the keybinding system.
-
-This means `Ctrl+Ф` on a Cyrillic layout fires the same action as `Ctrl+A` on a QWERTY layout, regardless of the active input method or language setting. All `Ctrl+<letter>` keybindings in the default table above work by physical position.
-
-### Implications for Custom Bindings
-
-If you add a binding for `ctrl+a` in `keybindings.json`, it will fire when you press `Ctrl` and the key in the `A` position on your physical keyboard, regardless of what character that key is labeled. This is intentional.
-
-If you want a binding that fires only when the `A` character is actually produced (i.e., layout-aware), prefix the key with `char:`:
-
-```json
-{
-  "context": "chat",
-  "action": "myAction",
-  "key": "ctrl+char:a"
-}
-```
-
-Layout-aware bindings are not recommended for the standard workflow bindings because they break on non-QWERTY layouts.
+There is no layout-aware binding syntax: a `ctrl+a` binding matches the `A` key, or the key mapped to it.
 
 ### Alt Key on macOS
 
-On macOS, `Alt` (Option) key combinations produce special Unicode characters at the OS level before they reach the terminal. Claurst intercepts these at the terminal input layer and re-emits them as `alt+<key>` events using the same positional mapping described above.
-
-If an `alt+<key>` binding does not fire on macOS, check whether your terminal emulator is configured to send `Escape + key` sequences for Option key combinations (the iTerm2 and Alacritty option is "Use Option as Meta Key" or equivalent).
+On macOS, `Option` combinations produce special characters unless the terminal sends them as `Escape` + key. If an `alt+<key>` binding does not fire, enable "Use Option as Meta Key" (Terminal.app), "Esc+" for Option (iTerm2) or the equivalent setting in your terminal. Claurst does not translate those characters itself.

@@ -7,40 +7,36 @@ This document is the complete reference for every slash command available in Cla
 ## Table of Contents
 
 1. [Command System Overview](#command-system-overview)
-2. [Session & Navigation](#session--navigation)
-3. [Model & Provider](#model--provider) — `/model`, `/providers`, `/connect`, `/thinking`, `/effort`, `/advisor`, `/fast`
-4. [Configuration & Settings](#configuration--settings) — `/config`, `/keybindings`, `/permissions`, `/hooks`, `/privacy-settings`, `/mcp`, `/output-style`, `/theme`, `/statusline`, `/vim`, `/voice`, `/terminal-setup`
-5. [Code & Git](#code--git) — `/commit`, `/diff`, `/undo`, `/review`, `/security-review`, `/init`, `/search`
-6. [Search & Files](#search--files) — `/files`, `/context`
-7. [Memory & Context](#memory--context) — `/memory`, `/usage`, `/cost`, `/stats`, `/status`, `/insights`
+2. [Session & Navigation](#session--navigation) — `/help`, `/clear`, `/new`, `/move`, `/exit`, `/resume`, `/session`, `/fork`, `/branch`, `/tag`, `/rename`, `/rewind`, `/compact`
+3. [Model & Provider](#model--provider) — `/model`, `/providers`, `/connect`, `/thinking`, `/effort`, `/advisor`, `/fast`, `/turns`, `/yolo`
+4. [Configuration & Settings](#configuration--settings) — `/config`, `/keybindings`, `/permissions`, `/hooks`, `/import-config`, `/privacy-settings`, `/mcp`, `/output-style`, `/theme`, `/statusline`, `/cc-statusline`, `/vim`, `/voice`, `/terminal-setup`, `/add-dir`
+5. [Code & Git](#code--git) — `/commit`, `/diff`, `/changes`, `/undo`, `/revert`, `/checkpoints`, `/snapshot`, `/review`, `/security-review`, `/init`, `/search`
+6. [Search & Files](#search--files) — `/files`, `/context`, `/ctx-viz`
+7. [Memory & Context](#memory--context) — `/memory`, `/usage`, `/extra-usage`, `/cost`, `/stats`, `/status`, `/insights`, `/rate-limit-options`
 8. [Agents & Tasks](#agents--tasks) — `/agents`, `/tasks`, `/goal`, `/managed-agents`, `/agent`
-9. [Planning & Review](#planning--review) — `/plan`, `/ultraplan`, `/ultrareview`
-10. [MCP & Integrations](#mcp--integrations) — `/mcp`, `/skills`, `ultracode`, `/plugin`, `/chrome`
+9. [Planning & Review](#planning--review) — `/plan`, `/ultrareview`
+10. [MCP & Integrations](#mcp--integrations) — `/mcp`, `/skills`, `ultracode`, `/plugin`, `/reload-plugins`, `/chrome`, `/ide`, `/pr-comments`, `/install-github-app`
 11. [Authentication](#authentication) — `/login`, `/logout`, `/accounts`, `/switch`, `/refresh`
-12. [Display & Terminal](#display--terminal) — `/theme`, `/output-style`, `/statusline`, `/vim`, `/terminal-setup`, `/caveman`, `/rocky`, `/normal`, `/mobile`, `/color`, `/stickers`
-13. [Diagnostics & Info](#diagnostics--info) — `/doctor`, `/version`, `/update`
-14. [Export & Sharing](#export--sharing) — `/export`, `/copy`
-15. [Advanced & Internal](#advanced--internal) — `/thinking`, `/connect`, `/fork`, `/effort`, `/summary`, `/brief`, `/sandbox-toggle`, `/think-back`, `/thinkback-play`
+12. [Display & Terminal](#display--terminal) — `/caveman`, `/rocky`, `/normal`, `/mobile`, `/desktop`, `/color`, `/stickers`, `/passes`
+13. [Diagnostics & Info](#diagnostics--info) — `/doctor`, `/heapdump`, `/version`, `/update`, `/release-notes`
+14. [Export & Sharing](#export--sharing) — `/export`, `/copy`, `/share`, `/links`, `/teleport`
+15. [Advanced & Internal](#advanced--internal) — `/summary`, `/btw`, `/sandbox-toggle`, `/think-back`, `/thinkback-play`, `/remote-control`, `/remote-env`, `/web-setup`, `/survey`
 16. [Command Availability](#command-availability)
 
 ---
 
 ## Command System Overview
 
-Commands are registered in a priority-ordered registry. When you type a command name, Claurst resolves it through this chain:
+When you submit `/name args`, Claurst resolves `name` in this order:
 
-```
-bundledSkills -> builtinPluginSkills -> skillDirCommands ->
-workflowCommands -> pluginCommands -> pluginSkills -> COMMANDS()
-```
+1. Built-in commands (this page), by name or alias.
+2. Custom command templates from the `commands` map in settings ([Custom Slash Commands](configuration.md#custom-slash-commands)).
+3. Skills discovered on disk ([Skills](configuration.md#skills)).
+4. Slash commands defined by plugins ([plugins.md](plugins.md)).
 
-### Command Types
+A built-in name always wins, so a template, skill or plugin command with the same name as a built-in is never reached.
 
-| Type | Behavior |
-|------|----------|
-| `local` | Runs synchronously; returns text output directly |
-| `local-jsx` | Renders an interactive TUI component (model picker, theme selector, etc.) |
-| `prompt` | Expands to a prompt sent to the model via the main inference loop |
+In the TUI, some commands open a view instead of printing text (for example `/model`, `/theme`, `/config`, `/diff`, `/stats`, `/mcp`, `/memory`, `/export`). When a view opens, the command's text output is not shown. `/turns`, `/yolo`, `/cc-statusline`, `/changes`, `/survey` and `/find` exist only in the TUI. An unknown name shows `Unknown command: /<name>`.
 
 Commands support aliases — for example `/h`, `/?`, and `/help` all invoke the same handler.
 
@@ -59,10 +55,11 @@ Arguments are passed as a single string after the command name. Most commands th
 ### /help
 **Aliases:** `h`, `?`
 
-Display all available commands with their descriptions. Respects `isHidden` flags — internal or rarely-needed commands are suppressed unless you are an Anthropic employee.
+In the TUI, opens the help overlay (also `F1`, or `?` on an empty prompt), with or without an argument. The text form lists every non-hidden command by category, and `/help <command>` prints that command's aliases and usage.
 
 ```
 /help
+/help compact
 /h
 /?
 ```
@@ -109,9 +106,9 @@ The destination must belong to the same git repository (typically a linked `git 
 ---
 
 ### /exit
-**Aliases:** `quit`
+**Aliases:** `quit`, `q`
 
-Exit the Claurst REPL. Equivalent to pressing `Ctrl+D`. Unsaved session state is flushed before exit.
+Exit Claurst. Pressing `Ctrl+C` or `Ctrl+D` (on an empty prompt) twice within two seconds also exits.
 
 ```
 /exit
@@ -121,9 +118,9 @@ Exit the Claurst REPL. Equivalent to pressing `Ctrl+D`. Unsaved session state is
 ---
 
 ### /resume
-**Aliases:** `continue`
+**Aliases:** `r`, `continue`
 
-Resume a previous session from the session store. Displays a list of recent sessions with timestamps and summaries. Select one to restore its message history and file state.
+Load a saved session: its messages, model and working directory replace the current ones. In the TUI, `/resume` without an argument opens the session browser; outside the TUI it loads the most recent session. `/resume <session-id>` loads that session directly.
 
 ```
 /resume
@@ -135,56 +132,80 @@ Resume a previous session from the session store. Displays a list of recent sess
 ### /session
 **Aliases:** `remote`
 
-Manage active and stored sessions. Subcommands allow listing, switching, deleting, and attaching to remote sessions.
+In the TUI, `/session` opens the session browser. The text form shows the current session and the five most recent ones, or the remote session URL when the remote-control bridge is connected. `/session list` prints the ten most recent sessions. There are no other subcommands; switch with `/resume <id>`.
 
 ```
 /session
 /session list
-/session delete <session-id>
-/session attach <session-id>
 ```
 
 ---
 
 ### /fork
 
-Fork the current session into a new independent session that begins from the current conversation state. Useful for exploring two different approaches without losing either.
+Save the conversation up to message index N (default: all of it) as a new session titled "Fork of ...", with the current session as its parent. The current session stays active; switch with `/resume <id>`.
 
 ```
 /fork
-/fork <new-session-name>
+/fork 5
+```
+
+---
+
+### /branch
+
+Create a branch of the current session at this point, list the current session's branches, or switch to one.
+
+```
+/branch
+/branch create
+/branch list
+/branch switch <session-id>
+```
+
+---
+
+### /tag
+
+Add, remove or toggle searchable tags on the current session.
+
+```
+/tag list
+/tag add <tag>
+/tag remove <tag>
+/tag toggle <tag>
 ```
 
 ---
 
 ### /rename
 
-Rename the current session. The new name is used in session listings and exports.
+Set the session title. Without a name, a short kebab-case title is generated from the conversation with the provider's fast model. In the TUI, `/rename` also opens the session browser in rename mode.
 
 ```
 /rename <new-name>
+/rename
 ```
 
 ---
 
 ### /rewind
-**Aliases:** `checkpoint`
 
-Rewind the conversation to a previous message. Displays a numbered list of messages; enter a number to truncate history to that point and resume from there.
+Open a picker over the conversation's messages (`Up`/`Down`, `Enter` to select, `y` to confirm). The selected message and everything after it are removed from the conversation and the saved session. The cut never separates a tool call from its result. Files are not restored; use `/undo` or `/revert` for that. Takes no arguments.
 
 ```
 /rewind
-/rewind <message-index>
 ```
 
 ---
 
 ### /compact
 
-Summarize and compress the conversation history to reduce context window usage. The model is asked to produce a dense summary of the prior exchange; that summary replaces the raw messages.
+Summarise the older part of the conversation now, through the active provider, keeping the most recent messages and your last few requests verbatim. Optional instructions steer what the summary keeps. `PreCompact` hooks run first. Reports the approximate token count before and after. See [Manual compaction](advanced.md#manual-compaction).
 
 ```
 /compact
+/compact keep the list of failing tests
 ```
 
 ---
@@ -193,19 +214,19 @@ Summarize and compress the conversation history to reduce context window usage. 
 
 ### /model
 
-Open the interactive model picker. Displays a searchable list of available models from all configured providers. The selected model is used for all subsequent inference in the current session.
+Without arguments, opens the model picker for the current provider (or the connect dialog when no provider has credentials). With a model ID, switches to it; a `provider/model` ID also switches the provider.
 
 ```
 /model
-/model claude-opus-4-5
 /model claude-sonnet-4-6
+/model openai/gpt-4o
 ```
 
 ---
 
 ### /providers
 
-List all configured AI providers and their connection status. Shows provider name, base URL, and whether credentials are present.
+List the providers in the model registry with their model counts, context windows and pricing.
 
 ```
 /providers
@@ -215,44 +236,32 @@ List all configured AI providers and their connection status. Shows provider nam
 
 ### /connect
 
-Connect to a remote AI provider or configure a custom provider endpoint. Supports OpenAI-compatible APIs, Anthropic direct, and others.
+Open the provider picker to connect and authenticate a provider. Takes no arguments.
 
 ```
 /connect
-/connect <provider-name>
-/connect openai https://api.openai.com/v1
 ```
 
 ---
 
 ### /thinking
+**Aliases:** `think`
 
-Configure extended thinking for the current session. Extended thinking allows the model to reason through problems before responding, at the cost of additional tokens.
+Print whether the current model supports extended thinking. It changes no setting and takes no arguments; use `/effort` to control reasoning depth.
 
 ```
 /thinking
-/thinking on
-/thinking off
 ```
-
-See also `/effort` for a higher-level interface to thinking depth.
 
 ---
 
 ### /effort
 
-Set the thinking effort level. This is a convenience wrapper over `/thinking` that maps human-readable levels to token budgets.
-
-| Level | Description |
-|-------|-------------|
-| `low` | Minimal thinking; fastest responses |
-| `medium` | Balanced thinking and speed |
-| `high` | Deep reasoning; slower responses |
-| `max` | Maximum token budget for thinking |
+Set the reasoning effort level. Without arguments, opens the effort picker; the levels offered depend on the provider and model (from `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultracode`). With an argument, sets the level directly (`normal` is accepted as `medium`). `/effort low` and `/effort high` also set the max output tokens to 4096 and 32768; `/effort normal` restores the default.
 
 ```
+/effort
 /effort low
-/effort medium
 /effort high
 /effort max
 ```
@@ -261,7 +270,7 @@ Set the thinking effort level. This is a convenience wrapper over `/thinking` th
 
 ### /advisor
 
-Set or unset a secondary advisor model that provides supplementary suggestions alongside the main model. When set, the advisor model's context is available to improve main-model responses.
+Store or clear an advisor model name. The value is written to `advisorModel` in `~/.claurst/settings.json`; nothing in the current build reads it, so it does not affect requests.
 
 ```
 /advisor                          — show current advisor setting
@@ -278,7 +287,7 @@ The advisor model persists to `~/.claurst/settings.json` under `advisorModel`. M
 ### /fast
 **Aliases:** `speed`
 
-Toggle fast mode. In fast mode, Claurst switches to the active provider's smaller, faster model for quick responses. Useful when you want rapid answers and deep reasoning is not required.
+Toggle fast mode. On switches the model to the active provider's fast model; off clears the model override, returning to the default model.
 
 ```
 /fast          — toggle fast mode on/off
@@ -286,7 +295,7 @@ Toggle fast mode. In fast mode, Claurst switches to the active provider's smalle
 /fast off      — disable fast mode
 ```
 
-Setting persists to `~/.claurst/ui-settings.json`.
+The on/off state is saved to `~/.claurst/ui-settings.json`.
 
 ---
 
@@ -326,30 +335,23 @@ project settings file cannot enable it. Same root/sudo guard as
 ### /config
 **Aliases:** `settings`
 
-View or modify Claurst configuration values. Without arguments, renders an interactive settings panel. With arguments, acts as a key-value accessor.
+In the TUI, opens the settings screen. The text form prints the effective configuration as JSON and supports these keys, saved to `~/.claurst/settings.json`:
 
 ```
 /config
-/config get <key>
-/config set <key> <value>
-/config reset <key>
+/config get <theme|output-style|model|permission-mode>
+/config set theme <default|dark|light|...>
+/config set output-style <name>
+/config set model <model>
+/config set permission-mode <default|accept-edits|bypass-permissions|plan>
+/config unset <model|output-style>
 ```
-
-Common keys:
-
-| Key | Description |
-|-----|-------------|
-| `model` | Default model name |
-| `theme` | Color theme name |
-| `vim` | Vim mode enabled (`true`/`false`) |
-| `outputStyle` | Output rendering style |
-| `autoApprove` | Auto-approve tool calls |
 
 ---
 
 ### /keybindings
 
-Open the interactive keybinding configurator. Displays all bound actions with their current shortcuts. Select an action to rebind it. Changes are written to `~/.claurst/keybindings.json`.
+Open `~/.claurst/keybindings.json` in your editor, creating it from the default bindings if it does not exist. Edits take effect the next time Claurst starts.
 
 ```
 /keybindings
@@ -386,9 +388,19 @@ Events: `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`, `SubagentStop`,
 
 ---
 
+### /import-config
+
+Open a dialog that previews and imports `~/.claude/CLAUDE.md` and `~/.claude/settings.json` into Claurst's configuration.
+
+```
+/import-config
+```
+
+---
+
 ### /privacy-settings
 
-Open Claurst privacy settings. Launches a browser to the Anthropic privacy portal where you can review data usage preferences, conversation retention, and account privacy options.
+Open `https://claude.ai/settings/data-privacy-controls` in the browser, or print the URL if no browser can be launched.
 
 ```
 /privacy-settings
@@ -398,33 +410,38 @@ Open Claurst privacy settings. Launches a browser to the Anthropic privacy porta
 
 ### /mcp
 
-Configure and manage Model Context Protocol (MCP) servers. MCP servers expose additional tools and resources to the agent.
+Inspect MCP servers. In the TUI, `/mcp` without arguments opens the MCP panel. Servers are added and removed by editing `mcpServers` in `~/.claurst/settings.json`; there are no add, remove or restart subcommands. See [The /mcp Command](mcp.md#the-mcp-command).
 
 ```
-/mcp
-/mcp list
-/mcp add <name> <command>
-/mcp remove <name>
-/mcp restart <name>
+/mcp                                     — configured servers with live status
+/mcp list                                — same
+/mcp status                              — type, endpoint and state of each server
+/mcp tools [server]                      — tools exposed by connected servers
+/mcp auth <server>                       — run the OAuth flow for an HTTP/SSE server, then reconnect it
+/mcp connect <server>                    — report a server's state (a failed server needs /mcp auth or a restart)
+/mcp logs <server>                       — recent errors for a server
+/mcp resources [server]                  — resources from connected servers
+/mcp prompts [server]                    — prompt templates from connected servers
+/mcp get-prompt <server> <prompt> [key=value ...]
 ```
 
 ---
 
 ### /output-style
 
-Select how the model's output is rendered in the terminal. Choices include `auto`, `plain`, `markdown`, `streaming`, and others depending on terminal capabilities.
+Show or switch the output style (the response persona added to the system prompt). Without arguments, lists the available styles and marks the current one; with a name, switches and saves it to settings. Built-in styles: `default`, `concise`, `explanatory`, `learning`, `caveman`, `rocky`; plugin and user styles are listed too. In the TUI the command also cycles a status-bar label (`auto`, `stream`, `verbose`) and the text listing is not shown.
 
 ```
 /output-style
-/output-style plain
-/output-style markdown
+/output-style concise
+/output-style default
 ```
 
 ---
 
 ### /theme
 
-Open the interactive theme picker. Preview and select a color theme for the Claurst TUI.
+Without arguments, opens the theme picker (Default, Dark, Light, Solarized, Nord, Dracula, Monokai, Deuteranopia). `/theme <name>` sets the theme and saves it to settings.
 
 ```
 /theme
@@ -437,17 +454,20 @@ Open the interactive theme picker. Preview and select a color theme for the Clau
 
 ### /statusline
 
-Configure the status line displayed at the bottom of the TUI. Toggle individual elements such as model name, token count, session name, and git branch.
+Save which items (`cost`, `tokens`, `model`, `time`, or `all`) the status line should show, in `~/.claurst/ui-settings.json`. The built-in status bar does not read these settings in the current build, so they have no visible effect. For a custom status line command, see `/cc-statusline`.
 
 ```
 /statusline
-/statusline toggle model
-/statusline toggle tokens
+/statusline show cost
+/statusline hide tokens
+/statusline show all
 ```
 
 ---
 
 ### /cc-statusline
+
+**Aliases:** `cc-status-line`
 
 Show the external `statusLine` command configured in `~/.claurst/settings.json` (command, poll interval, padding). See [External status line](configuration.md#external-status-line).
 
@@ -458,8 +478,9 @@ Show the external `statusLine` command configured in `~/.claurst/settings.json` 
 ---
 
 ### /vim
+**Aliases:** `vi`
 
-Toggle vim keybinding mode on or off. In vim mode the input field behaves like a vim editor (normal/insert/visual modes). Persisted to config.
+Toggle vim mode in the prompt for this session; `/vim on` and `/vim off` set it explicitly. The choice is also written to `~/.claurst/ui-settings.json`, which is not read at startup. See [Vim Mode](keybindings.md#vim-mode) for current limitations.
 
 ```
 /vim
@@ -471,24 +492,33 @@ Toggle vim keybinding mode on or off. In vim mode the input field behaves like a
 
 ### /voice
 
-Configure voice input/output. Requires a supported audio backend. Subcommands control microphone selection, TTS voice, and push-to-talk behavior.
+Toggle voice input. When on, `Alt+V` starts recording and `Alt+V` again stops and transcribes into the prompt. Transcription uses a Whisper-compatible API: `OPENAI_API_KEY` (or `ANTHROPIC_API_KEY` as a fallback key), and `WHISPER_ENDPOINT_URL` to use a local server. The enabled state is saved to `~/.claurst/ui-settings.json` and restored at startup (`CLAURST_VOICE_ENABLED=1` also enables it). There is no text-to-speech.
 
 ```
 /voice
 /voice on
 /voice off
-/voice mic <device>
-/voice tts <voice-name>
+/voice status
 ```
 
 ---
 
 ### /terminal-setup
 
-Run the terminal capability detection and setup wizard. Checks for true-color support, font ligatures, Unicode rendering, and configures Claurst accordingly.
+Print a report on the terminal (name, color depth, UTF-8 locale and related checks) with recommendations. It changes no settings.
 
 ```
 /terminal-setup
+```
+
+---
+
+### /add-dir
+
+Add a directory to the allowed workspace paths and save it to settings.
+
+```
+/add-dir <path>
 ```
 
 ---
@@ -497,63 +527,108 @@ Run the terminal capability detection and setup wizard. Checks for true-color su
 
 ### /commit
 
-Stage and commit changes to the current git repository. The model drafts a commit message based on the diff. You can review and edit the message before confirming.
+Ask the model to commit the currently staged changes: it reads `git diff --cached`, writes a message following the repository's conventions and runs `git commit`. Text after the command is passed as the message to use. Nothing is staged for you and there is no separate confirmation step.
 
 ```
 /commit
-/commit "optional message override"
+/commit fix login redirect
 ```
 
 ---
 
 ### /diff
 
-Show file diffs for changes made during the current session. Displays a unified diff of all files Claurst has written or edited since the session started.
+In the TUI, opens the diff viewer on the project's git working tree. The text form runs `git diff` and accepts `--stat`, `--staged` (or `--cached`), or a ref to diff against. For changes made by individual assistant turns, use `/changes`.
 
 ```
 /diff
-/diff <file-path>
+/diff --stat
+/diff --staged
+/diff main
+```
+
+---
+
+### /changes
+
+TUI only. Open the diff viewer on the file changes recorded for each assistant turn in this session.
+
+```
+/changes
 ```
 
 ---
 
 ### /undo
 
-Undo file changes made during the current session. Restores files to their state before Claurst's last write operation. Can be called multiple times to step further back.
+Revert all file changes made during the most recent assistant turn; same as `/revert` with no argument. Takes no arguments.
 
 ```
 /undo
-/undo <file-path>
+```
+
+---
+
+### /revert
+
+Restore the files changed during an assistant turn from the shadow-git snapshot and remove that turn and every later turn from the transcript. Requires git.
+
+```
+/revert           — the most recent turn
+/revert 2         — the second most recent turn
+/revert abc123    — the turn whose message id starts with abc123
+```
+
+---
+
+### /checkpoints
+
+List the assistant turns in this session that changed files.
+
+```
+/checkpoints
+```
+
+---
+
+### /snapshot
+
+Show the shadow-git diff for an assistant turn.
+
+```
+/snapshot             — the most recent turn
+/snapshot 2           — the second most recent turn
+/snapshot <hash>      — a snapshot tree hash (8+ hex characters)
 ```
 
 ---
 
 ### /review
 
-Initiate a code review pass over recent changes. The model examines all modified files and produces inline comments and a summary of issues found.
+Send a diff to the model for a structured review: `git diff <base>...HEAD` when a base ref is given, otherwise the staged diff (falling back to unstaged changes). When `GITHUB_TOKEN` is set and a PR number is known (`CLAUDE_PR_NUMBER`, or detected from git), the review is also posted as a PR comment. In the TUI, `/review` also opens the diff viewer and the review text is not shown.
 
 ```
 /review
-/review <file-path>
-/review --since HEAD~3
+/review main
+/review origin/main
 ```
 
 ---
 
 ### /security-review
 
-Run a security-focused review pass. The model looks specifically for vulnerabilities, credential exposure, injection risks, and other security concerns in modified files.
+Ask the model for a security review of a path (default: the working directory), covering injection, auth flaws, secrets, deserialization, path traversal, cryptography, dependencies, race conditions and information disclosure, with a severity per finding.
 
 ```
 /security-review
-/security-review <file-path>
+/security-review <path>
 ```
 
 ---
 
 ### /init
 
-Initialize Claurst project configuration in the current directory. Creates a `CLAUDE.md` file that acts as persistent project-level context injected at the start of every session.
+Create `AGENTS.md` in the working directory from a short template, unless it already exists. It does not analyse the project. See [Instruction Files](configuration.md#instruction-files-agentsmd--claudemd).
 
 ```
 /init
@@ -563,12 +638,11 @@ Initialize Claurst project configuration in the current directory. Creates a `CL
 
 ### /search
 
-Search the codebase using natural language or regex patterns. Wraps the GrepTool and GlobTool with a higher-level interface.
+In the TUI, opens the project search dialog, which runs ripgrep over the project (`/find` and `Ctrl+P` open the same dialog). The text form, `/search <query>`, searches saved session titles and messages in `~/.claurst/sessions.db`; its output is not shown in the TUI.
 
 ```
+/search
 /search <query>
-/search "TODO" --type ts
-/search "function.*export" --regex
 ```
 
 ---
@@ -577,22 +651,31 @@ Search the codebase using natural language or regex patterns. Wraps the GrepTool
 
 ### /files
 
-List all files currently tracked (read or written) in the active session. Useful for reviewing what context the model has access to.
+List the file paths mentioned in the conversation text that exist on disk. Takes no arguments.
 
 ```
 /files
-/files --written
-/files --read
 ```
 
 ---
 
 ### /context
 
-Analyze context window usage. Shows a breakdown of tokens consumed by system prompt, conversation history, file contents, and tool results. Helps identify what to compact or drop.
+In the TUI, toggles the context-usage overlay. The text form estimates the tokens used by the conversation against a fixed 200k-token window.
 
 ```
 /context
+```
+
+---
+
+### /ctx-viz
+**Aliases:** `ctx`, `context-visualizer`
+
+Print an estimated breakdown of context usage: system prompt, conversation messages and tool results against a 200k-token window.
+
+```
+/ctx-viz
 ```
 
 ---
@@ -601,21 +684,21 @@ Analyze context window usage. Shows a breakdown of tokens consumed by system pro
 
 ### /memory
 
-Manage session memory. Memory entries are short notes persisted across sessions. The model can read these at session start to maintain continuity.
+Work with the `AGENTS.md` memory files: `<project>/.claurst/AGENTS.md`, `<project>/AGENTS.md` and the global `~/.claurst/AGENTS.md`. In the TUI, `/memory` opens a picker of these files. The text form:
 
 ```
-/memory
-/memory list
-/memory add <note>
-/memory delete <id>
-/memory clear
+/memory                — show all AGENTS.md files
+/memory edit           — open the project AGENTS.md in your editor
+/memory edit global    — open ~/.claurst/AGENTS.md in your editor
+/memory clear          — clear the project AGENTS.md
+/memory clear global   — clear ~/.claurst/AGENTS.md
 ```
 
 ---
 
 ### /usage
 
-Display a detailed token usage breakdown for the current session. Shows input tokens, output tokens, cache reads, cache writes, and estimated cost per API call.
+Show this session's token usage and cost, plus account quota and rate-limit information when available.
 
 ```
 /usage
@@ -623,9 +706,19 @@ Display a detailed token usage breakdown for the current session. Shows input to
 
 ---
 
+### /extra-usage
+
+Show extended usage statistics: API call count, cache hit ratio, token breakdown by type and cost per call.
+
+```
+/extra-usage
+```
+
+---
+
 ### /cost
 
-Show the total token usage and estimated cost for the current session. Provides a quick summary without the per-call breakdown of `/usage`.
+Show the session's token usage and estimated cost. In the TUI, opens the stats dialog (same as `/stats`).
 
 ```
 /cost
@@ -635,7 +728,7 @@ Show the total token usage and estimated cost for the current session. Provides 
 
 ### /stats
 
-Display session statistics: number of messages, tool calls, files modified, tokens used, session duration, and model used.
+In the TUI, opens the stats dialog. The text form prints the model, user and assistant turn counts, tool calls, token usage (with cache reads and writes) and estimated cost. For totals across saved sessions, run `claurst stats` from the shell.
 
 ```
 /stats
@@ -645,7 +738,7 @@ Display session statistics: number of messages, tool calls, files modified, toke
 
 ### /status
 
-Show the current session status. Includes active model, permission mode, thinking config, connected MCP servers, and loaded plugins.
+Show authentication, model, permission mode, fast mode, editor mode, session id and title, message count, working directory, git branch, the number of configured MCP servers and hooks, and usage so far.
 
 ```
 /status
@@ -686,17 +779,24 @@ Tools
 
 ---
 
+### /rate-limit-options
+
+Show the account's plan type and rate-limit tier information.
+
+```
+/rate-limit-options
+```
+
+---
+
 ## Agents & Tasks
 
 ### /agents
 
-Manage sub-agents. Sub-agents are parallel model instances that can be spawned to work on independent tasks simultaneously.
+Open the agents menu: agent definitions and running agents. See [The /agent and /agents Commands](agents.md#the-agent-and-agents-commands).
 
 ```
 /agents
-/agents list
-/agents stop <agent-id>
-/agents output <agent-id>
 ```
 
 ---
@@ -704,13 +804,10 @@ Manage sub-agents. Sub-agents are parallel model instances that can be spawned t
 ### /tasks
 **Aliases:** `bashes`
 
-Manage tracked background tasks. Tasks are shell commands or model invocations running asynchronously. Monitor progress, fetch output, or stop tasks from this interface.
+Ask the model to list the current tasks with the `TaskList` tool. Takes no arguments. `Ctrl+T` opens the tasks overlay.
 
 ```
 /tasks
-/tasks list
-/tasks output <task-id>
-/tasks stop <task-id>
 ```
 
 ---
@@ -785,23 +882,15 @@ To activate an agent, start Claurst with `--agent <name>`. See [agents.md](./age
 
 ### /plan
 
-Enter plan mode (read-only). In plan mode the model can read files and reason about changes but cannot write, edit, or execute anything. Use this to draft an approach before allowing writes.
+Toggle plan mode (permission mode `plan`) and send a message asking the model for a step-by-step plan for the description (default: "the current task") without running commands or writing files. Every `/plan` sends that message, including the one that turns plan mode off; `Shift+Tab` leaves plan mode without sending anything. `/plan exit` toggles the same way but sends an exit note instead. See [Plan mode](advanced.md#plan-mode).
 
 ```
 /plan
+/plan add rate limiting to the API client
+/plan exit
 ```
 
-To exit plan mode, use `/plan off` or the `/exit-plan` internal action.
-
----
-
-### /ultraplan
-
-Extended planning mode with deeper reasoning. Like `/plan` but with an elevated thinking budget to allow more thorough analysis before acting.
-
-```
-/ultraplan
-```
+`/ultraplan` is not a slash command. `claurst ultraplan [--effort=medium|high|maximum]` prints a placeholder message and does not run a planner.
 
 ---
 
@@ -816,12 +905,11 @@ Run an exhaustive multi-dimensional code review over the current working directo
 - **Test coverage** — missing tests, brittle tests, missing edge cases
 - **API design, documentation, accessibility, and architecture**
 
-Each finding is tagged by category and severity.
+The command sends this request to the model as a prompt for a path (default: the working directory). Each finding is tagged by category and severity.
 
 ```
 /ultrareview
 /ultrareview <path>
-/ultrareview <PR-number>
 ```
 
 ---
@@ -835,6 +923,7 @@ Documented above under [Configuration & Settings](#configuration--settings).
 ---
 
 ### /skills
+**Aliases:** `skill`
 
 List the skills available to this session (discovered and bundled) with each skill's description and source file. Skills loaded from disk can be run as `/<name> args`; the model loads any listed skill with the `Skill` tool. See [Skills](configuration.md#skills).
 
@@ -871,17 +960,28 @@ please ultracode <task>    — activate ultracode for this one turn via the inli
 ---
 
 ### /plugin
-**Aliases:** `plugins`, `marketplace`
+**Aliases:** `plugins`
 
-Manage plugins. Plugins are loadable modules that can register new commands, tools, and hooks. Browse the marketplace or install from a local path.
+Manage installed plugins. There is no marketplace and no remove subcommand. See [plugins.md](plugins.md).
 
 ```
-/plugin
+/plugin                  — list installed plugins
 /plugin list
-/plugin install <name>
-/plugin install <path>
-/plugin remove <name>
+/plugin info <name>
+/plugin enable <name>    — saved to settings
+/plugin disable <name>   — saved to settings
+/plugin install <path>   — install from a local directory
 /plugin reload
+```
+
+---
+
+### /reload-plugins
+
+Reload all plugins from disk, re-register their hooks and show what changed.
+
+```
+/reload-plugins
 ```
 
 ---
@@ -909,6 +1009,36 @@ Then:
 ```
 
 Useful for testing web applications, scraping, or automating browser-based workflows without a separate browser-automation tool.
+
+---
+
+### /ide
+
+Show the detected IDE and the IDE connections found in `~/.claurst/ide/*.lock`.
+
+```
+/ide
+```
+
+---
+
+### /pr-comments
+
+Fetch the review comments of the current branch's GitHub pull request with the `gh` CLI.
+
+```
+/pr-comments
+```
+
+---
+
+### /install-github-app
+
+Print the steps to set up the GitHub app and Actions workflow for a repository.
+
+```
+/install-github-app
+```
 
 ---
 
@@ -980,7 +1110,7 @@ Switch the active account for a provider. Anthropic by default; pass `--codex` f
 
 ### /refresh
 
-Refresh the provider authentication state. Forces a token refresh without full re-authentication. Useful when a session token has expired mid-session.
+Delete saved provider credentials (the auth store and OAuth token file), the model caches, and the saved provider, model and API key in settings, then rebuild the provider state. Run `/connect` afterwards to authenticate again. Refused while a response is streaming. Takes no arguments.
 
 ```
 /refresh
@@ -990,69 +1120,33 @@ Refresh the provider authentication state. Forces a token refresh without full r
 
 ## Display & Terminal
 
-### /theme
-
-Documented above under [Configuration & Settings](#configuration--settings).
-
----
-
-### /output-style
-
-Documented above under [Configuration & Settings](#configuration--settings).
-
----
-
-### /statusline
-
-Documented above under [Configuration & Settings](#configuration--settings).
-
----
-
-### /vim
-
-Documented above under [Configuration & Settings](#configuration--settings).
-
----
-
-### /terminal-setup
-
-Documented above under [Code & Git](#code--git).
+`/theme`, `/output-style`, `/statusline`, `/vim` and `/terminal-setup` are documented under [Configuration & Settings](#configuration--settings).
 
 ---
 
 ### /caveman
 
-Activate caveman speech mode. In caveman mode the model strips pleasantries, hedging, articles, and transitional phrases from its responses, producing dense, telegraphic output. Useful for reducing verbosity and saving tokens on long sessions.
+Switch the output style to the `caveman` persona (terse, few words) and save it to settings; same as `/output-style caveman`. Takes no arguments. Typing the word `caveman` in a prompt applies it for that turn only. Deactivate with `/normal`.
 
 ```
-/caveman             — activate full caveman mode (~75% token reduction)
-/caveman lite        — remove pleasantries only (~40% reduction)
-/caveman full        — compress sentences and drop articles (default, ~75% reduction)
-/caveman ultra       — maximum compression, imperative phrases only (~85% reduction)
+/caveman
 ```
-
-Deactivate with `/normal`.
 
 ---
 
 ### /rocky
 
-Activate Rocky speech mode. Rocky is the Eridian alien engineer from *Project Hail Mary* who communicates in a distinctive pidgin English with specific grammar rules and expressive emphasis. In rocky mode the model adopts Rocky's communication style.
+Switch the output style to the `rocky` persona (the Eridian engineer from *Project Hail Mary*) and save it to settings; same as `/output-style rocky`. Takes no arguments. Typing the word `rocky` in a prompt applies it for that turn only. Deactivate with `/normal`.
 
 ```
-/rocky             — activate full Rocky mode (~75% token reduction)
-/rocky lite        — grammar rules only, minimal emphasis (~40% reduction)
-/rocky full        — full Rocky grammar + regular emphasis (default, ~75% reduction)
-/rocky ultra       — maximum Rocky personality, frequent emphasis, alien observations
+/rocky
 ```
-
-Deactivate with `/normal`.
 
 ---
 
 ### /normal
 
-Deactivate any active speech mode (caveman or rocky) and return the model to its standard response style.
+Reset the output style to `default` and save it; same as `/output-style default`. Typing `normal` in a prompt resets for that turn only.
 
 ```
 /normal
@@ -1068,20 +1162,30 @@ Display a QR code and download links for the Claude mobile app. Supports a `sess
 /mobile             — show QR code for claude.ai/mobile (works for both platforms)
 /mobile ios         — show QR code for the iOS App Store
 /mobile android     — show QR code for Google Play
-/mobile session     — show QR code linking to the active remote session (requires --remote)
+/mobile session     — show QR code linking to the active remote session (requires a connected remote-control bridge)
+```
+
+---
+
+### /desktop
+
+Show download and setup information for the Claude desktop app for the current platform.
+
+```
+/desktop
 ```
 
 ---
 
 ### /color
 
-Set the prompt bar color for the current session. Accepts standard color names or hex values. The color resets when the session ends unless saved via `/config`.
+Save a prompt bar color to `~/.claurst/ui-settings.json`. Accepts `red`, `green`, `blue`, `yellow`, `cyan`, `magenta`, `white`, `orange`, `purple`, `pink`, `gray`/`grey`, `#RGB` or `#RRGGBB`. The TUI does not read this setting in the current build, so the color does not change. `/color-set` is a hidden internal variant.
 
 ```
-/color               — open the interactive color picker
-/color <name>        — set to a named color (e.g., blue, red, green)
-/color #ff6b6b       — set to a hex color value
-/color default       — reset to the theme default
+/color               — show the saved color
+/color <name>
+/color #ff6b6b
+/color default       — clear the saved color
 ```
 
 ---
@@ -1096,11 +1200,21 @@ Opens the Claurst sticker page (`stickermule.com/claudecode`) in your default br
 
 ---
 
+### /passes
+
+Print where to get a referral link (`claude.ai/passes`).
+
+```
+/passes
+```
+
+---
+
 ## Diagnostics & Info
 
 ### /doctor
 
-Run the Claurst diagnostics suite. Checks configuration integrity, provider connectivity, tool availability, MCP server health, and reports any issues.
+Run diagnostics: API key validation (a live models request), git availability, MCP server status, disk space, config file integrity, a tool permission summary, the Claurst version and the log file path.
 
 ```
 /doctor
@@ -1108,10 +1222,20 @@ Run the Claurst diagnostics suite. Checks configuration integrity, provider conn
 
 ---
 
+### /heapdump
+
+Show process diagnostics: process ID, platform, architecture and memory figures (RSS and peak from `/proc/self/status` on Linux).
+
+```
+/heapdump
+```
+
+---
+
 ### /version
 **Aliases:** `v`
 
-Display the current Claurst version string and build metadata.
+Print the Claurst version.
 
 ```
 /version
@@ -1132,17 +1256,28 @@ Check for available updates. Queries the GitHub releases API and displays the la
 
 ---
 
+### /release-notes
+
+Fetch release notes from GitHub for the current version or a given one.
+
+```
+/release-notes
+/release-notes 0.2.0
+```
+
+---
+
 ## Export & Sharing
 
 ### /export
 
-Export the current session transcript. Supported formats include Markdown, JSON, and plain text. The output is written to a file or printed to stdout.
+Export the conversation as JSON (default) or Markdown. In the TUI, `/export` opens the export dialog. The text form writes to `--output <file>` (a bare file name also works; a `.md` name implies Markdown) or prints the export.
 
 ```
 /export
 /export --format markdown
 /export --format json --output session.json
-/export --stdout
+/export conversation.md
 ```
 
 ---
@@ -1159,35 +1294,47 @@ Copy the most recent assistant response to the system clipboard. Pass a number t
 
 ---
 
+### /share
+
+Render the session as a single HTML file, upload it as a secret GitHub gist with the `gh` CLI, and print a viewer URL (`https://claurst.kuber.studio/session/#<gist-id>`). Requires `gh auth login`. `CLAURST_SHARE_VIEWER_URL` overrides the viewer base URL. Anyone with the link can read a secret gist.
+
+```
+/share
+```
+
+---
+
+### /links
+**Aliases:** `link`
+
+Open URLs found in the session's messages in your browser.
+
+```
+/links          — open the most recent URL
+/links list     — numbered list, most recent first
+/links <N>      — open the Nth URL from the list
+/links last     — same as /links
+```
+
+---
+
+### /teleport
+
+Move session context between machines as a JSON bundle.
+
+```
+/teleport export [--output <file>]   — default ~/.claurst/teleport_<session_id>.json
+/teleport import <file>              — restore messages, working directory and tool permissions
+/teleport link                       — print a teleport:// deep link (base64 bundle)
+```
+
+---
+
 ## Advanced & Internal
-
-### /thinking
-
-Documented above under [Model & Provider](#model--provider).
-
----
-
-### /connect
-
-Documented above under [Model & Provider](#model--provider).
-
----
-
-### /fork
-
-Documented above under [Session & Navigation](#session--navigation).
-
----
-
-### /effort
-
-Documented above under [Model & Provider](#model--provider).
-
----
 
 ### /summary
 
-Generate a summary of the current session. The model produces a condensed description of what was accomplished. Primarily used internally for session metadata.
+Ask the model for a 3-5 sentence summary of the conversation so far. The request and the answer become part of the conversation.
 
 ```
 /summary
@@ -1195,26 +1342,20 @@ Generate a summary of the current session. The model produces a condensed descri
 
 ---
 
-### /brief
+### /btw
 
-Output a brief status message for use in non-interactive contexts. Renders minimal session info without the full TUI.
+Send a side question to the model. The question is sent as a normal user message with a `[/btw side-question ...]` prefix, so it and the answer are part of the conversation history.
 
 ```
-/brief
+/btw <question>
 ```
-
----
-
-### /context
-
-Documented above under [Search & Files](#search--files).
 
 ---
 
 ### /sandbox-toggle
 **Aliases:** `sandbox`
 
-Enable or disable sandboxed execution of shell commands. When sandbox mode is on, bash/shell commands run in an isolated environment to limit unintended side effects. Supported on macOS, Linux, and WSL2.
+Record a sandbox on/off flag and command exclusion patterns in `~/.claurst/ui-settings.json` (`sandbox_mode`, `sandbox_excluded_commands`). No shell execution path reads these settings in the current build, so commands are not sandboxed. Enabling is refused on native Windows.
 
 ```
 /sandbox-toggle                          — toggle sandbox mode on/off
@@ -1223,8 +1364,6 @@ Enable or disable sandboxed execution of shell commands. When sandbox mode is on
 /sandbox-toggle status                   — show current state and excluded patterns
 /sandbox-toggle exclude <pattern>        — add a command pattern to the exclusion list
 ```
-
-> A restart is recommended after toggling for full effect. On Windows (non-WSL), sandbox mode is not supported.
 
 ---
 
@@ -1254,38 +1393,59 @@ Replay a previous extended-thinking trace as a formatted, step-numbered walkthro
 
 ---
 
+### /remote-control
+**Aliases:** `rc`
+
+Show the remote-control bridge status. `start` and `stop` set `remoteControlAtStartup` in settings; the change applies on the next start. The bridge uses `CLAURST_BRIDGE_URL` and `CLAURST_BRIDGE_TOKEN`.
+
+```
+/remote-control
+/remote-control status
+/remote-control start
+/remote-control stop
+```
+
+---
+
+### /remote-env
+
+List, set or unset the variables in the settings `env` map that are forwarded to remote sessions. Values of keys containing `KEY`, `TOKEN`, `SECRET` or `PASSWORD` are masked in the listing.
+
+```
+/remote-env
+/remote-env set <KEY> <VALUE>
+/remote-env unset <KEY>
+```
+
+---
+
+### /web-setup
+**Aliases:** `remote-setup`
+
+Check what a remote Claurst environment needs (provider credentials, network reachability) and print setup steps.
+
+```
+/web-setup
+```
+
+---
+
+### /survey
+
+TUI only. Open the session feedback survey.
+
+```
+/survey
+```
+
+---
+
 ## Command Availability
 
-Not all commands are available in all contexts.
+All commands listed here are available in every interactive session; there are no remote-only, bridge-only or internal-only command sets.
 
-### Remote Mode
-
-When running with `--remote`, only a restricted set of commands is available:
-
-`session`, `exit`, `clear`, `help`, `theme`, `vim`, `cost`, `usage`, `plan`, `keybindings`, `statusline`
-
-### Bridge Mode
-
-Over the Remote Control bridge (used by IDE integrations), only `local`-type commands are forwarded:
-
-`compact`, `clear`, `cost`, `files`
-
-### Internal-Only Commands
-
-The following commands are only available when the `USER_TYPE` environment variable is set to `ant` (Anthropic internal builds):
-
-`commit-push-pr`, `ctx_viz`, `good-claude`, `issue`, `init-verifiers`, `mock-limits`, `bridge-kick`, `ultraplan`, `summary`, `teleport`, `ant-trace`, `perf-issue`, `env`, `oauth-refresh`, `debug-tool-call`, `autofix-pr`, `bughunter`, `backfill-sessions`, `break-cache`
-
-### Availability-Restricted Commands
-
-Some commands are available only under certain account or platform conditions:
-
-| Command | Restriction |
-|---------|-------------|
-| `/fast` | Available when a fast-mode model is configured for the active provider |
-| `/privacy-settings` | Opens Anthropic privacy portal (useful for claude.ai accounts) |
-| `/sandbox-toggle` | Functional on macOS, Linux, WSL2 only; no-op on native Windows |
-
-### Feature-Flagged Commands
-
-Some commands check `isEnabled()` at runtime. For example, voice-related commands check for audio device availability; the desktop command checks for a display server.
+| Command | Condition |
+|---------|-----------|
+| `/goal` | Disabled when `CLAURST_GOALS=0` |
+| `/sandbox-toggle on` | Refused on native Windows |
+| `/color-set` | Hidden from `/help`; use `/color` |
