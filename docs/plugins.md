@@ -1,6 +1,6 @@
 # Plugins
 
-Claurst's plugin system lets you extend the agent with additional slash commands, MCP servers, and lifecycle hooks, packaged in a single directory. The manifest also accepts agents, skills, output styles and LSP servers, but those are not loaded yet (see the field reference).
+Claurst's plugin system lets you extend the agent with additional slash commands, MCP servers, and lifecycle hooks, packaged in a single directory. Markdown files in a plugin's `agents/` directory are added to the prompt of Agent-tool sub-agents. The manifest also accepts skills, output styles and LSP servers, but those are not loaded yet (see the field reference).
 
 ---
 
@@ -15,7 +15,7 @@ Every discovered plugin is enabled. The `enabledPlugins` / `disabledPlugins` set
 ├── my-plugin/
 │   ├── plugin.toml          <- manifest
 │   ├── commands/            <- *.md slash command definitions
-│   ├── agents/              <- scanned, not used
+│   ├── agents/              <- *.md appended to the default system prompt of Agent-tool sub-agents
 │   ├── skills/              <- subdirectories with SKILL.md
 │   ├── hooks/               <- hooks.json (optional)
 │   └── output-styles/       <- scanned, not used
@@ -27,7 +27,7 @@ Both `plugin.toml` (TOML format) and `plugin.json` (JSON format) are supported; 
 
 ### Plugin commands
 
-Every `.md` file under `commands/` (searched recursively) and every path listed in the manifest's `commands` field becomes a slash command named `<plugin>:<subdir>:<file stem>`, e.g. `commands/build/deploy.md` in `my-plugin` is `/my-plugin:build:deploy`. A `SKILL.md` among them becomes `/<plugin>:<its directory name>`. Running the command sends the file's content as a user message, with `Arguments: <args>` appended when arguments are given. Plugin commands are read from disk each time they run.
+Every `.md` file under `commands/` (searched recursively) and every path listed in the manifest's `commands` field becomes a slash command named `<plugin>:<file stem>` regardless of subdirectory; `commands/build/deploy.md` in `my-plugin` is `/my-plugin:deploy`. A `SKILL.md` among them becomes `/<plugin>:<its directory name>`. Running the command sends the file's content as a user message, with `Arguments: <args>` appended when arguments are given. Plugin commands are read from disk each time they run.
 
 ---
 
@@ -177,7 +177,7 @@ marketplace_id = "you/my-plugin"
 | Field | Type | Description |
 |---|---|---|
 | `commands` | array of strings | Paths to extra slash command `.md` files or directories, relative to the plugin root. Supplements the `commands/` directory. |
-| `agents` | array of strings | Parsed, not used: plugin agents (this field and the `agents/` directory) are not loaded. |
+| `agents` | array of strings | Parsed, not read; the `agents/` directory is used (see above). |
 | `skills` | array of strings | Paths to extra skill directories (each must contain a `SKILL.md`). Supplements the `skills/` directory. Plugin skill directories are not yet part of the session skill registry; to use a plugin's skills today, add its `skills/` directory to `skills.paths` (see [Skills](configuration.md#skills)). |
 | `output_styles` | array of strings | Parsed, not used: plugin output styles (this field and the `output-styles/` directory) are not loaded. |
 
@@ -185,7 +185,7 @@ marketplace_id = "you/my-plugin"
 
 An array of inline MCP server definitions with `name`, `command`, `args`, `env`, `url` and `type` (see [MCP](mcp.md)); `headers` and the timeout fields are not read from plugins. In `plugin.json` the field can also be written as `"mcpServers"` with an object mapping (the loader converts it to the array form automatically).
 
-Plugin servers are added to the session's server list at startup unless a configured server already has that name. They are treated as user servers, so they launch without the project-server approval prompt, including servers from plugins in a project's `.claurst/plugins/`. `/plugin reload` does not add or remove servers.
+Servers from plugins in a project's `.claurst/plugins/` are tagged as project servers and need the same approval as project `mcp_servers`; user and system plugin servers connect without a prompt. Plugin servers are appended to the server list at startup (unless a configured server has that name) but are not started by the initial connect; they start the next time the MCP runtime is rebuilt in the TUI (`r` in the `/mcp` panel, approving a project server, finishing `/mcp auth`, or `/import-config`). They never start in headless or ACP runs. `/plugin reload` does not add or remove servers.
 
 ### lsp_servers
 

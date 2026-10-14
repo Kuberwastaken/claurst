@@ -36,7 +36,7 @@ Every tool implements the Rust `Tool` trait (`src-rust/crates/tools/src/lib.rs`)
 - `self_gates()` — `true` when the tool asks for permission itself inside `execute()`
 - `execute()` — runs the call and returns a `ToolResult` (text, an error flag, optional metadata and images)
 
-The tool set is built once per session: every tool returned by `all_tools()`, plus `Agent`, plus one tool per tool of each connected MCP server, plus `StructuredOutput` when `--json-schema` is given. A named agent with `read-only` or `search-only` access narrows the set (see [Agents](agents.md)). Every tool is sent with every request; there is no deferred or on-demand tool loading.
+The tool set is built once per session: every tool returned by `all_tools()`, plus `Agent`, plus one tool per tool of each connected MCP server, plus `StructuredOutput` when `--json-schema` is given. A named agent with `read-only` or `search-only` access narrows the set (see [Agents](agents.md)). Every tool is sent with every request, except tools hidden by a tool-wide deny rule and the final max-turns summary turn (which gets no tools); there is no deferred or on-demand tool loading.
 
 ### Tool Names
 
@@ -78,7 +78,9 @@ Each tool declares a permission level:
 | **Write** | Changes files or settings | `Write`, `Edit`, `BatchEdit`, `ApplyPatch`, `NotebookEdit`, `Config`, `TeamCreate` |
 | **Execute** | Runs code or processes | `Bash`, `PowerShell`, `REPL`, `CronCreate`, `TaskStop`, MCP server tools |
 | **Dangerous** | Desktop control | `computer` |
-| **Forbidden** | Never runs | `Bash` commands the classifier rates Critical (e.g. `rm -rf /`) |
+| **Forbidden** | Never runs | `Bash` commands the classifier rates Critical (e.g. `rm -rf /`)* |
+
+\* No tool declares this level; the refusal happens inside `Bash`.
 
 A tool that does not check permissions itself is checked before it runs when its level is anything other than `None` or `ReadOnly`. File tools, `Bash`, `PowerShell`, `REPL`, `computer` and MCP tools check inside the call, with the path or command they are about to touch.
 
@@ -88,8 +90,8 @@ Set with `--permission-mode` (`default`, `accept-edits`, `bypass-permissions`, `
 
 | Mode | Behavior |
 |------|----------|
-| `default` | Reads (`Read`, `Glob`, `Grep`, `LSP`, `Skill`) inside the workspace run without a prompt; everything else asks, including reads outside the workspace and `ListMcpResources` / `ReadMcpResource` |
-| `plan` | Those read tools run; every other tool is denied |
+| `default` | Reads (`Read`, `Glob`, `Grep`, `LSP`, `Skill`) inside the workspace run without a prompt. Write/Execute/Dangerous tools ask, as do reads outside the workspace and `ListMcpResources`/`ReadMcpResource`; `None`-level tools, `WebSearch` and `monitor` never prompt |
+| `plan` | `Read`, `Glob`, `Grep`, `LSP`, `Skill`, `ListMcpResources` and `ReadMcpResource` run anywhere without a prompt; every other tool is denied |
 | `acceptEdits` | `Edit`, `Write`, `NotebookEdit`, `BatchEdit` and `ApplyPatch` run without a prompt for targets inside the workspace; everything else behaves as in `default` |
 | `bypassPermissions` | Every tool runs without a prompt unless a deny rule covers it. `--dangerously-skip-permissions` and `yoloMode` select it; both refuse to start as root |
 
@@ -238,6 +240,7 @@ Execute a shell command in bash. The working directory (`cd`) and exported varia
 | `description` | string | no | Shown to the user as the approval question |
 | `timeout` | integer | no | Timeout in milliseconds (default 120000, max 600000) |
 | `run_in_background` | boolean | no | Run asynchronously and return a task ID immediately |
+| `notify` | boolean | no | With `run_in_background`: deliver the finished command's output to the session (`completionWakeups`) |
 
 Commands the bash classifier rates Critical (e.g. `rm -rf /`, fork bombs) are refused in every permission mode.
 
@@ -334,7 +337,7 @@ Keep an interpreter process alive per session and language: `bash --norc --nopro
 | `code` | string | yes | Code to evaluate |
 | `language` | string | no | `bash` (default), `python`, or `javascript` |
 
-Only stdout is returned; stderr (including Python and Node exception text) is not. A call fails if no output line arrives for 30 seconds. Every call goes through the same permission check as `Bash`, and bash code rated Critical is refused.
+Only stdout is returned; stderr (including Python and Node exception text) is not. A call fails if no output line arrives for 30 seconds. It asks for permission as an Execute tool under its own name (Bash rules do not cover it); code rated Critical is refused.
 
 ---
 
@@ -376,7 +379,7 @@ Search file contents with a Rust `regex` pattern (not ripgrep). Directories are 
 
 ### ToolSearchTool
 
-**Permission level:** ReadOnly
+**Permission level:** None
 
 Search available tools by name or keyword. Returns matching tool names with their descriptions, not parameter schemas; every tool's schema is already sent with each request, so nothing is loaded by this tool. `select:Name[,Other]` looks up exact names. The catalog covers the built-in tools and every tool of every connected MCP server (listed as `mcp__<server>__<tool>`, matched on its name, server and description).
 
@@ -502,7 +505,7 @@ Mark a `running` or `in_progress` task as `completed`. No process is signalled; 
 
 **Tool name:** `TaskOutput` · **Permission level:** None
 
-Return the task record with a `retrieval_status` of `success`, or `not_ready` for a running task when `block` is false. It does not wait.
+Return the task record with a `retrieval_status` of `success`, or `not_ready` for a task that is `Running` or `InProgress` when `block` is false. It does not wait.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -568,7 +571,7 @@ Read the content of a specific resource from an MCP server. Asks for permission 
 
 **Tool name:** `mcp__auth` · **Permission level:** None (the call itself asks for permission)
 
-Run the OAuth 2.0 + PKCE flow for an MCP server that requires authentication and store the token locally. For stdio servers that authenticate through environment variables, it returns setup instructions instead.
+Run the OAuth 2.0 + PKCE flow for an MCP server that requires authentication and store the token locally. For a server with no `url` (stdio) the call fails with an error that points to `/mcp auth <server>`.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -674,7 +677,7 @@ Load a skill's instructions by name. The available skills are listed to the mode
 
 **Tool name:** `GoalComplete`
 
-Mark the session's active goal (set with `/goal`) as complete. The tool is always registered; it returns an error when the session has no active goal. Its description tells the model to call it only after a completion audit.
+Mark the session's active goal (set with `/goal`) as complete. The tool is always registered; with no active goal the call still reports success (nothing is updated). Its description tells the model to call it only after a completion audit.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -747,7 +750,7 @@ Create a new git worktree on a new branch and switch the session's working direc
 |-----------|------|----------|-------------|
 | `branch` | string | no | Branch to create (default: a timestamped `claurst-YYYYMMDD-HHMMSS` name) |
 | `path` | string | no | Worktree directory (default `.worktrees/<branch>`) |
-| `post_create_command` | string | no | Command to run inside the new worktree (e.g. `npm install`); checked like a `Bash` command |
+| `post_create_command` | string | no | Command to run inside the new worktree (e.g. `npm install`); asks for permission as an Execute tool under its own name (Bash rules do not cover it); commands rated Critical are refused |
 
 ---
 
@@ -803,9 +806,9 @@ Pause for a specified duration without holding a shell process.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `ms` | integer | yes | Milliseconds to sleep |
+| `ms` | integer | yes | Milliseconds to sleep (`duration_ms` is accepted as an alias) |
 
-Maximum sleep duration is 300000 ms (5 minutes) per call.
+Values above 300000 ms (5 minutes) are capped to 300000.
 
 ---
 
@@ -813,7 +816,7 @@ Maximum sleep duration is 300000 ms (5 minutes) per call.
 
 **Tool name:** `Config` · **Permission level:** Write
 
-Read or change a setting; changes are saved to `~/.claurst/settings.json`. Supported settings: `model`, `provider`, `effort`, `max_tokens`, `verbose`, `permission_mode`, `auto_compact`. `setting: "list"` lists them.
+Read or change a setting; changes are saved to `~/.claurst/settings.json`. Supported settings: `model`, `provider`, `effort`, `max_tokens`, `verbose`, `permission_mode`, `auto_compact`. `setting: "list"` lists them. `verbose`, `permission_mode` and `auto_compact` written by this tool are overwritten by CLI defaults at startup.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -837,7 +840,7 @@ Schedule a prompt with a 5-field cron expression (`M H DoM Mon DoW`, local time)
 | `cron` | string | yes | Cron expression (e.g. `0 9 * * 1-5`) |
 | `prompt` | string | yes | Prompt to run at each scheduled time |
 | `recurring` | boolean | no | `true` (default) repeats; `false` fires once and deletes the task |
-| `durable` | boolean | no | `true` saves the task to `.claurst/scheduled_tasks.json`; `false` (default) keeps it for this session only |
+| `durable` | boolean | no | `true` saves the task to `~/.claurst/scheduled_tasks.json`; `false` (default) keeps it for this session only |
 
 ---
 
@@ -987,4 +990,4 @@ Every tool receives a `ToolContext` (`src-rust/crates/tools/src/lib.rs`) at call
 
 ### PermissionDecision
 
-A permission handler returns one of `Allow`, `AllowPermanently`, `Deny`, `DenyPermanently`, or `Ask { reason }` (`src-rust/crates/core/src/lib.rs`, `permissions` module). `Ask` shows the permission dialog in the TUI.
+A permission handler returns one of `Allow`, `AllowPermanently`, `Deny`, `DenyPermanently`, `DenyWithFeedback(String)`, or `Ask { reason }` (`src-rust/crates/core/src/lib.rs`, `permissions` module). `Ask` shows the permission dialog in the TUI.
