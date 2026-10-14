@@ -27,7 +27,17 @@ It's fast, it's memory-efficient, it's yours to run however you want, and there'
 > **Claurst is now officially in Beta (v0.1.8).** The core agent, multi-provider routing, and TUI are stable enough for daily driving — expect rough edges around experimental features (flagged below). Bug reports and PRs welcome.
 
 > [!NOTE]
-> **Recent Updates:**
+> **Recent Updates (v0.2.0, see the [changelog](docs/changelog.md)):**
+>
+> - **Sandbox and permissions:** on macOS, Bash commands run in a Seatbelt sandbox that limits writes to the workspace and blocks network by default (`/sandbox-toggle`). Bash approvals are matched per command, approvals can be saved for the current project, and `--allowed-tools` / `--disallowed-tools` are enforced. See [Permission modes](docs/configuration.md#permission-modes).
+>
+> - **Hooks:** Claude Code's hooks contract (settings shape, events, JSON stdin/stdout, exit code 2, timeouts), including plugin hooks. See [Hooks](docs/hooks.md).
+>
+> - **Skills and instruction files:** `AGENTS.md` and `CLAUDE.md` files are loaded from the git root down to the working directory, with `@include`; skills from `.claurst/skills`, `.agents/skills` and `.claude/skills` are listed to the model. See [Instruction files](docs/configuration.md#instruction-files-agentsmd--claudemd) and [Skills](docs/configuration.md#skills).
+>
+> - **Headless runs:** typed `stream-json` events, documented exit codes, `--resume` / `--continue`, and `--json-schema` for a structured answer. See [Headless mode](docs/advanced.md#headless-mode).
+>
+> - **Providers:** Anthropic prompt caching and adaptive thinking; ChatGPT (Codex) subscription token refresh, prompt caching and reasoning replay; one retry policy and context compaction for every provider.
 >
 > - **/share support:** Use `/share` to share chat sessions with others via unlisted GitHub Gists. `[EXPERIMENTAL]`
 >
@@ -118,12 +128,21 @@ cargo build --release --package claurst --no-default-features
 # Set your API key (or use /connect inside Claurst to configure)
 export ANTHROPIC_API_KEY=sk-ant-...
 
+# Or sign in with a ChatGPT subscription (Codex)
+claurst codex login
+
 # Start Claurst
 claurst
 
 # Or run a one-shot headless query
 claurst -p "explain this codebase"
+
+# Headless with one JSON event per line, or a structured answer
+claurst -p --output-format stream-json "fix the failing test"
+claurst -p --output-format json --json-schema schema.json "is this branch ready to merge?"
 ```
+
+Claurst asks before running commands and editing files; see [Permission modes](docs/configuration.md#permission-modes). Project instructions go in `AGENTS.md` or `CLAUDE.md` at the repository root.
 
 ## Devcontainer setup
 
@@ -170,9 +189,9 @@ args:    ["acp"]
 }
 ```
 
-Claurst will run in JSON-RPC 2.0 mode over stdio. It implements `initialize`, `session/new`, `session/prompt`, and `session/cancel`, streams `session/update` notifications (text deltas, agent thinking, tool calls with their progress + results), and routes every tool permission through `session/request_permission` so the editor can show a native approval dialog.
+Claurst will run in JSON-RPC 2.0 mode over stdio. It implements `initialize`, `session/new`, `session/prompt`, and `session/cancel`, streams `session/update` notifications (text deltas, agent thinking, tool calls with their progress + results), and evaluates tool permissions with the same rules as the TUI, sending only the calls that need approval to `session/request_permission` so the editor can show a native approval dialog. Each session uses the settings, instruction files and trusted MCP servers of its working directory.
 
-Configure your provider / API key in `~/.claurst/settings.json` (or `claurst auth login` / `claurst /connect`) before launching — the ACP agent uses the same credentials and providers as the interactive TUI.
+Configure your provider / API key in `~/.claurst/settings.json` (or `claurst auth login`, `claurst codex login`, or `/connect` inside the TUI) before launching — the ACP agent uses the same credentials and providers as the interactive TUI.
 
 Enable verbose ACP logging (to stderr — never stdout, which would corrupt the protocol) by setting `CLAURST_ACP_LOG=debug`.
 
