@@ -81,6 +81,9 @@ impl Tool for FileWriteTool {
             }
         }
 
+        // Serialise with other tools changing this file (#443).
+        let _lock = crate::lock_files([path.as_path()]).await;
+
         let existed = path.exists();
         let before_content = if existed {
             match tokio::fs::read(&path).await {

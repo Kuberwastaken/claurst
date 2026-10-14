@@ -107,6 +107,10 @@ impl Tool for FileEditTool {
             Err(e) => return ToolResult::error(e.to_string()),
         };
 
+        // Serialise with other tools changing this file (#443); held through
+        // the write and the formatter.
+        let _lock = crate::lock_files([path.as_path()]).await;
+
         // Open once and re-check where the handle really points; the read
         // and the write below are bound to this handle, so a symlink swapped
         // in after the permission check cannot redirect the edit (#415).
@@ -413,6 +417,37 @@ mod tests {
                 &ctx,
             )
             .await
+    }
+
+    /// #443: concurrent edits to one file serialise on the per-path lock, so
+    /// every edit lands instead of a later write dropping an earlier one (or
+    /// being refused because the file was replaced under its handle).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_edits_to_one_file_all_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.txt");
+        let original: String = (0..16).map(|i| format!("line {:02}\n", i)).collect();
+        std::fs::write(&path, &original).unwrap();
+
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let tasks: Vec<_> = (0..16)
+            .map(|i| {
+                let ctx = ctx.clone();
+                let input = json!({
+                    "file_path": path.to_string_lossy(),
+                    "old_string": format!("line {:02}", i),
+                    "new_string": format!("LINE {:02}", i),
+                });
+                tokio::spawn(async move { FileEditTool.execute(input, &ctx).await })
+            })
+            .collect();
+        for task in tasks {
+            let res = task.await.unwrap();
+            assert!(!res.is_error, "concurrent edit failed: {}", res.content);
+        }
+
+        let expected: String = (0..16).map(|i| format!("LINE {:02}\n", i)).collect();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
     }
 
     /// #443: a UTF-8 BOM survives an edit and does not stop a first-line match.

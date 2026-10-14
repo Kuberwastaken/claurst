@@ -246,6 +246,59 @@ pub fn clear_session_shadow(working_dir: &std::path::Path) {
     claurst_core::snapshot::remove(working_dir);
 }
 
+/// Per-file locks for the tools that read, change and write a file (#443).
+/// Tool calls in one turn run concurrently, so without these two edits to one
+/// file could both read the old content and the second write would drop the
+/// first edit. Process-global so sub-agents serialise against each other too.
+static FILE_LOCKS: once_cell::sync::Lazy<dashmap::DashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>> =
+    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+
+/// A held lock from [`lock_files`]; dropping it releases the file and removes
+/// the map entry once nobody else holds or waits for it.
+pub(crate) struct FileLock {
+    key: PathBuf,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        self.guard.take();
+        FILE_LOCKS.remove_if(&self.key, |_, lock| Arc::strong_count(lock) == 1);
+    }
+}
+
+/// Lock `paths` for a read-modify-write, keyed by canonical path so aliases
+/// of one file share a lock (a file that does not exist yet is keyed by its
+/// canonical parent plus its name). Keys are taken in sorted order, so two
+/// multi-file tools cannot deadlock. Callers take the lock before opening the
+/// file: a handle opened before another writer's atomic rename would point at
+/// the replaced inode and `write_atomic_bound` would refuse it.
+pub(crate) async fn lock_files<'a>(
+    paths: impl IntoIterator<Item = &'a std::path::Path>,
+) -> Vec<FileLock> {
+    let mut keys: Vec<PathBuf> = paths
+        .into_iter()
+        .map(|path| match std::fs::canonicalize(path) {
+            Ok(real) => real,
+            Err(_) => match (path.parent(), path.file_name()) {
+                (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+                    .map(|dir| dir.join(name))
+                    .unwrap_or_else(|_| path.to_path_buf()),
+                _ => path.to_path_buf(),
+            },
+        })
+        .collect();
+    keys.sort();
+    keys.dedup();
+    let mut locks = Vec::with_capacity(keys.len());
+    for key in keys {
+        let lock = FILE_LOCKS.entry(key.clone()).or_default().clone();
+        let guard = lock.lock_owned().await;
+        locks.push(FileLock { key, guard: Some(guard) });
+    }
+    locks
+}
+
 /// Write `contents` to `path` atomically: write to a temp file in the same
 /// directory, then rename over the destination. A crash or disk-full mid-write
 /// can never leave the destination truncated or half-written.

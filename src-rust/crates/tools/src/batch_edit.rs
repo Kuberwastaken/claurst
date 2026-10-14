@@ -101,6 +101,11 @@ impl Tool for BatchEditTool {
             return ToolResult::error(e.to_string());
         }
 
+        // Lock every target file for the whole batch (#443).
+        let paths: Vec<std::path::PathBuf> =
+            params.edits.iter().map(|edit| ctx.resolve_path(&edit.file_path)).collect();
+        let _locks = crate::lock_files(paths.iter().map(|p| p.as_path())).await;
+
         // ----------------------------------------------------------------
         // Phase 1: read all files and validate every edit before writing
         // ----------------------------------------------------------------
