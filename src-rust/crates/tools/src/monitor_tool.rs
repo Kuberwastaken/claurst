@@ -108,7 +108,7 @@ impl Tool for MonitorTool {
                             t.id,
                             status,
                             t.name,
-                            t.output.len()
+                            t.output_line_count()
                         ))
                     }
                 }
@@ -122,7 +122,8 @@ impl Tool for MonitorTool {
                 match global_registry().get(&id) {
                     None => ToolResult::error(format!("Task {} not found", id)),
                     Some(t) => {
-                        let output = t.output.join("\n");
+                        // Bounded head + tail windows, never the whole log (#442).
+                        let output = t.render_output();
                         if output.is_empty() {
                             ToolResult::success("(no output yet)")
                         } else {

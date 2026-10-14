@@ -266,19 +266,10 @@ impl Tool for PowerShellTool {
                 }
                 if output.is_empty() { output = "(no output)".to_string(); }
 
-                // Truncate very long output (same limit as BashTool)
+                // Truncate very long output (same limit as BashTool), on char
+                // boundaries so multibyte output cannot panic (#442).
                 const MAX_OUTPUT_LEN: usize = 100_000;
-                if output.len() > MAX_OUTPUT_LEN {
-                    let half = MAX_OUTPUT_LEN / 2;
-                    let start = &output[..half];
-                    let end = &output[output.len() - half..];
-                    output = format!(
-                        "{}\n\n... ({} characters truncated) ...\n\n{}",
-                        start,
-                        output.len() - MAX_OUTPUT_LEN,
-                        end
-                    );
-                }
+                let output = claurst_core::truncate::truncate_middle(output, MAX_OUTPUT_LEN);
 
                 if exit_code != 0 {
                     ToolResult::error(format!("PowerShell exited with code {}\n{}", exit_code, output))

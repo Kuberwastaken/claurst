@@ -21,6 +21,12 @@ pub fn claurst_home() -> PathBuf {
     crate::config::Settings::config_dir()
 }
 
+/// Where oversized tool output is spilled for the model to read back:
+/// `<claurst_home>/tool-output/` (#442).
+pub fn tool_output_dir() -> PathBuf {
+    claurst_home().join("tool-output")
+}
+
 /// Size at which the diagnostic log is rotated to `claurst.log.old` on open.
 pub const LOG_FILE_MAX_BYTES: u64 = 5 * 1024 * 1024;
 

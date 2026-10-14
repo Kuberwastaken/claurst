@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use agent_client_protocol_schema as acp;
 use claurst_api::streaming::{AnthropicStreamEvent, ContentDelta};
-use claurst_core::types::Message;
+use claurst_core::permissions::ManagedInteractivePermissionHandler;
+use claurst_core::types::{ContentBlock, ImageSource, Message};
 use claurst_query::{QueryEvent, QueryOutcome};
 use claurst_tools::ToolContext;
 use tokio::sync::mpsc;
@@ -15,42 +16,50 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use crate::connection::Connection;
-use crate::permission::AcpPermissionHandler;
-use crate::runtime::AgentRuntime;
 use crate::sessions::SessionState;
 
 /// Handle one `session/prompt` JSON-RPC call.
 ///
-/// Drives the full Claurst query loop with the runtime's tools, MCP servers,
-/// and provider registry, while streaming every text delta, thinking delta,
-/// and tool invocation back as `session/update` notifications. Returns the
-/// final `PromptResponse` with the appropriate `StopReason`.
+/// Drives the full Claurst query loop with the session runtime's tools, MCP
+/// servers, and provider registry, while streaming every text delta,
+/// thinking delta, and tool invocation back as `session/update`
+/// notifications. Returns the final `PromptResponse` with the appropriate
+/// `StopReason`, or a JSON-RPC error when the turn fails.
 pub async fn handle(
-    runtime: Arc<AgentRuntime>,
     connection: Arc<Connection>,
     session: Arc<SessionState>,
     params: acp::PromptRequest,
 ) -> Result<acp::PromptResponse, acp::Error> {
+    let runtime = &session.runtime;
     // Convert prompt content blocks → a single user message in Claurst's
     // internal format.
-    let user_text = render_prompt_blocks(&params.prompt);
-    if user_text.trim().is_empty() {
-        return Err(acp::Error::invalid_params());
-    }
+    let Some(message) = user_message(params.prompt, runtime.supports_images) else {
+        return Err(acp::Error::invalid_params()
+            .data(Some(serde_json::json!({ "reason": "prompt has no text or image content" }))));
+    };
+
+    // One prompt at a time per session, each with its own cancel token.
+    let Some(turn) = session.begin_turn() else {
+        return Err(acp::Error::new(
+            i32::from(acp::ErrorCode::InvalidRequest),
+            format!("Session {} already has a prompt running", session.session_id),
+        ));
+    };
+    let cancel = turn.token.clone();
 
     // Append the user turn to the session transcript.
     let mut messages: Vec<Message> = {
         let guard = session.messages.lock();
         guard.clone()
     };
-    messages.push(Message::user(user_text));
-
-    // Reset the session's cancellation token for this new turn.
-    let cancel = session.cancel_token.clone();
+    messages.push(message);
 
     // Build per-session ToolContext.
-    let permission_handler: Arc<dyn claurst_core::PermissionHandler> =
-        Arc::new(AcpPermissionHandler);
+    // The session's PermissionManager decides first; only its Ask decisions
+    // reach the client through the pending-permission queue.
+    let permission_handler: Arc<dyn claurst_core::PermissionHandler> = Arc::new(
+        ManagedInteractivePermissionHandler::new(session.permission_manager.clone()),
+    );
     let tool_ctx = ToolContext {
         working_dir: session.cwd.clone(),
         permission_mode: runtime.config.permission_mode.clone(),
@@ -65,7 +74,7 @@ pub async fn handle(
         managed_agent_config: runtime.config.managed_agents.clone(),
         completion_notifier: None,
         pending_permissions: Some(session.pending_permissions.clone()),
-        permission_manager: Some(runtime.permission_manager.clone()),
+        permission_manager: Some(session.permission_manager.clone()),
         user_question_tx: None,
         // Bind to this turn's cancel token so the parallel tool executor and any
         // sub-agents observe cancellation (issue #218). `run_query_loop` also
@@ -78,8 +87,10 @@ pub async fn handle(
     let drainer = crate::permission::spawn_drainer(
         connection.clone(),
         session.session_id.clone(),
+        session.permission_manager.clone(),
         session.pending_permissions.clone(),
         drainer_cancel.clone(),
+        cancel.clone(),
     );
 
     // Event channel + forwarder.
@@ -122,28 +133,34 @@ pub async fn handle(
         QueryOutcome::Cancelled => acp::StopReason::Cancelled,
         QueryOutcome::BudgetExceeded { .. } => acp::StopReason::MaxTurnRequests,
         QueryOutcome::Error(e) => {
+            // A failed turn is a JSON-RPC error, not a model refusal.
             error!(error = ?e, "ACP: query loop errored");
-            acp::StopReason::Refusal
+            return Err(acp::Error::new(
+                i32::from(acp::ErrorCode::InternalError),
+                e.to_string(),
+            ));
         }
     };
 
     Ok(acp::PromptResponse::new(stop_reason))
 }
 
-/// Concatenate text from prompt content blocks. Image / Audio / embedded
-/// resources are dropped here (they require additional prompt capabilities
-/// which v1 does not advertise) but are tracked for telemetry.
-fn render_prompt_blocks(blocks: &[acp::ContentBlock]) -> String {
+/// Convert prompt content blocks into one user message. Text, resource links
+/// and embedded text resources form the text part; images are passed through
+/// when the provider accepts them and replaced by a short note otherwise.
+/// Returns `None` when the prompt has nothing to send.
+fn user_message(blocks: Vec<acp::ContentBlock>, supports_images: bool) -> Option<Message> {
     let mut parts: Vec<String> = Vec::new();
+    let mut images: Vec<ContentBlock> = Vec::new();
     for block in blocks {
         match block {
-            acp::ContentBlock::Text(t) => parts.push(t.text.clone()),
+            acp::ContentBlock::Text(t) => parts.push(t.text),
             acp::ContentBlock::ResourceLink(link) => {
                 parts.push(format!("[resource link: {}]", link.uri));
             }
             acp::ContentBlock::Resource(res) => {
                 // Best-effort: emit any embedded text.
-                let json = serde_json::to_value(res).unwrap_or_default();
+                let json = serde_json::to_value(&res).unwrap_or_default();
                 if let Some(text) = json
                     .get("resource")
                     .and_then(|r| r.get("text"))
@@ -152,15 +169,48 @@ fn render_prompt_blocks(blocks: &[acp::ContentBlock]) -> String {
                     parts.push(text.to_string());
                 }
             }
-            acp::ContentBlock::Image(_) | acp::ContentBlock::Audio(_) => {
-                warn!("ACP: ignoring multimedia content block (capability not advertised)");
+            acp::ContentBlock::Image(image) => {
+                if !supports_images {
+                    warn!("ACP: dropping image, the active provider does not accept image input");
+                    parts.push(
+                        "[image omitted: the active provider does not accept image input]"
+                            .to_string(),
+                    );
+                } else if image.data.is_empty() {
+                    parts.push(format!(
+                        "[image: {}]",
+                        image.uri.as_deref().unwrap_or("no data")
+                    ));
+                } else {
+                    images.push(ContentBlock::Image {
+                        source: ImageSource {
+                            source_type: "base64".to_string(),
+                            media_type: Some(image.mime_type),
+                            data: Some(image.data),
+                            url: None,
+                        },
+                    });
+                }
+            }
+            acp::ContentBlock::Audio(_) => {
+                warn!("ACP: ignoring audio content block (capability not advertised)");
             }
             _ => {
                 warn!("ACP: ignoring unknown content block variant");
             }
         }
     }
-    parts.join("\n\n")
+    let text = parts.join("\n\n");
+    if images.is_empty() {
+        if text.trim().is_empty() {
+            return None;
+        }
+        return Some(Message::user(text));
+    }
+    if !text.trim().is_empty() {
+        images.push(ContentBlock::Text { text });
+    }
+    Some(Message::user_blocks(images))
 }
 
 /// Pump QueryEvents → `session/update` SessionNotifications.
@@ -330,39 +380,61 @@ fn tool_title(tool_name: &str, raw_input: Option<&serde_json::Value>) -> String 
 mod tests {
     use super::*;
 
+    fn text_of(blocks: Vec<acp::ContentBlock>) -> String {
+        user_message(blocks, false)
+            .expect("prompt has content")
+            .get_all_text()
+    }
+
     #[test]
-    fn render_prompt_blocks_joins_text_blocks_with_blank_line() {
+    fn user_message_joins_text_blocks_with_blank_line() {
         let blocks = vec![
             acp::ContentBlock::Text(acp::TextContent::new("first")),
             acp::ContentBlock::Text(acp::TextContent::new("second")),
         ];
-        assert_eq!(render_prompt_blocks(&blocks), "first\n\nsecond");
+        assert_eq!(text_of(blocks), "first\n\nsecond");
     }
 
     #[test]
-    fn render_prompt_blocks_renders_resource_links() {
+    fn user_message_renders_resource_links() {
         let blocks = vec![acp::ContentBlock::ResourceLink(acp::ResourceLink::new(
             "notes.md",
             "file:///tmp/notes.md",
         ))];
-        assert_eq!(
-            render_prompt_blocks(&blocks),
-            "[resource link: file:///tmp/notes.md]"
-        );
+        assert_eq!(text_of(blocks), "[resource link: file:///tmp/notes.md]");
     }
 
     #[test]
-    fn render_prompt_blocks_drops_images_without_panicking() {
+    fn user_message_passes_images_through_when_supported() {
         let blocks = vec![
             acp::ContentBlock::Text(acp::TextContent::new("caption")),
             acp::ContentBlock::Image(acp::ImageContent::new("base64data", "image/png")),
         ];
-        assert_eq!(render_prompt_blocks(&blocks), "caption");
+        let message = user_message(blocks, true).expect("prompt has content");
+        let content = message.content_blocks();
+        assert!(matches!(
+            &content[0],
+            ContentBlock::Image { source }
+                if source.source_type == "base64"
+                    && source.media_type.as_deref() == Some("image/png")
+                    && source.data.as_deref() == Some("base64data")
+        ));
+        assert!(matches!(&content[1], ContentBlock::Text { text } if text == "caption"));
     }
 
     #[test]
-    fn render_prompt_blocks_empty_input_is_empty_string() {
-        assert_eq!(render_prompt_blocks(&[]), "");
+    fn user_message_notes_images_the_provider_cannot_take() {
+        let blocks = vec![
+            acp::ContentBlock::Text(acp::TextContent::new("caption")),
+            acp::ContentBlock::Image(acp::ImageContent::new("base64data", "image/png")),
+        ];
+        let text = text_of(blocks);
+        assert!(text.starts_with("caption\n\n[image omitted"), "{text}");
+    }
+
+    #[test]
+    fn user_message_empty_input_is_none() {
+        assert!(user_message(Vec::new(), true).is_none());
     }
 
     #[test]

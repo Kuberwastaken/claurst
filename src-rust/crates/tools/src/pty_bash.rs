@@ -14,9 +14,14 @@ use crate::{PermissionLevel, Tool, ToolContext, ToolResult, session_shell_state}
 use async_trait::async_trait;
 use claurst_core::bash_classifier::{BashRiskLevel, classify_bash_command};
 use claurst_core::tasks::{BackgroundTask, global_registry};
+use claurst_core::truncate::bound_head_tail;
+use crate::output_spill::{
+    Captured, OutputAccumulator, RAW_HEAD_BYTES, RAW_TAIL_BYTES, finish_spill, spill_bytes,
+    with_full_output,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -27,6 +32,8 @@ use tracing::debug;
 #[cfg(unix)]
 use crate::ShellState;
 #[cfg(unix)]
+use claurst_core::truncate::{head_window, join_head_tail, tail_window, OUTPUT_WINDOW_BYTES, OUTPUT_WINDOW_LINES};
+#[cfg(unix)]
 use regex::Regex;
 #[cfg(unix)]
 use std::collections::HashMap;
@@ -36,6 +43,24 @@ use std::collections::HashMap;
 const SHELL_STATE_SENTINEL: &str = "__CC_SHELL_STATE__";
 
 pub struct PtyBashTool;
+
+/// Environment every shell child gets (#442): pagers are disabled so
+/// `git log`, `git diff` or `man` cannot hang in `less`, git never prompts for
+/// credentials on the terminal, and scripts can tell they run under an agent.
+/// On the PTY path these are forced after the restored session env: the PTY
+/// has no stdin writer, so an earlier `export PAGER=less` would only hang the
+/// next `git log` until timeout (codex forces them the same way).
+const CHILD_ENV: [(&str, &str); 6] = [
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+    ("GH_PAGER", "cat"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("CLAURST", "1"),
+    ("AGENT", "1"),
+];
+
+/// `TERM` for the child when the parent environment has none.
+const DEFAULT_TERM: &str = "dumb";
 
 #[derive(Debug, Deserialize)]
 struct BashInput {
@@ -120,7 +145,7 @@ cd '{cwd}'
 set +e
 {user_cmd}
 __CC_EXIT_CODE=$?
-echo '{sentinel}'
+printf '\n%s\n' '{sentinel}'
 pwd
 env | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' || true
 exit $__CC_EXIT_CODE
@@ -129,6 +154,23 @@ exit $__CC_EXIT_CODE
         user_cmd = command,
         sentinel = SHELL_STATE_SENTINEL,
     )
+}
+
+/// Build the PTY child's environment (#442): [`DEFAULT_TERM`] when no `TERM`
+/// is inherited, then the restored session env (which may set `TERM`), then
+/// [`CHILD_ENV`], which always wins.
+#[cfg(unix)]
+fn apply_child_env(
+    cmd: &mut portable_pty::CommandBuilder,
+    restored: &HashMap<String, String>,
+) {
+    if cmd.get_env("TERM").is_none() {
+        cmd.env("TERM", DEFAULT_TERM);
+    }
+    apply_restored_env(cmd, restored);
+    for (key, value) in CHILD_ENV {
+        cmd.env(key, value);
+    }
 }
 
 /// Plumb the persisted shell env vars into the child process's environment
@@ -147,13 +189,20 @@ fn apply_restored_env(cmd: &mut portable_pty::CommandBuilder, env_vars: &HashMap
 // Background execution (identical to bash.rs — no PTY needed for background)
 // ---------------------------------------------------------------------------
 
-async fn run_in_background(command: String, cwd: PathBuf, timeout_ms: u64) -> ToolResult {
-    let task_name = format!("bg: {}", &command[..command.len().min(60)]);
+async fn run_in_background(
+    command: String,
+    cwd: PathBuf,
+    timeout_ms: u64,
+    spill_dir: &Path,
+) -> ToolResult {
+    let task_name = format!("bg: {}", &command[..command.floor_char_boundary(60)]);
     let mut task = BackgroundTask::new(&task_name);
     task.pid = None;
     let task_id = global_registry().register(task);
     let task_id_clone = task_id.clone();
     let command_clone = command.clone();
+    let spill_path = spill_dir.join(format!("{task_id}.txt"));
+    let term = std::env::var_os("TERM").unwrap_or_else(|| DEFAULT_TERM.into());
 
     tokio::spawn(async move {
         let result = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
@@ -164,6 +213,7 @@ async fn run_in_background(command: String, cwd: PathBuf, timeout_ms: u64) -> To
                     .arg("/C")
                     .arg(&command_clone)
                     .current_dir(&cwd)
+                    .envs(CHILD_ENV)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .stdin(Stdio::null())
@@ -174,6 +224,8 @@ async fn run_in_background(command: String, cwd: PathBuf, timeout_ms: u64) -> To
                     .arg("-c")
                     .arg(&command_clone)
                     .current_dir(&cwd)
+                    .envs(CHILD_ENV)
+                    .env("TERM", &term)
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .stdin(Stdio::null())
@@ -186,20 +238,49 @@ async fn run_in_background(command: String, cwd: PathBuf, timeout_ms: u64) -> To
                     if let Some(pid) = c.id() {
                         global_registry().set_pid(&task_id_clone, pid);
                     }
-                    let stdout = c.stdout.take();
-                    let stderr = c.stderr.take();
-                    if let Some(out) = stdout {
-                        let mut lines = BufReader::new(out).lines();
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            global_registry().append_output(&task_id_clone, &line);
-                        }
+                    let mut stdout = c.stdout.take().map(|s| BufReader::new(s).lines());
+                    let mut stderr = c.stderr.take().map(|s| BufReader::new(s).lines());
+                    // Full output for the spill file; the registry keeps only
+                    // bounded windows of lines (#442).
+                    let mut full = OutputAccumulator::new(
+                        RAW_HEAD_BYTES,
+                        RAW_TAIL_BYTES,
+                        Some(spill_path.clone()),
+                    );
+                    // Drain both pipes concurrently until both close. Reading
+                    // stdout to EOF first let a child that filled the stderr pipe
+                    // block forever (#442).
+                    while stdout.is_some() || stderr.is_some() {
+                        let line = tokio::select! {
+                            line = next_line(&mut stdout), if stdout.is_some() => match line {
+                                Some(line) => line,
+                                None => {
+                                    stdout = None;
+                                    continue;
+                                }
+                            },
+                            line = next_line(&mut stderr), if stderr.is_some() => match line {
+                                Some(line) => format!("STDERR: {}", line),
+                                None => {
+                                    stderr = None;
+                                    continue;
+                                }
+                            },
+                        };
+                        full.push(format!("{line}\n").as_bytes());
+                        global_registry().append_output(&task_id_clone, &line);
                     }
-                    if let Some(err) = stderr {
-                        let mut lines = BufReader::new(err).lines();
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            global_registry()
-                                .append_output(&task_id_clone, &format!("STDERR: {}", line));
+                    let spilled = match full.finish() {
+                        Captured::Truncated { tail, spill, .. } => finish_spill(spill, &tail),
+                        Captured::Complete(bytes) => {
+                            match bound_head_tail(&String::from_utf8_lossy(&bytes)) {
+                                Some(_) => spill_bytes(&spill_path, &bytes),
+                                None => None,
+                            }
                         }
+                    };
+                    if let Some(path) = spilled {
+                        global_registry().set_output_file(&task_id_clone, path);
                     }
                     match c.wait().await {
                         Ok(status) if status.success() => {
@@ -248,6 +329,17 @@ async fn run_in_background(command: String, cwd: PathBuf, timeout_ms: u64) -> To
         "Command started in background.\nTask ID: {}\nCommand: {}",
         task_id, command
     ))
+}
+
+/// Next line from an optional line reader; `None` at EOF, on a read error, or
+/// when the reader is absent.
+async fn next_line<R: tokio::io::AsyncBufRead + Unpin>(
+    lines: &mut Option<tokio::io::Lines<R>>,
+) -> Option<String> {
+    match lines {
+        Some(lines) => lines.next_line().await.ok().flatten(),
+        None => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -312,8 +404,8 @@ fn strip_ansi(s: &str) -> String {
 /// Outcome of a single foreground PTY run.
 #[cfg(unix)]
 enum PtyOutcome {
-    /// The command finished; carries (raw PTY output, exit code).
-    Completed(String, i32),
+    /// The command finished; carries (bounded raw PTY output, exit code).
+    Completed(Captured, i32),
     /// The command exceeded its timeout. The child has been KILLED (#220).
     TimedOut,
     /// The PTY could not be set up / the command could not be spawned.
@@ -369,6 +461,7 @@ async fn run_in_pty(
     working_dir: &str,
     env_vars: &HashMap<String, String>,
     timeout: Duration,
+    spill_path: PathBuf,
 ) -> PtyOutcome {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
@@ -388,7 +481,7 @@ async fn run_in_pty(
     cmd.args(["-c", script]);
     cmd.cwd(working_dir);
     // Restored shell vars go through the child's ENVIRONMENT, never its argv (#211).
-    apply_restored_env(&mut cmd, env_vars);
+    apply_child_env(&mut cmd, env_vars);
 
     let child = match pair.slave.spawn_command(cmd) {
         Ok(c) => c,
@@ -418,7 +511,7 @@ async fn run_in_pty(
     // which a detached grandchild would hold open forever (#184).
     let read_handle = tokio::task::spawn_blocking(move || {
         let master_fd = master.as_raw_fd();
-        let result = drive_pty_child(child, reader, master_fd);
+        let result = drive_pty_child(child, reader, master_fd, spill_path);
         // Keep the master fd alive until reading + reaping is complete.
         drop(master);
         result
@@ -429,9 +522,9 @@ async fn run_in_pty(
     let mut guard = PtyKillGuard::new(killer);
 
     match tokio::time::timeout(timeout, read_handle).await {
-        Ok(Ok((output, exit_code))) => {
+        Ok(Ok((captured, exit_code))) => {
             guard.disarm();
-            PtyOutcome::Completed(output, exit_code)
+            PtyOutcome::Completed(captured, exit_code)
         }
         Ok(Err(e)) => {
             guard.disarm();
@@ -477,7 +570,11 @@ fn poll_readable(fd: std::os::unix::io::RawFd, timeout_ms: i32) -> bool {
 }
 
 /// Drive a spawned PTY child to completion: read its output while it runs, reap
-/// it, and return `(output, exit_code)`.
+/// it, and return `(captured output, exit_code)`.
+///
+/// The pty is drained to the end however much the child writes: output past
+/// the in-memory head + tail windows is dropped from the middle rather than
+/// left unread, which would block the child on a full pty until timeout (#442).
 ///
 /// Crucially — and mirroring bash.rs's `drive_child` — the loop stops as soon as
 /// the DIRECT child exits rather than waiting for pty EOF. A grandchild that
@@ -490,13 +587,12 @@ fn drive_pty_child(
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
     mut reader: Box<dyn std::io::Read + Send>,
     master_fd: Option<std::os::unix::io::RawFd>,
-) -> (String, i32) {
+    spill_path: PathBuf,
+) -> (Captured, i32) {
     use std::io::Read;
 
-    let mut output = String::new();
-    let mut buf = [0u8; 4096];
-    const MAX_BYTES: usize = 2 * 1024 * 1024;
-    let mut total = 0usize;
+    let mut output = OutputAccumulator::new(RAW_HEAD_BYTES, RAW_TAIL_BYTES, Some(spill_path));
+    let mut buf = vec![0u8; 64 * 1024];
 
     // Set once the direct child has exited. We then drain any already-buffered
     // pty output and stop — we never block waiting for EOF that a detached
@@ -515,12 +611,7 @@ fn drive_pty_child(
             match reader.read(&mut buf) {
                 Ok(0) => break, // EOF: every pty writer (incl. the child) is gone
                 Ok(n) => {
-                    total += n;
-                    if total > MAX_BYTES {
-                        output.push_str("\n[output truncated at 2 MB limit]");
-                        break;
-                    }
-                    output.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    output.push(&buf[..n]);
                     continue; // keep draining while bytes remain
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -549,7 +640,93 @@ fn drive_pty_child(
         Ok(status) => status.exit_code() as i32,
         Err(_) => -1,
     };
-    (output, exit_code)
+    (output.finish(), exit_code)
+}
+
+/// Split raw PTY output at the wrapper's shell-state sentinel: returns the
+/// user's output and the state lines that follow the sentinel (`pwd`, then the
+/// `env` dump). Works on raw bytes so it also applies to a retained tail (#442).
+///
+/// The sentinel line counts when nothing but escape sequences and whitespace
+/// precede it since the last `\n` or `\r` (a spinner's `\r\x1b[K` or a
+/// reset-on-exit `\x1b[0m` must not hide it) and a line ending or the end of
+/// the stream follows; the last such line wins. The wrapper prints a newline
+/// before the sentinel so output without a trailing newline cannot glue onto
+/// it; one trailing line ending is dropped from the user's output to undo that.
+#[cfg(unix)]
+fn split_state_block(raw: &[u8]) -> (&[u8], Vec<String>) {
+    let needle = SHELL_STATE_SENTINEL.as_bytes();
+    let mut end = raw.len();
+    while let Some(pos) = raw[..end].windows(needle.len()).rposition(|w| w == needle) {
+        let line_start = raw[..pos]
+            .iter()
+            .rposition(|&b| b == b'\n' || b == b'\r')
+            .map_or(0, |i| i + 1);
+        let rest = &raw[pos + needle.len()..];
+        let own_line = strip_ansi(&String::from_utf8_lossy(&raw[line_start..pos]))
+            .trim()
+            .is_empty()
+            && (rest.is_empty() || rest.starts_with(b"\n") || rest.starts_with(b"\r\n"));
+        if own_line {
+            let state = strip_ansi(&String::from_utf8_lossy(rest));
+            let user = &raw[..line_start];
+            let user = user
+                .strip_suffix(b"\r\n")
+                .or_else(|| user.strip_suffix(b"\n"))
+                .unwrap_or(user);
+            // `rest` opens with the sentinel line's own line ending; skip it.
+            return (user, state.lines().skip(1).map(str::to_string).collect());
+        }
+        end = pos + needle.len() - 1;
+    }
+    (raw, Vec::new())
+}
+
+/// Turn captured PTY output into the text shown to the model plus the shell
+/// state lines. ANSI codes are stripped and the final newline dropped; output
+/// larger than the head + tail windows keeps only those windows, and the full
+/// output is spilled to `spill_path` with a `Full output:` trailer (#442). The
+/// shell-state block (it carries the environment) is never written to disk.
+#[cfg(unix)]
+fn render_pty_output(captured: Captured, spill_path: &Path) -> (String, Vec<String>) {
+    match captured {
+        Captured::Complete(raw) => {
+            let (user, state) = split_state_block(&raw);
+            let text = strip_ansi(&String::from_utf8_lossy(user));
+            let text = text.strip_suffix('\n').unwrap_or(&text);
+            let output = match bound_head_tail(text) {
+                Some(bounded) => with_full_output(bounded, spill_bytes(spill_path, text.as_bytes())),
+                None => text.to_string(),
+            };
+            (output, state)
+        }
+        Captured::Truncated {
+            head,
+            tail,
+            omitted,
+            spill,
+        } => {
+            let (tail, state) = split_state_block(&tail);
+            // The stream overflowed memory: the spill file holds the raw PTY
+            // bytes (head + dropped middle); finish it with the user's tail.
+            let spilled = finish_spill(spill, tail);
+            // The rolling tail starts mid-line (possibly mid-char or mid-escape):
+            // begin at the next full line.
+            let tail = match tail.iter().position(|&b| b == b'\n') {
+                Some(i) => &tail[i + 1..],
+                None => tail,
+            };
+            let head_text = strip_ansi(&String::from_utf8_lossy(&head));
+            let tail_text = strip_ansi(&String::from_utf8_lossy(tail));
+            let tail_text = tail_text.strip_suffix('\n').unwrap_or(&tail_text);
+            let head = head_window(&head_text, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES);
+            let tail = tail_window(tail_text, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES);
+            let omitted =
+                omitted + (head_text.len() - head.len() + tail_text.len() - tail.len()) as u64;
+            let output = join_head_tail(head, tail, &format!("about {omitted} bytes"));
+            (with_full_output(output, spilled), state)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -620,11 +797,13 @@ async fn run_windows_fallback(
     effective_cwd: &PathBuf,
     timeout_dur: Duration,
     timeout_ms: u64,
+    spill_dir: &Path,
 ) -> ToolResult {
     let mut child = match Command::new("cmd")
         .arg("/C")
         .arg(command)
         .current_dir(effective_cwd)
+        .envs(CHILD_ENV)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
@@ -682,7 +861,14 @@ async fn run_windows_fallback(
             if output.is_empty() {
                 output = "(no output)".to_string();
             }
-            truncate_output(output, exit_code)
+            let output = match bound_head_tail(&output) {
+                Some(bounded) => {
+                    let path = spill_dir.join(format!("{}.txt", uuid::Uuid::new_v4()));
+                    with_full_output(bounded, spill_bytes(&path, output.as_bytes()))
+                }
+                None => output,
+            };
+            shell_result(output, exit_code)
         }
         Err(_) => {
             // Kill the whole tree, not just cmd.exe (#391); `child.kill` remains
@@ -695,23 +881,11 @@ async fn run_windows_fallback(
 }
 
 // ---------------------------------------------------------------------------
-// Shared output truncation helper
+// Shared result helper
 // ---------------------------------------------------------------------------
 
-fn truncate_output(mut output: String, exit_code: i32) -> ToolResult {
-    const MAX_OUTPUT_LEN: usize = 100_000;
-    if output.len() > MAX_OUTPUT_LEN {
-        let half = MAX_OUTPUT_LEN / 2;
-        let start = output[..half].to_string();
-        let end = output[output.len() - half..].to_string();
-        output = format!(
-            "{}\n\n... ({} characters truncated) ...\n\n{}",
-            start,
-            output.len() - MAX_OUTPUT_LEN,
-            end
-        );
-    }
-
+/// Wrap already-bounded command output in a tool result keyed on the exit code.
+fn shell_result(output: String, exit_code: i32) -> ToolResult {
     if exit_code != 0 {
         ToolResult::error(format!("Command exited with code {}\n{}", exit_code, output))
     } else {
@@ -734,10 +908,13 @@ impl Tool for PtyBashTool {
 
     fn description(&self) -> &str {
         "Executes a given bash command in a real terminal (PTY) and returns its output. \
-         The working directory persists between commands. Supports interactive programs, \
-         colored output (stripped for readability), and terminal-aware tools like npm, \
-         cargo, git, and pytest. Use for running shell commands, scripts, git operations, \
-         and system tasks."
+         The working directory and exported variables persist between commands. Pagers are \
+         disabled, so git and man never wait for input. Large output \
+         is cut to its first and last lines and the full output is saved to a file named in a \
+         trailing `Full output: <path>` line; read that file with offset/limit instead of \
+         piping through `| head` or `| tail`. Do not chain unrelated commands with separators \
+         like `echo \"====\"`; run them as separate calls. Use for running shell commands, \
+         scripts, git operations, and system tasks."
     }
 
     fn permission_level(&self) -> PermissionLevel {
@@ -805,6 +982,7 @@ impl Tool for PtyBashTool {
         let timeout_ms = params.timeout.min(600_000);
         let timeout_dur = Duration::from_millis(timeout_ms);
         let shell_state_arc = session_shell_state(&ctx.session_id);
+        let spill_dir = claurst_core::paths::tool_output_dir();
 
         // ── Background path ──────────────────────────────────────────────────
         if params.run_in_background {
@@ -812,7 +990,7 @@ impl Tool for PtyBashTool {
                 let state = shell_state_arc.lock();
                 state.cwd.clone().unwrap_or_else(|| ctx.working_dir.clone())
             };
-            return run_in_background(params.command, cwd, timeout_ms).await;
+            return run_in_background(params.command, cwd, timeout_ms, &spill_dir).await;
         }
 
         debug!(command = %params.command, "Executing bash command via PTY");
@@ -824,84 +1002,91 @@ impl Tool for PtyBashTool {
                 let state = shell_state_arc.lock();
                 state.cwd.clone().unwrap_or_else(|| ctx.working_dir.clone())
             };
-            return run_windows_fallback(&params.command, &effective_cwd, timeout_dur, timeout_ms)
-                .await;
+            return run_windows_fallback(
+                &params.command,
+                &effective_cwd,
+                timeout_dur,
+                timeout_ms,
+                &spill_dir,
+            )
+            .await;
         }
 
         // ── Unix PTY path ────────────────────────────────────────────────────
         #[cfg(unix)]
         {
-            // Build the wrapper script that restores cwd + captures shell state.
-            // Restored env vars are cloned out and later injected into the child's
-            // environment (never its argv) — see `apply_restored_env` (#211).
-            let (script, restored_env, working_dir_str) = {
-                let state = shell_state_arc.lock();
-                let script = build_wrapper_script(&params.command, &state, &ctx.working_dir);
-                let restored_env = state.env_vars.clone();
-                let wd = ctx.working_dir.to_string_lossy().into_owned();
-                (script, restored_env, wd)
-            };
+            run_pty_foreground(
+                &params.command,
+                &shell_state_arc,
+                &ctx.working_dir,
+                timeout_dur,
+                timeout_ms,
+                &spill_dir,
+            )
+            .await
+        }
+    }
+}
 
-            // run_in_pty owns the timeout so it can KILL the child when it fires
-            // (a bare outer timeout would just drop the future and orphan it) (#220).
-            let outcome = run_in_pty(&script, &working_dir_str, &restored_env, timeout_dur).await;
+/// Run `command` in a PTY with the session's persisted shell state, fold the
+/// wrapper's state block back into that state, and render the bounded result.
+#[cfg(unix)]
+async fn run_pty_foreground(
+    command: &str,
+    shell_state: &parking_lot::Mutex<ShellState>,
+    base_cwd: &PathBuf,
+    timeout_dur: Duration,
+    timeout_ms: u64,
+    spill_dir: &Path,
+) -> ToolResult {
+    // Build the wrapper script that restores cwd + captures shell state.
+    // Restored env vars are cloned out and later injected into the child's
+    // environment (never its argv) — see `apply_restored_env` (#211).
+    let (script, restored_env, working_dir_str) = {
+        let state = shell_state.lock();
+        let script = build_wrapper_script(command, &state, base_cwd);
+        let restored_env = state.env_vars.clone();
+        let wd = base_cwd.to_string_lossy().into_owned();
+        (script, restored_env, wd)
+    };
 
-            match outcome {
-                PtyOutcome::Completed(raw_output, exit_code) => {
-                    // Strip ANSI escape codes from PTY output
-                    let cleaned = strip_ansi(&raw_output);
+    // run_in_pty owns the timeout so it can KILL the child when it fires
+    // (a bare outer timeout would just drop the future and orphan it) (#220).
+    let spill_path = spill_dir.join(format!("{}.txt", uuid::Uuid::new_v4()));
+    let outcome =
+        run_in_pty(&script, &working_dir_str, &restored_env, timeout_dur, spill_path.clone())
+            .await;
 
-                    // Split into user-visible lines and state block
-                    let all_lines: Vec<String> =
-                        cleaned.lines().map(|l| l.to_string()).collect();
+    match outcome {
+        PtyOutcome::Completed(captured, exit_code) => {
+            let (mut output, state_lines) = render_pty_output(captured, &spill_path);
 
-                    let sentinel_pos = all_lines
-                        .iter()
-                        .rposition(|l| l.trim() == SHELL_STATE_SENTINEL);
-
-                    let (user_lines, state_lines) = match sentinel_pos {
-                        Some(pos) => (&all_lines[..pos], &all_lines[pos + 1..]),
-                        None => (all_lines.as_slice(), &[][..]),
-                    };
-
-                    // Update persistent shell state
-                    if !state_lines.is_empty() {
-                        if let Some((new_cwd, env_delta)) =
-                            parse_shell_state_block(state_lines)
-                        {
-                            let mut state = shell_state_arc.lock();
-                            state.cwd = Some(new_cwd);
-                            for (k, v) in env_delta {
-                                state.env_vars.insert(k, v);
-                            }
-                        }
-                    }
-
-                    // Fast-path export capture
-                    {
-                        let exports = extract_exports_from_command(&params.command);
-                        if !exports.is_empty() {
-                            let mut state = shell_state_arc.lock();
-                            for (k, v) in exports {
-                                state.env_vars.insert(k, v);
-                            }
-                        }
-                    }
-
-                    let mut output = user_lines.join("\n");
-                    if output.is_empty() {
-                        output = "(no output)".to_string();
-                    }
-
-                    truncate_output(output, exit_code)
-                }
-                PtyOutcome::Failed(e) => {
-                    ToolResult::error(format!("PTY execution failed: {}", e))
-                }
-                PtyOutcome::TimedOut => {
-                    ToolResult::error(format!("Command timed out after {}ms", timeout_ms))
+            // Update persistent shell state
+            if let Some((new_cwd, env_delta)) = parse_shell_state_block(&state_lines) {
+                let mut state = shell_state.lock();
+                state.cwd = Some(new_cwd);
+                for (k, v) in env_delta {
+                    state.env_vars.insert(k, v);
                 }
             }
+
+            // Fast-path export capture
+            let exports = extract_exports_from_command(command);
+            if !exports.is_empty() {
+                let mut state = shell_state.lock();
+                for (k, v) in exports {
+                    state.env_vars.insert(k, v);
+                }
+            }
+
+            if output.is_empty() {
+                output = "(no output)".to_string();
+            }
+            shell_result(output, exit_code)
+        }
+        PtyOutcome::Failed(e) => ToolResult::error(format!("PTY execution failed: {}", e)),
+        PtyOutcome::TimedOut => {
+            ToolResult::error(format!("Command timed out after {}ms", timeout_ms))
         }
     }
 }
@@ -973,6 +1158,169 @@ mod tests {
                 !arg.to_string_lossy().contains("topsecret"),
                 "secret value leaked into CommandBuilder argv: {arg:?}"
             );
+        }
+    }
+
+    /// #442: output whose cut point lands inside a multibyte char used to panic
+    /// on a byte-offset slice. 'é' is 2 bytes; the leading ASCII byte puts every
+    /// char boundary on an odd offset, so the even-sized window cuts split one.
+    #[test]
+    fn render_multibyte_at_cut_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill = dir.path().join("out.txt");
+        let text = format!("a{}", "é".repeat(60_000));
+        let (output, state) =
+            render_pty_output(Captured::Complete(text.clone().into_bytes()), &spill);
+        assert!(state.is_empty());
+        assert!(output.contains("bytes omitted"), "len {}", output.len());
+        assert!(output.starts_with('a'));
+        assert!(output.ends_with(&format!("é\n\nFull output: {}", spill.display())));
+        assert_eq!(std::fs::read_to_string(&spill).unwrap(), text);
+    }
+
+    #[test]
+    fn render_splits_state_block_from_complete_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill = dir.path().join("out.txt");
+        let raw = format!("hello\r\nworld\r\n{SHELL_STATE_SENTINEL}\r\n/tmp\r\nFOO=bar\r\n");
+        let (output, state) = render_pty_output(Captured::Complete(raw.into_bytes()), &spill);
+        assert_eq!(output, "hello\nworld");
+        assert!(!spill.exists(), "output that fits must not spill");
+        assert_eq!(state, vec!["/tmp".to_string(), "FOO=bar".to_string()]);
+    }
+
+    /// #442 review: escape sequences or a carriage return before the sentinel
+    /// (spinner cleanup, colour reset on exit) must not hide the state block.
+    #[test]
+    fn render_finds_sentinel_after_escape_sequences() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill = dir.path().join("o.txt");
+        for raw in [
+            format!("busy\r\x1b[K{SHELL_STATE_SENTINEL}\r\n/tmp\r\n"),
+            format!("done\x1b[0m\r\n\x1b[?25h {SHELL_STATE_SENTINEL}\r\n/tmp\r\n"),
+        ] {
+            let (output, state) = render_pty_output(Captured::Complete(raw.into_bytes()), &spill);
+            assert_eq!(state, vec!["/tmp".to_string()]);
+            assert!(!output.contains(SHELL_STATE_SENTINEL), "{output:?}");
+        }
+    }
+
+    /// The newline the wrapper prints before the sentinel keeps output without
+    /// a trailing newline apart from it, and is not shown to the model.
+    #[tokio::test]
+    async fn output_without_trailing_newline_keeps_shell_state() {
+        let state = parking_lot::Mutex::new(ShellState::new());
+        let spill_dir = tempfile::tempdir().unwrap();
+        let result = run_pty_foreground(
+            "cd / && printf foo",
+            &state,
+            &std::env::temp_dir(),
+            Duration::from_secs(30),
+            30_000,
+            spill_dir.path(),
+        )
+        .await;
+        assert_eq!(result.content, "foo");
+        assert_eq!(state.lock().cwd, Some(PathBuf::from("/")));
+
+        let result = run_pty_foreground(
+            "printf 'a\\n\\n'",
+            &state,
+            &std::env::temp_dir(),
+            Duration::from_secs(30),
+            30_000,
+            spill_dir.path(),
+        )
+        .await;
+        assert_eq!(result.content, "a\n");
+    }
+
+    /// A sentinel embedded in a line of user output is not the state block.
+    #[test]
+    fn render_ignores_sentinel_inside_a_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = format!("x{SHELL_STATE_SENTINEL}\n");
+        let (output, state) =
+            render_pty_output(Captured::Complete(raw.into_bytes()), &dir.path().join("o.txt"));
+        assert_eq!(output, format!("x{SHELL_STATE_SENTINEL}"));
+        assert!(state.is_empty());
+    }
+
+    #[test]
+    fn render_truncated_keeps_head_tail_and_state() {
+        let tail = format!("partial\nlast line\n{SHELL_STATE_SENTINEL}\n/tmp\n");
+        let dir = tempfile::tempdir().unwrap();
+        let captured = Captured::Truncated {
+            head: b"first line\n".to_vec(),
+            tail: tail.into_bytes(),
+            omitted: 1000,
+            spill: None,
+        };
+        let (output, state) = render_pty_output(captured, &dir.path().join("o.txt"));
+        assert!(output.starts_with("first line"));
+        assert!(output.ends_with("last line"));
+        assert!(!output.contains("partial"));
+        assert!(output.contains("bytes omitted"));
+        assert_eq!(state, vec!["/tmp".to_string()]);
+    }
+
+    /// #442: TERM is filled in only when the child would otherwise have none,
+    /// and the restored session env may override it; the pager / prompt vars
+    /// are forced even over a restored `export PAGER=less`.
+    #[test]
+    fn child_env_forces_pagers_and_defaults_term() {
+        use portable_pty::CommandBuilder;
+
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.env_remove("TERM");
+        apply_child_env(&mut cmd, &HashMap::new());
+        assert_eq!(cmd.get_env("TERM"), Some(OsStr::new(DEFAULT_TERM)));
+        assert_eq!(cmd.get_env("GIT_PAGER"), Some(OsStr::new("cat")));
+
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.env("TERM", "xterm-256color");
+        apply_child_env(&mut cmd, &HashMap::new());
+        assert_eq!(cmd.get_env("TERM"), Some(OsStr::new("xterm-256color")));
+
+        let restored: HashMap<String, String> = [
+            ("TERM", "vt100"),
+            ("PAGER", "less"),
+            ("GIT_PAGER", "less"),
+            ("GIT_TERMINAL_PROMPT", "1"),
+            ("SECRET", "kept"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let mut cmd = CommandBuilder::new("bash");
+        apply_child_env(&mut cmd, &restored);
+        assert_eq!(cmd.get_env("TERM"), Some(OsStr::new("vt100")));
+        assert_eq!(cmd.get_env("PAGER"), Some(OsStr::new("cat")));
+        assert_eq!(cmd.get_env("GIT_PAGER"), Some(OsStr::new("cat")));
+        assert_eq!(cmd.get_env("GIT_TERMINAL_PROMPT"), Some(OsStr::new("0")));
+        assert_eq!(cmd.get_env("SECRET"), Some(OsStr::new("kept")));
+    }
+
+    /// #442 review: a model `export PAGER=less` does not re-enable paging on
+    /// the next call.
+    #[tokio::test]
+    async fn exported_pager_does_not_survive_into_next_call() {
+        let state = parking_lot::Mutex::new(ShellState::new());
+        let spill_dir = tempfile::tempdir().unwrap();
+        for command in ["export PAGER=less GIT_PAGER=less", "echo \"$PAGER $GIT_PAGER\""] {
+            let result = run_pty_foreground(
+                command,
+                &state,
+                &std::env::temp_dir(),
+                Duration::from_secs(30),
+                30_000,
+                spill_dir.path(),
+            )
+            .await;
+            assert!(!result.is_error, "{}", result.content);
+            if command.starts_with("echo") {
+                assert_eq!(result.content, "cat cat");
+            }
         }
     }
 
@@ -1076,6 +1424,146 @@ mod tests {
         }
     }
 
+    /// #442: 10 MB of output used to hit the reader's 2 MB head-only cap, after
+    /// which nothing drained the pty, the child blocked, and the call timed out.
+    /// It must now complete with a head window, a tail window, a private spill
+    /// file holding all of it, and the shell state (cwd) still captured from
+    /// the end of the stream -- without writing that state (env) to disk.
+    #[tokio::test]
+    async fn ten_megabytes_of_output_completes_with_head_tail_and_spill() {
+        let state = parking_lot::Mutex::new(ShellState::new());
+        let base = std::env::temp_dir();
+        let spill_dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let result = run_pty_foreground(
+            "cd / && yes line | head -n 2000000; echo END",
+            &state,
+            &base,
+            Duration::from_secs(120),
+            120_000,
+            spill_dir.path(),
+        )
+        .await;
+        assert!(
+            !result.is_error,
+            "command failed after {:?}: {}",
+            started.elapsed(),
+            &result.content[..result.content.len().min(200)]
+        );
+        assert!(result.content.starts_with("line\nline\n"));
+        assert!(result.content.contains("line\nEND\n\nFull output: "));
+        assert!(result.content.contains("bytes omitted"));
+        assert!(
+            result.content.len() <= 2 * OUTPUT_WINDOW_BYTES + 400,
+            "result not bounded: {} bytes",
+            result.content.len()
+        );
+        assert_eq!(state.lock().cwd, Some(PathBuf::from("/")));
+
+        let (_, path) = result.content.rsplit_once("Full output: ").unwrap();
+        let path = PathBuf::from(path);
+        assert_eq!(path.parent(), Some(spill_dir.path()));
+        let spilled = std::fs::read(&path).unwrap();
+        // 2M "line" rows; the pty turns each "\n" into "\r\n".
+        assert_eq!(spilled.len(), 2_000_000 * 6 + "END\r\n".len());
+        assert!(spilled.ends_with(b"line\r\nEND\r\n"));
+        assert!(
+            !spilled.windows(SHELL_STATE_SENTINEL.len()).any(|w| w == SHELL_STATE_SENTINEL.as_bytes()),
+            "shell-state block (env) leaked into the spill file"
+        );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    /// Start `command` in the background and wait for its task to finish.
+    async fn run_background_to_completion(command: &str, spill_dir: &Path) -> BackgroundTask {
+        let started =
+            run_in_background(command.to_string(), std::env::temp_dir(), 60_000, spill_dir).await;
+        let task_id = started
+            .content
+            .lines()
+            .find_map(|l| l.strip_prefix("Task ID: "))
+            .unwrap()
+            .to_string();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let task = global_registry().get(&task_id).unwrap();
+            if !task.is_running() {
+                return task;
+            }
+            assert!(std::time::Instant::now() < deadline, "background task never finished");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// #442 (Monitor path): a chatty background task keeps bounded windows in
+    /// the registry and spills its full output to a private file.
+    #[tokio::test]
+    async fn background_output_is_bounded_and_spilled() {
+        let spill_dir = tempfile::tempdir().unwrap();
+        let task = run_background_to_completion("seq 1 300000", spill_dir.path()).await;
+        assert_eq!(task.status, claurst_core::tasks::TaskStatus::Completed);
+        assert_eq!(task.output_line_count(), 300_000);
+
+        let rendered = task.render_output();
+        assert!(rendered.starts_with("1\n2\n"));
+        assert!(rendered.contains("lines omitted"));
+        let path = task.output_file.clone().unwrap();
+        assert!(rendered.ends_with(&format!("300000\n\nFull output: {}", path.display())));
+
+        let expected: String = (1..=300_000).map(|i| format!("{i}\n")).collect();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// #442: stdout used to be read to EOF before stderr, so a child that
+    /// filled the stderr pipe blocked forever. Both pipes now drain together.
+    #[tokio::test]
+    async fn background_drains_stderr_while_stdout_is_open() {
+        let spill_dir = tempfile::tempdir().unwrap();
+        let task = run_background_to_completion(
+            "head -c 300000 /dev/zero | tr '\\0' x >&2; echo done",
+            spill_dir.path(),
+        )
+        .await;
+        assert_eq!(task.status, claurst_core::tasks::TaskStatus::Completed);
+        assert!(task.output.iter().any(|l| l == "done"));
+    }
+
+    const ENV_PROBE: &str = "echo \"$PAGER $GIT_PAGER $GH_PAGER $GIT_TERMINAL_PROMPT $CLAURST $AGENT ${TERM:+term}\"";
+
+    /// #442: the PTY child runs with pagers off, no git prompts, the agent
+    /// markers, and a TERM.
+    #[tokio::test]
+    async fn pty_child_gets_pager_free_agent_env() {
+        let state = parking_lot::Mutex::new(ShellState::new());
+        let spill_dir = tempfile::tempdir().unwrap();
+        let result = run_pty_foreground(
+            ENV_PROBE,
+            &state,
+            &std::env::temp_dir(),
+            Duration::from_secs(30),
+            30_000,
+            spill_dir.path(),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(result.content, "cat cat cat 0 1 1 term");
+    }
+
+    /// #442: background children get the same environment.
+    #[tokio::test]
+    async fn background_child_gets_pager_free_agent_env() {
+        let spill_dir = tempfile::tempdir().unwrap();
+        let task = run_background_to_completion(ENV_PROBE, spill_dir.path()).await;
+        assert_eq!(task.output, vec!["cat cat cat 0 1 1 term".to_string()]);
+    }
+
     /// Regression test for #184: a tool command that spawns a child which
     /// detaches into its own session (`setsid`) inherits the pty slave. The
     /// read loop must stop once the *direct* child exits instead of blocking on
@@ -1155,9 +1643,15 @@ mod windows_tests {
     async fn dropping_the_future_kills_the_process_tree() {
         let cwd = std::env::temp_dir();
         let command = format!("ping -n {MARKER}");
+        let spill_dir = tempfile::tempdir().unwrap();
         // Boxed (not `tokio::pin!`) so `drop(fut)` really drops the future.
-        let mut fut =
-            Box::pin(run_windows_fallback(&command, &cwd, Duration::from_secs(120), 120_000));
+        let mut fut = Box::pin(run_windows_fallback(
+            &command,
+            &cwd,
+            Duration::from_secs(120),
+            120_000,
+            spill_dir.path(),
+        ));
 
         // Let the command start, then confirm both cmd.exe and ping.exe are up.
         tokio::select! {

@@ -21,6 +21,7 @@ use std::sync::Arc;
 // Sub-modules – each contains a full tool implementation.
 pub mod ask_user;
 pub mod pty_bash;
+mod output_spill;
 pub mod brief;
 pub mod config_tool;
 pub mod cron;
@@ -38,6 +39,7 @@ pub mod glob_tool;
 pub mod grep_tool;
 pub mod lsp_tool;
 pub mod mcp_resources;
+pub mod mcp_tool;
 pub mod todo_write;
 pub mod notebook_edit;
 pub mod powershell;
@@ -78,6 +80,7 @@ pub use glob_tool::GlobTool;
 pub use grep_tool::GrepTool;
 pub use lsp_tool::LspTool;
 pub use mcp_resources::{ListMcpResourcesTool, ReadMcpResourceTool};
+pub use mcp_tool::{mcp_tools, McpToolWrapper};
 pub use todo_write::TodoWriteTool;
 pub use notebook_edit::NotebookEditTool;
 pub use powershell::PowerShellTool;
@@ -575,6 +578,13 @@ impl ToolContext {
         is_read_only: bool,
         path: Option<PathBuf>,
     ) -> PermissionRequest {
+        let mut allowed_roots = self.permission_allowed_roots();
+        if is_read_only {
+            // Spilled tool output (#442) is claurst's own data, referenced by
+            // a `Full output: <path>` trailer: reading it back never prompts.
+            // Read-only requests only, so it never widens what can be written.
+            allowed_roots.push(claurst_core::paths::tool_output_dir());
+        }
         PermissionRequest {
             tool_name: tool_name.to_string(),
             description: description.to_string(),
@@ -582,7 +592,7 @@ impl ToolContext {
             is_read_only,
             path: path.map(|p| p.display().to_string()),
             working_dir: Some(self.working_dir.clone()),
-            allowed_roots: self.permission_allowed_roots(),
+            allowed_roots,
             context_description: None,
         }
     }
@@ -998,6 +1008,19 @@ mod tests {
             user_question_tx: None,
             cancel_token: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    /// #442: the spill directory is an allowed root for reads only.
+    #[test]
+    fn spill_dir_is_a_read_only_permission_root() {
+        let ctx = test_tool_context(Arc::new(AskPermissionHandler {
+            reason: String::new(),
+        }));
+        let spill_dir = claurst_core::paths::tool_output_dir();
+        let read = ctx.build_permission_request("Read", "read", None, true, None);
+        assert!(read.allowed_roots.contains(&spill_dir));
+        let write = ctx.build_permission_request("Write", "write", None, false, None);
+        assert!(!write.allowed_roots.contains(&spill_dir));
     }
 
     // ---- Tool registry tests ------------------------------------------------

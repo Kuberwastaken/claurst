@@ -19,8 +19,8 @@
 //! | `session/request_permission` | A → C      | Tool approval dialog                        |
 //!
 //! Per-session MCP server configs supplied via `session/new` are accepted
-//! but currently ignored in favour of the global `settings.json` MCP roster.
-//! This will be resolved as part of the planned unified MCP routing work
+//! but currently ignored in favour of the MCP servers configured in the
+//! settings for the session's working directory. This will be resolved as part of the planned unified MCP routing work
 //! (see `src-rust/plan/migration-todo.md`).
 
 mod connection;
@@ -30,7 +30,8 @@ mod runtime;
 mod server;
 mod sessions;
 
-use std::sync::Arc;
+#[cfg(test)]
+mod e2e_tests;
 
 use tokio::sync::mpsc;
 use tracing::{error, info};
@@ -40,19 +41,17 @@ pub use runtime::AgentRuntime;
 pub use server::AgentServer;
 
 /// Run the ACP server on the current process' stdin / stdout. Returns when
-/// stdin reaches EOF or when the runtime fails to initialize.
+/// stdin reaches EOF.
 pub async fn run_acp_server() -> anyhow::Result<()> {
     // We must NEVER write to stdout outside the protocol — every byte on
     // stdout is parsed by the client as JSON-RPC. Force logs to stderr.
     install_stderr_tracing();
 
-    let working_dir = std::env::current_dir()?;
-    info!(cwd = %working_dir.display(), version = env!("CARGO_PKG_VERSION"), "ACP: starting server");
+    info!(version = env!("CARGO_PKG_VERSION"), "ACP: starting server");
 
-    let runtime = AgentRuntime::build(working_dir).await?;
-    let runtime = Arc::new(runtime);
+    // Runtimes are built per session working directory on `session/new`.
     let connection = Connection::new(tokio::io::stdout());
-    let server = AgentServer::new(connection.clone(), runtime);
+    let server = AgentServer::new(connection.clone());
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let reader_fut = connection::run_reader(connection, tokio::io::stdin(), tx);

@@ -6,14 +6,16 @@
 // Auth: Bearer token obtained via the Codex OAuth flow stored in
 //   ~/.claurst/codex_tokens.json (`CodexTokens` struct).
 //
-// Token refresh: if `expires_at` is in the past we POST to the OpenAI token
-//   endpoint with `grant_type=refresh_token` before making the request.
+// Token refresh: when the access token (JWT `exp`, else the stored
+//   `expires_at`) expires within `REFRESH_WINDOW_SECS` we POST to the OpenAI
+//   token endpoint with `grant_type=refresh_token` before making the request,
+//   matching the official client's 5-minute proactive refresh window.
 //
 // Model list: static — the Codex endpoint does not expose a /models route,
 //   so we use the `CODEX_MODELS` constant from `claurst-core`.
 
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_stream::stream;
@@ -21,6 +23,7 @@ use async_trait::async_trait;
 use claurst_core::codex_oauth::{
     CODEX_API_ENDPOINT, CODEX_MODELS, CODEX_TOKEN_URL, DEFAULT_CODEX_MODEL,
 };
+use claurst_core::accounts::jwt_identity;
 use claurst_core::oauth_config::{get_codex_tokens, save_codex_tokens, CodexTokens};
 use claurst_core::provider_id::{ModelId, ProviderId};
 use claurst_core::types::UsageInfo;
@@ -43,6 +46,44 @@ use crate::providers::copilot::CopilotProvider;
 // CodexProvider
 // ---------------------------------------------------------------------------
 
+/// Refresh the access token this many seconds before it expires (the official
+/// client's `CHATGPT_ACCESS_TOKEN_REFRESH_WINDOW_MINUTES` = 5).
+const REFRESH_WINDOW_SECS: u64 = 5 * 60;
+
+/// Process-wide refresh guard (the official client's `AuthManager.refresh_lock`).
+/// Refresh tokens are single-use and the query path builds a fresh
+/// `CodexProvider` per request, so the lock cannot live on the instance.
+static REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// OAuth error codes meaning the refresh token is permanently unusable
+/// (official `classify_refresh_token_failure`).
+fn is_permanent_refresh_failure(status: u16, body: &str) -> bool {
+    let code = serde_json::from_str::<Value>(body).ok().and_then(|v| {
+        v.pointer("/error/code")
+            .or_else(|| v.get("error"))
+            .or_else(|| v.get("code"))
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase)
+    });
+    status == 401
+        || matches!(
+            code.as_deref(),
+            Some(
+                "invalid_grant"
+                    | "refresh_token_expired"
+                    | "refresh_token_reused"
+                    | "refresh_token_invalidated"
+            )
+        )
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub struct CodexProvider {
     id: ProviderId,
     http_client: reqwest::Client,
@@ -51,7 +92,12 @@ pub struct CodexProvider {
 }
 
 impl CodexProvider {
-    pub fn new(tokens: CodexTokens) -> Self {
+    pub fn new(mut tokens: CodexTokens) -> Self {
+        // Token files written before the claim name was fixed carry no
+        // account id; derive it so `ChatGPT-Account-Id` is still sent.
+        if tokens.account_id.is_none() {
+            tokens.account_id = jwt_identity(&tokens.access_token).account_id;
+        }
         let http_client = reqwest::Client::builder()
             .timeout(crate::request_timeout())
             .build()
@@ -77,31 +123,51 @@ impl CodexProvider {
     // Token management
     // -----------------------------------------------------------------------
 
-    fn is_expired(tokens: &CodexTokens) -> bool {
-        let Some(expires_at) = tokens.expires_at else {
-            return false; // No expiry info — assume still valid.
-        };
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // Treat as expired 60 s early to avoid races.
-        now + 60 >= expires_at
+    /// True when the access token expires within `REFRESH_WINDOW_SECS` of
+    /// `now`. Tokens with no known expiry are treated as valid.
+    fn is_expired(tokens: &CodexTokens, now: u64) -> bool {
+        tokens
+            .access_token_expiry()
+            .is_some_and(|expires_at| now.saturating_add(REFRESH_WINDOW_SECS) >= expires_at)
+    }
+
+    /// Snapshot `(access_token, expired, refresh_token)` under the token lock.
+    fn token_state(&self) -> (String, bool, Option<String>) {
+        let guard = self.tokens.lock().unwrap_or_else(PoisonError::into_inner);
+        (
+            guard.access_token.clone(),
+            Self::is_expired(&guard, unix_now()),
+            guard.refresh_token.clone(),
+        )
     }
 
     /// Return the current access token, refreshing first if it is expired.
     async fn access_token(&self) -> Result<String, ProviderError> {
-        // Check expiry under the lock; clone what we need; release.
-        let (token, needs_refresh, refresh_token) = {
-            let guard = self.tokens.lock().unwrap();
-            let expired = Self::is_expired(&guard);
-            (
-                guard.access_token.clone(),
-                expired,
-                guard.refresh_token.clone(),
-            )
-        };
+        let (token, needs_refresh, _) = self.token_state();
+        if !needs_refresh {
+            return Ok(token);
+        }
 
+        // Under the process-wide lock, reload from disk: another provider
+        // instance (subagent, cron, a previous request) may already have
+        // refreshed and spent the single-use refresh token. Adopt its result
+        // instead of refreshing again (official `manager.rs` guarded reload).
+        let _refresh_guard = REFRESH_LOCK.lock().await;
+        if let Some(stored) = get_codex_tokens() {
+            if stored.access_token != token
+                && !stored.access_token.is_empty()
+                && !Self::is_expired(&stored, unix_now())
+            {
+                let fresh = stored.access_token.clone();
+                let mut guard = self.tokens.lock().unwrap_or_else(PoisonError::into_inner);
+                *guard = stored;
+                if guard.account_id.is_none() {
+                    guard.account_id = jwt_identity(&guard.access_token).account_id;
+                }
+                return Ok(fresh);
+            }
+        }
+        let (token, needs_refresh, refresh_token) = self.token_state();
         if !needs_refresh {
             return Ok(token);
         }
@@ -146,6 +212,14 @@ impl CodexProvider {
         })?;
 
         if !(200..300).contains(&(status as usize)) {
+            if is_permanent_refresh_failure(status, &text) {
+                return Err(ProviderError::AuthFailed {
+                    provider: self.id.clone(),
+                    message: "Codex refresh token was rejected (expired, revoked, or already \
+                              used); run /connect to sign in again"
+                        .to_string(),
+                });
+            }
             return Err(ProviderError::Other {
                 provider: self.id.clone(),
                 message: format!("Token refresh failed (HTTP {})", status),
@@ -181,19 +255,15 @@ impl CodexProvider {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        let expires_in = json_val.get("expires_in").and_then(|v| v.as_u64());
-
-        let new_expires_at = expires_in.map(|secs| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
-                + secs
-        });
+        let new_expires_at = claurst_core::oauth_config::codex_expires_at(
+            json_val.get("expires_in").and_then(|v| v.as_u64()),
+            &new_access,
+            unix_now(),
+        );
 
         // Persist and cache the refreshed tokens.
         let mut updated = {
-            let guard = self.tokens.lock().unwrap();
+            let guard = self.tokens.lock().unwrap_or_else(PoisonError::into_inner);
             guard.clone()
         };
         updated.access_token = new_access.clone();
@@ -201,13 +271,21 @@ impl CodexProvider {
             updated.refresh_token = Some(r);
         }
         updated.expires_at = new_expires_at;
+        if let Some(account_id) = json_val
+            .get("id_token")
+            .and_then(|v| v.as_str())
+            .and_then(|id_token| jwt_identity(id_token).account_id)
+            .or_else(|| jwt_identity(&new_access).account_id)
+        {
+            updated.account_id = Some(account_id);
+        }
 
         if let Err(e) = save_codex_tokens(&updated) {
             warn!("Failed to persist refreshed Codex tokens: {}", e);
         }
 
         {
-            let mut guard = self.tokens.lock().unwrap();
+            let mut guard = self.tokens.lock().unwrap_or_else(PoisonError::into_inner);
             *guard = updated;
         }
 
@@ -218,44 +296,76 @@ impl CodexProvider {
     // Request helpers
     // -----------------------------------------------------------------------
 
+    /// Auth and routing headers for a Codex request. `body` supplies the
+    /// `session-id` header: ChatGPT derives prompt-cache affinity from it, and
+    /// the official client sets it to the same value as `prompt_cache_key`.
     fn codex_headers(
         &self,
         builder: reqwest::RequestBuilder,
         token: &str,
         account_id: Option<&str>,
+        body: &Value,
     ) -> reqwest::RequestBuilder {
-        let builder = builder
+        let mut builder = builder
             .bearer_auth(token)
             .header("User-Agent", concat!("claurst/", env!("CARGO_PKG_VERSION")));
 
         if let Some(id) = account_id {
-            builder.header("ChatGPT-Account-Id", id)
-        } else {
-            builder
+            builder = builder.header("ChatGPT-Account-Id", id);
         }
+        if let Some(session_id) = body.get("prompt_cache_key").and_then(Value::as_str) {
+            builder = builder.header("session-id", session_id);
+        }
+        builder
+    }
+
+    /// Parse the `x-codex-{primary,secondary}-used-percent` headers (official
+    /// `codex-api/src/rate_limits.rs`). `None` when neither is present.
+    fn parse_rate_limits(headers: &reqwest::header::HeaderMap) -> Option<StreamEvent> {
+        let used = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|pct| pct.is_finite())
+        };
+        let primary_used_percent = used("x-codex-primary-used-percent");
+        let secondary_used_percent = used("x-codex-secondary-used-percent");
+        if primary_used_percent.is_none() && secondary_used_percent.is_none() {
+            return None;
+        }
+        Some(StreamEvent::RateLimits {
+            primary_used_percent,
+            secondary_used_percent,
+        })
     }
 
     fn account_id(&self) -> Option<String> {
-        self.tokens.lock().unwrap().account_id.clone()
-    }
-
-    fn system_prompt_to_text(request: &ProviderRequest) -> String {
-        match request.system_prompt.as_ref() {
-            Some(crate::provider_types::SystemPrompt::Text(text)) => text.clone(),
-            Some(crate::provider_types::SystemPrompt::Blocks(blocks)) => blocks
-                .iter()
-                .map(|b| b.text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n"),
-            None => String::new(),
-        }
+        self.tokens.lock().unwrap_or_else(PoisonError::into_inner).account_id.clone()
     }
 
     /// Build the Responses-API request body for Codex.
     fn build_responses_body(request: &ProviderRequest) -> Value {
         // Re-use the same message translation that the Copilot provider uses.
-        let input = CopilotProvider::to_responses_input_pub(request);
-        let instructions = Self::system_prompt_to_text(request);
+        // It emits the system prompt as a leading `role: system` input item;
+        // the official client sends base instructions exactly once, as an
+        // `input[0]` developer message with no top-level `instructions`.
+        let mut input = CopilotProvider::to_responses_input_pub(request);
+        if let Some(first) = input.first_mut() {
+            if first.get("role").and_then(Value::as_str) == Some("system") {
+                first["role"] = json!("developer");
+            }
+        }
+        // The official client only replays reasoning items that carry
+        // `encrypted_content`; a summary-only item cannot be resumed by a
+        // store:false backend, so drop those.
+        input.retain(|item| {
+            item.get("type").and_then(Value::as_str) != Some("reasoning")
+                || item
+                    .get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|data| !data.is_empty())
+        });
 
         let tools: Vec<Value> = request
             .tools
@@ -274,7 +384,6 @@ impl CodexProvider {
         let mut body = json!({
             "model": request.model,
             "input": input,
-            "instructions": instructions,
             "store": false,
         });
 
@@ -328,7 +437,7 @@ impl CodexProvider {
             .post(CODEX_API_ENDPOINT)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json");
-        let builder = self.codex_headers(builder, &token, account_id.as_deref());
+        let builder = self.codex_headers(builder, &token, account_id.as_deref(), &body);
 
         let resp = builder
             .json(&body)
@@ -378,7 +487,7 @@ impl CodexProvider {
             .post(CODEX_API_ENDPOINT)
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream");
-        let builder = self.codex_headers(builder, &token, account_id.as_deref());
+        let builder = self.codex_headers(builder, &token, account_id.as_deref(), &body);
 
         let resp = builder
             .json(&body)
@@ -473,6 +582,15 @@ impl CodexProvider {
                             });
                         }
                     }
+                    if let Some(data) = item
+                        .get("encrypted_content")
+                        .and_then(|v| v.as_str())
+                        .filter(|data| !data.is_empty())
+                    {
+                        content.push(ContentBlock::RedactedThinking {
+                            data: data.to_string(),
+                        });
+                    }
                 }
                 Some("function_call") => {
                     has_tool_call = true;
@@ -543,39 +661,22 @@ impl CodexProvider {
         })
     }
 
-}
-
-// ---------------------------------------------------------------------------
-// LlmProvider impl
-// ---------------------------------------------------------------------------
-
-#[async_trait]
-impl LlmProvider for CodexProvider {
-    fn id(&self) -> &ProviderId {
-        &self.id
-    }
-
-    fn name(&self) -> &str {
-        "OpenAI Codex"
-    }
-
-    async fn create_message(
-        &self,
-        request: ProviderRequest,
-    ) -> Result<ProviderResponse, ProviderError> {
-        self.send_responses_request(&request).await
-    }
-
-    async fn create_message_stream(
-        &self,
-        request: ProviderRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
+    /// Decode a Codex Responses SSE byte stream into `StreamEvent`s.
+    /// `rate_limits` (parsed from the response headers) is emitted first.
+    fn sse_events<S, B, E>(
+        mut byte_stream: S,
+        provider_id: ProviderId,
+        rate_limits: Option<StreamEvent>,
+    ) -> impl Stream<Item = Result<StreamEvent, ProviderError>> + Send
+    where
+        S: Stream<Item = Result<B, E>> + Unpin + Send,
+        B: AsRef<[u8]> + Send,
+        E: std::fmt::Display + Send,
     {
-        let resp = self.send_responses_streaming_request(&request).await?;
-        let provider_id = self.id.clone();
-
-        let s = stream! {
-            let mut byte_stream = resp.bytes_stream();
+        stream! {
+            if let Some(event) = rate_limits {
+                yield Ok(event);
+            }
             let mut leftover = String::new();
             let mut current_event = String::new();
             let mut current_data: Vec<String> = Vec::new();
@@ -598,7 +699,7 @@ impl LlmProvider for CodexProvider {
                     }
                 };
 
-                let text = String::from_utf8_lossy(&chunk);
+                let text = String::from_utf8_lossy(chunk.as_ref());
                 let combined = if leftover.is_empty() {
                     text.to_string()
                 } else {
@@ -793,12 +894,72 @@ impl LlmProvider for CodexProvider {
                                     });
                                 }
                             }
+                            "response.reasoning_summary_part.added" => {
+                                // Separate consecutive summary parts like the
+                                // official client's transcript does.
+                                let summary_index = json_val
+                                    .get("summary_index")
+                                    .and_then(|value| value.as_u64())
+                                    .unwrap_or(0);
+                                if summary_index > 0 {
+                                    let output_index = json_val
+                                        .get("output_index")
+                                        .and_then(|value| value.as_u64())
+                                        .unwrap_or(0) as usize;
+                                    yield Ok(StreamEvent::ThinkingDelta {
+                                        index: output_index,
+                                        thinking: "\n\n".to_string(),
+                                    });
+                                }
+                            }
+                            "response.reasoning_summary_text.delta" => {
+                                let output_index = json_val
+                                    .get("output_index")
+                                    .and_then(|value| value.as_u64())
+                                    .unwrap_or(0) as usize;
+                                let delta = json_val
+                                    .get("delta")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or("");
+                                if !message_started {
+                                    yield Ok(StreamEvent::MessageStart {
+                                        id: message_id.clone(),
+                                        model: model_name.clone(),
+                                        usage: UsageInfo::default(),
+                                    });
+                                    message_started = true;
+                                }
+                                if !delta.is_empty() {
+                                    yield Ok(StreamEvent::ThinkingDelta {
+                                        index: output_index,
+                                        thinking: delta.to_string(),
+                                    });
+                                }
+                            }
                             "response.output_item.done" => {
                                 let output_index = json_val
                                     .get("output_index")
                                     .and_then(|value| value.as_u64())
                                     .unwrap_or(0) as usize;
                                 if open_blocks.remove(&output_index) {
+                                    yield Ok(StreamEvent::ContentBlockStop { index: output_index });
+                                }
+                                // Carry the reasoning item's encrypted state so
+                                // the next (stateless, store:false) request can
+                                // replay it and the model keeps its chain.
+                                if let Some(data) = json_val
+                                    .get("item")
+                                    .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("reasoning"))
+                                    .and_then(|item| item.get("encrypted_content"))
+                                    .and_then(|value| value.as_str())
+                                    .filter(|data| !data.is_empty())
+                                {
+                                    yield Ok(StreamEvent::ContentBlockStart {
+                                        index: output_index,
+                                        content_block: claurst_core::types::ContentBlock::RedactedThinking {
+                                            data: data.to_string(),
+                                        },
+                                    });
                                     yield Ok(StreamEvent::ContentBlockStop { index: output_index });
                                 }
                             }
@@ -900,9 +1061,43 @@ impl LlmProvider for CodexProvider {
                 message: "Codex stream ended before response.completed".to_string(),
                 partial_response: None,
             });
-        };
+        }
+    }
+}
 
-        Ok(Box::pin(s))
+// ---------------------------------------------------------------------------
+// LlmProvider impl
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl LlmProvider for CodexProvider {
+    fn id(&self) -> &ProviderId {
+        &self.id
+    }
+
+    fn name(&self) -> &str {
+        "OpenAI Codex"
+    }
+
+    async fn create_message(
+        &self,
+        request: ProviderRequest,
+    ) -> Result<ProviderResponse, ProviderError> {
+        self.send_responses_request(&request).await
+    }
+
+    async fn create_message_stream(
+        &self,
+        request: ProviderRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
+    {
+        let resp = self.send_responses_streaming_request(&request).await?;
+        let rate_limits = Self::parse_rate_limits(resp.headers());
+        Ok(Box::pin(Self::sse_events(
+            resp.bytes_stream(),
+            self.id.clone(),
+            rate_limits,
+        )))
     }
 
     async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
@@ -928,13 +1123,13 @@ impl LlmProvider for CodexProvider {
 
     async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
         // Validate that a non-expired token exists without making a network call.
-        let guard = self.tokens.lock().unwrap();
+        let guard = self.tokens.lock().unwrap_or_else(PoisonError::into_inner);
         if guard.access_token.is_empty() {
             return Ok(ProviderStatus::Unavailable {
                 reason: "no Codex access token — run /connect to authenticate".to_string(),
             });
         }
-        if Self::is_expired(&guard) && guard.refresh_token.is_none() {
+        if Self::is_expired(&guard, unix_now()) && guard.refresh_token.is_none() {
             return Ok(ProviderStatus::Unavailable {
                 reason: "Codex access token expired and no refresh token — re-run /connect"
                     .to_string(),
@@ -956,5 +1151,290 @@ impl LlmProvider for CodexProvider {
             structured_output: false,
             system_prompt_style: SystemPromptStyle::SystemMessage,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+
+    fn jwt(payload: Value) -> String {
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string());
+        format!("h.{b64}.s")
+    }
+
+    fn request(system: Option<&str>) -> ProviderRequest {
+        ProviderRequest {
+            model: "gpt-5.5".to_string(),
+            messages: vec![claurst_core::types::Message::user("hi")],
+            system_prompt: system
+                .map(|text| crate::provider_types::SystemPrompt::Text(text.to_string())),
+            tools: Vec::new(),
+            max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: Vec::new(),
+            thinking: None,
+            provider_options: json!({}),
+        }
+    }
+
+    #[test]
+    fn body_sends_system_prompt_once_as_developer_message() {
+        let body = CodexProvider::build_responses_body(&request(Some("SYSTEM PROMPT")));
+        assert!(body.get("instructions").is_none());
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input[0]["content"][0]["text"], "SYSTEM PROMPT");
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(body.to_string().matches("SYSTEM PROMPT").count(), 1);
+
+        let body = CodexProvider::build_responses_body(&request(None));
+        assert_eq!(body["input"][0]["role"], "user");
+    }
+
+    #[test]
+    fn prompt_cache_key_option_reaches_body() {
+        let mut req = request(None);
+        req.provider_options = json!({ "prompt_cache_key": "session-abc" });
+        let body = CodexProvider::build_responses_body(&req);
+        assert_eq!(body["prompt_cache_key"], "session-abc");
+    }
+
+    #[tokio::test]
+    async fn sse_fixture_yields_reasoning_summary_encrypted_state_and_tool_call() {
+        use claurst_core::types::ContentBlock;
+        let fixture = include_str!("fixtures/codex_reasoning_tool_call.sse");
+        // Odd-sized chunks exercise the partial-line carry-over.
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> = fixture
+            .as_bytes()
+            .chunks(37)
+            .map(|chunk| Ok(chunk.to_vec()))
+            .collect();
+        let rate_limits = Some(StreamEvent::RateLimits {
+            primary_used_percent: Some(10.0),
+            secondary_used_percent: None,
+        });
+        let events: Vec<StreamEvent> = CodexProvider::sse_events(
+            futures::stream::iter(chunks),
+            ProviderId::new(ProviderId::CODEX),
+            rate_limits,
+        )
+        .map(|event| event.expect("fixture stream has no errors"))
+        .collect()
+        .await;
+
+        assert!(matches!(events.first(), Some(StreamEvent::RateLimits { .. })));
+        assert!(matches!(events.last(), Some(StreamEvent::MessageStop)));
+
+        let thinking: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ThinkingDelta { thinking, .. } => Some(thinking.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking, "**Inspecting the repo**\n\nListing files first.");
+
+        let encrypted: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockStart {
+                    content_block: ContentBlock::RedactedThinking { data },
+                    ..
+                } => Some(data.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(encrypted, ["gAAAAABo-ENCRYPTED-REASONING-STATE=="]);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockStart {
+                index: 1,
+                content_block: ContentBlock::ToolUse { id, name, .. },
+            } if id == "call_42" && name == "Bash"
+        )));
+        let args: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::InputJsonDelta { partial_json, .. } => Some(partial_json.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(args, r#"{"command":"ls"}"#);
+
+        let Some(StreamEvent::MessageDelta {
+            stop_reason: Some(StopReason::ToolUse),
+            usage: Some(usage),
+        }) = events.iter().rev().nth(1)
+        else {
+            panic!("expected a tool-use MessageDelta before MessageStop");
+        };
+        assert_eq!(usage.input_tokens, 1200);
+        assert_eq!(usage.cache_read_input_tokens, 1024);
+    }
+
+    #[test]
+    fn body_replays_encrypted_reasoning_and_drops_summary_only_items() {
+        use claurst_core::types::{ContentBlock, Message, ToolResultContent};
+        let mut req = request(None);
+        req.messages = vec![
+            Message::user("list files"),
+            Message::assistant_blocks(vec![
+                ContentBlock::Thinking {
+                    thinking: "Listing files first.".into(),
+                    signature: String::new(),
+                },
+                ContentBlock::RedactedThinking {
+                    data: "ENC-1".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call_42".into(),
+                    name: "Bash".into(),
+                    input: json!({ "command": "ls" }),
+                    thought_signature: None,
+                },
+            ]),
+            Message::user_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "call_42".into(),
+                content: ToolResultContent::Text("a.rs".into()),
+                is_error: None,
+            }]),
+            Message::assistant_blocks(vec![
+                ContentBlock::Thinking {
+                    thinking: "summary without state".into(),
+                    signature: String::new(),
+                },
+                ContentBlock::Text {
+                    text: "done".into(),
+                },
+            ]),
+        ];
+        let body = CodexProvider::build_responses_body(&req);
+        let input = body["input"].as_array().unwrap();
+        let types: Vec<&str> = input
+            .iter()
+            .map(|item| item["type"].as_str().or(item["role"].as_str()).unwrap_or(""))
+            .collect();
+        assert_eq!(
+            types,
+            ["user", "reasoning", "function_call", "function_call_output", "assistant"]
+        );
+        assert_eq!(input[1]["encrypted_content"], "ENC-1");
+        assert_eq!(input[1]["summary"][0]["text"], "Listing files first.");
+    }
+
+    #[test]
+    fn parses_codex_rate_limit_headers() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut headers = HeaderMap::new();
+        headers.insert("x-codex-primary-used-percent", HeaderValue::from_static("12.5"));
+        headers.insert("x-codex-primary-window-minutes", HeaderValue::from_static("300"));
+        headers.insert("x-codex-secondary-used-percent", HeaderValue::from_static("71"));
+        match CodexProvider::parse_rate_limits(&headers) {
+            Some(StreamEvent::RateLimits {
+                primary_used_percent,
+                secondary_used_percent,
+            }) => {
+                assert_eq!(primary_used_percent, Some(12.5));
+                assert_eq!(secondary_used_percent, Some(71.0));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let mut partial = HeaderMap::new();
+        partial.insert("x-codex-secondary-used-percent", HeaderValue::from_static("garbage"));
+        assert!(CodexProvider::parse_rate_limits(&partial).is_none());
+        assert!(CodexProvider::parse_rate_limits(&HeaderMap::new()).is_none());
+    }
+
+    #[test]
+    fn new_derives_account_id_from_access_token_claim() {
+        let provider = CodexProvider::new(CodexTokens {
+            access_token: jwt(json!({
+                "https://api.openai.com/auth": { "chatgpt_account_id": "ws_123" }
+            })),
+            ..Default::default()
+        });
+        assert_eq!(provider.account_id().as_deref(), Some("ws_123"));
+    }
+
+    #[tokio::test]
+    async fn access_token_adopts_fresh_tokens_refreshed_by_another_instance() {
+        let home = std::env::temp_dir().join(format!("claurst-codex-{}", uuid::Uuid::new_v4()));
+        let prev_home = std::env::var_os("CLAURST_HOME");
+        std::env::set_var("CLAURST_HOME", &home);
+
+        let stale = CodexProvider::new(CodexTokens {
+            access_token: jwt(json!({ "exp": 1 })),
+            refresh_token: Some("spent-refresh-token".into()),
+            ..Default::default()
+        });
+        let fresh_access = jwt(json!({ "exp": unix_now() + 3_600 }));
+        let saved = claurst_core::oauth_config::save_codex_tokens_and_register(
+            &CodexTokens {
+                access_token: fresh_access.clone(),
+                refresh_token: Some("new-refresh-token".into()),
+                ..Default::default()
+            },
+            None,
+        );
+        // No network: the expired in-memory token must be replaced by the
+        // one on disk without POSTing the spent refresh token.
+        let token = stale.access_token().await;
+
+        match prev_home {
+            Some(v) => std::env::set_var("CLAURST_HOME", v),
+            None => std::env::remove_var("CLAURST_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+
+        saved.unwrap();
+        assert_eq!(token.unwrap(), fresh_access);
+        assert_eq!(
+            stale.tokens.lock().unwrap().refresh_token.as_deref(),
+            Some("new-refresh-token")
+        );
+    }
+
+    #[test]
+    fn classifies_permanent_refresh_failures() {
+        assert!(is_permanent_refresh_failure(400, r#"{"error":"invalid_grant"}"#));
+        assert!(is_permanent_refresh_failure(
+            400,
+            r#"{"error":{"code":"refresh_token_reused","message":"x"}}"#
+        ));
+        assert!(is_permanent_refresh_failure(401, ""));
+        assert!(!is_permanent_refresh_failure(500, r#"{"error":"server_error"}"#));
+        assert!(!is_permanent_refresh_failure(400, "not json"));
+    }
+
+    #[test]
+    fn is_expired_uses_jwt_exp_with_five_minute_window() {
+        let tokens = CodexTokens {
+            access_token: jwt(json!({ "exp": 10_000 })),
+            ..Default::default()
+        };
+        assert!(!CodexProvider::is_expired(&tokens, 10_000 - REFRESH_WINDOW_SECS - 1));
+        assert!(CodexProvider::is_expired(&tokens, 10_000 - REFRESH_WINDOW_SECS));
+        assert!(CodexProvider::is_expired(&tokens, 20_000));
+    }
+
+    #[test]
+    fn is_expired_falls_back_to_stored_expiry_then_valid() {
+        let stored = CodexTokens {
+            access_token: "opaque".into(),
+            expires_at: Some(1_000),
+            ..Default::default()
+        };
+        assert!(CodexProvider::is_expired(&stored, 900));
+        let unknown = CodexTokens {
+            access_token: "opaque".into(),
+            ..Default::default()
+        };
+        assert!(!CodexProvider::is_expired(&unknown, u64::MAX - 1));
     }
 }

@@ -185,6 +185,14 @@ pub enum StreamEvent {
         index: usize,
         reasoning: String,
     },
+
+    /// Subscription usage windows reported alongside the response (Codex
+    /// `x-codex-{primary,secondary}-used-percent` headers, 0-100). Primary is
+    /// the short (5 h) window, secondary the weekly one.
+    RateLimits {
+        primary_used_percent: Option<f32>,
+        secondary_used_percent: Option<f32>,
+    },
 }
 
 // ---------------------------------------------------------------------------

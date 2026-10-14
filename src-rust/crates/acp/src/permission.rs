@@ -1,52 +1,36 @@
-//! Bridge between Claurst's synchronous `PermissionHandler` trait and the
+//! Bridge between Claurst's synchronous permission checks and the
 //! asynchronous `session/request_permission` JSON-RPC round-trip used by ACP.
 //!
-//! The handler itself simply returns `Ask { reason }` for every permission
-//! check. That causes `ToolContext::request_permission_inner` to enqueue the
-//! request onto a shared `PendingPermissionStore` and block on a oneshot.
-//! A background task — spawned by `prompt::handle_prompt` — drains the queue,
-//! converts each pending request into a `session/request_permission` call to
-//! the connected client, and forwards the client's decision back through the
-//! oneshot to unblock the tool.
+//! Every tool check runs through the session's `PermissionManager` first
+//! (via `ManagedInteractivePermissionHandler`), exactly like the TUI: reads
+//! inside the workspace, allow rules and bypass mode resolve without asking
+//! anyone. Only a real `Ask` decision makes `ToolContext` enqueue the request
+//! onto the session's `PendingPermissionStore` and block on a oneshot. A
+//! background task — spawned by `prompt::handle` — drains the queue, sends
+//! each request to the client as `session/request_permission`, records an
+//! "Allow always" answer on the manager, and forwards the decision back
+//! through the oneshot to unblock the tool.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use agent_client_protocol_schema as acp;
-use claurst_core::permissions::{PermissionDecision, PermissionRequest};
-use claurst_core::PermissionHandler;
+use claurst_core::config::Settings;
+use claurst_core::permissions::{PermissionDecision, PermissionManager, PermissionRequest};
 use claurst_tools::{PendingPermissionStore, PendingPermissionRequest};
 use tracing::{debug, warn};
 
 use crate::connection::Connection;
 
-/// Permission handler that defers every decision to the ACP client.
-pub struct AcpPermissionHandler;
-
-impl PermissionHandler for AcpPermissionHandler {
-    fn check_permission(&self, _request: &PermissionRequest) -> PermissionDecision {
-        // Defer everything to interactive resolution.
-        PermissionDecision::Ask {
-            reason: String::new(),
-        }
-    }
-
-    fn request_permission(&self, request: &PermissionRequest) -> PermissionDecision {
-        let mut reason = format!("Tool '{}' requires approval", request.tool_name);
-        if let Some(detail) = &request.details {
-            reason.push_str(": ");
-            reason.push_str(detail);
-        }
-        PermissionDecision::Ask { reason }
-    }
-}
-
 /// Drain a single pending permission request, route it through the
 /// connection as `session/request_permission`, and fire the oneshot with
-/// the resulting decision.
+/// the resulting decision. A cancel of the prompt denies the request
+/// without waiting for the client, so the blocked tool unwinds.
 pub async fn forward_pending(
     connection: Arc<Connection>,
     session_id: acp::SessionId,
+    manager: Arc<Mutex<PermissionManager>>,
     pending: PendingPermissionRequest,
+    turn_cancel: tokio_util::sync::CancellationToken,
 ) {
     let PendingPermissionRequest {
         tool_use_id,
@@ -92,20 +76,37 @@ pub async fn forward_pending(
 
     let request_params = acp::RequestPermissionRequest::new(session_id, tool_call, options);
 
+    // The drainer does not watch the turn token, so the turn may already be
+    // cancelled here; never show the client a request for a dead turn.
+    if turn_cancel.is_cancelled() {
+        debug!(tool = %request.tool_name, "ACP permission: prompt already cancelled, denying");
+        let _ = decision_tx.send(PermissionDecision::Deny);
+        return;
+    }
+
     debug!(tool = %request.tool_name, "ACP permission: requesting from client");
-    let result = connection
-        .send_request::<_, acp::RequestPermissionResponse>(
+    let result = tokio::select! {
+        // Checked first so a cancel always wins over a ready send.
+        biased;
+        _ = turn_cancel.cancelled() => {
+            debug!(tool = %request.tool_name, "ACP permission: prompt cancelled, denying");
+            let _ = decision_tx.send(PermissionDecision::Deny);
+            return;
+        }
+        result = connection.send_request::<_, acp::RequestPermissionResponse>(
             "session/request_permission",
             request_params,
-        )
-        .await;
+        ) => result,
+    };
 
     let decision = match result {
         Ok(Ok(response)) => match response.outcome {
             acp::RequestPermissionOutcome::Selected(sel) => match sel.option_id.0.as_ref() {
                 "allow_once" => PermissionDecision::Allow,
-                "allow_always" => PermissionDecision::AllowPermanently,
-                "reject_always" => PermissionDecision::DenyPermanently,
+                "allow_always" => {
+                    remember_allow_always(&manager, &request);
+                    PermissionDecision::Allow
+                }
                 _ => PermissionDecision::Deny,
             },
             acp::RequestPermissionOutcome::Cancelled => PermissionDecision::Deny,
@@ -122,6 +123,34 @@ pub async fn forward_pending(
     };
 
     let _ = decision_tx.send(decision);
+}
+
+/// Record an "Allow always" answer the way the TUI does: a persistent allow
+/// rule saved to the global settings, scoped to the requested path when there
+/// is one. When the settings cannot be saved the rule is kept for the rest of
+/// the session instead.
+fn remember_allow_always(manager: &Mutex<PermissionManager>, request: &PermissionRequest) {
+    let Ok(mut manager) = manager.lock() else {
+        warn!(tool = %request.tool_name, "ACP permission: manager lock poisoned, allow-always not remembered");
+        return;
+    };
+    let pattern = request.path.as_deref().map(|path| format!("{path}*"));
+    let persisted = Settings::load_sync().and_then(|mut settings| {
+        match pattern.as_deref() {
+            Some(pattern) => {
+                manager.add_persistent_allow_path(&request.tool_name, pattern, &mut settings)
+            }
+            None => manager.add_persistent_allow(&request.tool_name, &mut settings),
+        }
+        .map_err(|e| anyhow::anyhow!("{e}"))
+    });
+    if let Err(e) = persisted {
+        warn!(error = %e, tool = %request.tool_name, "ACP permission: could not save allow-always, keeping it for this session");
+        match pattern.as_deref() {
+            Some(pattern) => manager.add_session_allow_path(&request.tool_name, pattern),
+            None => manager.add_session_allow(&request.tool_name),
+        }
+    }
 }
 
 /// Classify a Claurst tool name into an ACP `ToolKind` for client UI hints.
@@ -143,12 +172,15 @@ fn infer_tool_kind(request: &PermissionRequest) -> acp::ToolKind {
 
 /// Spawn a task that watches the shared `PendingPermissionStore` and
 /// forwards each enqueued request through the ACP connection. The task
-/// exits when `cancel` is fired or the connection drops.
+/// exits when `cancel` is fired or the connection drops; `turn_cancel` is
+/// the prompt's token, which denies requests still waiting on the client.
 pub fn spawn_drainer(
     connection: Arc<Connection>,
     session_id: acp::SessionId,
+    manager: Arc<Mutex<PermissionManager>>,
     store: Arc<parking_lot::Mutex<PendingPermissionStore>>,
     cancel: tokio_util::sync::CancellationToken,
+    turn_cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
@@ -163,11 +195,13 @@ pub fn spawn_drainer(
                 guard.queue.drain(..).collect()
             };
             for pending in popped {
-                let conn = connection.clone();
-                let sid = session_id.clone();
-                tokio::spawn(async move {
-                    forward_pending(conn, sid, pending).await;
-                });
+                tokio::spawn(forward_pending(
+                    connection.clone(),
+                    session_id.clone(),
+                    manager.clone(),
+                    pending,
+                    turn_cancel.clone(),
+                ));
             }
         }
     })
@@ -228,28 +262,5 @@ mod tests {
             infer_tool_kind(&request("SomeCustomMcpTool", false)),
             acp::ToolKind::Other
         );
-    }
-
-    #[test]
-    fn handler_check_permission_always_asks_with_empty_reason() {
-        let handler = AcpPermissionHandler;
-        let decision = handler.check_permission(&request("Bash", false));
-        assert!(matches!(decision, PermissionDecision::Ask { reason } if reason.is_empty()));
-    }
-
-    #[test]
-    fn handler_request_permission_includes_tool_name_and_detail() {
-        let handler = AcpPermissionHandler;
-        let mut req = request("Bash", false);
-        req.details = Some("rm -rf /tmp/x".to_string());
-
-        let decision = handler.request_permission(&req);
-        match decision {
-            PermissionDecision::Ask { reason } => {
-                assert!(reason.contains("Bash"));
-                assert!(reason.contains("rm -rf /tmp/x"));
-            }
-            other => panic!("expected Ask decision, got {other:?}"),
-        }
     }
 }

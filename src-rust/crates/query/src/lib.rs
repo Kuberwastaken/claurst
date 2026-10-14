@@ -283,6 +283,9 @@ pub enum QueryEvent {
     /// `state` is Warning (≥ 80 %) or Critical (≥ 95 %).
     /// `pct_used` is the fraction of the context window consumed (0.0–1.0).
     TokenWarning { state: TokenWarningState, pct_used: f64 },
+    /// Provider-reported subscription usage (0-100 per window), e.g. the
+    /// Codex `x-codex-*` rate-limit headers.
+    RateLimits { primary_used_percent: Option<f32>, secondary_used_percent: Option<f32> },
 }
 
 // ---------------------------------------------------------------------------
@@ -1061,12 +1064,25 @@ pub async fn run_query_loop(
                             effective_thinking_budget
                                 .map(claurst_api::ThinkingConfig::enabled)
                         },
-                        provider_options: build_provider_options(
-                            &provider_id_str,
-                            &model_id_str,
-                            effective_effort_level,
-                            effective_thinking_budget,
-                        ),
+                        provider_options: {
+                            let mut options = build_provider_options(
+                                &provider_id_str,
+                                &model_id_str,
+                                effective_effort_level,
+                                effective_thinking_budget,
+                            );
+                            // ChatGPT routes its prompt cache on a stable
+                            // per-session key (official client: session id).
+                            if matches!(provider_id_str.as_str(), "codex" | "openai-codex") {
+                                if let Some(map) = options.as_object_mut() {
+                                    map.insert(
+                                        "prompt_cache_key".to_string(),
+                                        serde_json::json!(tool_ctx.session_id),
+                                    );
+                                }
+                            }
+                            options
+                        },
                     };
 
                     // Use create_message_stream so the TUI receives real-time
@@ -1086,6 +1102,9 @@ pub async fn run_query_loop(
                     // Accumulate reasoning/thinking content for providers like
                     // DeepSeek that require reasoning_content to be sent back.
                     let mut thinking_chunks: Vec<String> = Vec::new();
+                    // Opaque reasoning state (Codex `encrypted_content`)
+                    // that must be replayed on the next request.
+                    let mut redacted_thinking_blocks: Vec<ContentBlock> = Vec::new();
                     // tool_call_blocks: index → (id, name, accumulated_json, thought_signature)
                     // thought_signature carries Gemini's opaque per-call signature
                     // through stream assembly so it survives into the persisted
@@ -1144,6 +1163,12 @@ pub async fn run_query_loop(
                                             } => {
                                                 tool_call_blocks.insert(*index, (id.clone(), name.clone(), String::new(), thought_signature.clone()));
                                             }
+                                            claurst_api::StreamEvent::ContentBlockStart {
+                                                content_block: block @ ContentBlock::RedactedThinking { .. },
+                                                ..
+                                            } => {
+                                                redacted_thinking_blocks.push(block.clone());
+                                            }
                                             claurst_api::StreamEvent::TextDelta { text, .. } => {
                                                 text_chunks.push(text.clone());
                                             }
@@ -1173,6 +1198,14 @@ pub async fn run_query_loop(
                                                 }
                                             }
                                             claurst_api::StreamEvent::MessageStop => break,
+                                            claurst_api::StreamEvent::RateLimits { primary_used_percent, secondary_used_percent } => {
+                                                if let Some(ref tx) = event_tx {
+                                                    let _ = tx.send(QueryEvent::RateLimits {
+                                                        primary_used_percent: *primary_used_percent,
+                                                        secondary_used_percent: *secondary_used_percent,
+                                                    });
+                                                }
+                                            }
                                             _ => {}
                                         }
                                     }
@@ -1245,6 +1278,7 @@ pub async fn run_query_loop(
                             signature: String::new(),
                         });
                     }
+                    content_blocks.append(&mut redacted_thinking_blocks);
 
                     let combined_text = text_chunks.join("");
                     if !combined_text.is_empty() {

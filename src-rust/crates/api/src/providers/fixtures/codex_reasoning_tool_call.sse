@@ -1,0 +1,39 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_0a1b","object":"response","status":"in_progress","model":"gpt-5.5","output":[]}}
+
+event: response.in_progress
+data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_0a1b","object":"response","status":"in_progress","model":"gpt-5.5","output":[]}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"id":"rs_0a1b","type":"reasoning","summary":[]}}
+
+event: response.reasoning_summary_part.added
+data: {"type":"response.reasoning_summary_part.added","sequence_number":3,"item_id":"rs_0a1b","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}
+
+event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","sequence_number":4,"item_id":"rs_0a1b","output_index":0,"summary_index":0,"delta":"**Inspecting the repo**"}
+
+event: response.reasoning_summary_part.added
+data: {"type":"response.reasoning_summary_part.added","sequence_number":5,"item_id":"rs_0a1b","output_index":0,"summary_index":1,"part":{"type":"summary_text","text":""}}
+
+event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","sequence_number":6,"item_id":"rs_0a1b","output_index":0,"summary_index":1,"delta":"Listing files first."}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":7,"output_index":0,"item":{"id":"rs_0a1b","type":"reasoning","summary":[{"type":"summary_text","text":"**Inspecting the repo**"},{"type":"summary_text","text":"Listing files first."}],"encrypted_content":"gAAAAABo-ENCRYPTED-REASONING-STATE=="}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":8,"output_index":1,"item":{"id":"fc_0a1b","type":"function_call","status":"in_progress","arguments":"","call_id":"call_42","name":"Bash"}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","sequence_number":9,"item_id":"fc_0a1b","output_index":1,"delta":"{\"command\":"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","sequence_number":10,"item_id":"fc_0a1b","output_index":1,"delta":"\"ls\"}"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":11,"output_index":1,"item":{"id":"fc_0a1b","type":"function_call","status":"completed","arguments":"{\"command\":\"ls\"}","call_id":"call_42","name":"Bash"}}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":12,"response":{"id":"resp_0a1b","object":"response","status":"completed","model":"gpt-5.5","usage":{"input_tokens":1200,"input_tokens_details":{"cached_tokens":1024},"output_tokens":64,"output_tokens_details":{"reasoning_tokens":40},"total_tokens":1264}}}
+

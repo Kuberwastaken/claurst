@@ -416,6 +416,26 @@ pub struct CodexTokens {
     pub expires_at: Option<u64>,
 }
 
+impl CodexTokens {
+    /// Unix seconds at which the access token expires. The JWT `exp` claim
+    /// wins (it is what the official Codex client checks, and it heals token
+    /// files written before `expires_at` was recorded); the stored
+    /// `expires_at` is the fallback for opaque tokens.
+    pub fn access_token_expiry(&self) -> Option<u64> {
+        crate::accounts::jwt_identity(&self.access_token)
+            .exp
+            .or(self.expires_at)
+    }
+}
+
+/// Expiry to record for a freshly issued Codex access token: `now +
+/// expires_in` from the token response, else the token's JWT `exp` claim.
+pub fn codex_expires_at(expires_in: Option<u64>, access_token: &str, now: u64) -> Option<u64> {
+    expires_in
+        .map(|secs| now.saturating_add(secs))
+        .or_else(|| crate::accounts::jwt_identity(access_token).exp)
+}
+
 /// Legacy single-file path: `~/.claurst/codex_tokens.json`. Kept for
 /// backward-compat reads when no account registry exists.
 fn codex_tokens_path() -> Option<std::path::PathBuf> {
@@ -576,6 +596,37 @@ pub fn is_codex_subscriber() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn jwt_with_exp(exp: u64) -> String {
+        use base64::Engine;
+        let payload = serde_json::json!({ "exp": exp }).to_string();
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+        format!("h.{b64}.s")
+    }
+
+    #[test]
+    fn codex_expires_at_prefers_expires_in_then_jwt_exp() {
+        let jwt = jwt_with_exp(5_000);
+        assert_eq!(codex_expires_at(Some(3_600), &jwt, 1_000), Some(4_600));
+        assert_eq!(codex_expires_at(None, &jwt, 1_000), Some(5_000));
+        assert_eq!(codex_expires_at(None, "opaque", 1_000), None);
+    }
+
+    #[test]
+    fn codex_access_token_expiry_reads_jwt_when_expires_at_missing() {
+        let tokens = CodexTokens {
+            access_token: jwt_with_exp(7_000),
+            expires_at: None,
+            ..Default::default()
+        };
+        assert_eq!(tokens.access_token_expiry(), Some(7_000));
+        let opaque = CodexTokens {
+            access_token: "opaque".into(),
+            expires_at: Some(42),
+            ..Default::default()
+        };
+        assert_eq!(opaque.access_token_expiry(), Some(42));
+    }
 
     #[test]
     fn test_prod_config_urls_are_https() {

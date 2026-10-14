@@ -222,7 +222,7 @@ Task statuses: `running`, `completed`, `failed: <reason>`, `cancelled`.
 
 **Permission level:** Execute
 
-Execute a command in a full pseudo-terminal (PTY). Required for interactive programs (editors, pagers, prompts) that need terminal capabilities such as ANSI codes, raw input, or window size detection. Behaves like `BashTool` for non-interactive commands.
+Execute a command in a pseudo-terminal (PTY) so programs that check `isatty()` behave as in a terminal. There is no stdin writer, so interactive programs cannot be driven. Pagers are disabled (`PAGER`, `GIT_PAGER`, `GH_PAGER` = `cat`, `GIT_TERMINAL_PROMPT=0`) and `CLAURST=1` / `AGENT=1` are set. Output larger than 2000 lines / 50 KiB at either end is cut to its head and tail; the full output is saved to a private file under `<claurst home>/tool-output/`, named in a trailing `Full output: <path>` line, and readable without a permission prompt. Files older than 7 days are deleted.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

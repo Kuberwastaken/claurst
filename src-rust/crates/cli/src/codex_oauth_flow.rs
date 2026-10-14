@@ -220,27 +220,33 @@ async fn exchange_code_for_tokens(code: &str, verifier: &str) -> anyhow::Result<
     }
 
     let refresh_token = body["refresh_token"].as_str().map(|s| s.to_string());
-    let account_id = extract_account_id_from_jwt(&access_token);
+    let account_id = codex_account_id(body["id_token"].as_str(), &access_token);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let expires_at = claurst_core::oauth_config::codex_expires_at(
+        body["expires_in"].as_u64(),
+        &access_token,
+        now,
+    );
 
     Ok(CodexTokens {
         access_token,
         refresh_token,
         account_id,
-        expires_at: None,
+        expires_at,
     })
 }
 
-/// Extract chatgpt-account-id from the JWT access token.
-/// The account_id is in the middle segment (payload) under
-/// https://api.openai.com/auth.account_id
-fn extract_account_id_from_jwt(token: &str) -> Option<String> {
-    let parts: Vec<&str> = token.splitn(3, '.').collect();
-    let payload_b64 = parts.get(1)?;
-    let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&payload).ok()?;
-    json["https://api.openai.com/auth"]["account_id"]
-        .as_str()
-        .map(|s| s.to_string())
+/// The ChatGPT workspace id (`chatgpt_account_id` claim) sent as the
+/// `ChatGPT-Account-Id` header: read from the id_token like the official
+/// client, falling back to the access token.
+fn codex_account_id(id_token: Option<&str>, access_token: &str) -> Option<String> {
+    use claurst_core::accounts::jwt_identity;
+    id_token
+        .and_then(|token| jwt_identity(token).account_id)
+        .or_else(|| jwt_identity(access_token).account_id)
 }
 
 #[cfg(test)]
@@ -282,15 +288,20 @@ mod tests {
         assert!(url.contains("response_type=code"));
     }
 
+    fn jwt(payload: serde_json::Value) -> String {
+        format!("h.{}.s", URL_SAFE_NO_PAD.encode(payload.to_string()))
+    }
+
     #[test]
-    fn test_extract_account_id_from_valid_jwt() {
-        // This is a test JWT (not real credentials) with account_id in it
-        // Format: header.payload.signature
-        // For testing we'd need to create a valid JWT structure, which is complex
-        // In practice, this function is tested via integration tests
-        let invalid_token = "not.a.jwt";
-        let result = extract_account_id_from_jwt(invalid_token);
-        // Invalid JWT should return None
-        assert!(result.is_none() || result.unwrap().is_empty());
+    fn test_codex_account_id_prefers_id_token_claim() {
+        let id_token = jwt(serde_json::json!({
+            "https://api.openai.com/auth": { "chatgpt_account_id": "ws_from_id" }
+        }));
+        let access = jwt(serde_json::json!({
+            "https://api.openai.com/auth": { "chatgpt_account_id": "ws_from_access" }
+        }));
+        assert_eq!(codex_account_id(Some(&id_token), &access).as_deref(), Some("ws_from_id"));
+        assert_eq!(codex_account_id(None, &access).as_deref(), Some("ws_from_access"));
+        assert_eq!(codex_account_id(Some("not.a.jwt"), "not.a.jwt"), None);
     }
 }
