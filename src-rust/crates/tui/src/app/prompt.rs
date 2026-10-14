@@ -1,5 +1,7 @@
 //! Prompt input state machine and voice hold-to-talk.
 
+use claurst_core::types::Message;
+
 use crate::overlays::SelectorMessage;
 use crate::prompt_input::InputMode;
 use super::App;
@@ -9,22 +11,37 @@ impl App {
     /// Open the rewind flow with the current message list converted to
     /// `SelectorMessage` entries.
     pub fn open_rewind_flow(&mut self) {
-        let selector_msgs: Vec<SelectorMessage> = self
-            .messages
-            .iter()
+        self.open_rewind_flow_with_archive(std::iter::empty());
+    }
+
+    /// Open the rewind flow over `archived` (the messages earlier compactions
+    /// replaced, oldest first) followed by the current messages. Selecting
+    /// an archived message sets [`App::pending_rewind`] (issue #449).
+    pub fn open_rewind_flow_with_archive<'a>(
+        &mut self,
+        archived: impl Iterator<Item = &'a Message>,
+    ) {
+        let entry = |idx: usize, m: &Message, prefix: &str| {
+            let preview: String = prefix.chars().chain(m.get_all_text().chars()).take(80).collect();
+            SelectorMessage {
+                idx,
+                role: format!("{:?}", m.role).to_lowercase(),
+                preview,
+                has_tool_use: !m.get_tool_use_blocks().is_empty(),
+            }
+        };
+        let mut selector_msgs: Vec<SelectorMessage> = archived
             .enumerate()
-            .map(|(i, m)| {
-                let text = m.get_all_text();
-                let preview: String = text.chars().take(80).collect();
-                let has_tool_use = !m.get_tool_use_blocks().is_empty();
-                SelectorMessage {
-                    idx: i,
-                    role: format!("{:?}", m.role).to_lowercase(),
-                    preview,
-                    has_tool_use,
-                }
-            })
+            .map(|(i, m)| entry(i, m, "[compacted] "))
             .collect();
+        let archive_len = selector_msgs.len();
+        selector_msgs.extend(
+            self.messages
+                .iter()
+                .enumerate()
+                .map(|(i, m)| entry(archive_len + i, m, "")),
+        );
+        self.rewind_archive_len = archive_len;
         self.rewind_flow.open(selector_msgs);
     }
 

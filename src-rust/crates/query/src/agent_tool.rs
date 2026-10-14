@@ -386,6 +386,8 @@ impl Tool for AgentTool {
             degradation_enabled: ctx.config.degradation_summary_enabled_or_default(),
             retry: claurst_api::RetryConfig::with_max_retries(ctx.config.max_retries),
             auto_compact: true,
+            // A sub-agent's history is not the parent session's.
+            session_journal: None,
             is_subagent: true,
             // Filled by `run_query_loop` from the sub-agent's tool context.
             sandbox_state: None,

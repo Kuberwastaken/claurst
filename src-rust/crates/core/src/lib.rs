@@ -18,6 +18,9 @@ pub use provider_id::{ProviderId, ModelId};
 // Session transcript persistence (JSONL, matches TS sessionStorage.ts schema).
 pub mod session_storage;
 
+// Crash-safe writer and loader for `~/.claurst/sessions` (issue #449).
+pub mod session_journal;
+
 // SQLite-backed session storage (faster alternative to JSONL).
 pub mod sqlite_storage;
 pub use sqlite_storage::{SqliteSessionStore, SessionSummary};
@@ -4988,7 +4991,9 @@ pub mod history {
     /// One compaction of the session history (issue #441). The head of the
     /// history was replaced by the summary message whose uuid is
     /// `summary_uuid`; this entry records when, why and how much it saved.
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    /// The replaced range is `[0, replaced_len())` of the pre-compaction
+    /// history, and its messages are kept in `replaced` (issue #449).
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct CompactionRecord {
         pub at: chrono::DateTime<chrono::Utc>,
         pub trigger: CompactionTrigger,
@@ -5002,6 +5007,47 @@ pub mod history {
         /// `false` when the summariser failed and the head was dropped to
         /// recover from a context-window error, keeping only the untouched tail.
         pub summarised: bool,
+        /// The messages the summary replaced, oldest first, so `/rewind` can
+        /// still reach them. Empty in sessions written before issue #449.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub replaced: Vec<Message>,
+    }
+
+    impl CompactionRecord {
+        /// Length of the replaced head: the compacted history is the summary
+        /// followed by the pre-compaction messages from this index on.
+        pub fn replaced_len(&self) -> usize {
+            (self.messages_before + 1).saturating_sub(self.messages_after)
+        }
+
+        /// This record without the archived messages (the journal keeps those
+        /// as the message entries that precede the compaction entry).
+        pub fn without_replaced(&self) -> Self {
+            Self {
+                at: self.at,
+                trigger: self.trigger,
+                summary_uuid: self.summary_uuid.clone(),
+                messages_before: self.messages_before,
+                messages_after: self.messages_after,
+                tokens_before: self.tokens_before,
+                tokens_after: self.tokens_after,
+                summarised: self.summarised,
+                replaced: Vec::new(),
+            }
+        }
+    }
+
+    /// Replace `messages` with the compacted history and move the head it
+    /// replaced into `record.replaced`, so the pre-compaction messages stay
+    /// reachable by `/rewind` (issue #449).
+    pub fn apply_compaction(
+        messages: &mut Vec<Message>,
+        compacted: Vec<Message>,
+        record: &mut CompactionRecord,
+    ) {
+        let mut previous = std::mem::replace(messages, compacted);
+        previous.truncate(record.replaced_len());
+        record.replaced = previous;
     }
 
     /// A single persisted conversation session.
@@ -5044,6 +5090,11 @@ pub mod history {
         /// Compactions applied to `messages`, oldest first.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub compactions: Vec<CompactionRecord>,
+        /// Sequence number of the last journal entry folded into this
+        /// snapshot; newer entries in `<id>.jsonl` are replayed on load
+        /// (issue #449). 0 for sessions written before the journal existed.
+        #[serde(default)]
+        pub journal_seq: u64,
     }
 
     impl ConversationSession {
@@ -5067,6 +5118,7 @@ pub mod history {
                 parent_session_id: None,
                 fork_point_message_index: None,
                 compactions: vec![],
+                journal_seq: 0,
             }
         }
 
@@ -5084,6 +5136,40 @@ pub mod history {
                 .iter()
                 .rev()
                 .find(|m| m.role == crate::types::Role::User)
+        }
+
+        /// The messages `/rewind` can reach, oldest first: the head each
+        /// compaction replaced, then the live history. A position in this
+        /// sequence is what [`Self::rewind_to`] takes.
+        pub fn rewind_timeline(&self) -> impl Iterator<Item = &Message> {
+            self.compactions
+                .iter()
+                .flat_map(|c| c.replaced.iter())
+                .chain(self.messages.iter())
+        }
+
+        /// Rewind to `position` in [`Self::rewind_timeline`], dropping that
+        /// message and everything after it. A position inside a compaction's
+        /// replaced head restores the history as it was before that
+        /// compaction (and drops it and every later compaction).
+        pub fn rewind_to(&mut self, position: usize) {
+            let mut offset = 0;
+            let target = self.compactions.iter().enumerate().find_map(|(idx, c)| {
+                let start = offset;
+                offset += c.replaced.len();
+                (position < offset).then_some((idx, position - start))
+            });
+            match target {
+                Some((idx, keep)) => {
+                    if let Some(compaction) = self.compactions.drain(idx..).next() {
+                        let mut head = compaction.replaced;
+                        head.truncate(keep);
+                        self.messages = head;
+                    }
+                }
+                None => self.messages.truncate(position.saturating_sub(offset)),
+            }
+            self.updated_at = chrono::Utc::now();
         }
     }
 
@@ -5125,65 +5211,37 @@ pub mod history {
     // -------------------------------------------------------------------------
 
     /// The on-disk directory for conversation sessions.
-    fn sessions_dir() -> std::path::PathBuf {
+    pub fn sessions_dir() -> std::path::PathBuf {
         crate::config::Settings::config_dir().join("sessions")
     }
 
-    /// Save a session to `~/.claurst/sessions/<id>.json`.
-    pub async fn save_session(session: &ConversationSession) -> anyhow::Result<()> {
-        let dir = sessions_dir();
-        tokio::fs::create_dir_all(&dir).await?;
-        crate::accounts::set_user_only_dir_perms(&dir);
-        let path = dir.join(format!("{}.json", session.id));
-        let content = serde_json::to_string_pretty(session)?;
-        tokio::fs::write(&path, content).await?;
-        // Session transcripts can contain secrets pulled into context; keep
-        // them owner-only (issue #212).
-        crate::accounts::set_user_only_perms(&path);
-        Ok(())
+    /// Checkpoint a session: journal any unrecorded change, then rewrite
+    /// `~/.claurst/sessions/<id>.json` atomically (issue #449). Fails with
+    /// [`crate::session_journal::SessionLocked`] when another process holds
+    /// the session.
+    ///
+    /// The IO is synchronous (small appends plus one snapshot write) and runs
+    /// on the calling task; it is `async` only to keep the existing API.
+    pub async fn save_session(session: &mut ConversationSession) -> anyhow::Result<()> {
+        crate::session_journal::save(&sessions_dir(), session)
     }
 
-    /// Load a specific session by ID.
+    /// Load a specific session by ID: the snapshot plus any newer journal
+    /// entries, or the journal alone when the snapshot is missing or torn.
     pub async fn load_session(id: &str) -> anyhow::Result<ConversationSession> {
-        let path = sessions_dir().join(format!("{}.json", id));
-        let content = tokio::fs::read_to_string(&path).await?;
-        Ok(serde_json::from_str(&content)?)
+        crate::session_journal::load(&sessions_dir(), id).map(|loaded| loaded.session)
     }
 
     /// List all sessions, sorted by most-recently-updated first.
     pub async fn list_sessions() -> Vec<ConversationSession> {
-        let dir = sessions_dir();
-        if !dir.exists() {
-            return vec![];
-        }
-
-        let mut sessions = vec![];
-        if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                    if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                        if let Ok(session) =
-                            serde_json::from_str::<ConversationSession>(&content)
-                        {
-                            sessions.push(session);
-                        }
-                    }
-                }
-            }
-        }
-
+        let mut sessions = crate::session_journal::list(&sessions_dir());
         sessions.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
         sessions
     }
 
-    /// Delete a session by ID.
+    /// Delete a session by ID: its snapshot, journal and lock file.
     pub async fn delete_session(id: &str) -> anyhow::Result<()> {
-        let path = sessions_dir().join(format!("{}.json", id));
-        if path.exists() {
-            tokio::fs::remove_file(&path).await?;
-        }
-        Ok(())
+        crate::session_journal::delete(&sessions_dir(), id)
     }
 
     /// Rename (set the title of) a session.
@@ -5191,7 +5249,7 @@ pub mod history {
         let mut session = load_session(id).await?;
         session.title = Some(new_title.to_string());
         session.updated_at = chrono::Utc::now();
-        save_session(&session).await
+        save_session(&mut session).await
     }
 
     /// Add a tag to a session (idempotent — duplicate tags are ignored).
@@ -5201,7 +5259,7 @@ pub mod history {
         if !session.tags.contains(&tag_str) {
             session.tags.push(tag_str);
             session.updated_at = chrono::Utc::now();
-            save_session(&session).await?;
+            save_session(&mut session).await?;
         }
         Ok(())
     }
@@ -5213,7 +5271,7 @@ pub mod history {
         session.tags.retain(|t| t != tag);
         if session.tags.len() != before_len {
             session.updated_at = chrono::Utc::now();
-            save_session(&session).await?;
+            save_session(&mut session).await?;
         }
         Ok(())
     }
@@ -5229,7 +5287,7 @@ pub mod history {
         let source = load_session(source_id).await?;
         let clamped_idx = at_message_idx.min(source.messages.len());
         let now = chrono::Utc::now();
-        let branched = ConversationSession {
+        let mut branched = ConversationSession {
             id: uuid::Uuid::new_v4().to_string(),
             created_at: now,
             updated_at: now,
@@ -5249,8 +5307,9 @@ pub mod history {
             parent_session_id: None,
             fork_point_message_index: None,
             compactions: vec![],
+            journal_seq: 0,
         };
-        save_session(&branched).await?;
+        save_session(&mut branched).await?;
         Ok(branched)
     }
 

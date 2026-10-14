@@ -193,6 +193,11 @@ pub struct QueryConfig {
     /// `--no-auto-compact`) leaves the history alone and surfaces overflow
     /// errors; `/compact` still works.
     pub auto_compact: bool,
+    /// Writer for the session this loop runs in (issue #449). When set, the
+    /// history is journaled after every assistant message, every tool-result
+    /// batch and every compaction, so a crash loses at most the step in
+    /// flight. `None` (sub-agents, headless runs) persists nothing.
+    pub session_journal: Option<Arc<claurst_core::session_journal::SessionJournal>>,
     /// Set for a sub-agent's loop: a finished turn fires `SubagentStop`
     /// hooks instead of `Stop` (#447).
     pub is_subagent: bool,
@@ -235,8 +240,19 @@ impl Default for QueryConfig {
             continuation: crate::continuation::ContinuationMode::Default,
             retry: claurst_api::RetryConfig::default(),
             auto_compact: true,
+            session_journal: None,
             is_subagent: false,
             sandbox_state: None,
+        }
+    }
+}
+
+/// Journal the history (issue #449). A failed write is logged, never fatal:
+/// the turn goes on and the snapshot at its end is the fallback.
+fn persist_step(config: &QueryConfig, messages: &[Message]) {
+    if let Some(journal) = config.session_journal.as_deref() {
+        if let Err(e) = journal.sync_messages(messages) {
+            warn!(error = %e, "Session journal write failed");
         }
     }
 }
@@ -759,6 +775,10 @@ pub async fn run_query_loop(
             }
         }
 
+        // Persist the input queued since the last step before the compaction
+        // check, which journals the compaction against this history.
+        persist_step(config, messages);
+
         // Resolve where this request goes once, up front, so the compaction
         // check below summarises through the same provider the request uses.
         let route = config.provider_registry.as_deref().map(|registry| {
@@ -807,6 +827,7 @@ pub async fn run_query_loop(
                 context_window,
                 config.max_tokens,
                 &mut compact_state,
+                config.session_journal.as_deref(),
                 event_tx.as_ref(),
                 &cancel_token,
                 tool_ctx,
@@ -1174,6 +1195,7 @@ pub async fn run_query_loop(
                                     provider.as_ref(),
                                     &model_id_str,
                                     config.max_tokens,
+                                    config.session_journal.as_deref(),
                                     event_tx.as_ref(),
                                     tool_ctx,
                                 )
@@ -1367,6 +1389,7 @@ pub async fn run_query_loop(
                                 provider.as_ref(),
                                 &model_id_str,
                                 config.max_tokens,
+                                config.session_journal.as_deref(),
                                 event_tx.as_ref(),
                                 tool_ctx,
                             )
@@ -1474,6 +1497,7 @@ pub async fn run_query_loop(
                     overflow_recovery_used = false;
 
                     messages.push(assistant_msg.clone());
+                    persist_step(config, messages);
 
                     // PostModelTurn hooks (#447): a deny vetoes continuing.
                     let model_turn_hooks = post_model_turn(&assistant_msg, tool_ctx).await;
@@ -1567,6 +1591,7 @@ pub async fn run_query_loop(
                             let _ = tx.send(QueryEvent::MessageCommitted(results_msg.clone()));
                         }
                         messages.push(results_msg);
+                        persist_step(config, messages);
                         continue; // loop for next turn
                     }
 
@@ -1674,6 +1699,7 @@ pub async fn run_query_loop(
                         &summariser,
                         &effective_model,
                         config.max_tokens,
+                        config.session_journal.as_deref(),
                         event_tx.as_ref(),
                         tool_ctx,
                     )
@@ -1796,6 +1822,7 @@ pub async fn run_query_loop(
                     &summariser,
                     &effective_model,
                     config.max_tokens,
+                    config.session_journal.as_deref(),
                     event_tx.as_ref(),
                     tool_ctx,
                 )
@@ -1864,6 +1891,7 @@ pub async fn run_query_loop(
 
         // Append assistant message to conversation
         messages.push(assistant_msg.clone());
+        persist_step(config, messages);
         if let Some(ref tx) = event_tx {
             let _ = tx.send(QueryEvent::MessageCommitted(assistant_msg.clone()));
         }
@@ -2189,6 +2217,7 @@ pub async fn run_query_loop(
                     let _ = tx.send(QueryEvent::MessageCommitted(results_msg.clone()));
                 }
                 messages.push(results_msg);
+                persist_step(config, messages);
 
                 // If the batch was abandoned due to cancellation, stop the loop
                 // now rather than sending the (cancelled) results back to the model.
@@ -2340,6 +2369,7 @@ mod tests {
             continuation: crate::continuation::ContinuationMode::Default,
             retry: claurst_api::RetryConfig::default(),
             auto_compact: true,
+            session_journal: None,
             is_subagent: false,
             sandbox_state: None,
         }
@@ -4318,6 +4348,16 @@ mod tests {
         script: Vec<MainStep>,
         auto_compact: bool,
     ) -> (QueryOutcome, Vec<String>, Vec<Message>) {
+        drive_journaled_compaction_loop(history, script, auto_compact, None).await
+    }
+
+    /// [`drive_compaction_loop`] with a session journal attached.
+    async fn drive_journaled_compaction_loop(
+        history: Vec<Message>,
+        script: Vec<MainStep>,
+        auto_compact: bool,
+        journal: Option<Arc<claurst_core::session_journal::SessionJournal>>,
+    ) -> (QueryOutcome, Vec<String>, Vec<Message>) {
         let log = Arc::new(StdMutex::new(Vec::new()));
         let provider = Arc::new(CompactionProvider {
             id: claurst_core::provider_id::ProviderId::new("mockprov"),
@@ -4341,6 +4381,7 @@ mod tests {
         config.model = "mock-model".to_string();
         config.provider_registry = Some(Arc::new(registry));
         config.auto_compact = auto_compact;
+        config.session_journal = journal;
 
         let mut messages = history;
         let outcome = tokio::time::timeout(
@@ -4483,6 +4524,131 @@ mod tests {
         assert!(result.ends_with("LAST LINE"));
         assert!(result.contains("bytes omitted from the middle"));
         assert!(result.len() <= DEFAULT_TOOL_RESULT_MAX_BYTES + 100, "{}", result.len());
+    }
+
+    // ---- Issue #449: per-step session persistence ---------------------------
+
+    /// A tool named like the one `RecordingProvider` calls that records how
+    /// many messages the session journal holds while it runs.
+    struct JournalProbeTool {
+        dir: std::path::PathBuf,
+        session_id: String,
+        seen: Arc<StdMutex<Vec<usize>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for JournalProbeTool {
+        fn name(&self) -> &str { "noop_tool" }
+        fn description(&self) -> &str { "reads the session journal" }
+        fn permission_level(&self) -> PermissionLevel { PermissionLevel::ReadOnly }
+        fn input_schema(&self) -> Value { serde_json::json!({"type": "object"}) }
+        async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
+            let persisted = claurst_core::session_journal::load(&self.dir, &self.session_id)
+                .map(|loaded| loaded.session.messages.len())
+                .unwrap_or(0);
+            self.seen.lock().unwrap().push(persisted);
+            ToolResult::success("ok".to_string())
+        }
+    }
+
+    /// Each assistant message is on disk before its tools run and each
+    /// tool-result batch before the next request, so a crash loses at most
+    /// the step in flight. The loop never writes a snapshot itself: the
+    /// session below is rebuilt from the journal alone.
+    #[tokio::test]
+    async fn every_step_is_journaled_before_the_next_one_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = claurst_core::history::ConversationSession::new("mock-model".to_string());
+        let journal = claurst_core::session_journal::SessionJournal::new(dir.path(), &session);
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+
+        let provider = Arc::new(RecordingProvider {
+            id: claurst_core::provider_id::ProviderId::new("mockprov"),
+            tools_empty_per_request: Arc::new(StdMutex::new(Vec::new())),
+            systems_per_request: Arc::new(StdMutex::new(Vec::new())),
+            always_end_turn: false,
+        });
+        let mut registry = claurst_api::ProviderRegistry::new();
+        registry.register(provider);
+        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+
+        let mut ctx = deny_all_context();
+        ctx.session_id = session.id.clone();
+        ctx.config.provider = Some("mockprov".to_string());
+        let mut config = make_config(None, None);
+        config.model = "mock-model".to_string();
+        config.max_turns = 2;
+        config.provider_registry = Some(Arc::new(registry));
+        config.session_journal = Some(journal);
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(JournalProbeTool {
+            dir: dir.path().to_path_buf(),
+            session_id: session.id.clone(),
+            seen: seen.clone(),
+        })];
+
+        let mut messages = vec![Message::user("start")];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &tools,
+                &ctx,
+                &config,
+                claurst_core::cost::CostTracker::new(),
+                None,
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        // The tools ran with [start, tool_use] and then with
+        // [start, tool_use, results, tool_use] already journaled.
+        assert_eq!(*seen.lock().unwrap(), [2, 4]);
+        let loaded = claurst_core::session_journal::load(dir.path(), &session.id).unwrap();
+        assert!(loaded.rebuilt, "no snapshot was written by the loop");
+        let persisted: Vec<String> = loaded.session.messages.iter().map(|m| m.get_all_text()).collect();
+        let live: Vec<String> = messages.iter().map(|m| m.get_all_text()).collect();
+        assert_eq!(persisted, live);
+    }
+
+    /// A compaction inside the loop is journaled with the head it replaced,
+    /// so a resumed session starts from the summary and /rewind can still
+    /// reach the original messages.
+    #[tokio::test]
+    async fn loop_compaction_is_journaled_with_the_replaced_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = claurst_core::history::ConversationSession::new("mock-model".to_string());
+        let journal = claurst_core::session_journal::SessionJournal::new(dir.path(), &session);
+        let history = long_history(11, 30_000);
+        let first = history[0].get_all_text();
+
+        let (outcome, log, msgs) = drive_journaled_compaction_loop(
+            history,
+            vec![MainStep::Reply],
+            true,
+            Some(journal),
+        )
+        .await;
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(log, vec!["summary", "main:compacted"]);
+
+        let resumed = claurst_core::session_journal::load(dir.path(), &session.id)
+            .unwrap()
+            .session;
+        assert_eq!(resumed.messages.len(), msgs.len());
+        assert!(resumed.messages[0].get_all_text().contains("Earlier work, condensed."));
+        assert_eq!(resumed.compactions.len(), 1);
+        let replaced = &resumed.compactions[0].replaced;
+        assert_eq!(replaced.len(), resumed.compactions[0].replaced_len());
+        assert_eq!(replaced[0].get_all_text(), first);
+        assert_eq!(resumed.rewind_timeline().count(), replaced.len() + msgs.len());
     }
 
     /// #439 x #441: a context-window error compacts once and retries; it is

@@ -1988,15 +1988,21 @@ impl App {
             },
             RewindStep::Confirming { .. } => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    if let Some(idx) = self.rewind_flow.accept_confirm() {
-                        // Truncate conversation to the selected message index.
-                        self.messages.truncate(idx);
-                        self.pending_rewind = Some(idx);
-                        // Remove system annotations placed after the truncation point.
-                        self.system_annotations.retain(|a| a.after_index <= idx);
+                    if let Some(position) = self.rewind_flow.accept_confirm() {
+                        // Below `rewind_archive_len` the position is inside a
+                        // compaction's replaced head (issue #449): the host
+                        // restores that history from the session. Either way
+                        // the host maps it onto the model history (#484).
+                        if let Some(idx) = position.checked_sub(self.rewind_archive_len) {
+                            // Truncate conversation to the selected message index.
+                            self.messages.truncate(idx);
+                            // Remove system annotations placed after the truncation point.
+                            self.system_annotations.retain(|a| a.after_index <= idx);
+                        }
+                        self.pending_rewind = Some(position);
                         self.push_notification(
                             NotificationKind::Success,
-                            format!("Rewound to message #{}", idx),
+                            format!("Rewound to message #{}", position),
                             Some(4),
                         );
                     }

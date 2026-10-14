@@ -87,6 +87,7 @@ urlencoding = "2"
 open = "5"
 qrcode = "0.14"
 rusqlite = { version = "0.31", features = ["bundled"] }
+fslock = "0.2"
 icy_sixel = "0.5"
 image = { version = "0.25", features = ["png", "jpeg"] }
 

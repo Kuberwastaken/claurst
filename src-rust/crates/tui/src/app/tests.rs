@@ -997,7 +997,7 @@ use super::types::{ContextMenuItem, ContextMenuState};
         session.title = Some(title.to_string());
         session.working_dir = Some(working_dir.to_string_lossy().into_owned());
         session.add_message(Message::user("hello"));
-        claurst_core::history::save_session(&session).await.unwrap();
+        claurst_core::history::save_session(&mut session).await.unwrap();
         session.id
     }
 
@@ -1105,6 +1105,35 @@ use super::types::{ContextMenuItem, ContextMenuState};
         assert_eq!(pin.max_output_tokens, 131_072);
     }
 
+    // ---- /rewind into the compaction archive (issue #449) ----
+
+    #[test]
+    fn rewind_flow_lists_archived_messages_and_defers_rewinds_into_them() {
+        let mut app = make_app();
+        app.replace_messages(vec![Message::user("summary"), Message::assistant("a2")]);
+        let archived = [Message::user("u1"), Message::assistant("a1")];
+        app.open_rewind_flow_with_archive(archived.iter());
+        assert_eq!(app.rewind_archive_len, 2);
+
+        // The selection starts on the newest message (position 3); move up
+        // to "a1" (position 1, inside the archive) and confirm.
+        app.handle_rewind_flow_key(press_key(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_rewind_flow_key(press_key(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_rewind_flow_key(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_rewind_flow_key(press_key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(app.pending_rewind, Some(1));
+        assert_eq!(app.messages.len(), 2, "the caller applies archive rewinds");
+
+        // A live position ("a2", position 3) truncates the display in place
+        // and is handed to the host as archive length + display index.
+        app.pending_rewind = None;
+        app.open_rewind_flow_with_archive(archived.iter());
+        app.handle_rewind_flow_key(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_rewind_flow_key(press_key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(app.pending_rewind, Some(3));
+        assert_eq!(app.messages.len(), 1);
+    }
+
     // ---- context meter (#444) ----
 
     fn request_done(input: u64, output: u64, cache_write: u64, cache_read: u64) -> claurst_query::QueryEvent {
@@ -1162,6 +1191,7 @@ use super::types::{ContextMenuItem, ContextMenuState};
             tokens_before: 180_500,
             tokens_after: 12_000,
             summarised: true,
+            replaced: Vec::new(),
         }));
         assert_eq!(app.context_used_tokens, 12_000);
         assert_eq!(app.token_warning_threshold_shown, 0);

@@ -186,7 +186,7 @@ impl SlashCommand for ForkCommand {
         );
 
         let new_id = new_session.id.clone();
-        match claurst_core::history::save_session(&new_session).await {
+        match claurst_core::history::save_session(&mut new_session).await {
             Ok(()) => CommandResult::Message(format!(
                 "Session forked at message {}. New session: {}\nUse /resume {} to switch to it.",
                 fork_at, new_id, new_id

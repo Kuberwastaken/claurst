@@ -1334,6 +1334,10 @@ pub async fn compact_conversation(
         tokens_before: estimate_tokens_for_messages(messages) as u64,
         tokens_after: estimate_tokens_for_messages(&new_messages) as u64,
         summarised,
+        // Filled by `history::apply_compaction` when the result is applied,
+        // which owns the old history and can move the head instead of
+        // copying it.
+        replaced: Vec::new(),
     };
     Ok(Some(Compaction { messages: new_messages, record }))
 }

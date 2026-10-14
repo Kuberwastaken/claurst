@@ -93,9 +93,17 @@ Aliases: `/ctx`, `/context-visualizer`. Prints an estimated breakdown of the con
 
 ## Session management
 
-Sessions are stored as JSONL files under `~/.claurst/projects/<base64url(project-root)>/<session-id>.jsonl`. Each line in the file is a JSON object representing a message or event in the conversation. The per-session metadata index lives at `~/.claurst/sessions/<id>.json`.
+Sessions live in `~/.claurst/sessions/` (or `$CLAURST_HOME/sessions/`). Each session id has up to three files, all owner-only (0600):
 
-The transcript directory is derived from the working directory at session start. Worktrees and path sanitisation mean the per-project folder name is a normalised representation of the absolute path.
+| File | Contents |
+|---|---|
+| `<id>.json` | Snapshot: the whole session (messages, title, model, cost, compactions). Rewritten at the end of every turn and on idle metadata changes, atomically: written to a temp file in the same directory, flushed, then renamed over the old one. A crash leaves the previous or the new snapshot, never a half-written one. |
+| `<id>.jsonl` | Journal: append-only, one entry per line. The agent loop appends after every assistant message, every batch of tool results and every compaction, so a crash or a killed terminal loses at most the step that was in flight. It is never rewritten, so it also keeps the messages a later rewind or compaction replaced. |
+| `<id>.lock` | Advisory lock held by the one claurst process writing the session. The OS releases it when that process exits, so a crash never leaves a stale lock. |
+
+A second claurst that opens a session another process is writing can read it, but shows a warning and does not save it, so the two never interleave writes.
+
+`~/.claurst/sessions.db` is a SQLite search index refreshed at the end of each turn; it is not needed to resume.
 
 ### Commands
 
@@ -104,22 +112,31 @@ The transcript directory is derived from the working directory at session start.
 | `/resume [id or search]` | Resume a previous session by ID or fuzzy search term. Alias: `/continue`. |
 | `/session` | Show the remote session URL and QR code (available in remote mode). |
 | `/fork` | Fork the current session into a new branch with fresh UUIDs, preserving the full message history. |
-| `/rename <title>` | Rename the current session. Appends a custom-title entry to the JSONL file. |
+| `/rename <title>` | Rename the current session. |
 | `/export` | Export the current session transcript. |
-| `/rewind` | Step back to an earlier point in the conversation. |
+| `/rewind` | Step back to an earlier point in the conversation, including messages an earlier compaction replaced (listed first, marked `[compacted]`). |
 
-### JSONL transcript format
+### Journal format and recovery
 
-Every message in the transcript is a newline-delimited JSON object. The key fields present on most entries:
+Each journal line is `{"seq":N,"entry":{"type":...}}` with `seq` increasing by one per line. Entry types:
 
-```jsonl
-{"uuid":"<uuid>","parentUuid":"<parent-uuid>","type":"user","message":{...},"timestamp":1234567890}
-{"uuid":"<uuid>","parentUuid":"<parent-uuid>","type":"assistant","message":{...},"timestamp":1234567891}
-```
+| `type` | Meaning |
+|---|---|
+| `meta` | Session metadata (id, title, model, working directory, cost). The first line of every journal; repeated at each checkpoint. |
+| `message` | Append one message. |
+| `truncate` | Drop the messages from `len` on (a rewind). Every journal starts with `meta` then `truncate` to 0, so replaying it onto an older snapshot (from before the journal existed, or after the journal file was lost) replaces that snapshot's history rather than appending a second copy. |
+| `compaction` | Replace the head of the history, `[0, messages_before + 1 - messages_after)`, with `summary`. The replaced messages are kept in the compaction record so `/rewind` can return to them. |
+| `drop_compactions` | Forget the compactions from `keep` on (a rewind past a compaction). |
 
-The `parentUuid` field forms a linked chain that allows Claurst to reconstruct the conversation tree. `/fork` rewrites all UUIDs while preserving the chain structure.
+The snapshot records the `seq` of the last journal entry it includes (`journal_seq`). Loading a session (`--resume`, `/resume`, the session browser):
 
-Special entry types include `summary` (compaction summaries), `custom-title` (from `/rename`), and various ephemeral progress indicators that are filtered out when reading the transcript for display.
+1. Parse `<id>.json` and replay the journal entries with a higher `seq`. `--resume` reports how many it recovered; those are the steps of a turn that was interrupted before its snapshot.
+2. If the snapshot is missing or does not parse, rebuild the session from the journal alone.
+3. A journal line that does not parse (for example a line cut short by a crash) is skipped; the next write cuts it off before appending.
+
+A resumed session continues from the latest compaction summary forward, as before the crash.
+
+Sessions saved by older versions (a `<id>.json` with no journal) load unchanged. Their journal is created, starting with the full history, the first time they are written.
 
 ### SDK access
 

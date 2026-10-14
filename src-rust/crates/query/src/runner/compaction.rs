@@ -2,6 +2,7 @@
 // threshold check and compact-and-retry after a context-window error.
 
 use crate::*;
+use claurst_core::session_journal::SessionJournal;
 
 /// Wrap the loop's Anthropic client as an [`claurst_api::LlmProvider`] so the
 /// raw-client branch summarises through the same provider-agnostic path as
@@ -65,6 +66,7 @@ pub(crate) async fn compact_before_request(
     context_window: u64,
     max_output_tokens: u32,
     state: &mut compact::AutoCompactState,
+    journal: Option<&SessionJournal>,
     event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
     cancel_token: &tokio_util::sync::CancellationToken,
     tool_ctx: &ToolContext,
@@ -137,7 +139,7 @@ pub(crate) async fn compact_before_request(
     .await
     {
         Some(compaction) => {
-            apply_compaction(messages, compaction, event_tx);
+            apply_compaction(messages, compaction, journal, event_tx);
             true
         }
         None => false,
@@ -152,6 +154,7 @@ pub(crate) async fn compact_after_overflow(
     provider: &dyn claurst_api::LlmProvider,
     model: &str,
     max_output_tokens: u32,
+    journal: Option<&SessionJournal>,
     event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
     tool_ctx: &ToolContext,
 ) -> bool {
@@ -177,7 +180,7 @@ pub(crate) async fn compact_after_overflow(
                 after = compaction.messages.len(),
                 "Compacted after a context-window error; retrying the request"
             );
-            apply_compaction(messages, compaction, event_tx);
+            apply_compaction(messages, compaction, journal, event_tx);
             true
         }
         Ok(None) => {
@@ -191,17 +194,24 @@ pub(crate) async fn compact_after_overflow(
     }
 }
 
-/// Replace the history with a compaction's result and report it: a status
-/// line with the token counts and a [`QueryEvent::Compacted`] entry for the
-/// caller to record in the session.
+/// Replace the history with a compaction's result, keeping the replaced head
+/// in the record and the session journal (issue #449), and report it: a
+/// status line with the token counts and a [`QueryEvent::Compacted`] entry
+/// for the caller to record in the session.
 fn apply_compaction(
     messages: &mut Vec<Message>,
     compaction: compact::Compaction,
+    journal: Option<&SessionJournal>,
     event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
 ) {
-    *messages = compaction.messages;
+    let compact::Compaction { messages: compacted, mut record } = compaction;
+    claurst_core::history::apply_compaction(messages, compacted, &mut record);
+    if let Some(journal) = journal {
+        if let Err(e) = journal.record_compaction(&record, messages) {
+            warn!(error = %e, "Session journal: compaction not recorded");
+        }
+    }
     if let Some(tx) = event_tx {
-        let record = compaction.record;
         let verb = if record.summarised {
             "Context compacted"
         } else {

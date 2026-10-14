@@ -240,8 +240,13 @@ pub struct App {
     pub message_selector: MessageSelectorOverlay,
     /// Multi-step rewind flow overlay.
     pub rewind_flow: RewindFlowOverlay,
-    /// Display index confirmed in the rewind flow, waiting for the host loop
-    /// to truncate the model history (see `rewind_cut_index`).
+    /// Number of compaction-archived messages listed ahead of the displayed
+    /// ones in the open rewind flow (issue #449).
+    pub rewind_archive_len: usize,
+    /// Position confirmed in the rewind flow, waiting for the host loop to
+    /// apply it. Below `rewind_archive_len` it is a position in a compaction's
+    /// replaced head (`ConversationSession::rewind_to`); from there on it is
+    /// `rewind_archive_len` plus a display index (see `rewind_cut_index`).
     pub pending_rewind: Option<usize>,
     /// Bridge connection state.
     pub bridge_state: BridgeConnectionState,
@@ -683,6 +688,7 @@ impl App {
             global_search: GlobalSearchState::default(),
             message_selector: MessageSelectorOverlay::new(),
             rewind_flow: RewindFlowOverlay::new(),
+            rewind_archive_len: 0,
             pending_rewind: None,
             bridge_state: BridgeConnectionState::Disconnected,
             notifications: NotificationQueue::new(),
