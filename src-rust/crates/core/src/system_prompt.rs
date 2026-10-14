@@ -200,6 +200,32 @@ impl SystemPromptPrefix {
 }
 
 // ---------------------------------------------------------------------------
+// Platform
+// ---------------------------------------------------------------------------
+
+/// The platform the session runs on. It selects the single platform block in
+/// the stable section, so the model gets one consistent shell-syntax rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptPlatform {
+    Linux,
+    MacOs,
+    Windows,
+}
+
+impl PromptPlatform {
+    /// The platform this binary was built for.
+    pub fn current() -> Self {
+        if cfg!(target_os = "windows") {
+            Self::Windows
+        } else if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else {
+            Self::Linux
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Build options
 // ---------------------------------------------------------------------------
 
@@ -247,6 +273,8 @@ pub struct SystemPromptOptions {
     /// all per-tool guidance is emitted — preserving the previous behaviour
     /// for callers that don't yet thread the tool list through.
     pub enabled_tools: Option<Vec<String>>,
+    /// Platform for the platform block; `None` means [`PromptPlatform::current`].
+    pub platform: Option<PromptPlatform>,
 }
 
 // ---------------------------------------------------------------------------
@@ -279,13 +307,20 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
     // ------------------------------------------------------------------ //
     // CACHEABLE sections (before the dynamic boundary)                   //
     // ------------------------------------------------------------------ //
+    let enabled_tools = opts.enabled_tools.as_deref();
     let mut parts: Vec<String> = vec![
         // 1. Attribution header
         prefix.attribution_text().to_string(),
-        // 2. Core capabilities
-        CORE_CAPABILITIES.to_string(),
+        // 2. Capabilities: one line per declared tool, then how to approach tasks
+        build_capabilities_section(enabled_tools),
+        TASK_APPROACH.to_string(),
         // 3. Tool use guidelines (per-tool blocks are conditional on the enabled set)
-        build_tool_use_guidelines(opts.enabled_tools.as_deref()),
+        build_tool_use_guidelines(enabled_tools),
+        // 3b. Platform: one shell-syntax rule for the session's platform
+        build_platform_section(
+            opts.platform.unwrap_or_else(PromptPlatform::current),
+            enabled_tools,
+        ),
         // 4. Executing actions with care
         ACTIONS_SECTION.to_string(),
         // 5. Safety guidelines
@@ -424,13 +459,6 @@ fn build_env_info_section(working_dir: Option<&str>) -> String {
         &shell_env
     };
 
-    // Shell line: on Windows add Unix syntax note
-    let shell_line = if cfg!(target_os = "windows") {
-        format!("Shell: {} (use Unix shell syntax, not Windows — e.g., /dev/null not NUL, forward slashes in paths)", shell_name)
-    } else {
-        format!("Shell: {}", shell_name)
-    };
-
     // Is git repo?
     let is_git = working_dir
         .map(|d| std::path::Path::new(d).join(".git").exists())
@@ -441,55 +469,105 @@ fn build_env_info_section(working_dir: Option<&str>) -> String {
         .map(|d| format!("\nWorking directory: {}", d))
         .unwrap_or_default();
 
-    // Platform-specific guidance so the model uses the right commands.
-    let os_note = if cfg!(target_os = "windows") {
-        format!(
-            "\nIMPORTANT: The user is on Windows ({}). Use Windows-compatible commands \
-             (e.g., `dir` not `ls`, `type` not `cat`, backslashes in native paths). \
-             When the shell is bash/git-bash, Unix syntax is acceptable.",
-            os_version
-        )
-    } else if cfg!(target_os = "macos") {
-        format!(
-            "\nThe user is on macOS ({}). Use macOS-compatible commands. \
-             BSD variants of tools apply (e.g., `sed -i ''` not `sed -i`).",
-            os_version
-        )
-    } else {
-        format!(
-            "\nThe user is on Linux ({}). Use Linux-compatible commands.",
-            os_version
-        )
-    };
-
     format!(
-        "\n<env>{}\nIs directory a git repo: {}\nPlatform: {}\nOS Version: {}\n{}{}\n</env>",
+        "\n<env>{}\nIs directory a git repo: {}\nPlatform: {}\nOS Version: {}\nShell: {}\n</env>",
         cwd_line,
         if is_git { "Yes" } else { "No" },
         platform,
         os_version,
-        shell_line,
-        os_note,
+        shell_name,
     )
+}
+
+/// Build the platform block for the stable section. Exactly one shell-syntax
+/// rule is emitted. On Windows the Bash tool runs commands through `cmd.exe`
+/// (see `run_windows_fallback` in the tools crate), so Windows syntax applies.
+fn build_platform_section(platform: PromptPlatform, enabled: Option<&[String]>) -> String {
+    let rule = match platform {
+        PromptPlatform::Linux => {
+            "The user is on Linux. Shell commands run in a Unix shell: use POSIX shell \
+             syntax and the GNU variants of tools."
+        }
+        PromptPlatform::MacOs => {
+            "The user is on macOS. Shell commands run in a Unix shell: use POSIX shell \
+             syntax; the BSD variants of tools apply (e.g., `sed -i ''` not `sed -i`)."
+        }
+        PromptPlatform::Windows => {
+            "The user is on Windows. The Bash tool runs commands through cmd.exe, not a \
+             Unix shell: use Windows syntax (`dir` not `ls`, `type` not `cat`, `NUL` not \
+             `/dev/null`, backslashes in native paths)."
+        }
+    };
+    let powershell = platform == PromptPlatform::Windows
+        && enabled.is_none_or(|names| names.iter().any(|n| n == "PowerShell"));
+    let powershell_line = if powershell {
+        "\nUse the PowerShell tool for PowerShell syntax and cmdlets."
+    } else {
+        ""
+    };
+    format!("\n## Platform\n\n{rule}{powershell_line}\n")
 }
 
 // ---------------------------------------------------------------------------
 // Static system prompt sections
 // ---------------------------------------------------------------------------
 
-const CORE_CAPABILITIES: &str = r#"
-## Capabilities
+/// Tools that get a one-line entry in the capabilities list, in display order,
+/// with the summary shown for each. A declared tool not in this table is
+/// still usable; its own definition describes it.
+const CAPABILITY_SUMMARIES: &[(&str, &str)] = &[
+    ("Read", "Read file contents"),
+    ("Write", "Create or overwrite files"),
+    ("Edit", "Make precise edits with exact text replacement"),
+    ("BatchEdit", "Apply several exact text replacements in one atomic call"),
+    ("ApplyPatch", "Apply a unified diff to one or more files"),
+    ("Glob", "Find files by name pattern"),
+    ("Grep", "Search file contents with regular expressions"),
+    ("Bash", "Run shell commands"),
+    ("PowerShell", "Run PowerShell commands"),
+    ("LSP", "Query a configured language server (definitions, references, diagnostics)"),
+    ("WebSearch", "Search the web"),
+    ("WebFetch", "Fetch and read a URL"),
+    ("Agent", "Delegate a bounded task to a sub-agent"),
+    ("TodoWrite", "Track a multi-step plan"),
+    ("NotebookEdit", "Edit Jupyter notebook cells"),
+    ("Skill", "Run a skill"),
+    ("AskUserQuestion", "Ask the user to choose between options"),
+    ("ToolSearch", "Find a tool by describing the capability you need"),
+];
 
-You have access to powerful tools for software engineering tasks:
-- **Read/Write files**: Read any file, write new files, edit existing files with precise diffs
-- **Execute commands**: Run bash commands, PowerShell scripts, background processes
-- **Search**: Glob patterns, regex grep, web search, file content search
-- **Web**: Fetch URLs, search the internet
-- **Agents**: Spawn parallel sub-agents for complex multi-step work
-- **Memory**: Persistent notes across sessions via the memory system
-- **MCP servers**: Connect to external tools and APIs via Model Context Protocol
-- **Jupyter notebooks**: Read and edit notebook cells
+/// Build the "Capabilities" section: one line per declared tool that has a
+/// summary in [`CAPABILITY_SUMMARIES`]. With an unknown tool set (`None`) only
+/// the general sentence is emitted, so the prompt never claims a tool that is
+/// not loaded.
+fn build_capabilities_section(enabled: Option<&[String]>) -> String {
+    let mut lines = vec![
+        String::new(),
+        "## Capabilities".to_string(),
+        String::new(),
+        "Only the tools declared in this request are available; do not claim or call any other."
+            .to_string(),
+    ];
+    if let Some(names) = enabled {
+        for (tool, summary) in CAPABILITY_SUMMARIES {
+            if names.iter().any(|n| n == tool) {
+                lines.push(format!("- {tool}: {summary}"));
+            }
+        }
+        if names
+            .iter()
+            .any(|n| !CAPABILITY_SUMMARIES.iter().any(|(tool, _)| tool == n))
+        {
+            lines.push(
+                "Other declared tools, such as those from MCP servers, are described by their own definitions."
+                    .to_string(),
+            );
+        }
+    }
+    lines.join("\n")
+}
 
+const TASK_APPROACH: &str = r#"
 ## How to approach tasks
 
 1. **Understand before acting**: Read relevant files before making changes
@@ -564,9 +642,13 @@ fn build_tool_use_guidelines(enabled: Option<&[String]>) -> String {
             .to_string(),
         "- Parallelize independent tool calls by issuing them together in a single response."
             .to_string(),
-        "- When you're unsure which tool fits a task, use ToolSearch to discover an appropriate one."
-            .to_string(),
     ];
+    if enabled.is_none_or(|names| names.iter().any(|n| n == "ToolSearch")) {
+        lines.push(
+            "- When you're unsure which tool fits a task, use ToolSearch to discover an appropriate one."
+                .to_string(),
+        );
+    }
 
     for &tool in GUIDELINE_TOOLS {
         let include = match enabled {
@@ -846,6 +928,70 @@ mod tests {
         assert!(prompt.contains("Parallelize independent tool calls"));
         assert!(!prompt.contains("Bash commands time out"));
         assert!(!prompt.contains("Read a file with the Read tool"));
+    }
+
+    fn stable_block(opts: &SystemPromptOptions) -> String {
+        let prompt = build_system_prompt(opts);
+        split_at_dynamic_boundary(&prompt).0.to_string()
+    }
+
+    #[test]
+    fn capabilities_list_only_declared_tools() {
+        let opts = SystemPromptOptions {
+            enabled_tools: Some(vec!["Read".to_string(), "Bash".to_string()]),
+            ..Default::default()
+        };
+        let stable = stable_block(&opts);
+        assert!(stable.contains("- Read: Read file contents"));
+        assert!(stable.contains("- Bash: Run shell commands"));
+        for absent in ["- WebSearch:", "- Agent:", "- NotebookEdit:", "Jupyter", "MCP servers", "Memory"] {
+            assert!(!stable.contains(absent), "{absent} must not be claimed");
+        }
+        assert!(!stable.contains("Other declared tools"));
+        assert!(!stable.contains("ToolSearch"));
+    }
+
+    #[test]
+    fn capabilities_mention_undescribed_tools_and_tool_search_when_declared() {
+        let opts = SystemPromptOptions {
+            enabled_tools: Some(vec!["ToolSearch".to_string(), "github_list_issues".to_string()]),
+            ..Default::default()
+        };
+        let stable = stable_block(&opts);
+        assert!(stable.contains("- ToolSearch: Find a tool"));
+        assert!(stable.contains("use ToolSearch to discover"));
+        assert!(stable.contains("Other declared tools, such as those from MCP servers"));
+    }
+
+    #[test]
+    fn platform_block_has_one_shell_rule() {
+        let unix = stable_block(&SystemPromptOptions {
+            platform: Some(PromptPlatform::Linux),
+            enabled_tools: Some(vec!["Bash".to_string(), "PowerShell".to_string()]),
+            ..Default::default()
+        });
+        assert_eq!(unix.matches("## Platform").count(), 1);
+        assert!(unix.contains("use POSIX shell syntax"));
+        assert!(!unix.contains("cmd.exe"));
+        assert!(!unix.contains("PowerShell tool for"));
+
+        let windows = stable_block(&SystemPromptOptions {
+            platform: Some(PromptPlatform::Windows),
+            enabled_tools: Some(vec!["Bash".to_string(), "PowerShell".to_string()]),
+            ..Default::default()
+        });
+        assert_eq!(windows.matches("## Platform").count(), 1);
+        assert!(windows.contains("through cmd.exe"));
+        assert!(windows.contains("PowerShell tool for"));
+        assert!(!windows.contains("Unix shell syntax"));
+        assert!(!windows.contains("POSIX"));
+
+        let windows_no_ps = stable_block(&SystemPromptOptions {
+            platform: Some(PromptPlatform::Windows),
+            enabled_tools: Some(vec!["Bash".to_string()]),
+            ..Default::default()
+        });
+        assert!(!windows_no_ps.contains("PowerShell tool for"));
     }
 
     #[test]
