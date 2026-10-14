@@ -195,9 +195,24 @@ impl PluginRegistry {
     }
 
     /// Collect all MCP server configs contributed by enabled plugins.
+    ///
+    /// Servers from project plugins (a repository's `.claurst/plugins/`) are
+    /// tagged [`McpServerOrigin::Project`] so they go through the same
+    /// approval gate as servers in a project's `.claurst/settings.json`: the
+    /// repository, not the user, put them there (#493). Servers from user and
+    /// `--plugin-dir` plugins stay [`McpServerOrigin::User`].
+    ///
+    /// [`McpServerOrigin::Project`]: claurst_core::config::McpServerOrigin::Project
+    /// [`McpServerOrigin::User`]: claurst_core::config::McpServerOrigin::User
     pub fn all_mcp_servers(&self) -> Vec<claurst_core::config::McpServerConfig> {
+        use claurst_core::config::McpServerOrigin;
         let mut servers: Vec<claurst_core::config::McpServerConfig> = Vec::new();
         for plugin in self.enabled() {
+            let origin = if plugin.source == PluginSource::Project {
+                McpServerOrigin::Project
+            } else {
+                McpServerOrigin::User
+            };
             for mcp in &plugin.manifest.mcp_servers {
                 servers.push(claurst_core::config::McpServerConfig {
                     name: mcp.name.clone(),
@@ -209,8 +224,7 @@ impl PluginRegistry {
                     headers: Default::default(),
                     connect_timeout_ms: None,
                     catalog_timeout_ms: None,
-                    // Plugins are enabled explicitly by the user: trusted.
-                    origin: Default::default(),
+                    origin,
                 });
             }
         }

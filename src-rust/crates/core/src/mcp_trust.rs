@@ -9,8 +9,9 @@
 //! This module implements the trust model that gates those servers:
 //!
 //! - Servers with [`McpServerOrigin::User`] (global settings, `--mcp-config`,
-//!   enabled plugins) are always allowed — no behavior change.
-//! - Servers with [`McpServerOrigin::Project`] are only launched if the user
+//!   user and `--plugin-dir` plugins) are always allowed — no behavior change.
+//! - Servers with [`McpServerOrigin::Project`] (project settings, plugins in a
+//!   project's `.claurst/plugins/`) are only launched if the user
 //!   has approved them, either:
 //!     * globally (`trustProjectMcpServers` setting / `--trust-project-mcp`),
 //!     * for this session (in-memory `session_trusted` set), or
