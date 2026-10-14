@@ -820,6 +820,25 @@ async fn main() -> anyhow::Result<()> {
     query_config.append_system_prompt = None;
     query_config.session_context = Some(system_ctx);
     query_config.working_directory = Some(cwd.display().to_string());
+    // Skills are discovered once per session: the listing goes into the
+    // cached system block, so it must not change between turns. Discovery
+    // walks the filesystem and may `git clone` skills.urls, hence the
+    // blocking pool.
+    let skill_registry = {
+        let cwd = cwd.clone();
+        let skills_config = config.skills.clone();
+        tokio::task::spawn_blocking(move || claurst_core::SkillRegistry::discover(&cwd, &skills_config))
+            .await
+            .context("Skill discovery failed")?
+    };
+    query_config.available_skills = skill_registry
+        .skills()
+        .iter()
+        .map(|skill| claurst_core::system_prompt::SkillListing {
+            name: skill.name().to_string(),
+            description: skill.description().to_string(),
+        })
+        .collect();
     if let Some(tokens) = cli.thinking {
         query_config.thinking_budget = Some(tokens);
     }
@@ -908,6 +927,7 @@ async fn main() -> anyhow::Result<()> {
             user_question_rx,
             pending_project_mcp,
             mcp_project_root,
+            skill_registry,
         )
         .await
     };
@@ -1867,6 +1887,7 @@ async fn run_interactive(
     user_question_rx: Option<tokio::sync::mpsc::UnboundedReceiver<claurst_tools::UserQuestionEvent>>,
     pending_project_mcp: Vec<claurst_core::config::McpServerConfig>,
     mcp_project_root: Option<PathBuf>,
+    skill_registry: claurst_core::SkillRegistry,
 ) -> anyhow::Result<()> {
     use claurst_commands::{execute_command, CommandContext, CommandResult};
     use claurst_bridge::{BridgeOutbound, TuiBridgeEvent};
@@ -1961,23 +1982,14 @@ async fn run_interactive(
     // state that would otherwise outlive a signalled exit and garble the shell.
     claurst_tui::spawn_signal_restore_watchers();
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
-    // Discover skill slash commands once at startup so they appear in
-    // autocomplete without re-running discovery per keystroke. Discovery walks
-    // the filesystem and may `git clone` skill URLs, so it runs on the blocking
-    // pool and the main loop installs the result when it arrives.
-    let (skill_cmds_tx, mut skill_cmds_rx) = mpsc::channel::<Vec<(String, String)>>(1);
-    {
-        let cwd = tool_ctx.working_dir.clone();
-        let skills_config = live_config.skills.clone();
-        tokio::task::spawn_blocking(move || {
-            let registry = claurst_core::SkillRegistry::discover(&cwd, &skills_config);
-            let commands = claurst_commands::commands_from_skill_registry(&registry)
-                .iter()
-                .map(|c| (c.name().to_string(), c.description().to_string()))
-                .collect();
-            let _ = skill_cmds_tx.blocking_send(commands);
-        });
-    }
+    // Skill slash commands for autocomplete, from the registry discovered
+    // at startup.
+    app.set_discovered_slash_commands(
+        claurst_commands::commands_from_skill_registry(&skill_registry)
+            .iter()
+            .map(|c| (c.name().to_string(), c.description().to_string()))
+            .collect(),
+    );
     if let Some(error) = settings_load_error {
         app.invalid_config_dialog =
             claurst_tui::InvalidConfigDialogState::show_settings_error(&error);
@@ -3980,11 +3992,6 @@ async fn run_interactive(
         // Refresh task list if the overlay is visible.
         if app.tasks_overlay.visible {
             app.tasks_overlay.refresh_tasks(&claurst_tools::TASK_STORE);
-        }
-
-        // Install skill slash commands once background discovery finishes.
-        if let Ok(commands) = skill_cmds_rx.try_recv() {
-            app.set_discovered_slash_commands(commands);
         }
 
         // Check if the background update task has reported a result.

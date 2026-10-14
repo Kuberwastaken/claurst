@@ -357,6 +357,8 @@ impl Tool for AgentTool {
             output_style: ctx.config.effective_output_style(),
             output_style_prompt: ctx.config.resolve_output_style_prompt(),
             working_directory: Some(working_dir_str),
+            // Sub-agents get no skill listing; they can still call the Skill tool.
+            available_skills: Vec::new(),
             thinking_budget: None,
             temperature: None,
             tool_result_max_bytes: crate::DEFAULT_TOOL_RESULT_MAX_BYTES,

@@ -281,6 +281,10 @@ pub struct SystemPromptOptions {
     /// Current permission mode. It can change mid-session (/yolo, Shift+Tab),
     /// so its sentence goes in the dynamic section; `None` omits it.
     pub permission_mode: Option<crate::config::PermissionMode>,
+    /// Skills listed in the `<available_skills>` block, in display order.
+    /// Rendered into the cached block, so callers pass a list that is fixed
+    /// for the session. Empty: no block.
+    pub available_skills: Vec<SkillListing>,
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +352,13 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
             "\n<custom_instructions>\n{}\n</custom_instructions>",
             custom
         ));
+    }
+
+    // Available skills (cacheable: discovered once per session)
+    if let Some(skills) =
+        render_available_skills(&opts.available_skills, enabled_tools)
+    {
+        parts.push(skills);
     }
 
     // Sections start with a newline; drop their trailing newlines so the
@@ -812,6 +823,90 @@ follow-up work. Use TaskCreate/TaskUpdate to track parallel work.
 "#;
 
 // ---------------------------------------------------------------------------
+// Available skills (issue #446)
+// ---------------------------------------------------------------------------
+
+/// A skill as listed to the model: its name and one-line description.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillListing {
+    pub name: String,
+    pub description: String,
+}
+
+/// Size budget for the skill entries with descriptions, in bytes (about
+/// 3k tokens). Skills past it are listed by name only.
+const AVAILABLE_SKILLS_BUDGET_BYTES: usize = 12_000;
+
+/// Longest description kept per skill, in characters.
+const SKILL_DESCRIPTION_MAX_CHARS: usize = 250;
+
+/// Render the `<available_skills>` block, or `None` when there are no
+/// skills or the Skill tool is not enabled (the model could not load them).
+///
+/// Each skill gets one `- name: description` line, using the first line of
+/// its description capped at [`SKILL_DESCRIPTION_MAX_CHARS`]. Once the lines
+/// reach [`AVAILABLE_SKILLS_BUDGET_BYTES`], the remaining skills are listed
+/// by name only. The output depends only on `skills`, so a session-fixed list
+/// keeps the cached block byte-identical across turns.
+pub fn render_available_skills(
+    skills: &[SkillListing],
+    enabled_tools: Option<&[String]>,
+) -> Option<String> {
+    if skills.is_empty() {
+        return None;
+    }
+    if enabled_tools.is_some_and(|names| !names.iter().any(|n| n == "Skill")) {
+        return None;
+    }
+
+    let mut entries = String::new();
+    let mut overflow: Vec<String> = Vec::new();
+    for skill in skills {
+        let name = escape_skill_text(&skill.name);
+        if !overflow.is_empty() {
+            overflow.push(name);
+            continue;
+        }
+        let first_line = skill.description.lines().next().unwrap_or("").trim();
+        let mut description: String = first_line.chars().take(SKILL_DESCRIPTION_MAX_CHARS).collect();
+        if description.len() < first_line.len() {
+            description.push_str("...");
+        }
+        let entry = if description.is_empty() {
+            format!("- {}\n", name)
+        } else {
+            format!("- {}: {}\n", name, escape_skill_text(&description))
+        };
+        if entries.len() + entry.len() > AVAILABLE_SKILLS_BUDGET_BYTES {
+            overflow.push(name);
+        } else {
+            entries.push_str(&entry);
+        }
+    }
+    if !overflow.is_empty() {
+        entries.push_str(&format!(
+            "- Also available (descriptions omitted for length): {}\n",
+            overflow.join(", ")
+        ));
+    }
+
+    Some(format!(
+        "\n## Skills\n\n\
+         Skills are packaged instructions for specific tasks. When a task matches a \
+         skill's description, load it with the Skill tool (skill=\"<name>\") before \
+         starting and follow the instructions it returns. A skill the user already ran \
+         as a slash command does not need to be loaded again.\n\n\
+         <available_skills>\n{}</available_skills>",
+        entries
+    ))
+}
+
+/// Escape the characters that could close or forge the surrounding tags.
+fn escape_skill_text(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1243,6 +1338,65 @@ mod tests {
     #[test]
     fn stable_block_snapshot_windows_full_tools() {
         assert_stable_snapshot("stable_windows_full", PromptPlatform::Windows, FULL_TOOLS);
+    }
+
+    fn listing(name: &str, description: &str) -> SkillListing {
+        SkillListing { name: name.to_string(), description: description.to_string() }
+    }
+
+    #[test]
+    fn available_skills_render_in_the_stable_block() {
+        let opts = SystemPromptOptions {
+            available_skills: vec![
+                listing("review", "Review a diff\nSecond line is dropped"),
+                listing("x<y>", "a & b"),
+            ],
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+        let (stable, dynamic) = split_at_dynamic_boundary(&prompt);
+        assert!(stable.contains("<available_skills>\n- review: Review a diff\n"));
+        assert!(!stable.contains("Second line is dropped"));
+        assert!(stable.contains("- x&lt;y&gt;: a &amp; b\n</available_skills>"));
+        assert!(!dynamic.contains("available_skills"));
+        // Same input, same bytes: the cached block is stable across turns.
+        assert_eq!(build_system_prompt(&opts), prompt);
+    }
+
+    #[test]
+    fn available_skills_absent_without_skills_or_skill_tool() {
+        assert!(render_available_skills(&[], None).is_none());
+        let skills = vec![listing("review", "Review")];
+        let no_skill_tool = vec!["Read".to_string()];
+        assert!(render_available_skills(&skills, Some(&no_skill_tool)).is_none());
+        let with_skill_tool = vec!["Skill".to_string()];
+        assert!(render_available_skills(&skills, Some(&with_skill_tool)).is_some());
+        assert!(!build_system_prompt(&default_opts()).contains("<available_skills>"));
+    }
+
+    #[test]
+    fn available_skills_budget_lists_overflow_by_name() {
+        let long = "d".repeat(400);
+        let skills: Vec<SkillListing> = (0..200)
+            .map(|i| listing(&format!("skill-{:03}", i), &long))
+            .collect();
+        let block = render_available_skills(&skills, None).unwrap();
+        // Descriptions are capped per skill.
+        assert!(block.contains(&format!("- skill-000: {}...\n", "d".repeat(SKILL_DESCRIPTION_MAX_CHARS))));
+        assert!(!block.contains(&"d".repeat(SKILL_DESCRIPTION_MAX_CHARS + 1)));
+        // Entries with descriptions stay within the budget; the rest are names only.
+        let entries_end = block.find("- Also available").unwrap();
+        let entries_start = block.find("<available_skills>\n").unwrap();
+        assert!(entries_end - entries_start <= AVAILABLE_SKILLS_BUDGET_BYTES + 32);
+        assert!(block.contains("skill-199"));
+        assert!(!block.contains("- skill-199:"));
+        // Every skill is listed exactly once, in input order.
+        let mut last = 0;
+        for i in 0..200 {
+            let pos = block.find(&format!("skill-{:03}", i)).unwrap();
+            assert!(pos >= last);
+            last = pos;
+        }
     }
 
     #[test]

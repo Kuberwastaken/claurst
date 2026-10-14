@@ -106,7 +106,23 @@ impl Tool for SkillTool {
             return ToolResult::error(format!("Skill '{}' expanded to empty content.", skill_name));
         }
 
-        ToolResult::success(body.to_string())
+        ToolResult::success(wrap_skill_content(skill.name(), skill.base_dir(), body))
+    }
+}
+
+/// Wrap a skill body for the model. File skills carry their directory as
+/// `base_dir` plus a note that relative paths in the body resolve against it;
+/// bundled skills have no directory.
+fn wrap_skill_content(name: &str, base_dir: Option<&std::path::Path>, body: &str) -> String {
+    match base_dir {
+        Some(dir) => format!(
+            "<skill_content name=\"{name}\" base_dir=\"{dir}\">\n{body}\n\n\
+             Relative paths in this skill (for example scripts/ or references/) are \
+             relative to the base directory {dir}; use absolute paths built from it in \
+             tool calls.\n</skill_content>",
+            dir = dir.display()
+        ),
+        None => format!("<skill_content name=\"{name}\">\n{body}\n</skill_content>"),
     }
 }
 
@@ -135,4 +151,76 @@ fn list_skills(registry: &SkillRegistry) -> ToolResult {
         lines.len(),
         lines.join("\n")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
+    fn ctx_in(dir: &std::path::Path) -> ToolContext {
+        use claurst_core::permissions::AutoPermissionHandler;
+        let handler = Arc::new(AutoPermissionHandler {
+            mode: claurst_core::config::PermissionMode::Default,
+        });
+        ToolContext {
+            working_dir: dir.to_path_buf(),
+            permission_mode: claurst_core::config::PermissionMode::Default,
+            permission_handler: handler,
+            cost_tracker: claurst_core::cost::CostTracker::new(),
+            session_id: "test-skill".to_string(),
+            file_history: Arc::new(parking_lot::Mutex::new(
+                claurst_core::file_history::FileHistory::new(),
+            )),
+            current_turn: Arc::new(AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config: claurst_core::config::Config::default(),
+            managed_agent_config: None,
+            completion_notifier: None,
+            pending_permissions: None,
+            permission_manager: None,
+            user_question_tx: None,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_tool_round_trip_from_project_skill_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let skill_dir = tmp.path().join(".claurst").join("skills").join("deploy-446");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: Deploy\n---\nRun scripts/deploy.sh for $ARGUMENTS",
+        )
+        .unwrap();
+
+        let ctx = ctx_in(tmp.path());
+        let result = SkillTool
+            .execute(json!({"skill": "deploy-446", "args": "staging"}), &ctx)
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        let expected_open = format!(
+            "<skill_content name=\"deploy-446\" base_dir=\"{}\">\nRun scripts/deploy.sh for staging\n",
+            skill_dir.display()
+        );
+        assert!(result.content.starts_with(&expected_open), "{}", result.content);
+        assert!(result.content.contains("relative to the base directory"));
+        assert!(result.content.ends_with("</skill_content>"));
+
+        let listed = SkillTool.execute(json!({"skill": "list"}), &ctx).await;
+        assert!(listed.content.contains("deploy-446 — Deploy"), "{}", listed.content);
+
+        let missing = SkillTool.execute(json!({"skill": "no-such-skill-446"}), &ctx).await;
+        assert!(missing.is_error);
+    }
+
+    #[test]
+    fn bundled_skill_content_has_no_base_dir() {
+        let wrapped = wrap_skill_content("debug", None, "Body");
+        assert_eq!(wrapped, "<skill_content name=\"debug\">\nBody\n</skill_content>");
+    }
 }
