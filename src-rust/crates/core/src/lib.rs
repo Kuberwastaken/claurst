@@ -1470,8 +1470,8 @@ pub mod config {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
     pub enum McpServerOrigin {
         /// Defined in the user's global `~/.claurst/settings.json`, supplied
-        /// on the command line (`--mcp-config`), or contributed by a user or
-        /// `--plugin-dir` plugin. Considered trusted: auto-connects.
+        /// on the command line (`--mcp-config`), or contributed by a user plugin
+        /// (or one from a `PluginSource::Extra` path). Considered trusted: auto-connects.
         #[default]
         User,
         /// Defined in a repository's project-level `.claurst/settings.json`,

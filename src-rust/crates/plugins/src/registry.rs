@@ -199,8 +199,8 @@ impl PluginRegistry {
     /// Servers from project plugins (a repository's `.claurst/plugins/`) are
     /// tagged [`McpServerOrigin::Project`] so they go through the same
     /// approval gate as servers in a project's `.claurst/settings.json`: the
-    /// repository, not the user, put them there (#493). Servers from user and
-    /// `--plugin-dir` plugins stay [`McpServerOrigin::User`].
+    /// repository, not the user, put them there (#493). Servers from user plugins
+    /// (and any `PluginSource::Extra` path) stay [`McpServerOrigin::User`].
     ///
     /// [`McpServerOrigin::Project`]: claurst_core::config::McpServerOrigin::Project
     /// [`McpServerOrigin::User`]: claurst_core::config::McpServerOrigin::User
