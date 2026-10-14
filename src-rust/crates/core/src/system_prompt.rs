@@ -180,15 +180,17 @@ impl SystemPromptPrefix {
         Self::Cli
     }
 
-    /// The opening attribution string for this prefix variant.
+    /// The opening attribution string for this prefix variant. It names no
+    /// model vendor: the same prompt is sent to every provider.
     pub fn attribution_text(self) -> &'static str {
         match self {
             Self::Cli | Self::Vertex | Self::Bedrock | Self::Remote => {
-                "You are Claurst, Anthropic's official CLI for Claude."
+                "You are Claurst, a coding agent that runs in the user's terminal. \
+                You help by reading files, running commands, editing code, and writing new files."
             }
             Self::SdkPreset => {
-                "You are Claurst, Anthropic's official CLI for Claude, \
-                running within the Claude Agent SDK."
+                "You are Claurst, a coding agent running within the Claude Agent SDK. \
+                You help by reading files, running commands, editing code, and writing new files."
             }
             Self::Sdk => {
                 "You are a Claude agent, built on Anthropic's Claude Agent SDK."
@@ -655,6 +657,14 @@ mod tests {
     fn test_default_prompt_contains_attribution() {
         let prompt = build_system_prompt(&default_opts());
         assert!(prompt.contains("Claurst"), "Default prompt must contain attribution");
+    }
+
+    #[test]
+    fn cli_identity_is_provider_neutral() {
+        let identity = SystemPromptPrefix::Cli.attribution_text();
+        assert!(identity.starts_with("You are Claurst, a coding agent"));
+        assert!(!identity.contains("Anthropic"));
+        assert!(!identity.contains("Claude"));
     }
 
     #[test]
