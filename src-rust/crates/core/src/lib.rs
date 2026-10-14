@@ -4933,6 +4933,10 @@ pub mod tasks {
         /// Lines dropped from the middle of `output` to keep memory bounded.
         #[serde(default)]
         pub omitted_output_lines: u64,
+        /// File holding the task's full output when it outgrew the in-memory
+        /// windows (#442).
+        #[serde(default)]
+        pub output_file: Option<std::path::PathBuf>,
         /// OS process ID, if applicable.
         pub pid: Option<u32>,
         /// Cancellation token for the task's in-process work loop. Signalling it
@@ -4953,6 +4957,7 @@ pub mod tasks {
                 completed_at: None,
                 output: Vec::new(),
                 omitted_output_lines: 0,
+                output_file: None,
                 pid: None,
                 cancel_token: None,
             }
@@ -4964,20 +4969,26 @@ pub mod tasks {
         }
 
         /// The task's output bounded for the model: a head window and a tail
-        /// window (lines and bytes) around a note naming what was left out (#442).
+        /// window (lines and bytes) around a note naming what was left out,
+        /// plus `Full output: <path>` once the full output was spilled (#442).
         pub fn render_output(&self) -> String {
-            if self.omitted_output_lines == 0 {
+            let mut text = if self.omitted_output_lines == 0 {
                 let text = self.output.join("\n");
-                return bound_head_tail(&text).unwrap_or(text);
+                bound_head_tail(&text).unwrap_or(text)
+            } else {
+                let split = OUTPUT_WINDOW_LINES.min(self.output.len());
+                let head = self.output[..split].join("\n");
+                let tail = self.output[split..].join("\n");
+                join_head_tail(
+                    head_window(&head, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES),
+                    tail_window(&tail, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES),
+                    &format!("{} lines", self.omitted_output_lines),
+                )
+            };
+            if let Some(path) = &self.output_file {
+                text.push_str(&format!("\n\nFull output: {}", path.display()));
             }
-            let split = OUTPUT_WINDOW_LINES.min(self.output.len());
-            let head = self.output[..split].join("\n");
-            let tail = self.output[split..].join("\n");
-            join_head_tail(
-                head_window(&head, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES),
-                tail_window(&tail, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES),
-                &format!("{} lines", self.omitted_output_lines),
-            )
+            text
         }
 
         /// Return `true` if the task is still running.
@@ -5073,6 +5084,13 @@ pub mod tasks {
             self.update_status(id, TaskStatus::Cancelled);
         }
 
+        /// Record the file holding a task's full output.  No-op if unknown.
+        pub fn set_output_file(&self, id: &str, path: std::path::PathBuf) {
+            if let Some(mut entry) = self.tasks.get_mut(id) {
+                entry.output_file = Some(path);
+            }
+        }
+
         /// Set the OS process ID for a task.  No-op if unknown.
         pub fn set_pid(&self, id: &str, pid: u32) {
             if let Some(mut entry) = self.tasks.get_mut(id) {
@@ -5119,6 +5137,10 @@ pub mod tasks {
             assert!(rendered.ends_with("line 99999"));
             assert!(rendered.contains("lines omitted"));
             assert!(rendered.len() <= 2 * OUTPUT_WINDOW_BYTES + 100);
+
+            registry.set_output_file(&id, std::path::PathBuf::from("/spill/x.txt"));
+            let rendered = registry.get(&id).unwrap().render_output();
+            assert!(rendered.ends_with("line 99999\n\nFull output: /spill/x.txt"));
         }
 
         #[test]
