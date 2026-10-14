@@ -1,14 +1,13 @@
 //! Shared agent runtime owned by the ACP server.
 //!
 //! Built once on startup and reused for every session. Per-session state
-//! (cwd, transcript, cancellation token, permission queue) is layered on
-//! top via `sessions::SessionState`.
+//! (cwd, transcript, cancellation token, permission manager and queue) is
+//! layered on top via `sessions::SessionState`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use claurst_core::config::{Config, Settings};
-use claurst_core::permissions::PermissionManager;
 use claurst_core::CostTracker;
 use claurst_query::QueryConfig;
 use claurst_tools::Tool;
@@ -25,7 +24,6 @@ pub struct AgentRuntime {
     pub cost_tracker: Arc<CostTracker>,
     pub query_config: QueryConfig,
     pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
-    pub permission_manager: Arc<std::sync::Mutex<PermissionManager>>,
     pub working_dir: PathBuf,
 }
 
@@ -66,11 +64,6 @@ impl AgentRuntime {
             client_config,
         ));
 
-        let permission_manager = Arc::new(std::sync::Mutex::new(PermissionManager::new(
-            config.permission_mode.clone(),
-            &settings,
-        )));
-
         let cost_tracker = CostTracker::new();
 
         // MCP servers from settings — connect upfront so their tools are
@@ -100,7 +93,6 @@ impl AgentRuntime {
             cost_tracker,
             query_config,
             mcp_manager,
-            permission_manager,
             working_dir,
         })
     }

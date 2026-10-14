@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use agent_client_protocol_schema as acp;
 use claurst_api::streaming::{AnthropicStreamEvent, ContentDelta};
+use claurst_core::permissions::ManagedInteractivePermissionHandler;
 use claurst_core::types::Message;
 use claurst_query::{QueryEvent, QueryOutcome};
 use claurst_tools::ToolContext;
@@ -15,7 +16,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use crate::connection::Connection;
-use crate::permission::AcpPermissionHandler;
 use crate::runtime::AgentRuntime;
 use crate::sessions::SessionState;
 
@@ -55,8 +55,11 @@ pub async fn handle(
     messages.push(Message::user(user_text));
 
     // Build per-session ToolContext.
-    let permission_handler: Arc<dyn claurst_core::PermissionHandler> =
-        Arc::new(AcpPermissionHandler);
+    // The session's PermissionManager decides first; only its Ask decisions
+    // reach the client through the pending-permission queue.
+    let permission_handler: Arc<dyn claurst_core::PermissionHandler> = Arc::new(
+        ManagedInteractivePermissionHandler::new(session.permission_manager.clone()),
+    );
     let tool_ctx = ToolContext {
         working_dir: session.cwd.clone(),
         permission_mode: runtime.config.permission_mode.clone(),
@@ -71,7 +74,7 @@ pub async fn handle(
         managed_agent_config: runtime.config.managed_agents.clone(),
         completion_notifier: None,
         pending_permissions: Some(session.pending_permissions.clone()),
-        permission_manager: Some(runtime.permission_manager.clone()),
+        permission_manager: Some(session.permission_manager.clone()),
         user_question_tx: None,
         // Bind to this turn's cancel token so the parallel tool executor and any
         // sub-agents observe cancellation (issue #218). `run_query_loop` also
@@ -84,6 +87,7 @@ pub async fn handle(
     let drainer = crate::permission::spawn_drainer(
         connection.clone(),
         session.session_id.clone(),
+        session.permission_manager.clone(),
         session.pending_permissions.clone(),
         drainer_cancel.clone(),
         cancel.clone(),

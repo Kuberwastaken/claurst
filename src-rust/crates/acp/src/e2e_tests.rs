@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use agent_client_protocol_schema as acp;
 use claurst_api::{ProviderError, ProviderRequest, StreamEvent};
-use claurst_core::types::UsageInfo;
+use claurst_core::types::{ContentBlock, UsageInfo};
 use dashmap::DashMap;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
@@ -25,6 +25,8 @@ pub(crate) enum Step {
     Hang,
     /// End the turn with this text.
     Text(&'static str),
+    /// Call one tool with this input.
+    Tool(&'static str, Value),
 }
 
 /// Provider double that replays `Step`s and records every request.
@@ -104,6 +106,27 @@ impl claurst_api::LlmProvider for ScriptedProvider {
                 }),
                 Ok(StreamEvent::MessageStop),
             ],
+            Step::Tool(name, input) => vec![
+                start,
+                Ok(StreamEvent::ContentBlockStart {
+                    index: 0,
+                    content_block: ContentBlock::ToolUse {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name: name.to_string(),
+                        input: json!({}),
+                        thought_signature: None,
+                    },
+                }),
+                Ok(StreamEvent::InputJsonDelta {
+                    index: 0,
+                    partial_json: input.to_string(),
+                }),
+                Ok(StreamEvent::MessageDelta {
+                    stop_reason: Some(StopReason::ToolUse),
+                    usage: Some(UsageInfo::default()),
+                }),
+                Ok(StreamEvent::MessageStop),
+            ],
         };
         Ok(Box::pin(futures::stream::iter(events)))
     }
@@ -152,10 +175,6 @@ pub(crate) fn scripted_runtime(cwd: &Path, provider: Arc<ScriptedProvider>) -> A
     query_config.max_turns = 10;
     query_config.provider_registry = Some(provider_registry.clone());
 
-    let permission_manager = Arc::new(std::sync::Mutex::new(
-        claurst_core::permissions::PermissionManager::new(config.permission_mode.clone(), &settings),
-    ));
-
     AgentRuntime {
         config,
         settings,
@@ -165,7 +184,6 @@ pub(crate) fn scripted_runtime(cwd: &Path, provider: Arc<ScriptedProvider>) -> A
         cost_tracker: claurst_core::CostTracker::new(),
         query_config,
         mcp_manager: None,
-        permission_manager,
         working_dir: cwd.to_path_buf(),
     }
 }
@@ -295,6 +313,28 @@ pub(crate) fn stop_reason(response: &Value) -> acp::StopReason {
     result.stop_reason
 }
 
+/// Serialises the tests that read or write the global settings, and points
+/// the settings directory at a fresh scratch directory for each of them so
+/// an "Allow always" rule saved by one test never leaks into another (or
+/// into the real user settings).
+pub(crate) async fn isolated_home() -> tokio::sync::MutexGuard<'static, ()> {
+    static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let guard = HOME_LOCK.lock().await;
+    std::env::set_var("CLAURST_HOME", scratch_dir("home"));
+    guard
+}
+
+/// Tool-call updates the agent sent, as `(status, tool title)` pairs.
+pub(crate) fn tool_statuses(client: &Client) -> Vec<String> {
+    client
+        .updates
+        .lock()
+        .iter()
+        .filter(|u| u["update"]["sessionUpdate"] == "tool_call_update")
+        .map(|u| u["update"]["status"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
 /// A fresh, canonical scratch directory.
 pub(crate) fn scratch_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("claurst-acp-{tag}-{}", uuid::Uuid::new_v4()));
@@ -304,6 +344,7 @@ pub(crate) fn scratch_dir(tag: &str) -> PathBuf {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prompt_after_cancel_runs_normally() {
+    let _home = isolated_home().await;
     let cwd = scratch_dir("cancel");
     let provider = ScriptedProvider::new(vec![Step::Hang, Step::Text("second answer")]);
     let client = Client::start(scripted_runtime(&cwd, provider.clone()));
@@ -331,6 +372,7 @@ async fn prompt_after_cancel_runs_normally() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_prompt_on_one_session_is_rejected() {
+    let _home = isolated_home().await;
     let cwd = scratch_dir("busy");
     let provider = ScriptedProvider::new(vec![Step::Hang]);
     let client = Client::start(scripted_runtime(&cwd, provider.clone()));
@@ -354,4 +396,115 @@ async fn concurrent_prompt_on_one_session_is_rejected() {
         .await;
     let first = first.await.expect("first prompt task");
     assert_eq!(stop_reason(&first), acp::StopReason::Cancelled);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_inside_workspace_runs_without_asking_the_client() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("read");
+    let file = cwd.join("notes.txt");
+    std::fs::write(&file, "hello").expect("seed file");
+    let provider = ScriptedProvider::new(vec![
+        Step::Tool("Read", json!({ "file_path": file })),
+        Step::Text("read it"),
+    ]);
+    let client = Client::start(scripted_runtime(&cwd, provider));
+    let session_id = client.new_session(&cwd).await;
+
+    let response = client.prompt(&session_id, "read the notes").await;
+    assert_eq!(stop_reason(&response), acp::StopReason::EndTurn);
+    assert!(
+        client.permission_requests.lock().is_empty(),
+        "a read inside the workspace is allowed by policy and must not reach the client"
+    );
+    assert_eq!(tool_statuses(&client), vec!["completed"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_outside_workspace_asks_the_client() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("workspace");
+    let outside = scratch_dir("outside").join("secret.txt");
+    std::fs::write(&outside, "secret").expect("seed file");
+    let provider = ScriptedProvider::new(vec![
+        Step::Tool("Read", json!({ "file_path": outside })),
+        Step::Text("read it"),
+    ]);
+    let client = Client::start(scripted_runtime(&cwd, provider));
+    client.permission_answers.lock().push_back("allow_once");
+    let session_id = client.new_session(&cwd).await;
+
+    let response = client.prompt(&session_id, "read the secret").await;
+    assert_eq!(stop_reason(&response), acp::StopReason::EndTurn);
+    let requests = client.permission_requests.lock().clone();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    let request: acp::RequestPermissionRequest =
+        serde_json::from_value(requests[0].clone()).expect("request_permission params");
+    assert_eq!(request.session_id, session_id);
+    assert_eq!(tool_statuses(&client), vec!["completed"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_asks_once_then_allow_always_is_remembered_and_saved() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("write");
+    let target = cwd.join("out.txt");
+    let provider = ScriptedProvider::new(vec![
+        Step::Tool("Write", json!({ "file_path": target, "content": "one" })),
+        Step::Text("wrote one"),
+        Step::Tool("Write", json!({ "file_path": target, "content": "two" })),
+        Step::Text("wrote two"),
+    ]);
+    let client = Client::start(scripted_runtime(&cwd, provider));
+    client.permission_answers.lock().push_back("allow_always");
+    let session_id = client.new_session(&cwd).await;
+
+    let first = client.prompt(&session_id, "write one").await;
+    assert_eq!(stop_reason(&first), acp::StopReason::EndTurn);
+    assert_eq!(client.permission_requests.lock().len(), 1);
+    assert_eq!(std::fs::read_to_string(&target).expect("written"), "one");
+
+    let second = client.prompt(&session_id, "write two").await;
+    assert_eq!(stop_reason(&second), acp::StopReason::EndTurn);
+    assert_eq!(
+        client.permission_requests.lock().len(),
+        1,
+        "allow-always must not ask again in the same session"
+    );
+    assert_eq!(std::fs::read_to_string(&target).expect("written"), "two");
+
+    let saved = claurst_core::config::Settings::load_sync().expect("settings readable");
+    assert!(
+        saved
+            .permission_rules
+            .iter()
+            .any(|rule| rule.tool_name.as_deref() == Some("Write")),
+        "allow-always must be saved like the TUI does: {:?}",
+        saved.permission_rules
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejected_write_fails_the_tool_and_asks_again_next_time() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("reject");
+    let target = cwd.join("out.txt");
+    let provider = ScriptedProvider::new(vec![
+        Step::Tool("Write", json!({ "file_path": target, "content": "one" })),
+        Step::Text("could not write"),
+        Step::Tool("Write", json!({ "file_path": target, "content": "two" })),
+        Step::Text("could not write"),
+    ]);
+    let client = Client::start(scripted_runtime(&cwd, provider));
+    client
+        .permission_answers
+        .lock()
+        .extend(["reject_once", "reject_once"]);
+    let session_id = client.new_session(&cwd).await;
+
+    client.prompt(&session_id, "write one").await;
+    client.prompt(&session_id, "write two").await;
+    assert_eq!(client.permission_requests.lock().len(), 2);
+    assert!(!target.exists(), "a rejected write must not touch the file");
+    assert_eq!(tool_statuses(&client), vec!["failed", "failed"]);
 }

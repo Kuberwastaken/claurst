@@ -3,6 +3,8 @@
 use std::sync::Arc;
 
 use agent_client_protocol_schema as acp;
+use claurst_core::config::Settings;
+use claurst_core::permissions::PermissionManager;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
@@ -155,7 +157,17 @@ impl AgentServer {
                 .data(Some(serde_json::json!({ "reason": "cwd must be absolute" }))));
         }
         let session_id = acp::SessionId::new(format!("acp-{}", uuid::Uuid::new_v4()));
-        let state = SessionState::new(session_id.clone(), req.cwd.clone());
+        // Permission rules live only in the global settings; read them fresh
+        // so "Allow always" answers from earlier sessions apply here too.
+        let mode = self.runtime.config.permission_mode.clone();
+        let permission_manager = match Settings::load_sync() {
+            Ok(settings) => PermissionManager::new(mode, &settings),
+            Err(e) => {
+                warn!(error = %e, "ACP: could not reload settings, using startup permission rules");
+                PermissionManager::new(mode, &self.runtime.settings)
+            }
+        };
+        let state = SessionState::new(session_id.clone(), req.cwd.clone(), permission_manager);
         info!(session_id = %session_id, cwd = %req.cwd.display(), "ACP: new session");
 
         // v1: ignore req.mcp_servers — agent uses settings.json MCP roster.

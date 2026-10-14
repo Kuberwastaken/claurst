@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_client_protocol_schema as acp;
+use claurst_core::permissions::PermissionManager;
 use claurst_core::types::Message;
 use claurst_tools::PendingPermissionStore;
 use dashmap::DashMap;
@@ -20,12 +21,19 @@ pub struct SessionState {
     /// `session/cancel` only ever affects the turn that was in flight.
     active_turn: parking_lot::Mutex<Option<CancellationToken>>,
     pub pending_permissions: Arc<parking_lot::Mutex<PendingPermissionStore>>,
+    /// Decides every tool check before anything is sent to the client, and
+    /// holds this session's "Allow always" rules.
+    pub permission_manager: Arc<std::sync::Mutex<PermissionManager>>,
     pub file_history: Arc<parking_lot::Mutex<claurst_core::file_history::FileHistory>>,
     pub current_turn: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl SessionState {
-    pub fn new(session_id: acp::SessionId, cwd: PathBuf) -> Arc<Self> {
+    pub fn new(
+        session_id: acp::SessionId,
+        cwd: PathBuf,
+        permission_manager: PermissionManager,
+    ) -> Arc<Self> {
         Arc::new(Self {
             session_id,
             cwd,
@@ -34,6 +42,7 @@ impl SessionState {
             pending_permissions: Arc::new(parking_lot::Mutex::new(
                 PendingPermissionStore::default(),
             )),
+            permission_manager: Arc::new(std::sync::Mutex::new(permission_manager)),
             file_history: Arc::new(parking_lot::Mutex::new(
                 claurst_core::file_history::FileHistory::new(),
             )),
@@ -108,11 +117,19 @@ impl SessionRegistry {
 mod tests {
     use super::*;
 
+    fn session(id: &str, cwd: &str) -> Arc<SessionState> {
+        let manager = PermissionManager::new(
+            claurst_core::PermissionMode::Default,
+            &claurst_core::config::Settings::default(),
+        );
+        SessionState::new(acp::SessionId::new(id), PathBuf::from(cwd), manager)
+    }
+
     #[test]
     fn new_session_starts_empty_and_idle() {
         let id = acp::SessionId::new("session-1");
         let cwd = PathBuf::from("/tmp/claurst-test");
-        let state = SessionState::new(id.clone(), cwd.clone());
+        let state = session("session-1", "/tmp/claurst-test");
 
         assert_eq!(state.session_id, id);
         assert_eq!(state.cwd, cwd);
@@ -126,7 +143,7 @@ mod tests {
 
     #[test]
     fn second_concurrent_turn_is_rejected() {
-        let state = SessionState::new(acp::SessionId::new("busy"), PathBuf::from("/tmp"));
+        let state = session("busy", "/tmp");
         let first = state.begin_turn().expect("idle session accepts a turn");
         assert!(state.begin_turn().is_none(), "a running turn must block a second one");
         drop(first);
@@ -135,7 +152,7 @@ mod tests {
 
     #[test]
     fn cancel_only_affects_the_running_turn() {
-        let state = SessionState::new(acp::SessionId::new("cancel"), PathBuf::from("/tmp"));
+        let state = session("cancel", "/tmp");
         let first = state.begin_turn().expect("idle session accepts a turn");
         assert!(state.cancel_turn());
         assert!(first.token.is_cancelled());
@@ -152,7 +169,7 @@ mod tests {
     fn registry_insert_get_remove_round_trip() {
         let registry = SessionRegistry::new();
         let id = acp::SessionId::new("session-2");
-        let state = SessionState::new(id.clone(), PathBuf::from("/tmp"));
+        let state = session("session-2", "/tmp");
 
         assert!(registry.get(&id).is_none());
 
