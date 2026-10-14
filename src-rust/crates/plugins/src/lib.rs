@@ -334,6 +334,9 @@ pub fn format_plugin_info(registry: &PluginRegistry, name: &str) -> String {
             // MCP servers.
             if !p.manifest.mcp_servers.is_empty() {
                 out.push_str(&format!("\nMCP servers ({}):\n", p.manifest.mcp_servers.len()));
+                if p.source == PluginSource::Project {
+                    out.push_str("  (project plugin: each server needs your approval before it starts)\n");
+                }
                 for srv in &p.manifest.mcp_servers {
                     out.push_str(&format!("  {}\n", srv.name));
                 }
