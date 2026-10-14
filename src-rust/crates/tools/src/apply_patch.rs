@@ -772,6 +772,21 @@ pub(crate) async fn apply_patch_text(
     }
 }
 
+/// If `command` is only `apply_patch <<'EOF' ... EOF` (optionally after
+/// `cd <dir> &&`), apply the patch as the ApplyPatch tool would instead of
+/// running it, resolving paths against the session shell's current directory
+/// (plus the `cd`). Returns `None` for any other command.
+pub(crate) async fn run_heredoc_invocation(command: &str, ctx: &ToolContext) -> Option<ToolResult> {
+    let invocation = envelope::parse_heredoc_invocation(command)?;
+    let shell_cwd = crate::session_shell_state(&ctx.session_id).lock().cwd.clone();
+    let shell_cwd = shell_cwd.unwrap_or_else(|| ctx.working_dir.clone());
+    let base = match &invocation.workdir {
+        Some(dir) => shell_cwd.join(dir),
+        None => shell_cwd,
+    };
+    Some(apply_patch_text(&invocation.patch, false, &base, ctx).await)
+}
+
 // ---------------------------------------------------------------------------
 // Tool implementation
 // ---------------------------------------------------------------------------
@@ -1393,5 +1408,38 @@ mod tests {
             .collect();
         assert_eq!(std::fs::read_to_string(&a).unwrap(), expected);
         assert_eq!(std::fs::read_to_string(&b).unwrap(), expected);
+    }
+
+    /// `cd <dir> && apply_patch <<'EOF'` resolves paths under `<dir>`.
+    #[tokio::test]
+    async fn heredoc_invocation_applies_relative_to_cd() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/f.txt"), "old\n").unwrap();
+        let ctx = crate::test_support::allow_all_context(dir.path().to_path_buf());
+        let command = "cd sub && apply_patch <<'EOF'\n*** Begin Patch\n*** Update File: f.txt\n@@\n-old\n+new\n*** End Patch\nEOF\n";
+        let res = run_heredoc_invocation(command, &ctx).await.unwrap();
+        assert!(!res.is_error, "{}", res.content);
+        assert_eq!(std::fs::read_to_string(dir.path().join("sub/f.txt")).unwrap(), "new\n");
+        assert!(run_heredoc_invocation("ls -la", &ctx).await.is_none());
+    }
+
+    /// The Bash tool routes an `apply_patch` heredoc to the patch code
+    /// (with Edit permission checks) instead of running it in a shell.
+    #[tokio::test]
+    async fn bash_tool_routes_apply_patch_heredoc() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "old\n").unwrap();
+        let handler = std::sync::Arc::new(RecordingHandler(parking_lot::Mutex::new(Vec::new())));
+        let mut ctx = crate::test_support::context_with_handler(dir.path().to_path_buf(), handler.clone());
+        ctx.session_id = format!("apply-patch-heredoc-{}", uuid::Uuid::new_v4());
+        let command = "apply_patch <<'EOF'\n*** Begin Patch\n*** Update File: f.txt\n@@\n-old\n+new\n*** End Patch\nEOF";
+        let res = crate::PtyBashTool.execute(json!({ "command": command }), &ctx).await;
+        assert!(!res.is_error, "{}", res.content);
+        assert_eq!(res.content, "Success. Updated the following files:\nM f.txt\n");
+        assert_eq!(std::fs::read_to_string(dir.path().join("f.txt")).unwrap(), "new\n");
+        let requests = handler.0.lock();
+        assert!(!requests.is_empty());
+        assert!(requests.iter().all(|(tool, _)| tool == claurst_core::constants::TOOL_NAME_FILE_EDIT));
     }
 }

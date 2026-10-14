@@ -952,6 +952,13 @@ impl Tool for PtyBashTool {
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
 
+        // `apply_patch <<'EOF' ... EOF` feeds a patch to a program that does
+        // not exist here: apply it as ApplyPatch does, with that tool's
+        // per-path Edit permission checks, from the shell's current directory.
+        if let Some(result) = crate::apply_patch::run_heredoc_invocation(&params.command, ctx).await {
+            return result;
+        }
+
         // Permission check
         let reason = params
             .description

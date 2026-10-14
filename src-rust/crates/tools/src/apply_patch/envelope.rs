@@ -35,6 +35,9 @@ const EOF_MARKER: &str = "*** End of File";
 const CHANGE_CONTEXT_MARKER: &str = "@@ ";
 const EMPTY_CHANGE_CONTEXT_MARKER: &str = "@@";
 
+/// The commands a shell heredoc may feed a patch to.
+const APPLY_PATCH_COMMANDS: [&str; 2] = ["apply_patch", "applypatch"];
+
 /// One file operation in an envelope patch.
 #[derive(Debug, PartialEq)]
 pub(super) enum Hunk {
@@ -568,6 +571,76 @@ pub(super) fn apply_chunks(original: &str, path: &str, chunks: &[UpdateFileChunk
     Ok(format!("{}{}", bom, source.into_contents()))
 }
 
+// ---------------------------------------------------------------------------
+// Shell heredoc invocations
+// ---------------------------------------------------------------------------
+
+/// A shell command that only feeds a patch to `apply_patch` through a heredoc.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct HeredocInvocation {
+    /// The heredoc body: the patch text.
+    pub(crate) patch: String,
+    /// The directory of a leading `cd <dir> &&`, if any.
+    pub(crate) workdir: Option<String>,
+}
+
+/// Recognise `apply_patch <<'EOF' ... EOF` (or `applypatch`, any of
+/// `<<EOF` / `<<'EOF'` / `<<"EOF"` with any delimiter word), optionally
+/// preceded by `cd <dir> &&`, as the whole command. Like codex this is
+/// deliberately strict: anything before or after the heredoc, a `cd` with
+/// flags or a quoted or multi-word argument, or a body that is not an
+/// envelope patch means it is not an apply_patch invocation and the command
+/// runs as usual.
+pub(crate) fn parse_heredoc_invocation(command: &str) -> Option<HeredocInvocation> {
+    let (first_line, rest) = command.trim_start().split_once('\n')?;
+    let first_line = first_line.trim_end_matches('\r');
+
+    let mut words = first_line.split_whitespace().peekable();
+    let workdir = if words.peek() == Some(&"cd") {
+        words.next();
+        let dir = words.next()?;
+        let plain = |c: char| c.is_ascii_alphanumeric() || "/._-~+@%:,".contains(c);
+        if !dir.chars().all(plain) || dir.starts_with('-') || words.next() != Some("&&") {
+            return None;
+        }
+        Some(dir.to_string())
+    } else {
+        None
+    };
+    if !APPLY_PATCH_COMMANDS.contains(&words.next()?) {
+        return None;
+    }
+    // The redirect may be written `<<EOF` or `<< EOF`.
+    let redirect: String = words.collect::<Vec<_>>().concat();
+    let delimiter = redirect.strip_prefix("<<")?;
+    let delimiter = match delimiter.as_bytes() {
+        [b'\'', .., b'\''] | [b'"', .., b'"'] if delimiter.len() >= 3 => &delimiter[1..delimiter.len() - 1],
+        _ => delimiter,
+    };
+    if delimiter.is_empty() || !delimiter.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+
+    // The body runs to the first line that is exactly the delimiter, and
+    // nothing but whitespace may follow it.
+    let mut body = String::new();
+    let mut lines = rest.split('\n');
+    let mut closed = false;
+    for line in lines.by_ref() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line == delimiter {
+            closed = true;
+            break;
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    if !closed || lines.any(|line| !line.trim().is_empty()) || !is_envelope(&body) {
+        return None;
+    }
+    Some(HeredocInvocation { patch: body, workdir })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,5 +811,43 @@ mod tests {
                  '*** Update File: {path}'"
                 .to_string())
         );
+    }
+
+    // --- heredoc invocations ---
+
+    #[test]
+    fn heredoc_forms_are_recognised() {
+        let body = "*** Begin Patch\n*** Add File: a.txt\n+hi\n*** End Patch\n";
+        for (command, workdir) in [
+            (format!("apply_patch <<'EOF'\n{}EOF", body), None),
+            (format!("applypatch <<EOF\n{}EOF\n", body), None),
+            (format!("apply_patch << \"PATCH\"\n{}PATCH\n  \n", body), None),
+            (format!("cd sub/dir && apply_patch <<'EOF'\n{}EOF", body), Some("sub/dir".to_string())),
+        ] {
+            assert_eq!(
+                parse_heredoc_invocation(&command),
+                Some(HeredocInvocation { patch: body.to_string(), workdir }),
+                "{}",
+                command
+            );
+        }
+    }
+
+    #[test]
+    fn heredoc_lookalikes_are_not_recognised() {
+        let body = "*** Begin Patch\n*** Add File: a.txt\n+hi\n*** End Patch\n";
+        for command in [
+            format!("echo hi; apply_patch <<'EOF'\n{}EOF", body),
+            format!("apply_patch <<'EOF'\n{}EOF\necho done", body),
+            format!("apply_patch <<'EOF' && rm -rf x\n{}EOF", body),
+            format!("cd \"a b\" && apply_patch <<'EOF'\n{}EOF", body),
+            format!("cd a || apply_patch <<'EOF'\n{}EOF", body),
+            format!("apply_patch <<'EOF'\n{}", body),
+            "apply_patch <<'EOF'\n--- a/x\n+++ b/x\nEOF".to_string(),
+            "cat <<'EOF'\n*** Begin Patch\n*** End Patch\nEOF".to_string(),
+            "apply_patch".to_string(),
+        ] {
+            assert_eq!(parse_heredoc_invocation(&command), None, "{}", command);
+        }
     }
 }

@@ -24,6 +24,7 @@ use claurst_core::codex_oauth::{
     CODEX_API_ENDPOINT, CODEX_MODELS, CODEX_TOKEN_URL, DEFAULT_CODEX_MODEL,
 };
 use claurst_core::accounts::jwt_identity;
+use claurst_core::constants::TOOL_NAME_APPLY_PATCH;
 use claurst_core::oauth_config::{get_codex_tokens, save_codex_tokens, CodexTokens};
 use claurst_core::provider_id::{ModelId, ProviderId};
 use claurst_core::types::UsageInfo;
@@ -41,6 +42,85 @@ use crate::provider_types::{
 
 // Re-use Copilot's message translation helpers via the public Copilot type.
 use crate::providers::copilot::CopilotProvider;
+
+// ---------------------------------------------------------------------------
+// apply_patch as a freeform tool
+// ---------------------------------------------------------------------------
+
+/// The name Codex models call the patch tool by.
+const FREEFORM_APPLY_PATCH: &str = "apply_patch";
+
+/// The grammar the official client attaches to its freeform `apply_patch`
+/// tool, from openai/codex `codex-rs/core/assets/tools/apply_patch.lark`
+/// (Copyright 2025 OpenAI, Apache License 2.0).
+const APPLY_PATCH_LARK_GRAMMAR: &str = r#"start: begin_patch hunk+ end_patch
+begin_patch: "*** Begin Patch" LF
+end_patch: "*** End Patch" LF?
+
+hunk: add_hunk | delete_hunk | update_hunk
+add_hunk: "*** Add File: " filename LF add_line+
+delete_hunk: "*** Delete File: " filename LF
+update_hunk: "*** Update File: " filename LF change_move? change?
+
+filename: /(.+)/
+add_line: "+" /(.*)/ LF -> line
+
+change_move: "*** Move to: " filename LF
+change: (change_context | change_line)+ eof_line?
+change_context: ("@@" | "@@ " /(.+)/) LF
+change_line: ("+" | "-" | " ") /(.*)/ LF
+eof_line: "*** End of File" LF
+
+%import common.LF
+"#;
+
+/// Whether `model` takes apply_patch as a freeform `custom` tool with the
+/// Lark grammar rather than a JSON function tool. The official client reads
+/// this from the catalog's `apply_patch_tool_type`, which is `freeform` for
+/// every model it lists (all gpt-5 and later, `models-manager/models.json`);
+/// those are the models trained on the envelope.
+fn uses_freeform_apply_patch(model: &str) -> bool {
+    let model = model.rsplit('/').next().unwrap_or(model);
+    model.starts_with("gpt-5") || model.starts_with("gpt-6") || model.contains("codex")
+}
+
+/// Rewrite replayed ApplyPatch calls into the `custom_tool_call` /
+/// `custom_tool_call_output` items a freeform tool's calls are, so the
+/// history matches the tool the request declares.
+fn replay_apply_patch_as_custom(input: &mut [Value]) {
+    let mut call_ids: Vec<String> = Vec::new();
+    for item in input.iter_mut() {
+        if item["type"] != "function_call" || item["name"] != TOOL_NAME_APPLY_PATCH {
+            continue;
+        }
+        let patch = item["arguments"]
+            .as_str()
+            .and_then(|args| serde_json::from_str::<Value>(args).ok())
+            .and_then(|args| args["patch"].as_str().map(str::to_owned));
+        let (Some(patch), Some(call_id)) = (patch, item["call_id"].as_str().map(str::to_owned)) else {
+            continue;
+        };
+        *item = json!({
+            "type": "custom_tool_call",
+            "call_id": call_id,
+            "name": FREEFORM_APPLY_PATCH,
+            "input": patch,
+        });
+        call_ids.push(call_id);
+    }
+    for item in input.iter_mut() {
+        if item["type"] == "function_call_output"
+            && item["call_id"].as_str().is_some_and(|id| call_ids.iter().any(|c| c == id))
+        {
+            item["type"] = json!("custom_tool_call_output");
+        }
+    }
+}
+
+/// The tool a `custom_tool_call` names, in claurst's tool names.
+fn custom_tool_name(name: &str) -> String {
+    if name == FREEFORM_APPLY_PATCH { TOOL_NAME_APPLY_PATCH } else { name }.to_string()
+}
 
 // ---------------------------------------------------------------------------
 // CodexProvider
@@ -367,10 +447,23 @@ impl CodexProvider {
                     .is_some_and(|data| !data.is_empty())
         });
 
+        let freeform_patch = uses_freeform_apply_patch(&request.model);
         let tools: Vec<Value> = request
             .tools
             .iter()
             .map(|tool| {
+                if freeform_patch && tool.name == TOOL_NAME_APPLY_PATCH {
+                    return json!({
+                        "type": "custom",
+                        "name": FREEFORM_APPLY_PATCH,
+                        "description": "The `apply_patch` tool can be used to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+                        "format": {
+                            "type": "grammar",
+                            "syntax": "lark",
+                            "definition": APPLY_PATCH_LARK_GRAMMAR,
+                        },
+                    });
+                }
                 json!({
                     "type": "function",
                     "name": tool.name,
@@ -380,6 +473,9 @@ impl CodexProvider {
                 })
             })
             .collect();
+        if freeform_patch {
+            replay_apply_patch_as_custom(&mut input);
+        }
 
         let mut body = json!({
             "model": request.model,
@@ -617,6 +713,15 @@ impl CodexProvider {
                         thought_signature: None,
                     });
                 }
+                Some("custom_tool_call") => {
+                    has_tool_call = true;
+                    content.push(ContentBlock::ToolUse {
+                        id: item["call_id"].as_str().or(item["id"].as_str()).unwrap_or("").to_string(),
+                        name: custom_tool_name(item["name"].as_str().unwrap_or("")),
+                        input: json!({ "patch": item["input"].as_str().unwrap_or("") }),
+                        thought_signature: None,
+                    });
+                }
                 _ => {}
             }
         }
@@ -685,6 +790,8 @@ impl CodexProvider {
             let mut model_name = String::from(DEFAULT_CODEX_MODEL);
             let mut saw_tool_call = false;
             let mut open_blocks: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            // Freeform tool input streamed so far, by output index.
+            let mut custom_inputs: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
@@ -791,6 +898,21 @@ impl CodexProvider {
                                                 message_started = true;
                                             }
                                         }
+                                        Some("custom_tool_call") => {
+                                            saw_tool_call = true;
+                                            custom_inputs.insert(output_index, String::new());
+                                            if open_blocks.insert(output_index) {
+                                                yield Ok(StreamEvent::ContentBlockStart {
+                                                    index: output_index,
+                                                    content_block: claurst_core::types::ContentBlock::ToolUse {
+                                                        id: item["call_id"].as_str().or(item["id"].as_str()).unwrap_or("").to_string(),
+                                                        name: custom_tool_name(item["name"].as_str().unwrap_or("")),
+                                                        input: json!({}),
+                                                        thought_signature: None,
+                                                    },
+                                                });
+                                            }
+                                        }
                                         Some("function_call") => {
                                             saw_tool_call = true;
                                             let call_id = item
@@ -894,6 +1016,17 @@ impl CodexProvider {
                                     });
                                 }
                             }
+                            "response.custom_tool_call_input.delta" => {
+                                let output_index = json_val
+                                    .get("output_index")
+                                    .and_then(|value| value.as_u64())
+                                    .unwrap_or(0) as usize;
+                                if let (Some(buf), Some(delta)) =
+                                    (custom_inputs.get_mut(&output_index), json_val["delta"].as_str())
+                                {
+                                    buf.push_str(delta);
+                                }
+                            }
                             "response.reasoning_summary_part.added" => {
                                 // Separate consecutive summary parts like the
                                 // official client's transcript does.
@@ -941,6 +1074,17 @@ impl CodexProvider {
                                     .get("output_index")
                                     .and_then(|value| value.as_u64())
                                     .unwrap_or(0) as usize;
+                                // A freeform call's input is raw text, not JSON:
+                                // hand it over whole as the tool's `patch`.
+                                if let Some(streamed) = custom_inputs.remove(&output_index) {
+                                    let raw = json_val["item"]["input"].as_str().unwrap_or(&streamed);
+                                    if open_blocks.contains(&output_index) {
+                                        yield Ok(StreamEvent::InputJsonDelta {
+                                            index: output_index,
+                                            partial_json: json!({ "patch": raw }).to_string(),
+                                        });
+                                    }
+                                }
                                 if open_blocks.remove(&output_index) {
                                     yield Ok(StreamEvent::ContentBlockStop { index: output_index });
                                 }
@@ -1325,6 +1469,139 @@ mod tests {
         );
         assert_eq!(input[1]["encrypted_content"], "ENC-1");
         assert_eq!(input[1]["summary"][0]["text"], "Listing files first.");
+    }
+
+    fn tool(name: &str) -> claurst_core::types::ToolDefinition {
+        claurst_core::types::ToolDefinition {
+            name: name.to_string(),
+            description: format!("{name} tool"),
+            input_schema: json!({ "type": "object" }),
+        }
+    }
+
+    /// gpt-5 and later get apply_patch as the freeform tool the official
+    /// client sends; other tools, and other models, stay JSON functions.
+    #[test]
+    fn apply_patch_is_a_freeform_tool_for_gpt5_models() {
+        let mut req = request(None);
+        req.tools = vec![tool("Bash"), tool(TOOL_NAME_APPLY_PATCH)];
+        let body = CodexProvider::build_responses_body(&req);
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "Bash");
+        assert_eq!(tools[1]["type"], "custom");
+        assert_eq!(tools[1]["name"], "apply_patch");
+        assert_eq!(tools[1]["format"]["type"], "grammar");
+        assert_eq!(tools[1]["format"]["syntax"], "lark");
+        assert!(tools[1]["format"]["definition"]
+            .as_str()
+            .unwrap()
+            .starts_with("start: begin_patch hunk+ end_patch"));
+        assert!(tools[1].get("parameters").is_none());
+
+        req.model = "gpt-4.1".to_string();
+        let body = CodexProvider::build_responses_body(&req);
+        assert_eq!(body["tools"][1]["type"], "function");
+        assert_eq!(body["tools"][1]["name"], TOOL_NAME_APPLY_PATCH);
+
+        assert!(uses_freeform_apply_patch("gpt-5.3-codex-spark"));
+        assert!(uses_freeform_apply_patch("openai/gpt-6.1-sol"));
+        assert!(!uses_freeform_apply_patch("o3"));
+    }
+
+    /// An earlier ApplyPatch call is replayed as the custom tool call (and
+    /// output) the declared freeform tool produces.
+    #[test]
+    fn apply_patch_history_replays_as_custom_tool_items() {
+        use claurst_core::types::{ContentBlock, Message, ToolResultContent};
+        let patch = "*** Begin Patch\n*** Add File: a.txt\n+hi\n*** End Patch";
+        let mut req = request(None);
+        req.tools = vec![tool(TOOL_NAME_APPLY_PATCH)];
+        req.messages = vec![
+            Message::user("add a file"),
+            Message::assistant_blocks(vec![ContentBlock::ToolUse {
+                id: "call_7".into(),
+                name: TOOL_NAME_APPLY_PATCH.into(),
+                input: json!({ "patch": patch }),
+                thought_signature: None,
+            }]),
+            Message::user_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "call_7".into(),
+                content: ToolResultContent::Text("Success. Updated the following files:\nA a.txt\n".into()),
+                is_error: None,
+            }]),
+        ];
+        let body = CodexProvider::build_responses_body(&req);
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[1]["type"], "custom_tool_call");
+        assert_eq!(input[1]["call_id"], "call_7");
+        assert_eq!(input[1]["name"], "apply_patch");
+        assert_eq!(input[1]["input"], patch);
+        assert_eq!(input[2]["type"], "custom_tool_call_output");
+        assert_eq!(input[2]["call_id"], "call_7");
+    }
+
+    /// A streamed `custom_tool_call` becomes an ApplyPatch tool use whose
+    /// input is `{"patch": <raw text>}`.
+    #[tokio::test]
+    async fn sse_custom_tool_call_becomes_apply_patch_tool_use() {
+        use claurst_core::types::ContentBlock;
+        let patch = "*** Begin Patch\n*** Add File: a.txt\n+hi\n*** End Patch";
+        let events_text = [
+            json!({"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}}),
+            json!({"type":"response.output_item.added","output_index":0,"item":{"id":"ctc_1","type":"custom_tool_call","call_id":"call_9","name":"apply_patch","input":""}}),
+            json!({"type":"response.custom_tool_call_input.delta","output_index":0,"item_id":"ctc_1","delta":&patch[..20]}),
+            json!({"type":"response.custom_tool_call_input.delta","output_index":0,"item_id":"ctc_1","delta":&patch[20..]}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{"id":"ctc_1","type":"custom_tool_call","call_id":"call_9","name":"apply_patch","input":patch}}),
+            json!({"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.5","usage":{"input_tokens":10,"output_tokens":5}}}),
+        ]
+        .iter()
+        .map(|event| format!("event: {}\ndata: {}\n\n", event["type"].as_str().unwrap(), event))
+        .collect::<String>();
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> = vec![Ok(events_text.into_bytes())];
+        let events: Vec<StreamEvent> = CodexProvider::sse_events(
+            futures::stream::iter(chunks),
+            ProviderId::new(ProviderId::CODEX),
+            None,
+        )
+        .map(|event| event.expect("stream has no errors"))
+        .collect()
+        .await;
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: ContentBlock::ToolUse { id, name, .. },
+            } if id == "call_9" && name == TOOL_NAME_APPLY_PATCH
+        )));
+        let args: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::InputJsonDelta { partial_json, .. } => Some(partial_json.as_str()),
+                _ => None,
+            })
+            .collect();
+        let args: Value = serde_json::from_str(&args).unwrap();
+        assert_eq!(args, json!({ "patch": patch }));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::MessageDelta { stop_reason: Some(StopReason::ToolUse), .. }
+        )));
+
+        let response = json!({
+            "id": "resp_1",
+            "model": "gpt-5.5",
+            "output": [{"type":"custom_tool_call","call_id":"call_9","name":"apply_patch","input":patch}],
+        });
+        let parsed =
+            CodexProvider::parse_responses_response(&ProviderId::new(ProviderId::CODEX), &response).unwrap();
+        assert!(matches!(parsed.stop_reason, StopReason::ToolUse));
+        assert!(matches!(
+            &parsed.content[0],
+            ContentBlock::ToolUse { name, input, .. }
+                if name == TOOL_NAME_APPLY_PATCH && input == &json!({ "patch": patch })
+        ));
     }
 
     #[test]
