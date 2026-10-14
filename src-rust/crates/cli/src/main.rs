@@ -871,41 +871,30 @@ async fn main() -> anyhow::Result<()> {
         // they would only launch on the next MCP-runtime rebuild, which re-runs
         // the trust gate; queue the unapproved ones for the TUI approval prompt
         // here, like servers from a project's settings file.
-        if plugin_servers
-            .iter()
-            .any(|s| s.origin == claurst_core::config::McpServerOrigin::Project)
-        {
-            // A repo with plugins but no `.claurst/settings.json` has no root
-            // from `project_root_for`; key approvals by the directory the
-            // project plugins were loaded from.
-            mcp_project_root.get_or_insert_with(|| cwd.clone());
-            let store = claurst_core::mcp_trust::McpTrustStore::load();
-            let plugin_decision = claurst_core::mcp_trust::partition_mcp_servers(
-                &plugin_servers,
-                mcp_project_root.as_deref(),
-                settings.trust_project_mcp_servers,
-                &std::collections::HashSet::new(),
-                &store,
-            );
-            if !plugin_decision.pending.is_empty() {
-                let names: Vec<&str> =
-                    plugin_decision.pending.iter().map(|s| s.name.as_str()).collect();
-                if is_headless {
-                    warn!(
-                        servers = ?names,
-                        "Skipping MCP server(s) from project plugins pending approval. \
-                         Approve them in the interactive TUI, or pass --trust-project-mcp \
-                         (or set trustProjectMcpServers) to launch them in headless mode."
-                    );
-                } else {
-                    info!(
-                        servers = ?names,
-                        "MCP server(s) from project plugins require approval before launching."
-                    );
-                }
+        let plugin_pending = pending_project_plugin_mcp(
+            &plugin_servers,
+            &mut mcp_project_root,
+            &cwd,
+            settings.trust_project_mcp_servers,
+            &claurst_core::mcp_trust::McpTrustStore::load(),
+        );
+        if !plugin_pending.is_empty() {
+            let names: Vec<&str> = plugin_pending.iter().map(|s| s.name.as_str()).collect();
+            if is_headless {
+                warn!(
+                    servers = ?names,
+                    "Skipping MCP server(s) from project plugins pending approval. \
+                     Approve them in the interactive TUI, or pass --trust-project-mcp \
+                     (or set trustProjectMcpServers) to launch them in headless mode."
+                );
+            } else {
+                info!(
+                    servers = ?names,
+                    "MCP server(s) from project plugins require approval before launching."
+                );
             }
-            pending_project_mcp.extend(plugin_decision.pending);
         }
+        pending_project_mcp.extend(plugin_pending);
     }
     // Plugin hooks run through the core hook engine after settings hooks
     // (#447); the registry is then shared with commands and tools.
@@ -1057,6 +1046,38 @@ async fn main() -> anyhow::Result<()> {
 
     cron_cancel.cancel();
     result
+}
+
+/// Gate the MCP servers that plugins contributed (#493) and return the
+/// project-origin ones still pending approval, for the TUI approval prompt.
+///
+/// The startup gate ran before plugins loaded, so these servers were never
+/// queued; the MCP-runtime rebuild re-runs the gate before launching them. A
+/// repo with project plugins but no `.claurst/settings.json` has no root from
+/// `project_root_for`, so approvals are keyed by `cwd`, the directory the
+/// project plugins were loaded from.
+fn pending_project_plugin_mcp(
+    plugin_servers: &[claurst_core::config::McpServerConfig],
+    mcp_project_root: &mut Option<PathBuf>,
+    cwd: &std::path::Path,
+    trust_all_project: bool,
+    store: &claurst_core::mcp_trust::McpTrustStore,
+) -> Vec<claurst_core::config::McpServerConfig> {
+    if !plugin_servers
+        .iter()
+        .any(|s| s.origin == claurst_core::config::McpServerOrigin::Project)
+    {
+        return Vec::new();
+    }
+    let root = mcp_project_root.get_or_insert_with(|| cwd.to_path_buf());
+    claurst_core::mcp_trust::partition_mcp_servers(
+        plugin_servers,
+        Some(root.as_path()),
+        trust_all_project,
+        &std::collections::HashSet::new(),
+        store,
+    )
+    .pending
 }
 
 fn start_mcp_manager(
@@ -5462,6 +5483,57 @@ mod bare_mode_tests {
             !(normal.no_claude_md || normal.bare),
             "AGENTS.md stays enabled without --bare/--no-claude-md"
         );
+    }
+
+    #[test]
+    fn project_plugin_mcp_servers_are_queued_for_approval() {
+        use claurst_core::config::{McpServerConfig, McpServerOrigin};
+        use claurst_core::mcp_trust::McpTrustStore;
+        let server = |name: &str, origin| McpServerConfig {
+            name: name.to_string(),
+            command: Some("server-bin".to_string()),
+            args: vec![],
+            env: Default::default(),
+            url: None,
+            server_type: "stdio".to_string(),
+            headers: Default::default(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
+            origin,
+        };
+        let servers = vec![
+            server("user-srv", McpServerOrigin::User),
+            server("repo-srv", McpServerOrigin::Project),
+        ];
+        let cwd = std::env::temp_dir().join("claurst-493-project");
+        let mut store = McpTrustStore::default();
+
+        // (a) unapproved project-plugin server is pending; (b) with no
+        // settings-derived project root, approvals are keyed by cwd.
+        let mut root = None;
+        let pending = pending_project_plugin_mcp(&servers, &mut root, &cwd, false, &store);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].name, "repo-srv");
+        assert_eq!(root.as_deref(), Some(cwd.as_path()));
+
+        // An existing project root is kept.
+        let other = std::env::temp_dir().join("claurst-493-settings-root");
+        let mut root = Some(other.clone());
+        pending_project_plugin_mcp(&servers, &mut root, &cwd, false, &store);
+        assert_eq!(root, Some(other));
+
+        // (c) nothing pending once approved for cwd, or with global trust.
+        store.approve(&cwd, &servers[1]);
+        let mut root = None;
+        assert!(pending_project_plugin_mcp(&servers, &mut root, &cwd, false, &store).is_empty());
+        let mut root = None;
+        let empty = McpTrustStore::default();
+        assert!(pending_project_plugin_mcp(&servers, &mut root, &cwd, true, &empty).is_empty());
+
+        // User-only plugin servers leave the root untouched.
+        let mut root = None;
+        assert!(pending_project_plugin_mcp(&servers[..1], &mut root, &cwd, false, &empty).is_empty());
+        assert!(root.is_none());
     }
 
     #[test]
