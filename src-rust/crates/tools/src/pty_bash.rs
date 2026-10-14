@@ -14,6 +14,7 @@ use crate::{PermissionLevel, Tool, ToolContext, ToolResult, session_shell_state}
 use async_trait::async_trait;
 use claurst_core::bash_classifier::{BashRiskLevel, classify_bash_command};
 use claurst_core::tasks::{BackgroundTask, global_registry};
+use claurst_core::truncate::bound_head_tail;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -25,7 +26,11 @@ use tracing::debug;
 
 // Unix-only imports used by the shell-state helpers and PTY execution path.
 #[cfg(unix)]
+use crate::output_spill::{Captured, OutputAccumulator, RAW_HEAD_BYTES, RAW_TAIL_BYTES};
+#[cfg(unix)]
 use crate::ShellState;
+#[cfg(unix)]
+use claurst_core::truncate::{head_window, join_head_tail, tail_window, OUTPUT_WINDOW_BYTES, OUTPUT_WINDOW_LINES};
 #[cfg(unix)]
 use regex::Regex;
 #[cfg(unix)]
@@ -186,19 +191,22 @@ async fn run_in_background(command: String, cwd: PathBuf, timeout_ms: u64) -> To
                     if let Some(pid) = c.id() {
                         global_registry().set_pid(&task_id_clone, pid);
                     }
-                    let stdout = c.stdout.take();
-                    let stderr = c.stderr.take();
-                    if let Some(out) = stdout {
-                        let mut lines = BufReader::new(out).lines();
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            global_registry().append_output(&task_id_clone, &line);
-                        }
-                    }
-                    if let Some(err) = stderr {
-                        let mut lines = BufReader::new(err).lines();
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            global_registry()
-                                .append_output(&task_id_clone, &format!("STDERR: {}", line));
+                    let mut stdout = c.stdout.take().map(|s| BufReader::new(s).lines());
+                    let mut stderr = c.stderr.take().map(|s| BufReader::new(s).lines());
+                    // Drain both pipes concurrently until both close. Reading
+                    // stdout to EOF first let a child that filled the stderr pipe
+                    // block forever (#442).
+                    while stdout.is_some() || stderr.is_some() {
+                        tokio::select! {
+                            line = next_line(&mut stdout), if stdout.is_some() => match line {
+                                Some(line) => global_registry().append_output(&task_id_clone, &line),
+                                None => stdout = None,
+                            },
+                            line = next_line(&mut stderr), if stderr.is_some() => match line {
+                                Some(line) => global_registry()
+                                    .append_output(&task_id_clone, &format!("STDERR: {}", line)),
+                                None => stderr = None,
+                            },
                         }
                     }
                     match c.wait().await {
@@ -248,6 +256,17 @@ async fn run_in_background(command: String, cwd: PathBuf, timeout_ms: u64) -> To
         "Command started in background.\nTask ID: {}\nCommand: {}",
         task_id, command
     ))
+}
+
+/// Next line from an optional line reader; `None` at EOF, on a read error, or
+/// when the reader is absent.
+async fn next_line<R: tokio::io::AsyncBufRead + Unpin>(
+    lines: &mut Option<tokio::io::Lines<R>>,
+) -> Option<String> {
+    match lines {
+        Some(lines) => lines.next_line().await.ok().flatten(),
+        None => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -312,8 +331,8 @@ fn strip_ansi(s: &str) -> String {
 /// Outcome of a single foreground PTY run.
 #[cfg(unix)]
 enum PtyOutcome {
-    /// The command finished; carries (raw PTY output, exit code).
-    Completed(String, i32),
+    /// The command finished; carries (bounded raw PTY output, exit code).
+    Completed(Captured, i32),
     /// The command exceeded its timeout. The child has been KILLED (#220).
     TimedOut,
     /// The PTY could not be set up / the command could not be spawned.
@@ -429,9 +448,9 @@ async fn run_in_pty(
     let mut guard = PtyKillGuard::new(killer);
 
     match tokio::time::timeout(timeout, read_handle).await {
-        Ok(Ok((output, exit_code))) => {
+        Ok(Ok((captured, exit_code))) => {
             guard.disarm();
-            PtyOutcome::Completed(output, exit_code)
+            PtyOutcome::Completed(captured, exit_code)
         }
         Ok(Err(e)) => {
             guard.disarm();
@@ -477,7 +496,11 @@ fn poll_readable(fd: std::os::unix::io::RawFd, timeout_ms: i32) -> bool {
 }
 
 /// Drive a spawned PTY child to completion: read its output while it runs, reap
-/// it, and return `(output, exit_code)`.
+/// it, and return `(captured output, exit_code)`.
+///
+/// The pty is drained to the end however much the child writes: output past
+/// the in-memory head + tail windows is dropped from the middle rather than
+/// left unread, which would block the child on a full pty until timeout (#442).
 ///
 /// Crucially — and mirroring bash.rs's `drive_child` — the loop stops as soon as
 /// the DIRECT child exits rather than waiting for pty EOF. A grandchild that
@@ -490,13 +513,11 @@ fn drive_pty_child(
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
     mut reader: Box<dyn std::io::Read + Send>,
     master_fd: Option<std::os::unix::io::RawFd>,
-) -> (String, i32) {
+) -> (Captured, i32) {
     use std::io::Read;
 
-    let mut output = String::new();
-    let mut buf = [0u8; 4096];
-    const MAX_BYTES: usize = 2 * 1024 * 1024;
-    let mut total = 0usize;
+    let mut output = OutputAccumulator::new(RAW_HEAD_BYTES, RAW_TAIL_BYTES);
+    let mut buf = vec![0u8; 64 * 1024];
 
     // Set once the direct child has exited. We then drain any already-buffered
     // pty output and stop — we never block waiting for EOF that a detached
@@ -515,12 +536,7 @@ fn drive_pty_child(
             match reader.read(&mut buf) {
                 Ok(0) => break, // EOF: every pty writer (incl. the child) is gone
                 Ok(n) => {
-                    total += n;
-                    if total > MAX_BYTES {
-                        output.push_str("\n[output truncated at 2 MB limit]");
-                        break;
-                    }
-                    output.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    output.push(&buf[..n]);
                     continue; // keep draining while bytes remain
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -549,7 +565,66 @@ fn drive_pty_child(
         Ok(status) => status.exit_code() as i32,
         Err(_) => -1,
     };
-    (output, exit_code)
+    (output.finish(), exit_code)
+}
+
+/// Split raw PTY output at the wrapper's shell-state sentinel: returns the
+/// user's output and the state lines that follow the sentinel (`pwd`, then the
+/// `env` dump). The sentinel must sit on a line of its own; the last such line
+/// wins. Works on raw bytes so it also applies to a retained tail (#442).
+#[cfg(unix)]
+fn split_state_block(raw: &[u8]) -> (&[u8], Vec<String>) {
+    let needle = SHELL_STATE_SENTINEL.as_bytes();
+    let mut end = raw.len();
+    while let Some(pos) = raw[..end].windows(needle.len()).rposition(|w| w == needle) {
+        let rest = &raw[pos + needle.len()..];
+        let own_line = (pos == 0 || raw[pos - 1] == b'\n')
+            && (rest.is_empty() || rest.starts_with(b"\n") || rest.starts_with(b"\r\n"));
+        if own_line {
+            let state = strip_ansi(&String::from_utf8_lossy(rest));
+            // `rest` opens with the sentinel line's own line ending; skip it.
+            return (&raw[..pos], state.lines().skip(1).map(str::to_string).collect());
+        }
+        end = pos + needle.len() - 1;
+    }
+    (raw, Vec::new())
+}
+
+/// Turn captured PTY output into the text shown to the model plus the shell
+/// state lines. ANSI codes are stripped and the final newline dropped; output
+/// larger than the head + tail windows keeps only those windows (#442).
+#[cfg(unix)]
+fn render_pty_output(captured: Captured) -> (String, Vec<String>) {
+    match captured {
+        Captured::Complete(raw) => {
+            let (user, state) = split_state_block(&raw);
+            let text = strip_ansi(&String::from_utf8_lossy(user));
+            let text = text.strip_suffix('\n').unwrap_or(&text);
+            let output = bound_head_tail(text).unwrap_or_else(|| text.to_string());
+            (output, state)
+        }
+        Captured::Truncated {
+            head,
+            tail,
+            omitted,
+        } => {
+            let (tail, state) = split_state_block(&tail);
+            // The rolling tail starts mid-line (possibly mid-char or mid-escape):
+            // begin at the next full line.
+            let tail = match tail.iter().position(|&b| b == b'\n') {
+                Some(i) => &tail[i + 1..],
+                None => tail,
+            };
+            let head_text = strip_ansi(&String::from_utf8_lossy(&head));
+            let tail_text = strip_ansi(&String::from_utf8_lossy(tail));
+            let tail_text = tail_text.strip_suffix('\n').unwrap_or(&tail_text);
+            let head = head_window(&head_text, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES);
+            let tail = tail_window(tail_text, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES);
+            let omitted =
+                omitted + (head_text.len() - head.len() + tail_text.len() - tail.len()) as u64;
+            (join_head_tail(head, tail, &format!("about {omitted} bytes")), state)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -682,7 +757,7 @@ async fn run_windows_fallback(
             if output.is_empty() {
                 output = "(no output)".to_string();
             }
-            truncate_output(output, exit_code)
+            shell_result(bound_head_tail(&output).unwrap_or(output), exit_code)
         }
         Err(_) => {
             // Kill the whole tree, not just cmd.exe (#391); `child.kill` remains
@@ -695,13 +770,11 @@ async fn run_windows_fallback(
 }
 
 // ---------------------------------------------------------------------------
-// Shared output truncation helper
+// Shared result helper
 // ---------------------------------------------------------------------------
 
-fn truncate_output(output: String, exit_code: i32) -> ToolResult {
-    const MAX_OUTPUT_LEN: usize = 100_000;
-    let output = claurst_core::truncate::truncate_middle(output, MAX_OUTPUT_LEN);
-
+/// Wrap already-bounded command output in a tool result keyed on the exit code.
+fn shell_result(output: String, exit_code: i32) -> ToolResult {
     if exit_code != 0 {
         ToolResult::error(format!("Command exited with code {}\n{}", exit_code, output))
     } else {
@@ -821,77 +894,73 @@ impl Tool for PtyBashTool {
         // ── Unix PTY path ────────────────────────────────────────────────────
         #[cfg(unix)]
         {
-            // Build the wrapper script that restores cwd + captures shell state.
-            // Restored env vars are cloned out and later injected into the child's
-            // environment (never its argv) — see `apply_restored_env` (#211).
-            let (script, restored_env, working_dir_str) = {
-                let state = shell_state_arc.lock();
-                let script = build_wrapper_script(&params.command, &state, &ctx.working_dir);
-                let restored_env = state.env_vars.clone();
-                let wd = ctx.working_dir.to_string_lossy().into_owned();
-                (script, restored_env, wd)
-            };
+            run_pty_foreground(
+                &params.command,
+                &shell_state_arc,
+                &ctx.working_dir,
+                timeout_dur,
+                timeout_ms,
+            )
+            .await
+        }
+    }
+}
 
-            // run_in_pty owns the timeout so it can KILL the child when it fires
-            // (a bare outer timeout would just drop the future and orphan it) (#220).
-            let outcome = run_in_pty(&script, &working_dir_str, &restored_env, timeout_dur).await;
+/// Run `command` in a PTY with the session's persisted shell state, fold the
+/// wrapper's state block back into that state, and render the bounded result.
+#[cfg(unix)]
+async fn run_pty_foreground(
+    command: &str,
+    shell_state: &parking_lot::Mutex<ShellState>,
+    base_cwd: &PathBuf,
+    timeout_dur: Duration,
+    timeout_ms: u64,
+) -> ToolResult {
+    // Build the wrapper script that restores cwd + captures shell state.
+    // Restored env vars are cloned out and later injected into the child's
+    // environment (never its argv) — see `apply_restored_env` (#211).
+    let (script, restored_env, working_dir_str) = {
+        let state = shell_state.lock();
+        let script = build_wrapper_script(command, &state, base_cwd);
+        let restored_env = state.env_vars.clone();
+        let wd = base_cwd.to_string_lossy().into_owned();
+        (script, restored_env, wd)
+    };
 
-            match outcome {
-                PtyOutcome::Completed(raw_output, exit_code) => {
-                    // Strip ANSI escape codes from PTY output
-                    let cleaned = strip_ansi(&raw_output);
+    // run_in_pty owns the timeout so it can KILL the child when it fires
+    // (a bare outer timeout would just drop the future and orphan it) (#220).
+    let outcome = run_in_pty(&script, &working_dir_str, &restored_env, timeout_dur).await;
 
-                    // Split into user-visible lines and state block
-                    let all_lines: Vec<String> =
-                        cleaned.lines().map(|l| l.to_string()).collect();
+    match outcome {
+        PtyOutcome::Completed(captured, exit_code) => {
+            let (mut output, state_lines) = render_pty_output(captured);
 
-                    let sentinel_pos = all_lines
-                        .iter()
-                        .rposition(|l| l.trim() == SHELL_STATE_SENTINEL);
-
-                    let (user_lines, state_lines) = match sentinel_pos {
-                        Some(pos) => (&all_lines[..pos], &all_lines[pos + 1..]),
-                        None => (all_lines.as_slice(), &[][..]),
-                    };
-
-                    // Update persistent shell state
-                    if !state_lines.is_empty() {
-                        if let Some((new_cwd, env_delta)) =
-                            parse_shell_state_block(state_lines)
-                        {
-                            let mut state = shell_state_arc.lock();
-                            state.cwd = Some(new_cwd);
-                            for (k, v) in env_delta {
-                                state.env_vars.insert(k, v);
-                            }
-                        }
-                    }
-
-                    // Fast-path export capture
-                    {
-                        let exports = extract_exports_from_command(&params.command);
-                        if !exports.is_empty() {
-                            let mut state = shell_state_arc.lock();
-                            for (k, v) in exports {
-                                state.env_vars.insert(k, v);
-                            }
-                        }
-                    }
-
-                    let mut output = user_lines.join("\n");
-                    if output.is_empty() {
-                        output = "(no output)".to_string();
-                    }
-
-                    truncate_output(output, exit_code)
-                }
-                PtyOutcome::Failed(e) => {
-                    ToolResult::error(format!("PTY execution failed: {}", e))
-                }
-                PtyOutcome::TimedOut => {
-                    ToolResult::error(format!("Command timed out after {}ms", timeout_ms))
+            // Update persistent shell state
+            if let Some((new_cwd, env_delta)) = parse_shell_state_block(&state_lines) {
+                let mut state = shell_state.lock();
+                state.cwd = Some(new_cwd);
+                for (k, v) in env_delta {
+                    state.env_vars.insert(k, v);
                 }
             }
+
+            // Fast-path export capture
+            let exports = extract_exports_from_command(command);
+            if !exports.is_empty() {
+                let mut state = shell_state.lock();
+                for (k, v) in exports {
+                    state.env_vars.insert(k, v);
+                }
+            }
+
+            if output.is_empty() {
+                output = "(no output)".to_string();
+            }
+            shell_result(output, exit_code)
+        }
+        PtyOutcome::Failed(e) => ToolResult::error(format!("PTY execution failed: {}", e)),
+        PtyOutcome::TimedOut => {
+            ToolResult::error(format!("Command timed out after {}ms", timeout_ms))
         }
     }
 }
@@ -968,14 +1037,47 @@ mod tests {
 
     /// #442: output whose cut point lands inside a multibyte char used to panic
     /// on a byte-offset slice. 'é' is 2 bytes; the leading ASCII byte puts every
-    /// char boundary on an odd offset, so the 50 000-byte head cut splits one.
+    /// char boundary on an odd offset, so the even-sized window cuts split one.
     #[test]
-    fn truncate_output_multibyte_at_cut_does_not_panic() {
-        let output = format!("a{}", "é".repeat(60_000));
-        let result = truncate_output(output, 0);
-        assert!(!result.is_error);
-        assert!(result.content.contains("bytes truncated"));
-        assert!(result.content.starts_with('a') && result.content.ends_with('é'));
+    fn render_multibyte_at_cut_does_not_panic() {
+        let raw = format!("a{}", "é".repeat(60_000)).into_bytes();
+        let (output, state) = render_pty_output(Captured::Complete(raw));
+        assert!(state.is_empty());
+        assert!(output.contains("bytes omitted"), "len {}", output.len());
+        assert!(output.starts_with('a') && output.ends_with('é'));
+    }
+
+    #[test]
+    fn render_splits_state_block_from_complete_output() {
+        let raw = format!("hello\r\nworld\r\n{SHELL_STATE_SENTINEL}\r\n/tmp\r\nFOO=bar\r\n");
+        let (output, state) = render_pty_output(Captured::Complete(raw.into_bytes()));
+        assert_eq!(output, "hello\nworld");
+        assert_eq!(state, vec!["/tmp".to_string(), "FOO=bar".to_string()]);
+    }
+
+    /// A sentinel embedded in a line of user output is not the state block.
+    #[test]
+    fn render_ignores_sentinel_inside_a_line() {
+        let raw = format!("x{SHELL_STATE_SENTINEL}\n");
+        let (output, state) = render_pty_output(Captured::Complete(raw.into_bytes()));
+        assert_eq!(output, format!("x{SHELL_STATE_SENTINEL}"));
+        assert!(state.is_empty());
+    }
+
+    #[test]
+    fn render_truncated_keeps_head_tail_and_state() {
+        let tail = format!("partial\nlast line\n{SHELL_STATE_SENTINEL}\n/tmp\n");
+        let captured = Captured::Truncated {
+            head: b"first line\n".to_vec(),
+            tail: tail.into_bytes(),
+            omitted: 1000,
+        };
+        let (output, state) = render_pty_output(captured);
+        assert!(output.starts_with("first line"));
+        assert!(output.ends_with("last line"));
+        assert!(!output.contains("partial"));
+        assert!(output.contains("bytes omitted"));
+        assert_eq!(state, vec!["/tmp".to_string()]);
     }
 
     // -----------------------------------------------------------------------
@@ -1076,6 +1178,40 @@ mod tests {
                 "timed-out child `{marker}` was not killed; still running (pids: {lingering:?})",
             );
         }
+    }
+
+    /// #442: 10 MB of output used to hit the reader's 2 MB head-only cap, after
+    /// which nothing drained the pty, the child blocked, and the call timed out.
+    /// It must now complete with a head window, a tail window, and the shell
+    /// state (cwd) still captured from the end of the stream.
+    #[tokio::test]
+    async fn ten_megabytes_of_output_completes_with_head_and_tail() {
+        let state = parking_lot::Mutex::new(ShellState::new());
+        let base = std::env::temp_dir();
+        let started = std::time::Instant::now();
+        let result = run_pty_foreground(
+            "cd / && yes line | head -n 2000000; echo END",
+            &state,
+            &base,
+            Duration::from_secs(120),
+            120_000,
+        )
+        .await;
+        assert!(
+            !result.is_error,
+            "command failed after {:?}: {}",
+            started.elapsed(),
+            &result.content[..result.content.len().min(200)]
+        );
+        assert!(result.content.starts_with("line\nline\n"));
+        assert!(result.content.ends_with("line\nEND"));
+        assert!(result.content.contains("bytes omitted"));
+        assert!(
+            result.content.len() <= 2 * OUTPUT_WINDOW_BYTES + 200,
+            "result not bounded: {} bytes",
+            result.content.len()
+        );
+        assert_eq!(state.lock().cwd, Some(PathBuf::from("/")));
     }
 
     /// Regression test for #184: a tool command that spawns a child which

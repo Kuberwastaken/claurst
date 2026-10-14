@@ -4881,6 +4881,10 @@ pub mod paths;
 // tasks module — background task registry
 // ---------------------------------------------------------------------------
 pub mod tasks {
+    use crate::truncate::{
+        bound_head_tail, head_window, join_head_tail, tail_window, OUTPUT_WINDOW_BYTES,
+        OUTPUT_WINDOW_LINES,
+    };
     use chrono::{DateTime, Utc};
     use dashmap::DashMap;
     use once_cell::sync::Lazy;
@@ -4922,8 +4926,13 @@ pub mod tasks {
         pub started_at: DateTime<Utc>,
         /// When the task finished (completed, failed, or cancelled).
         pub completed_at: Option<DateTime<Utc>>,
-        /// Lines of output produced by the task.
+        /// Lines of output produced by the task: the first
+        /// [`OUTPUT_WINDOW_LINES`] lines followed by a rolling tail. Lines
+        /// dropped in between are counted in `omitted_output_lines` (#442).
         pub output: Vec<String>,
+        /// Lines dropped from the middle of `output` to keep memory bounded.
+        #[serde(default)]
+        pub omitted_output_lines: u64,
         /// OS process ID, if applicable.
         pub pid: Option<u32>,
         /// Cancellation token for the task's in-process work loop. Signalling it
@@ -4943,9 +4952,32 @@ pub mod tasks {
                 started_at: Utc::now(),
                 completed_at: None,
                 output: Vec::new(),
+                omitted_output_lines: 0,
                 pid: None,
                 cancel_token: None,
             }
+        }
+
+        /// Total lines the task has produced, including omitted ones.
+        pub fn output_line_count(&self) -> u64 {
+            self.output.len() as u64 + self.omitted_output_lines
+        }
+
+        /// The task's output bounded for the model: a head window and a tail
+        /// window (lines and bytes) around a note naming what was left out (#442).
+        pub fn render_output(&self) -> String {
+            if self.omitted_output_lines == 0 {
+                let text = self.output.join("\n");
+                return bound_head_tail(&text).unwrap_or(text);
+            }
+            let split = OUTPUT_WINDOW_LINES.min(self.output.len());
+            let head = self.output[..split].join("\n");
+            let tail = self.output[split..].join("\n");
+            join_head_tail(
+                head_window(&head, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES),
+                tail_window(&tail, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES),
+                &format!("{} lines", self.omitted_output_lines),
+            )
         }
 
         /// Return `true` if the task is still running.
@@ -4986,9 +5018,18 @@ pub mod tasks {
         }
 
         /// Append a line of output to an existing task.  No-op if unknown.
+        ///
+        /// Memory stays bounded (#442): the first [`OUTPUT_WINDOW_LINES`] lines
+        /// are kept, and once the buffer holds two further tail windows the
+        /// middle is dropped back down to one (amortised O(1) per line).
         pub fn append_output(&self, id: &str, line: &str) {
             if let Some(mut entry) = self.tasks.get_mut(id) {
                 entry.output.push(line.to_string());
+                if entry.output.len() > 3 * OUTPUT_WINDOW_LINES {
+                    let end = entry.output.len() - OUTPUT_WINDOW_LINES;
+                    entry.output.drain(OUTPUT_WINDOW_LINES..end);
+                    entry.omitted_output_lines += (end - OUTPUT_WINDOW_LINES) as u64;
+                }
             }
         }
 
@@ -5052,6 +5093,42 @@ pub mod tasks {
     /// Return a reference to the process-global `TaskRegistry`.
     pub fn global_registry() -> &'static TaskRegistry {
         &GLOBAL_REGISTRY
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// #442: a chatty background task keeps a head window plus a rolling
+        /// tail instead of every line, and renders a bounded result.
+        #[test]
+        fn task_output_is_bounded_head_plus_tail() {
+            let registry = TaskRegistry::new();
+            let id = registry.register(BackgroundTask::new("chatty"));
+            for i in 0..100_000 {
+                registry.append_output(&id, &format!("line {i}"));
+            }
+            let task = registry.get(&id).unwrap();
+            assert!(task.output.len() <= 3 * OUTPUT_WINDOW_LINES);
+            assert_eq!(task.output_line_count(), 100_000);
+            assert_eq!(task.output[0], "line 0");
+            assert_eq!(task.output.last().unwrap(), "line 99999");
+
+            let rendered = task.render_output();
+            assert!(rendered.starts_with("line 0\n"));
+            assert!(rendered.ends_with("line 99999"));
+            assert!(rendered.contains("lines omitted"));
+            assert!(rendered.len() <= 2 * OUTPUT_WINDOW_BYTES + 100);
+        }
+
+        #[test]
+        fn small_task_output_renders_whole() {
+            let registry = TaskRegistry::new();
+            let id = registry.register(BackgroundTask::new("quiet"));
+            registry.append_output(&id, "a");
+            registry.append_output(&id, "b");
+            assert_eq!(registry.get(&id).unwrap().render_output(), "a\nb");
+        }
     }
 }
 

@@ -21,6 +21,8 @@ use std::sync::Arc;
 // Sub-modules – each contains a full tool implementation.
 pub mod ask_user;
 pub mod pty_bash;
+#[cfg(unix)]
+mod output_spill;
 pub mod brief;
 pub mod config_tool;
 pub mod cron;
