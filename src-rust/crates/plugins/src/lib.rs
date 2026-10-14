@@ -125,29 +125,23 @@ pub async fn load_plugins(
     extra_paths: &[std::path::PathBuf],
 ) -> PluginRegistry {
     let mut registry = PluginRegistry::new();
-    let mut search_dirs: Vec<std::path::PathBuf> = Vec::new();
-
-    // 1. User-global plugins directory.
-    if let Some(user_dir) = default_user_plugins_dir() {
-        search_dirs.push(user_dir);
-    }
-
-    // 2. Project-local plugins directory.
-    search_dirs.push(project_plugins_dir(project_dir));
-
-    // 3. Extra paths (from --plugin-dir or settings).
-    search_dirs.extend_from_slice(extra_paths);
 
     // User plugins.
-    if let Some(user_dir) = default_user_plugins_dir() {
-        let (plugins, errors) = discover_plugins(&[user_dir], PluginSource::User).await;
+    let user_dir = default_user_plugins_dir();
+    if let Some(user_dir) = &user_dir {
+        let (plugins, errors) =
+            discover_plugins(std::slice::from_ref(user_dir), PluginSource::User).await;
         registry.extend(plugins, errors);
     }
 
-    // Project plugins.
+    // Project plugins. With the legacy `~/.claurst` layout and cwd == $HOME
+    // the project dir *is* the user dir; scanning it again would re-register
+    // every user plugin as a project plugin (and gate its MCP servers).
     let proj_dir = project_plugins_dir(project_dir);
-    let (plugins, errors) = discover_plugins(&[proj_dir], PluginSource::Project).await;
-    registry.extend(plugins, errors);
+    if !user_dir.as_deref().is_some_and(|user_dir| same_dir(user_dir, &proj_dir)) {
+        let (plugins, errors) = discover_plugins(&[proj_dir], PluginSource::Project).await;
+        registry.extend(plugins, errors);
+    }
 
     // Extra paths.
     for path in extra_paths {
@@ -157,6 +151,16 @@ pub async fn load_plugins(
     }
 
     registry
+}
+
+/// Whether two paths name the same directory, resolving symlinks when both
+/// exist (e.g. a symlinked `$HOME`).
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
 }
 
 /// Reload plugins: produce a new registry, compute the diff, and replace the old one.
@@ -552,8 +556,13 @@ mod tests {
         );
     }
 
+    /// Serializes the `load_plugins` tests: one of them points the
+    /// process-global `CLAURST_HOME` (the user plugins dir) at a tempdir.
+    static PLUGIN_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn load_plugins_empty_dirs() {
+        let _lock = PLUGIN_HOME_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         let reg = load_plugins(tmp.path(), &[]).await;
         assert_eq!(reg.plugin_count(), 0);
@@ -562,6 +571,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_plugins_finds_project_plugin() {
+        let _lock = PLUGIN_HOME_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         let plugin_dir = tmp.path().join(".claurst").join("plugins").join("test-plugin");
         std::fs::create_dir_all(&plugin_dir).unwrap();
@@ -574,6 +584,29 @@ mod tests {
         assert_eq!(reg.plugin_count(), 1);
         assert!(reg.get("test-plugin").is_some());
         assert!(reg.is_enabled("test-plugin"));
+    }
+
+    /// Legacy `~/.claurst` layout with cwd == $HOME: the project plugins dir
+    /// is the user plugins dir, so its plugins must stay user plugins.
+    #[tokio::test]
+    async fn load_plugins_project_dir_equal_to_user_dir_stays_user() {
+        let _lock = PLUGIN_HOME_LOCK.lock().await;
+        let home = TempDir::new().unwrap();
+        let claurst_home = home.path().join(".claurst");
+        let plugin_dir = claurst_home.join("plugins").join("mine");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        write_manifest(&plugin_dir, &serde_json::json!({ "name": "mine" }));
+
+        let saved = std::env::var_os("CLAURST_HOME");
+        std::env::set_var("CLAURST_HOME", &claurst_home);
+        let reg = load_plugins(home.path(), &[]).await;
+        match saved {
+            Some(v) => std::env::set_var("CLAURST_HOME", v),
+            None => std::env::remove_var("CLAURST_HOME"),
+        }
+
+        assert_eq!(reg.plugin_count(), 1);
+        assert_eq!(reg.get("mine").unwrap().source, PluginSource::User);
     }
 
     #[test]
