@@ -754,7 +754,7 @@ via the `provider` key in settings or the `--provider` CLI flag.
 | `mistral` | `mistral-large-latest` |
 | `xai` | `grok-2` |
 | `openrouter` | `anthropic/claude-sonnet-4` |
-| `togetherai` | `meta-llama/Llama-3.3-70B-Instruct-Turbo` |
+| `together-ai` | `meta-llama/Llama-3.3-70B-Instruct-Turbo` |
 | `perplexity` | `sonar-pro` |
 | `cohere` | `command-r-plus` |
 | `qwen` | `qwen3-max` |

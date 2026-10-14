@@ -72,7 +72,7 @@ These models support tool calling, vision, and extended reasoning. The `/model` 
 
 ### OpenAI
 
-Uses the OpenAI Chat Completions API (`/v1/chat/completions`); model ids starting with `o3`, `o4`, or `gpt-5` use the Responses API instead.
+Uses the OpenAI Chat Completions API (`/v1/chat/completions`). Model ids starting with `o3`, `o4`, or `gpt-5` are rejected by the `openai` provider (the Responses API is not implemented); use a `gpt-4o`-class id, the `codex` provider for GPT-5.x, or give a local model a different id.
 
 **Authentication:** `OPENAI_API_KEY` environment variable.
 
@@ -143,7 +143,7 @@ Uses the Azure OpenAI Chat Completions endpoint. The deployment name acts as the
 **Authentication:**
 - `AZURE_API_KEY` — your Azure OpenAI API key (or `api_key` in settings)
 - `AZURE_RESOURCE_NAME` — your Azure resource name (the subdomain of `.openai.azure.com`), or `options.resource_name` in settings
-- `AZURE_API_VERSION` — optional API version, read only when the provider is built from the environment; defaults to `2024-08-01-preview`
+- `AZURE_API_VERSION` is currently not honoured for the selected provider; requests use `2024-08-01-preview`.
 
 **Default model:** `gpt-4o`
 
@@ -225,7 +225,7 @@ Uses a ChatGPT subscription login against the Codex Responses endpoint (`https:/
 
 **Authentication:** OAuth only. Run `claurst codex login` or choose OpenAI Codex in `/connect`. Tokens are stored per profile under `~/.claurst/accounts/codex/` and refreshed automatically; see [Authentication](auth).
 
-**Default model:** `gpt-5.5`. The model list is the models.dev `openai` catalog filtered to `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`, and newer `gpt-<major>.<minor>` releases (`gpt-5.5-pro` excluded).
+**Default model:** `gpt-5.5` when selected through `/connect`; with `--provider codex` pass `--model` explicitly. The model list is the models.dev `openai` catalog filtered to `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`, and newer `gpt-<major>.<minor>` releases (`gpt-5.5-pro` excluded).
 
 ```
 claurst --provider codex --model gpt-5.5

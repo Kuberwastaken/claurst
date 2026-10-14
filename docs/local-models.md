@@ -72,8 +72,7 @@ OPENAI_BASE_URL=http://localhost:8000/v1 \
 
 Claurst normalizes the base URL, so the host root (`http://localhost:8000`) and
 a value ending in `/v1` both work; requests go to `<host>/v1/chat/completions`.
-The `openai` provider switches to the Responses API for model ids starting with
-`o3`, `o4`, or `gpt-5`, so give a local model a different id.
+Model ids starting with `o3`, `o4`, or `gpt-5` are rejected by the `openai` provider (the Responses API is not implemented); use a `gpt-4o`-class id, the `codex` provider for GPT-5.x, or give a local model a different id.
 
 ---
 

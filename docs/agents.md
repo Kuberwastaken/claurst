@@ -70,7 +70,7 @@ claurst --agent plan --provider openai --model o3 "review this architecture"
 
 An unknown name prints a warning and runs without an agent. In the interactive TUI, pressing `Tab` on an empty prompt (while no response is streaming) toggles between the `build` and `plan` agents.
 
-Access levels filter the tool list: `read-only` keeps tools whose permission level is read-only or none, plus `AskUserQuestion`; `search-only` keeps only `Grep`, `Glob`, `Read`, `WebSearch`, and `WebFetch`.
+Access levels filter the tool list: `read-only` keeps tools whose permission level is read-only or none, plus `AskUserQuestion` (built-in tools only; `Agent` and MCP tools are removed); `search-only` keeps only `Grep`, `Glob`, `Read`, `WebSearch`, and `WebFetch`.
 
 ---
 
