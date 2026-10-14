@@ -34,11 +34,13 @@ Development Host with the extension loaded.
 
 ## Permission requests
 
-When `claurst` needs approval to run a tool (e.g. `Bash`, `Edit`), the
-extension shows a quick pick with the options the agent offered (allow once,
-allow always, reject). Dismissing the quick pick without choosing defaults to
-the first (least-privileged) option offered, per the ACP spec's guidance to
-avoid hanging the agent indefinitely.
+`claurst` evaluates permissions with the same rules as the TUI (workspace
+reads, allow rules and the permission mode resolve without asking). When a
+tool call still needs approval (e.g. `Bash`, `Edit`), the extension shows a
+quick pick with the options the agent offered (allow once, allow always,
+reject). "Allow always" is saved by `claurst` as a rule in the global
+settings. Dismissing the quick pick without choosing sends the ACP
+`cancelled` outcome, so nothing is granted and the tool call fails.
 
 ## Scope
 
