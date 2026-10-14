@@ -33,8 +33,8 @@ Claurst runs a multi-turn loop: it streams a response from the model, executes a
 - **File operations** — read, write, edit, patch, batch-edit
 - **Shell** — bash with persistent working directory and environment
 - **Search** — glob file patterns, grep contents, web search, web fetch
-- **Git** — commit, branch, worktree
-- **Notebooks** — read and edit Jupyter notebooks
+- **Worktrees** — enter and leave isolated git worktrees
+- **Notebooks** — edit Jupyter notebook cells
 - **Desktop automation** — screenshot, click, type (optional feature)
 - **Task management** — create, track, and complete tasks
 
@@ -50,8 +50,17 @@ Store multiple named Anthropic (Claude.ai / Console) and Codex (ChatGPT) account
 ### @file injection
 Type `@path/to/file` anywhere in a prompt to inject the file's contents inline. Typeahead autocomplete suggests paths as you type, with size/binary safety checks before submit. See [@file Injection](keybindings#file-injection-with-typeahead).
 
+### Permissions and sandbox
+Reads inside the workspace run without asking; edits and shell commands ask first. Bash approvals are matched per command, and approvals can be kept for the session, the project or everywhere. On macOS, Bash commands run in a Seatbelt sandbox that limits writes to the workspace. See [Permission modes](configuration#permission-modes) and the `sandbox` settings in [Configuration](configuration).
+
+### Hooks
+Shell commands that run before and after tool calls, on prompt submit, on stop and at session start and end, using Claude Code's hooks contract. See [Hooks](hooks).
+
+### Instruction files and skills
+`AGENTS.md` and `CLAUDE.md` files from the git root down to the working directory are added to the system prompt. Skills in `.claurst/skills`, `.agents/skills` or `.claude/skills` are listed to the model and run with the Skill tool or as slash commands. See [Instruction files](configuration#instruction-files-agentsmd--claudemd) and [Skills](configuration#skills).
+
 ### Plugin system
-Extend Claurst with TOML-manifest plugins that add custom slash commands, MCP servers, hooks, output styles, and tool overlays.
+Extend Claurst with plugins (`plugin.toml` or `plugin.json`) that add slash commands, agents, skills, MCP and LSP servers, hooks, and output styles.
 
 ### Multi-agent orchestration
 Run named agents (`build`, `plan`, `explore`) or spawn parallel sub-agents in coordinator mode. Agents communicate via a shared task registry and message channels.
@@ -82,7 +91,7 @@ irm https://github.com/Kuberwastaken/claurst/releases/latest/download/install.ps
 ```
 
 The installer auto-detects your platform/arch, drops `claurst` into
-`~/.claurst/bin/`, and adds it to your `PATH`. See
+`~/.local/bin` (`$XDG_BIN_HOME` if set; `%LOCALAPPDATA%\Programs\claurst` on Windows), and adds it to your `PATH`. See
 [Installation](installation) for flags, manual download, and uninstall steps.
 
 **2. Set your API key**
@@ -113,9 +122,7 @@ Claurst reads `~/.claurst/settings.json` at startup. The most common settings:
 {
   "config": {
     "model": "claude-opus-4-6",
-    "permission_mode": "default",
-    "auto_compact": true,
-    "compact_threshold": 0.8
+    "permission_mode": "default"
   }
 }
 ```
@@ -149,6 +156,10 @@ LM Studio, Ollama, or any OpenAI-compatible server on your own machine.
 | Headless print | `claurst --print "task"` | Scripts, CI |
 | JSON output | `claurst --output-format json "task"` | Machine consumption |
 | Stream JSON | `claurst --output-format stream-json "task"` | Real-time piping |
+| Structured answer | `claurst -p --output-format json --json-schema schema.json "task"` | A JSON answer that matches a schema |
+| Continue a session | `claurst -p --resume <id> "task"` | Multi-step scripts |
+
+Headless runs never prompt for permission, exit with `0` / `1` / `2` / `130`, and are saved like interactive sessions. See [Headless mode](advanced#headless-mode).
 
 ---
 
@@ -199,4 +210,5 @@ See [Slash Commands](commands) for the complete reference.
 - [Plugins](plugins) — building and using plugins
 - [Agents](agents) — multi-agent orchestration
 - [Hooks](hooks) — event-driven automation
-- [Advanced Features](advanced) — extended thinking, sessions, and more
+- [Advanced Features](advanced) — extended thinking, sessions, headless mode, and more
+- [Changelog](changelog) — changes per release
