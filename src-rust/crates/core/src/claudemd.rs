@@ -1,110 +1,56 @@
-//! AGENTS.md hierarchical memory loading.
-//! Mirrors src/utils/claudemd.ts (1,479 lines).
+//! Instruction files: `AGENTS.md` / `CLAUDE.md` loaded into the system prompt.
 //!
-//! Priority order: managed > user > project > local
-//! Supports @include directives, YAML frontmatter, and mtime-based caching.
+//! Load order (stable; later files are more specific):
+//!   1. The global directory (`<claurst home>`)
+//!   2. Each project directory from the git root down to `cwd`
+//!      (`skill_discovery::project_search_dirs`: never past the git root,
+//!      only `cwd` when there is no `.git`)
+//!
+//! In each directory `AGENTS.override.md`, when present, replaces the other
+//! files; otherwise `AGENTS.md` then `CLAUDE.md` are loaded (a `CLAUDE.md`
+//! that is the same file or has the same content as `AGENTS.md` is skipped).
+//! YAML frontmatter is stripped and `@include <path>` lines are expanded,
+//! confined to the project root (project files) or the global directory
+//! (global files). All files share a [`INSTRUCTION_BUDGET_BYTES`] budget.
 
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-/// Memory file type / priority scope.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MemoryScope {
-    /// `~/.claurst/rules/*.md` — global managed policy.
-    Managed,
-    /// `~/.claurst/AGENTS.md` — user-level memory.
-    User,
-    /// `{project_root}/AGENTS.md` — project-level memory.
-    Project,
-    /// `{project_root}/.claurst/AGENTS.md` — local override.
-    Local,
-}
-
-/// Frontmatter parsed from a AGENTS.md file.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct MemoryFrontmatter {
-    #[serde(default)]
-    pub memory_type: Option<String>,
-    #[serde(default)]
-    pub priority: Option<u32>,
-    #[serde(default)]
-    pub scope: Option<String>,
-}
-
-/// Loaded memory file with metadata.
-#[derive(Debug, Clone)]
-pub struct MemoryFileInfo {
+/// One loaded instruction file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstructionFile {
+    /// Path of the file as found on disk.
     pub path: PathBuf,
-    pub scope: MemoryScope,
+    /// Content with frontmatter stripped and `@include` lines expanded,
+    /// truncated to fit the budget.
     pub content: String,
-    pub frontmatter: MemoryFrontmatter,
-    pub mtime: Option<SystemTime>,
 }
 
+/// Total size of all instruction files, in bytes.
+pub const INSTRUCTION_BUDGET_BYTES: usize = 32 * 1024;
+
+/// In a directory that has it, this file replaces `AGENTS.md` and `CLAUDE.md`.
+const OVERRIDE_FILE_NAME: &str = "AGENTS.override.md";
+
+/// Loaded in this order when a directory has no override file.
+const INSTRUCTION_FILE_NAMES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
+
 // ---------------------------------------------------------------------------
-// Cache
+// YAML frontmatter
 // ---------------------------------------------------------------------------
 
-/// Simple mtime-keyed file cache.
-#[derive(Default)]
-pub struct MemoryCache {
-    entries: HashMap<PathBuf, (SystemTime, String)>,
-}
-
-impl MemoryCache {
-    /// Return cached content if the file hasn't changed since last read.
-    pub fn get(&self, path: &Path) -> Option<&str> {
-        let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
-        let (cached_mtime, content) = self.entries.get(path)?;
-        if *cached_mtime == mtime { Some(content.as_str()) } else { None }
-    }
-
-    /// Store file content with its current mtime.
-    pub fn insert(&mut self, path: PathBuf, content: String) {
-        if let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) {
-            self.entries.insert(path, (mtime, content));
+/// Strip YAML frontmatter (`---` ... `---`) from the start of `content`.
+pub fn strip_frontmatter(content: &str) -> &str {
+    if let Some(after_first) = content.strip_prefix("---") {
+        if let Some(end) = after_first.find("\n---") {
+            return after_first[end + 4..].trim_start_matches(['\r', '\n']);
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// YAML frontmatter parsing
-// ---------------------------------------------------------------------------
-
-/// Strip YAML frontmatter (--- ... ---) from content and parse it.
-/// Returns (frontmatter, body_without_frontmatter).
-pub fn parse_frontmatter(content: &str) -> (MemoryFrontmatter, &str) {
-    if !content.starts_with("---") {
-        return (MemoryFrontmatter::default(), content);
-    }
-    let after_first = &content[3..];
-    if let Some(end) = after_first.find("\n---") {
-        let yaml = after_first[..end].trim();
-        let body = &after_first[end + 4..];
-        // Minimal YAML key-value parse (no external dependency).
-        let mut fm = MemoryFrontmatter::default();
-        for line in yaml.lines() {
-            let line = line.trim();
-            if let Some((key, val)) = line.split_once(':') {
-                let val = val.trim().to_string();
-                match key.trim() {
-                    "memory_type" => fm.memory_type = Some(val),
-                    "priority" => fm.priority = val.parse().ok(),
-                    "scope" => fm.scope = Some(val),
-                    _ => {}
-                }
-            }
-        }
-        return (fm, body.trim_start_matches('\n'));
-    }
-    (MemoryFrontmatter::default(), content)
+    content
 }
 
 // ---------------------------------------------------------------------------
@@ -114,11 +60,19 @@ pub fn parse_frontmatter(content: &str) -> (MemoryFrontmatter, &str) {
 /// Maximum @include nesting depth.
 const MAX_INCLUDE_DEPTH: usize = 10;
 
-/// Expand @include directives in content.
-/// Circular references are detected via `visited` set.
+/// Largest file `@include` will pull in, in bytes.
+const MAX_INCLUDE_BYTES: u64 = 40 * 1024;
+
+/// Expand `@include <path>` lines in `content`.
+///
+/// Paths are relative to `base_dir` (the including file's directory),
+/// absolute, or `~/`-prefixed. A target outside `root` is not read, so a
+/// repository's AGENTS.md cannot pull files such as `~/.ssh/...` into the
+/// prompt. Circular references are detected via `visited`.
 pub fn expand_includes(
     content: &str,
     base_dir: &Path,
+    root: &Path,
     visited: &mut HashSet<PathBuf>,
     depth: usize,
 ) -> String {
@@ -126,205 +80,274 @@ pub fn expand_includes(
         return content.to_string();
     }
 
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut result = String::with_capacity(content.len());
     for line in content.lines() {
-        let trimmed = line.trim();
-        if let Some(path_str) = trimmed.strip_prefix("@include ") {
-            let path_str = path_str.trim();
-            // Resolve relative to base_dir; expand ~ to home dir.
-            let include_path = if path_str.starts_with('~') {
-                dirs::home_dir()
-                    .unwrap_or_default()
-                    .join(&path_str[2..])
-            } else if Path::new(path_str).is_absolute() {
-                PathBuf::from(path_str)
-            } else {
-                base_dir.join(path_str)
-            };
-
-            let canonical = include_path.canonicalize().unwrap_or(include_path.clone());
-            if visited.contains(&canonical) {
-                result.push_str(&format!("<!-- circular @include {} skipped -->\n", path_str));
-                continue;
-            }
-            if let Ok(included) = std::fs::read_to_string(&include_path) {
-                // Check max size.
-                if included.len() > 40 * 1024 {
-                    result.push_str(&format!("<!-- @include {} exceeds 40KB limit -->\n", path_str));
-                    continue;
-                }
-                visited.insert(canonical);
-                let expanded = expand_includes(
-                    &included,
-                    include_path.parent().unwrap_or(base_dir),
-                    visited,
-                    depth + 1,
-                );
-                result.push_str(&expanded);
-                result.push('\n');
-            } else {
-                result.push_str(&format!("<!-- @include {} not found -->\n", path_str));
-            }
-        } else {
+        let Some(path_str) = line.trim().strip_prefix("@include ") else {
             result.push_str(line);
             result.push('\n');
+            continue;
+        };
+        let path_str = path_str.trim();
+        let include_path = match path_str.strip_prefix("~/") {
+            Some(rest) => match dirs::home_dir() {
+                Some(home) => home.join(rest),
+                None => {
+                    result.push_str(&format!("<!-- @include {} not found -->\n", path_str));
+                    continue;
+                }
+            },
+            None if Path::new(path_str).is_absolute() => PathBuf::from(path_str),
+            None => base_dir.join(path_str),
+        };
+
+        let Ok(canonical) = include_path.canonicalize() else {
+            result.push_str(&format!("<!-- @include {} not found -->\n", path_str));
+            continue;
+        };
+        if !canonical.starts_with(&canonical_root) {
+            result.push_str(&format!(
+                "<!-- @include {} skipped: outside {} -->\n",
+                path_str,
+                root.display()
+            ));
+            continue;
         }
+        if visited.contains(&canonical) {
+            result.push_str(&format!("<!-- circular @include {} skipped -->\n", path_str));
+            continue;
+        }
+        if std::fs::metadata(&canonical).is_ok_and(|m| m.len() > MAX_INCLUDE_BYTES) {
+            result.push_str(&format!("<!-- @include {} exceeds 40KB limit -->\n", path_str));
+            continue;
+        }
+        let Ok(included) = std::fs::read_to_string(&canonical) else {
+            result.push_str(&format!("<!-- @include {} not found -->\n", path_str));
+            continue;
+        };
+        let include_dir = canonical.parent().unwrap_or(base_dir).to_path_buf();
+        visited.insert(canonical);
+        result.push_str(&expand_includes(&included, &include_dir, root, visited, depth + 1));
+        result.push('\n');
     }
     result
 }
 
 // ---------------------------------------------------------------------------
-// Loading API
+// Loading
 // ---------------------------------------------------------------------------
 
-const MAX_FILE_SIZE: u64 = 40 * 1024; // 40 KB
-
-/// Load a single AGENTS.md file (respects MAX_FILE_SIZE, expands @includes).
-pub fn load_memory_file(path: &Path, scope: MemoryScope) -> Option<MemoryFileInfo> {
-    let meta = std::fs::metadata(path).ok()?;
-    if meta.len() > MAX_FILE_SIZE {
-        eprintln!("WARNING: {} exceeds 40KB limit, skipping", path.display());
-        return None;
+/// The instruction files present in `dir`, in load order.
+fn files_in_dir(dir: &Path) -> Vec<PathBuf> {
+    let override_file = dir.join(OVERRIDE_FILE_NAME);
+    if override_file.is_file() {
+        return vec![override_file];
     }
-    let raw = std::fs::read_to_string(path).ok()?;
-    let mtime = meta.modified().ok();
-
-    let (frontmatter, body) = parse_frontmatter(&raw);
-    let mut visited = HashSet::new();
-    visited.insert(path.canonicalize().unwrap_or(path.to_path_buf()));
-    let content = expand_includes(body, path.parent().unwrap_or(Path::new(".")), &mut visited, 0);
-
-    Some(MemoryFileInfo {
-        path: path.to_path_buf(),
-        scope,
-        content,
-        frontmatter,
-        mtime,
-    })
-}
-
-/// Load memory files from a directory for a given scope.
-///
-/// Loads `AGENTS.md` first (primary/universal standard), then `CLAUDE.md` if
-/// present (Claude-specific additions or overrides). Either file may be absent.
-fn load_scope_files(dir: &Path, scope: MemoryScope, files: &mut Vec<MemoryFileInfo>) {
-    for name in &["AGENTS.md", "CLAUDE.md"] {
-        let path = dir.join(name);
-        if path.exists() {
-            if let Some(f) = load_memory_file(&path, scope) {
-                files.push(f);
-            }
-        }
-    }
-}
-
-/// Load all memory files for the given project root, in priority order.
-///
-/// At each scope `AGENTS.md` is loaded first (universal standard), followed by
-/// `CLAUDE.md` if present (Claude-specific context). Either or both may exist.
-///
-/// Returned list is ordered: Managed (highest) → User → Project → Local.
-pub fn load_all_memory_files(project_root: &Path) -> Vec<MemoryFileInfo> {
-    let mut files = Vec::new();
-
-    // 1. Managed: <claurst home>/rules/*.md
-    {
-        let claurst = crate::config::Settings::config_dir();
-        let rules_dir = claurst.join("rules");
-        if let Ok(entries) = std::fs::read_dir(&rules_dir) {
-            let mut paths: Vec<PathBuf> = entries
-                .flatten()
-                .filter_map(|e| {
-                    let p = e.path();
-                    if p.extension().is_some_and(|x| x == "md") { Some(p) } else { None }
-                })
-                .collect();
-            paths.sort();
-            for p in paths {
-                if let Some(f) = load_memory_file(&p, MemoryScope::Managed) {
-                    files.push(f);
-                }
-            }
-        }
-
-        // 2. User: <claurst home>/AGENTS.md then <claurst home>/CLAUDE.md
-        load_scope_files(&claurst, MemoryScope::User, &mut files);
-    }
-
-    // 3. Project: {project_root}/AGENTS.md then {project_root}/CLAUDE.md
-    load_scope_files(project_root, MemoryScope::Project, &mut files);
-
-    // 4. Local: {project_root}/.claurst/AGENTS.md then {project_root}/.claurst/CLAUDE.md
-    load_scope_files(&project_root.join(".claurst"), MemoryScope::Local, &mut files);
-
-    files
-}
-
-/// Concatenate all memory file contents into a single system-prompt fragment.
-pub fn build_memory_prompt(files: &[MemoryFileInfo]) -> String {
-    files
+    INSTRUCTION_FILE_NAMES
         .iter()
-        .filter(|f| !f.content.trim().is_empty())
-        .map(|f| f.content.trim().to_string())
-        .collect::<Vec<_>>()
-        .join("\n\n")
+        .map(|name| dir.join(name))
+        .filter(|path| path.is_file())
+        .collect()
+}
+
+/// Load the instruction files for a session in `cwd`, with `global_dir` as
+/// the user-level directory (normally `Settings::config_dir()`).
+///
+/// Returns the files in load order. Once the combined content reaches
+/// [`INSTRUCTION_BUDGET_BYTES`], the file that crosses it is truncated with a
+/// note and later files carry only a note naming them.
+pub fn load_instruction_files(cwd: &Path, global_dir: &Path) -> Vec<InstructionFile> {
+    let project_dirs = crate::skill_discovery::project_search_dirs(cwd);
+    let project_root = project_dirs.last().map_or(cwd, PathBuf::as_path);
+
+    // (file, root its @include lines are confined to)
+    let mut sources: Vec<(PathBuf, &Path)> = files_in_dir(global_dir)
+        .into_iter()
+        .map(|file| (file, global_dir))
+        .collect();
+    for dir in project_dirs.iter().rev() {
+        sources.extend(files_in_dir(dir).into_iter().map(|file| (file, project_root)));
+    }
+
+    let mut files: Vec<InstructionFile> = Vec::new();
+    let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+    let mut seen_contents: HashSet<String> = HashSet::new();
+    let mut remaining = INSTRUCTION_BUDGET_BYTES;
+    for (path, root) in sources {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if !seen_paths.insert(canonical.clone()) {
+            continue;
+        }
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(err) => {
+                tracing::debug!(path = %path.display(), error = %err, "instruction file unreadable");
+                continue;
+            }
+        };
+        let base_dir = canonical.parent().unwrap_or(root).to_path_buf();
+        let mut visited = HashSet::from([canonical]);
+        let expanded = expand_includes(strip_frontmatter(&raw), &base_dir, root, &mut visited, 0);
+        let content = expanded.trim();
+        if content.is_empty() || !seen_contents.insert(content.to_string()) {
+            continue;
+        }
+
+        let content = if remaining == 0 {
+            format!(
+                "[Not loaded: the {} KiB instruction budget is used up. Read {} directly if it is relevant.]",
+                INSTRUCTION_BUDGET_BYTES / 1024,
+                path.display()
+            )
+        } else if content.len() <= remaining {
+            remaining -= content.len();
+            content.to_string()
+        } else {
+            let mut cut = remaining;
+            while !content.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            remaining = 0;
+            format!(
+                "{}\n\n[Truncated: instruction files are limited to {} KiB in total. Read {} for the rest.]",
+                &content[..cut],
+                INSTRUCTION_BUDGET_BYTES / 1024,
+                path.display()
+            )
+        };
+        files.push(InstructionFile { path, content });
+    }
+    files
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_frontmatter_basic() {
-        let content = "---\nmemory_type: project\npriority: 10\n---\nHello world";
-        let (fm, body) = parse_frontmatter(content);
-        assert_eq!(fm.memory_type.as_deref(), Some("project"));
-        assert_eq!(fm.priority, Some(10));
-        assert_eq!(body.trim(), "Hello world");
-    }
-
-    #[test]
-    fn parse_frontmatter_none() {
-        let content = "No frontmatter here";
-        let (fm, body) = parse_frontmatter(content);
-        assert!(fm.memory_type.is_none());
-        assert_eq!(body, content);
-    }
-
-    #[test]
-    fn load_scope_prefers_agents_then_claude() {
+    fn git_repo() -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("AGENTS.md"), "agents content").unwrap();
-        std::fs::write(tmp.path().join("CLAUDE.md"), "claude content").unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        (tmp, repo)
+    }
 
-        let files = load_all_memory_files(tmp.path());
-        // Filter to just the project-scope files from our temp dir.
-        let project: Vec<_> = files.iter().filter(|f| f.path.starts_with(tmp.path())).collect();
-        assert_eq!(project.len(), 2, "both AGENTS.md and CLAUDE.md should be loaded");
-        assert!(project[0].path.ends_with("AGENTS.md"), "AGENTS.md must come first");
-        assert!(project[1].path.ends_with("CLAUDE.md"), "CLAUDE.md must follow");
+    fn contents(files: &[InstructionFile]) -> Vec<&str> {
+        files.iter().map(|f| f.content.as_str()).collect()
     }
 
     #[test]
-    fn load_scope_claudemd_only_fallback() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("CLAUDE.md"), "claude only").unwrap();
-
-        let files = load_all_memory_files(tmp.path());
-        let project: Vec<_> = files.iter().filter(|f| f.path.starts_with(tmp.path())).collect();
-        assert_eq!(project.len(), 1);
-        assert!(project[0].path.ends_with("CLAUDE.md"));
+    fn strip_frontmatter_basic() {
+        assert_eq!(strip_frontmatter("---\npriority: 10\n---\nHello world"), "Hello world");
+        assert_eq!(strip_frontmatter("No frontmatter here"), "No frontmatter here");
     }
 
     #[test]
-    fn expand_includes_circular() {
+    fn loads_global_then_root_to_cwd_agents_before_claude() {
+        let (tmp, repo) = git_repo();
+        let global = tmp.path().join("global");
+        let pkg = repo.join("pkg");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(global.join("AGENTS.md"), "global").unwrap();
+        std::fs::write(repo.join("AGENTS.md"), "root agents").unwrap();
+        std::fs::write(repo.join("CLAUDE.md"), "root claude").unwrap();
+        std::fs::write(pkg.join("CLAUDE.md"), "pkg claude").unwrap();
+
+        let files = load_instruction_files(&pkg, &global);
+        assert_eq!(contents(&files), ["global", "root agents", "root claude", "pkg claude"]);
+        assert_eq!(files[0].path, global.join("AGENTS.md"));
+        assert_eq!(files[3].path, pkg.join("CLAUDE.md"));
+    }
+
+    #[test]
+    fn override_replaces_the_directory_files() {
+        let (tmp, repo) = git_repo();
+        std::fs::write(repo.join("AGENTS.md"), "agents").unwrap();
+        std::fs::write(repo.join("CLAUDE.md"), "claude").unwrap();
+        std::fs::write(repo.join("AGENTS.override.md"), "override").unwrap();
+
+        let files = load_instruction_files(&repo, &tmp.path().join("no-global"));
+        assert_eq!(contents(&files), ["override"]);
+    }
+
+    #[test]
+    fn stops_at_git_root() {
+        let (tmp, repo) = git_repo();
+        // Above the git root: never loaded.
+        std::fs::write(tmp.path().join("AGENTS.md"), "outside").unwrap();
+        std::fs::write(repo.join("AGENTS.md"), "inside").unwrap();
+
+        let files = load_instruction_files(&repo, &tmp.path().join("no-global"));
+        assert_eq!(contents(&files), ["inside"]);
+    }
+
+    #[test]
+    fn without_git_only_cwd_is_read() {
         let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a.md");
-        let b = tmp.path().join("b.md");
-        std::fs::write(&a, "@include b.md\n").unwrap();
-        std::fs::write(&b, "@include a.md\ncontent\n").unwrap();
-        let result = expand_includes("@include a.md\n", tmp.path(), &mut std::collections::HashSet::new(), 0);
-        // Should not infinite-loop; circular reference comment present.
-        assert!(result.contains("circular") || result.contains("content"));
+        let cwd = tmp.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(tmp.path().join("AGENTS.md"), "parent").unwrap();
+        std::fs::write(cwd.join("AGENTS.md"), "cwd").unwrap();
+
+        let files = load_instruction_files(&cwd, &tmp.path().join("no-global"));
+        assert_eq!(contents(&files), ["cwd"]);
+    }
+
+    #[test]
+    fn duplicate_claude_md_is_skipped() {
+        let (tmp, repo) = git_repo();
+        std::fs::write(repo.join("AGENTS.md"), "same rules").unwrap();
+        std::fs::write(repo.join("CLAUDE.md"), "---\nx: y\n---\nsame rules\n").unwrap();
+
+        let files = load_instruction_files(&repo, &tmp.path().join("no-global"));
+        assert_eq!(contents(&files), ["same rules"]);
+    }
+
+    #[test]
+    fn include_expands_inside_root_and_refuses_outside() {
+        let (tmp, repo) = git_repo();
+        std::fs::create_dir_all(repo.join("docs")).unwrap();
+        std::fs::write(repo.join("docs").join("style.md"), "use tabs").unwrap();
+        std::fs::write(tmp.path().join("secret.md"), "SECRET").unwrap();
+        std::fs::write(
+            repo.join("AGENTS.md"),
+            "head\n@include docs/style.md\n@include ../secret.md\n",
+        )
+        .unwrap();
+
+        let files = load_instruction_files(&repo, &tmp.path().join("no-global"));
+        assert_eq!(files.len(), 1);
+        assert!(files[0].content.contains("head\nuse tabs"));
+        assert!(!files[0].content.contains("SECRET"));
+        assert!(files[0].content.contains("skipped: outside"));
+    }
+
+    #[test]
+    fn include_circular_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.md"), "@include b.md\n").unwrap();
+        std::fs::write(tmp.path().join("b.md"), "@include a.md\ncontent\n").unwrap();
+        let result = expand_includes("@include a.md\n", tmp.path(), tmp.path(), &mut HashSet::new(), 0);
+        assert!(result.contains("circular"));
+        assert!(result.contains("content"));
+    }
+
+    #[test]
+    fn budget_truncates_then_names_skipped_files() {
+        let (tmp, repo) = git_repo();
+        let pkg = repo.join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(repo.join("AGENTS.md"), "a".repeat(INSTRUCTION_BUDGET_BYTES - 10)).unwrap();
+        std::fs::write(repo.join("CLAUDE.md"), "b".repeat(100)).unwrap();
+        std::fs::write(pkg.join("AGENTS.md"), "c".repeat(100)).unwrap();
+
+        let files = load_instruction_files(&pkg, &tmp.path().join("no-global"));
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].content.len(), INSTRUCTION_BUDGET_BYTES - 10);
+        assert!(files[1].content.starts_with(&"b".repeat(10)));
+        assert!(!files[1].content.starts_with(&"b".repeat(11)));
+        assert!(files[1].content.contains("[Truncated: instruction files are limited to 32 KiB"));
+        assert!(files[2].content.starts_with("[Not loaded"));
+        assert!(files[2].content.contains(&pkg.join("AGENTS.md").display().to_string()));
     }
 }

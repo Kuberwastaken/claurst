@@ -533,11 +533,19 @@ async fn main() -> anyhow::Result<()> {
             .api_base = Some(base.clone());
     }
 
+    // AGENTS.md / CLAUDE.md instruction files, loaded once per session and
+    // sent in the cached system block.
+    let instruction_files = if config.disable_claude_mds {
+        Vec::new()
+    } else {
+        claurst_core::claudemd::load_instruction_files(
+            &cwd,
+            &claurst_core::config::Settings::config_dir(),
+        )
+    };
+
     // Build context
-    let ctx_builder = ContextBuilder::new(cwd.clone())
-        .disable_claude_mds(config.disable_claude_mds);
-    let system_ctx = ctx_builder.build_system_context().await;
-    let user_ctx = ctx_builder.build_user_context().await;
+    let system_ctx = ContextBuilder::new(cwd.clone()).build_system_context().await;
 
     // Session-stable additions to the default prompt, which
     // `claurst_core::system_prompt::build_system_prompt` assembles on its own
@@ -545,7 +553,7 @@ async fn main() -> anyhow::Result<()> {
     // (it lands in the cached system block); `system_ctx` (git status, IDE
     // context) is passed separately as `session_context` and sent in the
     // dynamic block.
-    let system_prompt = [config.custom_system_prompt.clone(), Some(user_ctx), config.append_system_prompt.clone()]
+    let system_prompt = [config.custom_system_prompt.clone(), config.append_system_prompt.clone()]
         .into_iter()
         .flatten()
         .filter(|part| !part.is_empty())
@@ -573,6 +581,7 @@ async fn main() -> anyhow::Result<()> {
                     .collect(),
             ),
             permission_mode: Some(config.permission_mode.clone()),
+            instruction_files,
             ..Default::default()
         };
         let prompt = claurst_core::system_prompt::build_system_prompt(&opts);
@@ -820,6 +829,7 @@ async fn main() -> anyhow::Result<()> {
     query_config.append_system_prompt = None;
     query_config.session_context = Some(system_ctx);
     query_config.working_directory = Some(cwd.display().to_string());
+    query_config.instruction_files = instruction_files;
     // Skills are discovered once per session: the listing goes into the
     // cached system block, so it must not change between turns. Discovery
     // walks the filesystem and may `git clone` skills.urls, hence the

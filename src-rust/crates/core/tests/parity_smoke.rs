@@ -5,7 +5,7 @@ use claurst_core::{
     session_storage::transcript_dir,
     prompt_history::HistoryEntry,
     file_history::FileHistory,
-    claudemd::load_all_memory_files,
+    claudemd::load_instruction_files,
     message_utils::{estimate_tokens, get_message_text, is_tool_use_message},
     types::{Message, MessageContent, Role},
 };
@@ -82,12 +82,11 @@ fn is_tool_use_message_false_for_user() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn load_memory_from_nonexistent_dir() {
-    // Loading from a dir with no AGENTS.md should return empty, not panic.
+fn load_instructions_from_empty_dir() {
+    // A dir with no instruction files (and no global dir) loads nothing.
     let tmp = TempDir::new().unwrap();
-    let files = load_all_memory_files(tmp.path());
-    // May be empty or may pick up user ~/.claurst/AGENTS.md — both are valid.
-    let _ = files;
+    let files = load_instruction_files(tmp.path(), &tmp.path().join("no-global"));
+    assert!(files.is_empty());
 }
 
 // ---------------------------------------------------------------------------

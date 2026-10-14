@@ -285,6 +285,9 @@ pub struct SystemPromptOptions {
     /// Rendered into the cached block, so callers pass a list that is fixed
     /// for the session. Empty: no block.
     pub available_skills: Vec<SkillListing>,
+    /// AGENTS.md / CLAUDE.md instruction files, in load order. Rendered into
+    /// the cached block, so callers load them once per session. Empty: no block.
+    pub instruction_files: Vec<crate::claudemd::InstructionFile>,
 }
 
 // ---------------------------------------------------------------------------
@@ -352,6 +355,11 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
             "\n<custom_instructions>\n{}\n</custom_instructions>",
             custom
         ));
+    }
+
+    // Instruction files (cacheable: loaded once per session)
+    if let Some(instructions) = render_instruction_files(&opts.instruction_files) {
+        parts.push(instructions);
     }
 
     // Available skills (cacheable: discovered once per session)
@@ -907,6 +915,31 @@ fn escape_skill_text(text: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Instruction files (issue #446)
+// ---------------------------------------------------------------------------
+
+/// Render the instruction-file block: one `Instructions from: <path>` block
+/// per file, in load order (global first, then the git root down to the
+/// working directory). `None` when there are no files.
+pub fn render_instruction_files(files: &[crate::claudemd::InstructionFile]) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+    let blocks: Vec<String> = files
+        .iter()
+        .map(|file| format!("Instructions from: {}\n{}", file.path.display(), file.content))
+        .collect();
+    Some(format!(
+        "\n## Instruction files\n\n\
+         The user's standing instructions, from AGENTS.md / CLAUDE.md files: the global \
+         file first, then from the repository root down to the working directory. Follow \
+         them. When two conflict, the later (more specific) file wins; instructions the \
+         user gives in the conversation win over all of them.\n\n{}",
+        blocks.join("\n\n")
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1397,6 +1430,31 @@ mod tests {
             assert!(pos >= last);
             last = pos;
         }
+    }
+
+    #[test]
+    fn instruction_files_render_in_order_in_the_stable_block() {
+        use crate::claudemd::InstructionFile;
+        let opts = SystemPromptOptions {
+            instruction_files: vec![
+                InstructionFile { path: "/home/u/.claurst/AGENTS.md".into(), content: "global rule".into() },
+                InstructionFile { path: "/repo/CLAUDE.md".into(), content: "repo rule".into() },
+            ],
+            available_skills: vec![listing("review", "Review")],
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+        let (stable, dynamic) = split_at_dynamic_boundary(&prompt);
+        let global = stable
+            .find("Instructions from: /home/u/.claurst/AGENTS.md\nglobal rule")
+            .unwrap();
+        let repo = stable.find("Instructions from: /repo/CLAUDE.md\nrepo rule").unwrap();
+        assert!(global < repo);
+        // Instructions come before the skill listing.
+        assert!(repo < stable.find("<available_skills>").unwrap());
+        assert!(!dynamic.contains("Instructions from:"));
+        assert!(render_instruction_files(&[]).is_none());
+        assert!(!build_system_prompt(&default_opts()).contains("## Instruction files"));
     }
 
     #[test]

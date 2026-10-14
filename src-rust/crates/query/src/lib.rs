@@ -112,6 +112,9 @@ pub struct QueryConfig {
     /// Skills listed to the model in the cached system block (name and
     /// description), discovered once per session. Empty: no listing.
     pub available_skills: Vec<claurst_core::system_prompt::SkillListing>,
+    /// AGENTS.md / CLAUDE.md instruction files loaded at session start, sent
+    /// in the cached system block. Empty: none.
+    pub instruction_files: Vec<claurst_core::claudemd::InstructionFile>,
     pub thinking_budget: Option<u32>,
     pub temperature: Option<f32>,
     /// Per-item cap, in bytes, applied to each tool result when it is
@@ -206,6 +209,7 @@ impl Default for QueryConfig {
             output_style_prompt: None,
             working_directory: None,
             available_skills: Vec::new(),
+            instruction_files: Vec::new(),
             thinking_budget: None,
             temperature: None,
             tool_result_max_bytes: DEFAULT_TOOL_RESULT_MAX_BYTES,
@@ -2323,6 +2327,7 @@ mod tests {
             output_style_prompt: None,
             working_directory: None,
             available_skills: Vec::new(),
+            instruction_files: Vec::new(),
             thinking_budget: None,
             temperature: None,
             tool_result_max_bytes: DEFAULT_TOOL_RESULT_MAX_BYTES,
