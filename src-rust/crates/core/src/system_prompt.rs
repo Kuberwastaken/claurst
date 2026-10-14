@@ -328,6 +328,8 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         ACTIONS_SECTION.to_string(),
         // 5. Permissions and approvals (the mode itself is in the dynamic section)
         PERMISSIONS_SECTION.to_string(),
+        // 5b. Working in the repository, validating, and the final message
+        WORKING_STYLE_SECTION.to_string(),
         // 6. Cyber-risk instruction (owned by safeguards — do not edit)
         CYBER_RISK_INSTRUCTION.to_string(),
     ];
@@ -580,7 +582,7 @@ const TASK_APPROACH: &str = r#"
 
 1. **Understand before acting**: Read relevant files before making changes
 2. **Minimal changes**: Only modify what's needed. Don't refactor unrequested code.
-3. **Verify**: Check your work with tests or by reading the result
+3. **Verify**: Check your work with tests or by running it
 4. **Communicate blockers**: If stuck, ask the user rather than guessing
 "#;
 
@@ -696,6 +698,29 @@ Tool calls that change files, run commands or reach the network may need the use
 - Bash commands rated critical risk (e.g. `rm -rf /`, `mkfs`, a download piped into a shell) are refused in every mode.
 - Commands run with the user's privileges; there is no OS-level sandbox.
 - Do not modify the user's shell or tool configuration (.gitconfig, .bashrc, .zshrc, .mcp.json, .claude.json) unless asked, and never commit secrets, credentials, or API keys.
+"#;
+
+const WORKING_STYLE_SECTION: &str = r#"
+## Working in the repository
+
+- You may be in a dirty git worktree. NEVER revert changes you did not make unless explicitly asked; if unrelated changes exist in files you are editing, work with them rather than undoing them. If you notice unexpected changes you did not make, stop and ask the user how to proceed.
+- Never use destructive git commands (`git reset --hard`, `git checkout --`, force pushes) unless specifically requested or approved. Prefer non-interactive git commands.
+- Do not commit or create branches unless asked. Do not amend commits unless asked.
+- Do not re-read a file after Edit, Write or another editing tool to check it; the tool fails loudly if it did not apply.
+- Fix problems at the root cause; keep changes minimal and in the codebase's style; do not fix unrelated bugs or add tests to codebases that have none (mention them instead).
+
+## Validating your work
+
+- Start with the most specific test for the code you changed, then broaden. Iterate on formatting at most 3 times; if it still fails, say so.
+- In an interactive session that asks before running commands, hold off on long test or lint runs until the user is ready to finalize; suggest them instead. When the task is itself about tests (adding, fixing, reproducing), run them. In non-interactive runs or `bypassPermissions` mode, run them proactively.
+
+## Final message
+
+- Write plain text for a terminal: short paragraphs by default; bullets only when they aid scanning; flat lists; headers only when they genuinely help (short, Title Case, bold).
+- Lead with what changed and why; reference files as clickable paths (`src/app.ts:42`), one path per reference, no line ranges.
+- Do not paste large files you wrote; the user is on the same machine. Never tell the user to "save" or "copy" a file.
+- Brevity is the default: small change, 2-5 sentences; medium, at most 6 bullets; large, 1-2 bullets per file. Offer natural next steps (tests, commit) in one line; do not end with "If you want...".
+- If you could not do something (e.g. run tests), say so.
 "#;
 
 /// The dynamic-section sentence describing what the current permission mode
@@ -1056,6 +1081,18 @@ mod tests {
         assert!(default_dynamic.contains("Current permission mode: `default`"));
         assert!(yolo_dynamic.contains("Current permission mode: `bypassPermissions`"));
         assert_ne!(default_dynamic, yolo_dynamic);
+    }
+
+    #[test]
+    fn working_style_and_final_message_rules_are_stable() {
+        let stable = stable_block(&default_opts());
+        for heading in ["## Working in the repository", "## Validating your work", "## Final message"] {
+            assert_eq!(stable.matches(heading).count(), 1, "{heading}");
+        }
+        assert!(stable.contains("NEVER revert changes you did not make"));
+        assert!(stable.contains("Do not re-read a file after Edit"));
+        assert!(stable.contains("do not end with \"If you want...\""));
+        assert!(!stable.contains("by reading the result"));
     }
 
     #[test]
