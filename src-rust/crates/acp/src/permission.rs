@@ -76,17 +76,27 @@ pub async fn forward_pending(
 
     let request_params = acp::RequestPermissionRequest::new(session_id, tool_call, options);
 
+    // The drainer does not watch the turn token, so the turn may already be
+    // cancelled here; never show the client a request for a dead turn.
+    if turn_cancel.is_cancelled() {
+        debug!(tool = %request.tool_name, "ACP permission: prompt already cancelled, denying");
+        let _ = decision_tx.send(PermissionDecision::Deny);
+        return;
+    }
+
     debug!(tool = %request.tool_name, "ACP permission: requesting from client");
     let result = tokio::select! {
-        result = connection.send_request::<_, acp::RequestPermissionResponse>(
-            "session/request_permission",
-            request_params,
-        ) => result,
+        // Checked first so a cancel always wins over a ready send.
+        biased;
         _ = turn_cancel.cancelled() => {
             debug!(tool = %request.tool_name, "ACP permission: prompt cancelled, denying");
             let _ = decision_tx.send(PermissionDecision::Deny);
             return;
         }
+        result = connection.send_request::<_, acp::RequestPermissionResponse>(
+            "session/request_permission",
+            request_params,
+        ) => result,
     };
 
     let decision = match result {

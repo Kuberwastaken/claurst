@@ -33,7 +33,7 @@ pub async fn handle(
     let runtime = &session.runtime;
     // Convert prompt content blocks → a single user message in Claurst's
     // internal format.
-    let Some(message) = user_message(&params.prompt, runtime.supports_images) else {
+    let Some(message) = user_message(params.prompt, runtime.supports_images) else {
         return Err(acp::Error::invalid_params()
             .data(Some(serde_json::json!({ "reason": "prompt has no text or image content" }))));
     };
@@ -149,18 +149,18 @@ pub async fn handle(
 /// and embedded text resources form the text part; images are passed through
 /// when the provider accepts them and replaced by a short note otherwise.
 /// Returns `None` when the prompt has nothing to send.
-fn user_message(blocks: &[acp::ContentBlock], supports_images: bool) -> Option<Message> {
+fn user_message(blocks: Vec<acp::ContentBlock>, supports_images: bool) -> Option<Message> {
     let mut parts: Vec<String> = Vec::new();
     let mut images: Vec<ContentBlock> = Vec::new();
     for block in blocks {
         match block {
-            acp::ContentBlock::Text(t) => parts.push(t.text.clone()),
+            acp::ContentBlock::Text(t) => parts.push(t.text),
             acp::ContentBlock::ResourceLink(link) => {
                 parts.push(format!("[resource link: {}]", link.uri));
             }
             acp::ContentBlock::Resource(res) => {
                 // Best-effort: emit any embedded text.
-                let json = serde_json::to_value(res).unwrap_or_default();
+                let json = serde_json::to_value(&res).unwrap_or_default();
                 if let Some(text) = json
                     .get("resource")
                     .and_then(|r| r.get("text"))
@@ -185,8 +185,8 @@ fn user_message(blocks: &[acp::ContentBlock], supports_images: bool) -> Option<M
                     images.push(ContentBlock::Image {
                         source: ImageSource {
                             source_type: "base64".to_string(),
-                            media_type: Some(image.mime_type.clone()),
-                            data: Some(image.data.clone()),
+                            media_type: Some(image.mime_type),
+                            data: Some(image.data),
                             url: None,
                         },
                     });
@@ -380,7 +380,7 @@ fn tool_title(tool_name: &str, raw_input: Option<&serde_json::Value>) -> String 
 mod tests {
     use super::*;
 
-    fn text_of(blocks: &[acp::ContentBlock]) -> String {
+    fn text_of(blocks: Vec<acp::ContentBlock>) -> String {
         user_message(blocks, false)
             .expect("prompt has content")
             .get_all_text()
@@ -392,7 +392,7 @@ mod tests {
             acp::ContentBlock::Text(acp::TextContent::new("first")),
             acp::ContentBlock::Text(acp::TextContent::new("second")),
         ];
-        assert_eq!(text_of(&blocks), "first\n\nsecond");
+        assert_eq!(text_of(blocks), "first\n\nsecond");
     }
 
     #[test]
@@ -401,7 +401,7 @@ mod tests {
             "notes.md",
             "file:///tmp/notes.md",
         ))];
-        assert_eq!(text_of(&blocks), "[resource link: file:///tmp/notes.md]");
+        assert_eq!(text_of(blocks), "[resource link: file:///tmp/notes.md]");
     }
 
     #[test]
@@ -410,7 +410,7 @@ mod tests {
             acp::ContentBlock::Text(acp::TextContent::new("caption")),
             acp::ContentBlock::Image(acp::ImageContent::new("base64data", "image/png")),
         ];
-        let message = user_message(&blocks, true).expect("prompt has content");
+        let message = user_message(blocks, true).expect("prompt has content");
         let content = message.content_blocks();
         assert!(matches!(
             &content[0],
@@ -428,13 +428,13 @@ mod tests {
             acp::ContentBlock::Text(acp::TextContent::new("caption")),
             acp::ContentBlock::Image(acp::ImageContent::new("base64data", "image/png")),
         ];
-        let text = text_of(&blocks);
+        let text = text_of(blocks);
         assert!(text.starts_with("caption\n\n[image omitted"), "{text}");
     }
 
     #[test]
     fn user_message_empty_input_is_none() {
-        assert!(user_message(&[], true).is_none());
+        assert!(user_message(Vec::new(), true).is_none());
     }
 
     #[test]

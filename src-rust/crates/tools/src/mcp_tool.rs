@@ -55,7 +55,15 @@ impl Tool for McpToolWrapper {
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
-        let desc = format!("Run MCP tool {}", self.tool_def.name);
+        // Same shape as the central backstop's description, so the approval
+        // prompt shows what the call will send.
+        let rendered = serde_json::to_string(&input).unwrap_or_default();
+        let preview: String = rendered.chars().take(200).collect();
+        let desc = if preview.is_empty() || preview == "{}" || preview == "null" {
+            format!("Run MCP tool '{}'", self.tool_def.name)
+        } else {
+            format!("Run MCP tool '{}' with input: {}", self.tool_def.name, preview)
+        };
         if let Err(e) = ctx.check_permission(self.name(), &desc, false) {
             return ToolResult::error(e.to_string());
         }

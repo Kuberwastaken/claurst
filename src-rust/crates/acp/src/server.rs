@@ -41,14 +41,15 @@ impl AgentServer {
         if let Some(runtime) = runtimes.get(cwd) {
             return Ok(runtime.clone());
         }
-        let runtime = AgentRuntime::build(cwd.to_path_buf()).await.map_err(|e| {
+        let cwd = cwd.to_path_buf();
+        let runtime = AgentRuntime::build(cwd.clone()).await.map_err(|e| {
             acp::Error::new(
                 i32::from(acp::ErrorCode::InternalError),
                 format!("Failed to start the agent for {}: {e}", cwd.display()),
             )
         })?;
         let runtime = Arc::new(runtime);
-        runtimes.insert(cwd.to_path_buf(), runtime.clone());
+        runtimes.insert(cwd, runtime.clone());
         Ok(runtime)
     }
 

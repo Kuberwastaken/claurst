@@ -3,7 +3,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -217,6 +217,9 @@ pub(crate) struct Client {
     /// Option ids to answer permission requests with, in order. When empty
     /// the client rejects.
     pub permission_answers: Arc<parking_lot::Mutex<VecDeque<&'static str>>>,
+    /// When set, permission requests are recorded but never answered, like
+    /// a picker the user has not dismissed yet.
+    pub hold_permissions: AtomicBool,
     /// Every `session/update` notification the agent sent.
     pub updates: Arc<parking_lot::Mutex<Vec<Value>>>,
 }
@@ -248,6 +251,7 @@ impl Client {
             responses: Arc::new(DashMap::new()),
             permission_requests: Arc::new(parking_lot::Mutex::new(Vec::new())),
             permission_answers: Arc::new(parking_lot::Mutex::new(VecDeque::new())),
+            hold_permissions: AtomicBool::new(false),
             updates: Arc::new(parking_lot::Mutex::new(Vec::new())),
         });
         tokio::spawn(Self::read_loop(client.clone(), client_read));
@@ -261,6 +265,9 @@ impl Client {
             match msg.get("method").and_then(Value::as_str) {
                 Some("session/request_permission") => {
                     self.permission_requests.lock().push(msg["params"].clone());
+                    if self.hold_permissions.load(Ordering::SeqCst) {
+                        continue;
+                    }
                     let answer = self.permission_answers.lock().pop_front().unwrap_or("reject_once");
                     let reply = json!({
                         "jsonrpc": "2.0",
@@ -712,4 +719,42 @@ async fn runtime_uses_settings_and_agents_md_of_the_session_cwd() {
         system_prompt.contains("PROJECT-RULE-MARKER"),
         "AGENTS.md from the session cwd must reach the system prompt"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_while_a_permission_request_is_pending_unwinds_the_tool() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("cancel-pending");
+    let target = cwd.join("out.txt");
+    let provider = ScriptedProvider::new(vec![Step::Tool(
+        "Write",
+        json!({ "file_path": target, "content": "never" }),
+    )]);
+    let client = Client::start(scripted_runtime(&cwd, provider));
+    client.hold_permissions.store(true, Ordering::SeqCst);
+    let session_id = client.new_session(&cwd).await;
+
+    let prompt = {
+        let client = client.clone();
+        let session_id = session_id.clone();
+        tokio::spawn(async move { client.prompt(&session_id, "write it").await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while client.permission_requests.lock().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the write must reach the client as a permission request");
+
+    client
+        .notify("session/cancel", acp::CancelNotification::new(session_id.clone()))
+        .await;
+    // `Client::call` panics after 20 s without a response, so a tool stuck
+    // waiting on the unanswered request fails the test.
+    let response = prompt.await.expect("prompt task");
+    assert_eq!(stop_reason(&response), acp::StopReason::Cancelled);
+    assert!(!target.exists(), "a cancelled write must not touch the file");
+    assert_eq!(tool_statuses(&client), vec!["failed"]);
+    assert_eq!(client.permission_requests.lock().len(), 1);
 }
