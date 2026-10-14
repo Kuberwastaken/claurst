@@ -115,8 +115,7 @@ impl Tool for BatchEditTool {
         let mut pre_check_errors: Vec<String> = Vec::new();
         let mut path_content: HashMap<String, String> = HashMap::new();
 
-        for (i, edit) in params.edits.iter().enumerate() {
-            let path = ctx.resolve_path(&edit.file_path);
+        for (i, (edit, path)) in params.edits.iter().zip(&paths).enumerate() {
             debug!(path = %path.display(), index = i, "BatchEdit pre-check");
 
             if edit.old_string.is_empty() {
@@ -128,7 +127,7 @@ impl Tool for BatchEditTool {
                 // use cached edited content if available
                 content.clone()
             } else {
-                match tokio::fs::read_to_string(&path).await {
+                match tokio::fs::read_to_string(path).await {
                     Ok(c) => c,
                     Err(e) => {
                         pre_check_errors.push(format!(

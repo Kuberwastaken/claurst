@@ -16,7 +16,7 @@ const DEFAULT_LINE_LIMIT: usize = 2000;
 /// context; the trailer says where to continue.
 const MAX_OUTPUT_BYTES: usize = 50 * 1024;
 /// A single line longer than this is cut (on a char boundary).
-const MAX_LINE_BYTES: usize = 2000;
+pub(crate) const MAX_LINE_BYTES: usize = 2000;
 
 #[derive(Debug, Deserialize)]
 struct FileReadInput {
@@ -39,7 +39,7 @@ impl Tool for FileReadTool {
     fn description(&self) -> &str {
         "Reads a text file from the local filesystem. Each line is prefixed with \
          its number and a tab (\"12<TAB>\"), starting at 1. Returns at most 2000 \
-         lines and 50 KB per call; lines longer than 2000 bytes are cut. When more \
+         lines and about 50 KB per call; lines longer than 2000 bytes are cut. When more \
          remains, a trailer gives the offset to continue from: keep calling Read \
          with that offset until the file is fully read, rather than using cat or \
          sed. Images and PDFs are not decoded: the tool only confirms the file \
@@ -64,7 +64,7 @@ impl Tool for FileReadTool {
                 },
                 "limit": {
                     "type": "number",
-                    "description": "The maximum number of lines to read (default 2000). Output is also capped at 50 KB."
+                    "description": "The maximum number of lines to read (default 2000, at least 1). Output is also capped at about 50 KB."
                 }
             },
             "required": ["file_path"]
@@ -144,7 +144,10 @@ impl Tool for FileReadTool {
         }
 
         let start = params.offset.unwrap_or(0).saturating_sub(1);
-        let limit = params.limit.unwrap_or(DEFAULT_LINE_LIMIT).max(1);
+        let limit = params.limit.unwrap_or(DEFAULT_LINE_LIMIT);
+        if limit == 0 {
+            return ToolResult::error("limit must be at least 1".to_string());
+        }
         let page = match read_page(tokio::fs::File::from_std(file), start, limit).await {
             Ok(page) => page,
             Err(PageError::Binary) => {
@@ -192,6 +195,19 @@ impl Tool for FileReadTool {
     }
 }
 
+/// `text` cut to [`MAX_LINE_BYTES`] on a char boundary, with a marker giving
+/// the full length; borrowed unchanged when it already fits.
+pub(crate) fn cut_line(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.len() <= MAX_LINE_BYTES {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut cut = MAX_LINE_BYTES;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}... [line truncated: {} bytes]", &text[..cut], text.len()))
+}
+
 /// One page of a text file: the lines from the requested start that fit the
 /// line limit and [`MAX_OUTPUT_BYTES`], plus the file's total line count.
 struct Page {
@@ -235,15 +251,7 @@ async fn read_page(file: tokio::fs::File, start: usize, limit: usize) -> Result<
             return Err(PageError::Binary);
         }
         let text = std::str::from_utf8(raw).map_err(|_| PageError::Binary)?;
-        let line = if text.len() > MAX_LINE_BYTES {
-            let mut cut = MAX_LINE_BYTES;
-            while !text.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            format!("{}... [line truncated: {} bytes]", &text[..cut], text.len())
-        } else {
-            text.to_string()
-        };
+        let line = cut_line(text).into_owned();
         if !page.lines.is_empty() && page.bytes + line.len() > MAX_OUTPUT_BYTES {
             full = true;
             continue;
@@ -343,6 +351,16 @@ mod tests {
         let doc = read(&pdf, json!({})).await;
         assert!(doc.content.contains("you have not seen"), "{}", doc.content);
         assert!(!doc.content.contains("`pages`"), "{}", doc.content);
+    }
+
+    /// `limit: 0` is rejected rather than silently read as 1.
+    #[tokio::test]
+    async fn read_rejects_zero_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let res = read(&path, json!({ "limit": 0 })).await;
+        assert!(res.is_error && res.content.contains("limit must be at least 1"), "{}", res.content);
     }
 
     /// A UTF-8 BOM is not shown as part of the first line.

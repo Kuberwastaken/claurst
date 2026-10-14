@@ -257,6 +257,11 @@ fn find_whitespace_normalized(content: &str, old: &str) -> LineMatch {
         Some(body) => (body, true),
         None => (old, false),
     };
+    // Whitespace-only text would match any blank line; leave it to the
+    // exact tier.
+    if body.trim().is_empty() {
+        return LineMatch::None;
+    }
     let wanted: Vec<&str> = body.split('\n').map(str::trim_end).collect();
 
     // (byte offset, line including its terminator)
@@ -293,36 +298,57 @@ fn find_whitespace_normalized(content: &str, old: &str) -> LineMatch {
     }
 }
 
-/// Most line pairs [`closest_region`] compares, so a miss on a large file
-/// stays cheap; past it only a prefix of `old` is used to place the window.
-const MAX_HINT_COMPARISONS: usize = 20_000;
+/// Wall-time budget for [`closest_region`]. The hint runs synchronously
+/// while the file's lock is held, so it must stay cheap whatever the file
+/// holds (minified code, base64, one huge line).
+const HINT_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+/// Files with more lines than this get no hint.
+const MAX_HINT_FILE_LINES: usize = 100_000;
 
 /// The window of `normalized` most similar to `old`, rendered as numbered
-/// lines (as Read shows them) with two lines of context, or `None` when no
-/// window is at least half similar.
+/// lines (as Read shows them, long lines cut) with two lines of context, or
+/// `None` when no window is at least half similar.
+///
+/// Bounded by [`HINT_BUDGET`]: each per-line character diff carries the
+/// deadline, a pair whose lengths differ more than 3x is scored from the
+/// lengths alone (its ratio is then below 0.5 anyway), and the window scan
+/// stops at the deadline and keeps the best window found so far.
 fn closest_region(normalized: &str, old: &str) -> Option<String> {
+    let deadline = std::time::Instant::now() + HINT_BUDGET;
     let file: Vec<&str> = normalized.lines().collect();
-    let wanted: Vec<&str> = old.trim_end_matches('\n').split('\n').collect();
-    if file.is_empty() || file.len() > MAX_HINT_COMPARISONS * 5 {
+    let wanted: Vec<(&str, usize)> = old
+        .trim_end_matches('\n')
+        .split('\n')
+        .map(|w| (w.trim(), w.trim().chars().count()))
+        .collect();
+    if file.is_empty() || file.len() > MAX_HINT_FILE_LINES {
         return None;
     }
     let window = wanted.len().min(file.len());
-    let probe = &wanted[..window.min((MAX_HINT_COMPARISONS / file.len()).max(1))];
+    let probe = &wanted[..window];
 
-    let line_similarity = |a: &str, b: &str| -> f32 {
-        let (a, b) = (a.trim(), b.trim());
-        if a == b {
-            1.0
-        } else {
-            similar::TextDiff::from_chars(a, b).ratio()
+    let line_similarity = |(w, w_len): (&str, usize), line: &str| -> f32 {
+        let line = line.trim();
+        if w == line {
+            return 1.0;
         }
+        let line_len = line.chars().count();
+        let (short, long) = (w_len.min(line_len), w_len.max(line_len));
+        if long > 3 * short {
+            // ratio = 2 * matches / (short + long), and matches <= short.
+            return 2.0 * short as f32 / (short + long) as f32;
+        }
+        similar::TextDiff::configure().deadline(deadline).diff_chars(w, line).ratio()
     };
     let mut best = (0usize, 0f32);
     for i in 0..=file.len() - window {
+        if std::time::Instant::now() > deadline {
+            break;
+        }
         let score = probe
             .iter()
             .zip(&file[i..])
-            .map(|(w, l)| line_similarity(w, l))
+            .map(|(w, l)| line_similarity(*w, l))
             .sum::<f32>()
             / probe.len() as f32;
         if score > best.1 {
@@ -344,7 +370,12 @@ fn closest_region(normalized: &str, old: &str) -> Option<String> {
         score * 100.0
     );
     for (n, line) in file[from..to].iter().enumerate() {
-        out.push_str(&format!("{:>width$}\t{}\n", from + n + 1, line, width = width));
+        out.push_str(&format!(
+            "{:>width$}\t{}\n",
+            from + n + 1,
+            crate::file_read::cut_line(line),
+            width = width
+        ));
     }
     out.push_str("Copy old_string from the file exactly and retry.");
     Some(out)
@@ -526,6 +557,36 @@ mod tests {
         let res = edit(&path, "zzzz qqqq 9999", "x").await;
         assert!(res.is_error);
         assert!(res.content.contains("No similar region"), "{}", res.content);
+    }
+
+    /// #443 review: the closest-match hint stays fast on a file holding one
+    /// huge line, and that line is cut in the hint rather than echoed whole.
+    #[tokio::test]
+    async fn edit_miss_hint_is_bounded_on_huge_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("min.js");
+        let huge = "a".repeat(1024 * 1024);
+        let original = format!("let first = 1;\n{}\nlet last = 2;\n", huge);
+        std::fs::write(&path, &original).unwrap();
+
+        let started = std::time::Instant::now();
+        let res = edit(&path, "let frist = 1;\nlet lsat = 2;", "x").await;
+        let elapsed = started.elapsed();
+        assert!(res.is_error);
+        assert!(elapsed < std::time::Duration::from_secs(1), "hint took {:?}", elapsed);
+        assert!(res.content.len() < 8 * 1024, "hint echoed {} bytes", res.content.len());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    /// #443 review: whitespace-only old_string must not tier-2-match a blank line.
+    #[tokio::test]
+    async fn edit_whitespace_only_old_string_does_not_match_blank_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blank.txt");
+        std::fs::write(&path, "a\n\nb\n").unwrap();
+        let res = edit(&path, "   ", "x").await;
+        assert!(res.is_error, "whitespace-only edit applied: {}", res.content);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\n\nb\n");
     }
 
     /// Workspace `ws/` with `notes.txt`, a sibling `outside/secret.txt` with
