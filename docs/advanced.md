@@ -402,7 +402,7 @@ The new prompt is appended to the saved history, and a continued session keeps i
 
 ### Permissions
 
-Headless runs never prompt. A tool call that would ask for approval in the TUI (for example a write in `default` mode) is rejected, and the tool result tells the model why and not to retry; the run continues. Use `--permission-mode`, permission rules, or `--dangerously-skip-permissions` to allow more. `--allowed-tools` / `--disallowed-tools` are parsed but not applied yet.
+Headless runs never prompt. A tool call that would ask for approval in the TUI (for example a write in `default` mode) is rejected, and the tool result tells the model why and not to retry; the run continues. Use `--permission-mode`, permission rules, or `--dangerously-skip-permissions` to allow more. `--allowed-tools` / `--disallowed-tools` add allow and deny rules for the run; see [Permission Rules and Approvals](configuration.md#permission-rules-and-approvals).
 
 ### Structured output
 

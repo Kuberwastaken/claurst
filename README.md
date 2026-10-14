@@ -29,7 +29,7 @@ It's fast, it's memory-efficient, it's yours to run however you want, and there'
 > [!NOTE]
 > **Recent Updates (v0.2.0, see the [changelog](docs/changelog.md)):**
 >
-> - **Sandbox and permissions:** on macOS, Bash commands run in a Seatbelt sandbox that limits writes to the workspace and blocks network by default (`/sandbox-toggle`). Bash approvals are matched per command, approvals can be saved for the current project, and `--allowed-tools` / `--disallowed-tools` are enforced. See [Permission modes](docs/configuration.md#permission-modes).
+> - **Sandbox and permissions:** on macOS, Bash commands run in a Seatbelt sandbox that limits writes to the workspace and blocks network by default (`/sandbox-toggle`). Bash approvals are matched per command, approvals can be saved for the current project, and `--allowed-tools` / `--disallowed-tools` are enforced. See [Permission rules](docs/configuration.md#permission-rules-and-approvals) and [Shell Sandbox](docs/configuration.md#shell-sandbox).
 >
 > - **Hooks:** Claude Code's hooks contract (settings shape, events, JSON stdin/stdout, exit code 2, timeouts), including plugin hooks. See [Hooks](docs/hooks.md).
 >

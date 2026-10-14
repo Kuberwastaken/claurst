@@ -94,7 +94,7 @@ These keys are hard-coded in the prompt and have no action names, so they cannot
 | `Alt+B` / `Alt+F` | Move one word left / right |
 | `Ctrl+Backspace` | Delete the word before the cursor |
 | `Alt+Delete` / `Ctrl+Delete` | Delete the word after the cursor |
-| `Alt+Up` / `Alt+Down` | Scroll the transcript 20 lines |
+| `Alt+Up` / `Alt+Down` | Scroll the transcript 20 lines (`Alt+Up` edits the last queued message instead when one is pending) |
 | `Ctrl+V` / `Cmd+V` | Paste: an image from the clipboard if there is one, otherwise text |
 | `Shift+Insert` | Paste text |
 | `Alt+V` | Start / stop voice recording (when `/voice` is on) |
@@ -107,13 +107,15 @@ Tool permission prompts handle their keys directly; these keys cannot be rebound
 |-----|--------|
 | `y` | Allow once |
 | `Y` | Allow for this session |
-| `p` | Always allow (saved; "for this project" on file-write prompts) |
-| `P` | Bash prompts with a suggested prefix: allow commands matching that prefix |
-| `n` | Deny |
+| `p` | Always allow in this project |
+| `a` | Always allow everywhere |
+| `n` | Deny; then type an optional reason and press Enter (Esc denies without one) |
 | `1`-`9` | Select the option with that number |
 | `Up` / `Down` | Move the selection |
 | `Enter` | Choose the selected option |
 | `Escape` | Close the prompt |
+
+Opaque Bash lines (substitutions, heredocs, `eval`, `sudo`, `bash -c` and similar) offer only `y`, `Y` and `n`. A **Sandbox Denied** prompt uses `y` (rerun outside the sandbox once), `Y` (this session), `P` (always for commands starting with this word) and `n`. See [The permission dialog](configuration.md#the-permission-dialog) and [Shell Sandbox](configuration.md#shell-sandbox).
 
 ---
 

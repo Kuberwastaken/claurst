@@ -378,7 +378,6 @@ See [keybindings.md](./keybindings.md) for the full keybindings reference.
 ---
 
 ### /permissions
-**Aliases:** `allowed-tools`
 
 View and manage tool permission rules. Permissions control which tools can run without prompting, which are blocked, and which always require confirmation. `/permissions` (or `list`) shows the mode and every rule in effect: configured, saved for this project, saved everywhere, and this session's.
 
@@ -1374,14 +1373,15 @@ Send a side question to the model. The question is sent as a normal user message
 ### /sandbox-toggle
 **Aliases:** `sandbox`
 
-Record a sandbox on/off flag and command exclusion patterns in `~/.claurst/ui-settings.json` (`sandbox_mode`, `sandbox_excluded_commands`). No shell execution path reads these settings in the current build, so commands are not sandboxed. Enabling is refused on native Windows.
+Show or change the OS sandbox for Bash commands. On macOS, Bash commands run under Seatbelt (`/usr/bin/sandbox-exec`) unless the sandbox is off. Changes are saved to the `sandbox` block of the global settings file and apply to the next command. Other platforms have no OS sandbox yet: the setting is kept but has no effect. See [Shell Sandbox](configuration.md#shell-sandbox).
 
 ```
-/sandbox-toggle                          — toggle sandbox mode on/off
-/sandbox-toggle on                       — enable sandbox mode
-/sandbox-toggle off                      — disable sandbox mode
-/sandbox-toggle status                   — show current state and excluded patterns
-/sandbox-toggle exclude <pattern>        — add a command pattern to the exclusion list
+/sandbox-toggle                          — toggle between off and workspace-write
+/sandbox-toggle status                   — show the current mode and network setting
+/sandbox-toggle on | workspace-write     — writes only inside the workspace, --add-dir and temp dirs (default)
+/sandbox-toggle read-only                — no writes
+/sandbox-toggle off                      — run commands unsandboxed
+/sandbox-toggle network on|off           — network access for sandboxed commands (default off)
 ```
 
 ---
@@ -1466,5 +1466,4 @@ All commands listed here are available in every interactive session; there are n
 | Command | Condition |
 |---------|-----------|
 | `/goal` | Disabled when `CLAURST_GOALS=0` |
-| `/sandbox-toggle on` | Refused on native Windows |
 | `/color-set` | Hidden from `/help`; use `/color` |

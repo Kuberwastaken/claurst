@@ -90,20 +90,20 @@ Set with `--permission-mode` (`default`, `accept-edits`, `bypass-permissions`, `
 |------|----------|
 | `default` | Reads (`Read`, `Glob`, `Grep`, `LSP`, `Skill`) inside the workspace run without a prompt; everything else asks, including reads outside the workspace and `ListMcpResources` / `ReadMcpResource` |
 | `plan` | Those read tools run; every other tool is denied |
-| `acceptEdits` | `Edit` runs without a prompt; everything else behaves as in `default` |
-| `bypassPermissions` | Every tool runs without a prompt. `--dangerously-skip-permissions` and `yoloMode` select it; both refuse to start as root |
+| `acceptEdits` | `Edit`, `Write`, `NotebookEdit`, `BatchEdit` and `ApplyPatch` run without a prompt for targets inside the workspace; everything else behaves as in `default` |
+| `bypassPermissions` | Every tool runs without a prompt unless a deny rule covers it. `--dangerously-skip-permissions` and `yoloMode` select it; both refuse to start as root |
 
 Bash commands rated Critical by the classifier are refused in every mode. In headless (`--print`) runs nobody can answer a prompt, so a call that would ask is rejected with the reason returned to the model.
 
 ### Permission Rules
 
-Rules saved from the permission dialog's "always allow" choice are stored in the global settings file under `permissionRules`. Each rule has:
+Rules come from `allowed_tools` / `disallowed_tools` (and `--allowed-tools` / `--disallowed-tools`, `/permissions allow|deny`), from the dialog's "always allow in this project" choice (stored outside the repository) and from its "always allow everywhere" choice (stored in the global settings file under `permissionRules`). Bash rules are matched against each command of a compound line. The full model is in [Permission Rules and Approvals](configuration.md#permission-rules-and-approvals). A stored rule has:
 
 - `tool_name` — a tool name; omit it to match every tool. `mcp__<server>` or `mcp__<server>__*` matches every tool of that MCP server
 - `path_pattern` — optional glob matched against the call's path (file tools) or command (`Bash`)
 - `action` — `Allow` or `Deny`
 
-Order does not matter: if any deny rule matches, the call is denied; otherwise, if any allow rule matches, it is allowed; otherwise the mode decides. `bypassPermissions` skips the rules.
+Order does not matter: if any deny rule matches, the call is denied (in every mode, `bypassPermissions` included); otherwise, if any allow rule matches, it is allowed; otherwise the mode decides.
 
 ### No Read-Before-Write Check
 
