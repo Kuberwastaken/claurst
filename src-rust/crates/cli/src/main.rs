@@ -3135,7 +3135,6 @@ async fn run_interactive(
                         qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
                         // Session-local /turns override wins over agent and config caps.
                         qcfg.max_turns_override = app.max_turns_override;
-                        qcfg.append_system_prompt = cmd_ctx.config.append_system_prompt.clone();
                         qcfg.system_prompt = base_query_config.system_prompt.clone();
                         qcfg.output_style = cmd_ctx.config.effective_output_style();
                         qcfg.output_style_prompt = cmd_ctx.config.resolve_output_style_prompt();

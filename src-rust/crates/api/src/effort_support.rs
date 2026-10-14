@@ -251,7 +251,7 @@ fn claude_version(model: &str) -> Option<(u32, u32)> {
 /// The thinking and effort parameters for `model` (the single model-family
 /// table for Anthropic reasoning controls).
 ///
-/// * Claude 4.6 and later (Opus, Sonnet, Haiku 5, Fable, Mythos) take adaptive
+/// * Claude 4.6 and later (Opus, Sonnet, Haiku 5.5, Fable, Mythos) take adaptive
 ///   thinking, `thinking: {type: "adaptive"}`, with depth set by
 ///   `output_config.effort`. `budget_tokens` is deprecated on 4.6 and
 ///   rejected with HTTP 400 from Opus 4.7 / Sonnet 5 / Fable 5 on, and Opus

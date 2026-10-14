@@ -793,7 +793,8 @@ pub async fn run_query_loop(
             effective_effort_level,
             effective_thinking_budget,
         );
-        if let Some(thinking) = anthropic_reasoning.thinking.clone() {
+        let thinking_is_adaptive = anthropic_reasoning.is_adaptive();
+        if let Some(thinking) = anthropic_reasoning.thinking {
             req_builder = req_builder.thinking(thinking);
         }
         if let Some(effort) = anthropic_reasoning.effort {
@@ -811,7 +812,7 @@ pub async fn run_query_loop(
             })
             .or_else(|| {
                 effective_effort_level
-                    .filter(|_| !anthropic_reasoning.is_adaptive())
+                    .filter(|_| !thinking_is_adaptive)
                     .and_then(|el| el.temperature())
             });
         if let Some(t) = effective_temperature {
