@@ -888,10 +888,13 @@ impl Tool for PtyBashTool {
 
     fn description(&self) -> &str {
         "Executes a given bash command in a real terminal (PTY) and returns its output. \
-         The working directory persists between commands. Supports interactive programs, \
-         colored output (stripped for readability), and terminal-aware tools like npm, \
-         cargo, git, and pytest. Use for running shell commands, scripts, git operations, \
-         and system tasks."
+         The working directory and exported variables persist between commands. Colors are \
+         stripped and pagers are disabled, so git and man never wait for input. Large output \
+         is cut to its first and last lines and the full output is saved to a file named in a \
+         trailing `Full output: <path>` line; read that file with offset/limit instead of \
+         piping through `| head` or `| tail`. Do not chain unrelated commands with separators \
+         like `echo \"====\"`; run them as separate calls. Use for running shell commands, \
+         scripts, git operations, and system tasks."
     }
 
     fn permission_level(&self) -> PermissionLevel {
