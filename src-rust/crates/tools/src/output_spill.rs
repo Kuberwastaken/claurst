@@ -48,8 +48,12 @@ pub(crate) enum Captured {
     /// the tail last lets the PTY path leave its shell-state block (which
     /// carries the environment) off disk.
     Truncated {
+        // Only the PTY renderer (Unix) reads `head` and `omitted`; the
+        // background path needs just `tail` and `spill`.
+        #[cfg_attr(not(unix), allow(dead_code))]
         head: Vec<u8>,
         tail: Vec<u8>,
+        #[cfg_attr(not(unix), allow(dead_code))]
         omitted: u64,
         spill: Option<SpillFile>,
     },

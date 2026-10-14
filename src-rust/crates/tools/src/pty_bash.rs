@@ -1534,15 +1534,15 @@ mod windows_tests {
     async fn dropping_the_future_kills_the_process_tree() {
         let cwd = std::env::temp_dir();
         let command = format!("ping -n {MARKER}");
+        let spill_dir = tempfile::tempdir().unwrap();
         // Boxed (not `tokio::pin!`) so `drop(fut)` really drops the future.
-        let mut fut =
-            Box::pin(run_windows_fallback(
-                &command,
-                &cwd,
-                Duration::from_secs(120),
-                120_000,
-                &cwd.join("claurst-tool-output-test"),
-            ));
+        let mut fut = Box::pin(run_windows_fallback(
+            &command,
+            &cwd,
+            Duration::from_secs(120),
+            120_000,
+            spill_dir.path(),
+        ));
 
         // Let the command start, then confirm both cmd.exe and ping.exe are up.
         tokio::select! {
