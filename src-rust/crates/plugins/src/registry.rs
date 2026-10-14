@@ -368,4 +368,63 @@ mod tests {
         assert_eq!(diff.removed, vec!["gone"]);
         assert!(diff.updated.is_empty());
     }
+
+    fn with_mcp_server(mut plugin: LoadedPlugin, server: &str) -> LoadedPlugin {
+        plugin.manifest.mcp_servers.push(crate::manifest::PluginMcpServer {
+            name: server.to_string(),
+            command: Some("server-bin".to_string()),
+            args: vec![],
+            env: Default::default(),
+            url: None,
+            server_type: "stdio".to_string(),
+        });
+        plugin
+    }
+
+    #[test]
+    fn mcp_server_origin_follows_plugin_source() {
+        use claurst_core::config::McpServerOrigin;
+        let mut reg = PluginRegistry::new();
+        reg.insert(with_mcp_server(make_plugin("user-plugin"), "user-srv"));
+        let mut project = with_mcp_server(make_plugin("repo-plugin"), "repo-srv");
+        project.source = PluginSource::Project;
+        reg.insert(project);
+        let mut extra = with_mcp_server(make_plugin("extra-plugin"), "extra-srv");
+        extra.source = PluginSource::Extra("/opt/plugins".to_string());
+        reg.insert(extra);
+
+        let origin_of = |name: &str| {
+            reg.all_mcp_servers()
+                .into_iter()
+                .find(|s| s.name == name)
+                .map(|s| s.origin)
+        };
+        // A repository's own plugin must not auto-launch its MCP server (#493).
+        assert_eq!(origin_of("repo-srv"), Some(McpServerOrigin::Project));
+        assert_eq!(origin_of("user-srv"), Some(McpServerOrigin::User));
+        assert_eq!(origin_of("extra-srv"), Some(McpServerOrigin::User));
+    }
+
+    #[test]
+    fn project_plugin_mcp_server_is_held_by_trust_gate() {
+        use claurst_core::mcp_trust::{partition_mcp_servers, McpTrustStore};
+        let mut reg = PluginRegistry::new();
+        reg.insert(with_mcp_server(make_plugin("user-plugin"), "user-srv"));
+        let mut project = with_mcp_server(make_plugin("repo-plugin"), "repo-srv");
+        project.source = PluginSource::Project;
+        reg.insert(project);
+
+        let decision = partition_mcp_servers(
+            &reg.all_mcp_servers(),
+            None,
+            false,
+            &std::collections::HashSet::new(),
+            &McpTrustStore::default(),
+        );
+        let names = |v: &[claurst_core::config::McpServerConfig]| {
+            v.iter().map(|s| s.name.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(names(&decision.allowed), vec!["user-srv"]);
+        assert_eq!(names(&decision.pending), vec!["repo-srv"]);
+    }
 }
