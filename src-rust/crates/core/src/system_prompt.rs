@@ -1170,6 +1170,72 @@ mod tests {
         assert!(stable.contains("patterns of the surrounding code"));
     }
 
+    /// Compare the stable block for `platform` and `tools` against the golden
+    /// file `tests/snapshots/<name>.txt`. Set `UPDATE_PROMPT_SNAPSHOTS=1` to
+    /// rewrite the file. The prefix is pinned so cloud-provider env vars on
+    /// the test host cannot change the identity line.
+    fn assert_stable_snapshot(name: &str, platform: PromptPlatform, tools: &[&str]) {
+        let stable = stable_block(&SystemPromptOptions {
+            prefix: Some(SystemPromptPrefix::Cli),
+            platform: Some(platform),
+            enabled_tools: Some(tools.iter().map(|t| t.to_string()).collect()),
+            ..Default::default()
+        });
+
+        assert_eq!(stable.matches("You are ").count(), 1, "identity line must appear once");
+        for (tool, _) in CAPABILITY_SUMMARIES {
+            let line = format!("- {tool}: ");
+            assert_eq!(
+                stable.contains(&line),
+                tools.contains(tool),
+                "capability line for {tool} must match the declared tool set"
+            );
+        }
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/snapshots")
+            .join(format!("{name}.txt"));
+        if std::env::var_os("UPDATE_PROMPT_SNAPSHOTS").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, format!("{stable}\n")).unwrap();
+            return;
+        }
+        let expected = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+            .replace("\r\n", "\n");
+        assert_eq!(
+            format!("{stable}\n"),
+            expected,
+            "stable block changed; rerun with UPDATE_PROMPT_SNAPSHOTS=1 and review the diff"
+        );
+    }
+
+    const CORE_TOOLS: &[&str] = &["Read", "Edit", "Write", "Glob", "Grep", "Bash"];
+    const FULL_TOOLS: &[&str] = &[
+        "Read", "Edit", "Write", "BatchEdit", "Glob", "Grep", "Bash", "PowerShell", "WebSearch",
+        "WebFetch", "Agent", "TodoWrite", "Skill", "AskUserQuestion", "ToolSearch", "github_list_issues",
+    ];
+
+    #[test]
+    fn stable_block_snapshot_linux_core_tools() {
+        assert_stable_snapshot("stable_linux_core", PromptPlatform::Linux, CORE_TOOLS);
+    }
+
+    #[test]
+    fn stable_block_snapshot_windows_core_tools() {
+        assert_stable_snapshot("stable_windows_core", PromptPlatform::Windows, CORE_TOOLS);
+    }
+
+    #[test]
+    fn stable_block_snapshot_linux_full_tools() {
+        assert_stable_snapshot("stable_linux_full", PromptPlatform::Linux, FULL_TOOLS);
+    }
+
+    #[test]
+    fn stable_block_snapshot_windows_full_tools() {
+        assert_stable_snapshot("stable_windows_full", PromptPlatform::Windows, FULL_TOOLS);
+    }
+
     #[test]
     fn test_clear_section_cache() {
         // Populate cache then clear it — should not panic.
