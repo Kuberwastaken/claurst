@@ -288,10 +288,12 @@ pub fn discover_skills(
         }
     };
 
-    // ---- 1. Project skills: cwd up to the git root --------------------------
-    for dir in project_search_dirs(cwd) {
-        for root in [".claurst", ".agents", ".claude"] {
-            add_dir(&dir.join(root).join("skills"));
+    // ---- 1. Project skills: cwd up to the git root (not under --bare) -----
+    if !config_skills.skip_project_dirs {
+        for dir in project_search_dirs(cwd) {
+            for root in [".claurst", ".agents", ".claude"] {
+                add_dir(&dir.join(root).join("skills"));
+            }
         }
     }
 
@@ -629,6 +631,7 @@ mod tests {
         let config = crate::config::SkillsConfig {
             paths: vec![extra.path().to_str().unwrap().to_string()],
             urls: vec![],
+            ..Default::default()
         };
         let discovered = discover_skills(tmp.path(), &config);
         assert!(discovered.contains_key("extra"));
@@ -647,6 +650,7 @@ mod tests {
         let config = crate::config::SkillsConfig {
             paths: vec![extra.path().to_str().unwrap().to_string()],
             urls: vec![],
+            ..Default::default()
         };
         let discovered = discover_skills(tmp.path(), &config);
         // Project-level wins over extra path.
@@ -812,6 +816,24 @@ mod tests {
         assert_eq!(discovered["from-claude-446"].description, "claude dir");
         assert!(discovered.contains_key("near-446"));
         assert!(!discovered.contains_key("outside-446"));
+    }
+
+    #[test]
+    fn test_discover_skip_project_dirs_ignores_project_skills() {
+        let tmp = make_temp_dir();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        write_file(&tmp.path().join(".claurst").join("skills"), "repo-skill-446.md", "Repo.");
+        let extra = make_temp_dir();
+        write_file(extra.path(), "extra-skill-446.md", "Extra.");
+
+        let config = crate::config::SkillsConfig {
+            paths: vec![extra.path().to_str().unwrap().to_string()],
+            skip_project_dirs: true,
+            ..Default::default()
+        };
+        let discovered = discover_skills(tmp.path(), &config);
+        assert!(!discovered.contains_key("repo-skill-446"));
+        assert!(discovered.contains_key("extra-skill-446"));
     }
 
     // ---- SkillRegistry ------------------------------------------------------

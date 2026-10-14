@@ -192,7 +192,7 @@ struct Cli {
     #[arg(long = "disable-slash-commands", action = ArgAction::SetTrue)]
     disable_slash_commands: bool,
 
-    /// Run in bare mode (no hooks, no plugins, no AGENTS.md)
+    /// Run in bare mode (no hooks, no plugins, no AGENTS.md, no project skills)
     #[arg(long = "bare", action = ArgAction::SetTrue)]
     bare: bool,
 
@@ -484,6 +484,9 @@ async fn main() -> anyhow::Result<()> {
         // Bare mode runs no event hooks. Drop any hooks resolved from
         // settings so no `run_hooks` call site has anything to execute.
         config.hooks.clear();
+        // Nor does it list or run skills from the repository's own skill
+        // directories (global and bundled skills stay).
+        config.skills.skip_project_dirs = true;
     }
     if let Some(sp) = cli.system_prompt.clone() {
         config.custom_system_prompt = Some(sp);

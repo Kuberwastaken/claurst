@@ -1342,6 +1342,11 @@ pub mod config {
         /// Git repository URLs to fetch skills from (cloned once, then cached).
         #[serde(default)]
         pub urls: Vec<String>,
+        /// Skip the project skill directories (`.claurst/skills`,
+        /// `.agents/skills`, `.claude/skills` from cwd to the git root).
+        /// Set at runtime by `--bare`; never read from settings files.
+        #[serde(skip)]
+        pub skip_project_dirs: bool,
     }
 
     // ---- Settings --------------------------------------------------------
@@ -2162,7 +2167,7 @@ pub mod config {
                 skills: {
                     let mut paths = base.config.skills.paths;
                     for p in over.config.skills.paths { if !paths.contains(&p) { paths.push(p); } }
-                    SkillsConfig { paths, urls: base.config.skills.urls }
+                    SkillsConfig { paths, urls: base.config.skills.urls, ..Default::default() }
                 },
                 managed_agents: over.config.managed_agents.or(base.config.managed_agents),
                 auto_commits: over.config.auto_commits.or(base.config.auto_commits),
@@ -2216,7 +2221,7 @@ pub mod config {
                 skills: {
                     let mut paths = base.skills.paths;
                     for p in over.skills.paths { if !paths.contains(&p) { paths.push(p); } }
-                    SkillsConfig { paths, urls: base.skills.urls }
+                    SkillsConfig { paths, urls: base.skills.urls, ..Default::default() }
                 },
                 managed_agents: over.managed_agents.or(base.managed_agents),
                 auto_copy_on_highlight: over.auto_copy_on_highlight || base.auto_copy_on_highlight,
