@@ -105,11 +105,9 @@ Read the contents of a file from the local filesystem. Returns file contents as 
 |-----------|------|----------|-------------|
 | `file_path` | string | yes | Absolute path to the file |
 | `offset` | integer | no | First line to read (1-indexed) |
-| `limit` | integer | no | Maximum number of lines to read |
+| `limit` | integer | no | Maximum number of lines to read (default 2000, must be at least 1) |
 
-The tool tracks every read in `readFileState` with the file's modification time and content hash. Subsequent writes check this state.
-
-Supports reading: text files, images (PNG, JPG, GIF, WEBP — returned as base64), PDF files (text extraction), and Jupyter notebooks.
+Returns text only, prefixed with line numbers. Each call returns at most 2000 lines and about 50 KB of text; lines longer than 2000 bytes are cut. When more of the file remains, the result ends with `[truncated: N more lines; call Read with offset=M to continue]`. Images (PNG, JPG, GIF, BMP, WEBP, ICO) and PDFs are not decoded: the result only notes that the file exists and that its content was not seen. SVG is read as text. Binary files are rejected.
 
 ---
 

@@ -318,6 +318,11 @@ impl Tool for ApplyPatchTool {
         // Process each file in the patch
         // ----------------------------------------------------------------
 
+        // Lock every target file from the reads through the writes (#443).
+        let paths: Vec<std::path::PathBuf> =
+            file_patches.iter().map(|fp| ctx.resolve_path(&fp.path)).collect();
+        let _locks = crate::lock_files(paths.iter().map(|p| p.as_path())).await;
+
         let mut total_added: i64 = 0;
         let mut total_removed: i64 = 0;
         let mut file_summaries: Vec<Value> = Vec::new();

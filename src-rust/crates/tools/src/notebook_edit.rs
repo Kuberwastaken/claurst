@@ -110,6 +110,9 @@ impl Tool for NotebookEditTool {
             return ToolResult::error(e.to_string());
         }
 
+        // Serialise with other tools changing this file (#443).
+        let _lock = crate::lock_files([path.as_path()]).await;
+
         // Read notebook
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(c) => c,

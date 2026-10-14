@@ -2643,6 +2643,25 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
 
+        // 2. Prompt-cache tokens for the session (Anthropic reports these as
+        //    `cache_read_input_tokens` / `cache_creation_input_tokens`; reads
+        //    are already priced at the discounted rate by the cost tracker).
+        let cache_read = app.cost_tracker.cache_read_tokens();
+        let cache_write = app.cost_tracker.cache_creation_tokens();
+        if cache_read > 0 || cache_write > 0 {
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+            parts.push(Span::styled(
+                format!(
+                    "cache {} read \u{00b7} {} write",
+                    claurst_core::format_utils::format_tokens(cache_read),
+                    claurst_core::format_utils::format_tokens(cache_write),
+                ),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
         // 3. Cost — mirrors TS formatCost: 4 decimal places for costs < $0.50, else 2.
         // Display cost if it's >= 0.0, so free models show $0.00
         if app.cost_usd >= 0.0 {
@@ -4106,6 +4125,22 @@ mod status_line_tests {
             // Padding is clamped to half the width: at most one cell remains.
             assert!(rows(&terminal)[0].trim().chars().count() <= 1);
         }
+    }
+
+    #[test]
+    fn footer_shows_prompt_cache_tokens() {
+        let app = App::new(Config::default(), CostTracker::new());
+        let mut terminal = Terminal::new(TestBackend::new(160, 1)).unwrap();
+        terminal.draw(|f| render_footer(f, &app, f.area())).unwrap();
+        assert!(!rows(&terminal)[0].contains("cache "));
+
+        app.cost_tracker.add_usage(12, 40, 3_400, 51_000);
+        terminal.draw(|f| render_footer(f, &app, f.area())).unwrap();
+        assert!(
+            rows(&terminal)[0].contains("cache 51K read \u{00b7} 3.4K write"),
+            "footer: {:?}",
+            rows(&terminal)[0]
+        );
     }
 
     #[test]

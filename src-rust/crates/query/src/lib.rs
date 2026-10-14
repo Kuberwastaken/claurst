@@ -58,7 +58,7 @@ pub use session_memory::{
 
 use claurst_api::{
     ApiMessage, ApiToolDefinition, AnthropicStreamEvent, CreateMessageRequest, StreamAccumulator,
-    StreamHandler, SystemPrompt, ThinkingConfig,
+    StreamHandler, SystemBlock, SystemPrompt,
 };
 use claurst_core::config::Config;
 use claurst_core::cost::CostTracker;
@@ -106,6 +106,9 @@ pub struct QueryConfig {
     pub degradation_enabled: bool,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
+    /// Session context gathered at startup (date, git status, IDE context).
+    /// Sent in the dynamic system block, after the cached stable block.
+    pub session_context: Option<String>,
     pub output_style: claurst_core::system_prompt::OutputStyle,
     pub output_style_prompt: Option<String>,
     pub working_directory: Option<String>,
@@ -187,6 +190,7 @@ impl Default for QueryConfig {
             degradation_enabled: true,
             system_prompt: None,
             append_system_prompt: None,
+            session_context: None,
             output_style: claurst_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             working_directory: None,
@@ -667,8 +671,11 @@ pub async fn run_query_loop(
         let effective_effort_level =
             effective_effort_for_turn(config.effort_level, messages.as_slice());
 
-        // Verification nudge: if there are incomplete todos for this session
-        // and the conversation has more than 2 turns, append a reminder.
+        // Assemble the [stable, dynamic] system blocks. Everything that varies
+        // per turn (todo nudge, goal and ultracode addenda, the transient
+        // output-style persona) is routed into the dynamic block through
+        // `append_system_prompt` / `output_style`, so the stable block stays
+        // byte-identical across turns and keeps its prompt-cache entry.
         let system = {
             // Build a (possibly patched) config for system-prompt assembly.
             // Agent prompt prefix and todo nudge are both applied here.
@@ -710,7 +717,7 @@ pub async fn run_query_loop(
             if turn > 2 {
                 let nudge = build_todo_nudge(&tool_ctx.session_id);
                 if !nudge.is_empty() {
-                    patched.append_system_prompt = Some(match &config.append_system_prompt {
+                    patched.append_system_prompt = Some(match patched.append_system_prompt.take() {
                         Some(existing) => format!("{}\n\n{}", existing, nudge),
                         None => nudge,
                     });
@@ -777,12 +784,26 @@ pub async fn run_query_loop(
             effective_effort_level.and_then(|el| el.thinking_budget_tokens())
         });
 
-        if let Some(budget) = effective_thinking_budget {
-            req_builder = req_builder.thinking(ThinkingConfig::enabled(budget));
+        // Claude reasoning controls: adaptive thinking + `output_config.effort`
+        // on current models, `budget_tokens` on older ones (one table in
+        // `claurst_api::anthropic_reasoning`). Non-Claude models fall into the
+        // budget branch, which is the previous behaviour.
+        let anthropic_reasoning = claurst_api::anthropic_reasoning(
+            &effective_model,
+            effective_effort_level,
+            effective_thinking_budget,
+        );
+        let thinking_is_adaptive = anthropic_reasoning.is_adaptive();
+        if let Some(thinking) = anthropic_reasoning.thinking {
+            req_builder = req_builder.thinking(thinking);
+        }
+        if let Some(effort) = anthropic_reasoning.effort {
+            req_builder = req_builder.effort(effort);
         }
 
         // Apply temperature: explicit config value takes precedence, then agent override,
-        // then effort-level override.
+        // then effort-level override (not for adaptive-thinking models, which
+        // reject sampling parameters alongside thinking).
         let effective_temperature = config.temperature
             .or_else(|| {
                 config.agent_definition.as_ref()
@@ -790,13 +811,19 @@ pub async fn run_query_loop(
                     .map(|t| t as f32)
             })
             .or_else(|| {
-                effective_effort_level.and_then(|el| el.temperature())
+                effective_effort_level
+                    .filter(|_| !thinking_is_adaptive)
+                    .and_then(|el| el.temperature())
             });
         if let Some(t) = effective_temperature {
             req_builder = req_builder.temperature(t);
         }
 
-        let request = req_builder.build();
+        // `request` is only ever sent through the Anthropic client below (the
+        // provider dispatch path builds its own `ProviderRequest`), so the
+        // Anthropic prompt-cache breakpoints are placed here unconditionally.
+        let mut request = req_builder.build();
+        request.apply_cache_breakpoints();
 
         // Create a stream handler that forwards to the event channel
         let handler: Arc<dyn StreamHandler> = if let Some(ref tx) = event_tx {
@@ -1001,11 +1028,18 @@ pub async fn run_query_loop(
                         top_p: None,
                         top_k: None,
                         stop_sequences: vec![],
-                        thinking: if caps.thinking {
+                        thinking: if !caps.thinking {
+                            None
+                        } else if provider_id_str == "anthropic" {
+                            claurst_api::anthropic_reasoning(
+                                &model_id_str,
+                                effective_effort_level,
+                                effective_thinking_budget,
+                            )
+                            .thinking
+                        } else {
                             effective_thinking_budget
                                 .map(claurst_api::ThinkingConfig::enabled)
-                        } else {
-                            None
                         },
                         provider_options: build_provider_options(
                             &provider_id_str,
@@ -2168,6 +2202,7 @@ mod tests {
             degradation_enabled: true,
             system_prompt: sys.map(String::from),
             append_system_prompt: append.map(String::from),
+            session_context: None,
             output_style: claurst_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             working_directory: None,
@@ -2246,103 +2281,81 @@ mod tests {
 
     // ---- build_system_prompt tests ------------------------------------------
 
+    /// Unwrap the `[stable, dynamic]` system blocks and assert that the
+    /// internal boundary marker reaches neither of them.
+    fn prompt_halves(prompt: SystemPrompt) -> (String, String) {
+        let SystemPrompt::Blocks(blocks) = prompt else {
+            panic!("expected [stable, dynamic] system blocks");
+        };
+        assert_eq!(blocks.len(), 2, "expected exactly two system blocks");
+        for block in &blocks {
+            assert!(
+                !block.text.contains(claurst_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
+                "the boundary marker must never be sent to the model"
+            );
+        }
+        (blocks[0].text.clone(), blocks[1].text.clone())
+    }
+
     #[test]
     fn test_system_prompt_default_when_empty() {
         // The default prompt (no custom system prompt set) should include the
-        // Claurst attribution and standard sections.
+        // Claurst attribution and standard sections in the stable block.
         let cfg = make_config(None, None);
-        let prompt = build_system_prompt(&cfg);
-        if let SystemPrompt::Text(text) = prompt {
-            assert!(
-                text.contains("Claurst") || text.contains("Claude agent"),
-                "Default prompt should contain attribution: {}",
-                text
-            );
-            assert!(
-                text.contains(claurst_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
-                "Default prompt must contain the dynamic boundary marker"
-            );
-        } else {
-            panic!("Expected SystemPrompt::Text");
-        }
+        let (stable, _dynamic) = prompt_halves(build_system_prompt(&cfg));
+        assert!(
+            stable.contains("Claurst") || stable.contains("Claude agent"),
+            "Default prompt should contain attribution: {}",
+            stable
+        );
     }
 
     #[test]
     fn test_system_prompt_with_custom() {
-        // A custom system prompt is injected into the cacheable section as
+        // A custom system prompt is injected into the stable block as
         // <custom_instructions>; the default sections are still present.
         let cfg = make_config(Some("You are a code reviewer."), None);
-        let prompt = build_system_prompt(&cfg);
-        if let SystemPrompt::Text(text) = prompt {
-            assert!(
-                text.contains("You are a code reviewer."),
-                "Custom prompt text should appear in the output"
-            );
-            assert!(
-                text.contains("Claurst") || text.contains("Claude agent"),
-                "Default attribution should still be present"
-            );
-        } else {
-            panic!("Expected SystemPrompt::Text");
-        }
+        let (stable, _dynamic) = prompt_halves(build_system_prompt(&cfg));
+        assert!(
+            stable.contains("You are a code reviewer."),
+            "Custom prompt text should appear in the stable block"
+        );
+        assert!(
+            stable.contains("Claurst") || stable.contains("Claude agent"),
+            "Default attribution should still be present"
+        );
     }
 
     #[test]
     fn test_system_prompt_with_append() {
-        // Appended text lands after the dynamic boundary.
+        // Appended text lands in the dynamic block.
         let cfg = make_config(Some("Base prompt."), Some("Additional context."));
-        let prompt = build_system_prompt(&cfg);
-        if let SystemPrompt::Text(text) = prompt {
-            assert!(text.contains("Base prompt."));
-            assert!(text.contains("Additional context."));
-            // append_system_prompt appears after the boundary
-            let boundary_pos = text
-                .find(claurst_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
-                .expect("boundary must exist");
-            let append_pos = text.find("Additional context.").unwrap();
-            assert!(
-                append_pos > boundary_pos,
-                "Appended text must appear after the dynamic boundary"
-            );
-        } else {
-            panic!("Expected SystemPrompt::Text");
-        }
+        let (stable, dynamic) = prompt_halves(build_system_prompt(&cfg));
+        assert!(stable.contains("Base prompt."));
+        assert!(!stable.contains("Additional context."));
+        assert!(dynamic.contains("Additional context."));
     }
 
     #[test]
     fn test_system_prompt_append_only() {
         // When only append is set, default sections are present plus the
-        // appended text after the dynamic boundary.
+        // appended text in the dynamic block.
         let cfg = make_config(None, Some("Appended text."));
-        let prompt = build_system_prompt(&cfg);
-        if let SystemPrompt::Text(text) = prompt {
-            assert!(
-                text.contains("Appended text."),
-                "Appended text must appear in the prompt"
-            );
-            let boundary_pos = text
-                .find(claurst_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
-                .expect("boundary must exist");
-            let append_pos = text.find("Appended text.").unwrap();
-            assert!(
-                append_pos > boundary_pos,
-                "Appended text must appear after the dynamic boundary"
-            );
-        } else {
-            panic!("Expected SystemPrompt::Text");
-        }
+        let (stable, dynamic) = prompt_halves(build_system_prompt(&cfg));
+        assert!(!stable.contains("Appended text."));
+        assert!(
+            dynamic.contains("Appended text."),
+            "Appended text must appear in the dynamic block"
+        );
     }
 
     #[test]
     fn test_system_prompt_with_custom_output_style_prompt() {
         let mut cfg = make_config(None, None);
         cfg.output_style_prompt = Some("Answer like a pirate.".to_string());
-        let prompt = build_system_prompt(&cfg);
-        if let SystemPrompt::Text(text) = prompt {
-            assert!(text.contains("Answer like a pirate."));
-        } else {
-            panic!("Expected SystemPrompt::Text");
-        }
+        let (stable, dynamic) = prompt_halves(build_system_prompt(&cfg));
+        assert!(!stable.contains("Answer like a pirate."));
+        assert!(dynamic.contains("Answer like a pirate."));
     }
 
     // ---- QueryConfig tests --------------------------------------------------
@@ -2802,6 +2815,8 @@ mod tests {
         id: claurst_core::provider_id::ProviderId,
         /// One entry per request: `true` when its tool set was empty.
         tools_empty_per_request: Arc<StdMutex<Vec<bool>>>,
+        /// One entry per request: the system prompt it carried.
+        systems_per_request: Arc<StdMutex<Vec<Option<SystemPrompt>>>>,
         /// When true, always end the turn with text (ignores tools). Otherwise
         /// emit a `tool_use` while tools are present and end the turn once
         /// they're gone (so the degradation turn ends the loop).
@@ -2845,6 +2860,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(tools_empty);
+            self.systems_per_request
+                .lock()
+                .unwrap()
+                .push(request.system_prompt.clone());
 
             let msg_id = uuid::Uuid::new_v4().to_string();
             let emit_tool_use = !self.always_end_turn && !tools_empty;
@@ -2967,6 +2986,7 @@ mod tests {
         let provider = Arc::new(RecordingProvider {
             id: claurst_core::provider_id::ProviderId::new("mockprov"),
             tools_empty_per_request: recorded.clone(),
+            systems_per_request: Arc::new(StdMutex::new(Vec::new())),
             always_end_turn,
         });
         let mut registry = claurst_api::ProviderRegistry::new();
@@ -3020,6 +3040,73 @@ mod tests {
 
         let recorded = recorded.lock().unwrap().clone();
         (outcome, recorded, messages)
+    }
+
+    /// Issue #440: across a scripted multi-turn run the stable system block is
+    /// byte-identical on every request and never carries the boundary marker,
+    /// while per-session and per-turn content stays in the dynamic block.
+    #[tokio::test]
+    async fn stable_system_block_is_byte_identical_across_turns() {
+        let systems = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(RecordingProvider {
+            id: claurst_core::provider_id::ProviderId::new("mockprov"),
+            tools_empty_per_request: Arc::new(StdMutex::new(Vec::new())),
+            systems_per_request: systems.clone(),
+            always_end_turn: false,
+        });
+        let mut registry = claurst_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+
+        let mut ctx = deny_all_context();
+        ctx.session_id = "cache-stability-test".to_string();
+        ctx.config.provider = Some("mockprov".to_string());
+
+        let mut config = make_config(Some("Project rules."), Some("Appended."));
+        config.model = "mock-model".to_string();
+        config.max_turns = 1;
+        config.session_context = Some("# Git Status\n## main".to_string());
+        config.output_style = claurst_core::system_prompt::OutputStyle::Concise;
+        config.provider_registry = Some(Arc::new(registry));
+
+        let mut messages = vec![Message::user("start")];
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &noop_tools(),
+                &ctx,
+                &config,
+                claurst_core::cost::CostTracker::new(),
+                None,
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+
+        // Turn 1 uses a tool, turn 2 is the tool-less summary turn.
+        let systems = systems.lock().unwrap().clone();
+        assert_eq!(systems.len(), 2, "expected a two-turn run");
+        let halves: Vec<(String, String)> = systems
+            .into_iter()
+            .map(|system| prompt_halves(system.expect("system prompt sent")))
+            .collect();
+        let (stable, dynamic) = &halves[0];
+        assert_eq!(stable, &halves[1].0, "stable block changed between turns");
+        assert!(stable.contains("Project rules."));
+        for volatile in ["# Git Status", "maximally concise", "Appended."] {
+            assert!(!stable.contains(volatile), "{volatile:?} leaked into the stable block");
+            assert!(dynamic.contains(volatile), "{volatile:?} missing from the dynamic block");
+        }
     }
 
     /// (a) A non-goal turn that ends with `end_turn` stops after exactly one
