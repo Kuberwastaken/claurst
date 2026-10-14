@@ -10,11 +10,15 @@ use claurst_tools::PendingPermissionStore;
 use dashmap::DashMap;
 use tokio_util::sync::CancellationToken;
 
+use crate::runtime::AgentRuntime;
+
 /// One ACP session — a logical conversation with its own cwd, transcript,
 /// MCP server roster, and the cancellation token of its running prompt.
 pub struct SessionState {
     pub session_id: acp::SessionId,
     pub cwd: PathBuf,
+    /// Runtime built for `cwd`: settings, context, tools and MCP servers.
+    pub runtime: Arc<AgentRuntime>,
     pub messages: parking_lot::Mutex<Vec<Message>>,
     /// Cancellation token of the prompt currently running on this session,
     /// `None` while the session is idle. Each prompt gets a fresh token, so a
@@ -31,12 +35,13 @@ pub struct SessionState {
 impl SessionState {
     pub fn new(
         session_id: acp::SessionId,
-        cwd: PathBuf,
+        runtime: Arc<AgentRuntime>,
         permission_manager: PermissionManager,
     ) -> Arc<Self> {
         Arc::new(Self {
             session_id,
-            cwd,
+            cwd: runtime.working_dir.clone(),
+            runtime,
             messages: parking_lot::Mutex::new(Vec::new()),
             active_turn: parking_lot::Mutex::new(None),
             pending_permissions: Arc::new(parking_lot::Mutex::new(
@@ -122,7 +127,9 @@ mod tests {
             claurst_core::PermissionMode::Default,
             &claurst_core::config::Settings::default(),
         );
-        SessionState::new(acp::SessionId::new(id), PathBuf::from(cwd), manager)
+        let provider = crate::e2e_tests::ScriptedProvider::new(Vec::new());
+        let runtime = crate::e2e_tests::scripted_runtime(std::path::Path::new(cwd), provider);
+        SessionState::new(acp::SessionId::new(id), Arc::new(runtime), manager)
     }
 
     #[test]

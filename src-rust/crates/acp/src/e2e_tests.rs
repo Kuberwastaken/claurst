@@ -27,6 +27,8 @@ pub(crate) enum Step {
     Text(&'static str),
     /// Call one tool with this input.
     Tool(&'static str, Value),
+    /// Fail the request with a provider error.
+    Fail(&'static str),
 }
 
 /// Provider double that replays `Step`s and records every request.
@@ -40,11 +42,20 @@ pub(crate) struct ScriptedProvider {
 
 impl ScriptedProvider {
     pub fn new(steps: Vec<Step>) -> Arc<Self> {
+        Self::build(steps, false)
+    }
+
+    /// A provider that reports image input support.
+    pub fn with_images(steps: Vec<Step>) -> Arc<Self> {
+        Self::build(steps, true)
+    }
+
+    fn build(steps: Vec<Step>, image_input: bool) -> Arc<Self> {
         Arc::new(Self {
             id: claurst_core::provider_id::ProviderId::new("scripted"),
             steps: parking_lot::Mutex::new(steps.into()),
             requests: parking_lot::Mutex::new(Vec::new()),
-            image_input: false,
+            image_input,
             started: Notify::new(),
         })
     }
@@ -94,6 +105,12 @@ impl claurst_api::LlmProvider for ScriptedProvider {
         });
         let events = match step {
             Step::Hang => return Ok(Box::pin(futures::stream::pending())),
+            Step::Fail(message) => {
+                return Err(ProviderError::AuthFailed {
+                    provider: self.id.clone(),
+                    message: message.to_string(),
+                })
+            }
             Step::Text(text) => vec![
                 start,
                 Ok(StreamEvent::TextDelta {
@@ -174,6 +191,7 @@ pub(crate) fn scripted_runtime(cwd: &Path, provider: Arc<ScriptedProvider>) -> A
     query_config.model = "scripted-model".to_string();
     query_config.max_turns = 10;
     query_config.provider_registry = Some(provider_registry.clone());
+    let supports_images = crate::runtime::provider_accepts_images(&config, &provider_registry);
 
     AgentRuntime {
         config,
@@ -185,6 +203,7 @@ pub(crate) fn scripted_runtime(cwd: &Path, provider: Arc<ScriptedProvider>) -> A
         query_config,
         mcp_manager: None,
         working_dir: cwd.to_path_buf(),
+        supports_images,
     }
 }
 
@@ -209,7 +228,12 @@ impl Client {
         let (server_write, client_read) = tokio::io::duplex(1 << 20);
 
         let connection = Connection::new(server_write);
-        let server = AgentServer::new(connection.clone(), Arc::new(runtime));
+        let server = AgentServer::new(connection.clone());
+        server
+            .runtimes
+            .try_lock()
+            .expect("a new server's runtime cache is free")
+            .insert(runtime.working_dir.clone(), Arc::new(runtime));
         let (tx, mut rx) = mpsc::unbounded_channel();
         tokio::spawn(connection::run_reader(connection, server_read, tx));
         tokio::spawn(async move {
@@ -607,4 +631,85 @@ async fn trusted_mcp_tools_are_attached_and_callable() {
         .map(|u| u["update"]["rawOutput"].clone())
         .collect();
     assert_eq!(outputs, vec![json!("pong")]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_turn_is_a_jsonrpc_error_not_a_refusal() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("error");
+    let provider = ScriptedProvider::new(vec![Step::Fail("invalid api key")]);
+    let client = Client::start(scripted_runtime(&cwd, provider));
+    let session_id = client.new_session(&cwd).await;
+
+    let response = client.prompt(&session_id, "hello").await;
+    assert!(response.get("result").is_none(), "{response}");
+    let error: acp::Error =
+        serde_json::from_value(response["error"].clone()).expect("an ACP error object");
+    assert_eq!(error.code, acp::ErrorCode::InternalError);
+    assert!(error.message.contains("invalid api key"), "{}", error.message);
+
+    let retry = client.prompt(&session_id, "hello again").await;
+    assert_eq!(
+        stop_reason(&retry),
+        acp::StopReason::EndTurn,
+        "a failed turn must leave the session usable"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prompt_images_reach_a_provider_that_accepts_them() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("image");
+    let provider = ScriptedProvider::with_images(vec![Step::Text("a cat")]);
+    let client = Client::start(scripted_runtime(&cwd, provider.clone()));
+    let session_id = client.new_session(&cwd).await;
+
+    let response = client
+        .call(
+            "session/prompt",
+            acp::PromptRequest::new(
+                session_id.clone(),
+                vec![
+                    acp::ContentBlock::Text(acp::TextContent::new("what is this?")),
+                    acp::ContentBlock::Image(acp::ImageContent::new("aGVsbG8=", "image/png")),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(stop_reason(&response), acp::StopReason::EndTurn);
+
+    let requests = provider.requests.lock();
+    let user = requests[0]
+        .messages
+        .iter()
+        .find(|m| m.role == claurst_core::types::Role::User)
+        .expect("the request carries the user turn");
+    let has_image = user.content_blocks().iter().any(|block| {
+        matches!(block, ContentBlock::Image { source } if source.data.as_deref() == Some("aGVsbG8="))
+    });
+    assert!(has_image, "the image must be passed to the provider: {user:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn runtime_uses_settings_and_agents_md_of_the_session_cwd() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("project");
+    std::fs::create_dir_all(cwd.join(".claurst")).expect("create .claurst");
+    let mut project = claurst_core::config::Settings::default();
+    project.config.model = Some("project-pinned-model".to_string());
+    std::fs::write(
+        cwd.join(".claurst").join("settings.json"),
+        serde_json::to_string(&project).expect("serialize project settings"),
+    )
+    .expect("write project settings");
+    std::fs::write(cwd.join("AGENTS.md"), "Project rule: PROJECT-RULE-MARKER").expect("write AGENTS.md");
+
+    let runtime = AgentRuntime::build(cwd.clone()).await.expect("runtime builds");
+    assert_eq!(runtime.working_dir, cwd);
+    assert_eq!(runtime.query_config.model, "project-pinned-model");
+    let system_prompt = runtime.query_config.system_prompt.as_deref().unwrap_or_default();
+    assert!(
+        system_prompt.contains("PROJECT-RULE-MARKER"),
+        "AGENTS.md from the session cwd must reach the system prompt"
+    );
 }

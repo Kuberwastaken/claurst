@@ -1,8 +1,10 @@
-//! Shared agent runtime owned by the ACP server.
+//! Agent runtime for one working directory.
 //!
-//! Built once on startup and reused for every session. Per-session state
-//! (cwd, transcript, cancellation token, permission manager and queue) is
-//! layered on top via `sessions::SessionState`.
+//! Built the first time a session is opened in a directory (settings,
+//! AGENTS.md context and MCP servers all resolve against that directory)
+//! and shared by every later session in it. Per-session state (transcript,
+//! cancellation token, permission manager and queue) is layered on top via
+//! `sessions::SessionState`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,8 +14,8 @@ use claurst_core::CostTracker;
 use claurst_query::QueryConfig;
 use claurst_tools::Tool;
 
-/// Snapshot of the global agent runtime — built at server startup, cloned
-/// (cheaply, via Arc) into each session.
+/// Snapshot of the agent runtime for one working directory, shared (via
+/// Arc) by every session opened in that directory.
 #[derive(Clone)]
 pub struct AgentRuntime {
     pub config: Config,
@@ -25,15 +27,25 @@ pub struct AgentRuntime {
     pub query_config: QueryConfig,
     pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
     pub working_dir: PathBuf,
+    /// Whether the active provider accepts image input, so prompt images
+    /// are passed through instead of being replaced by a note.
+    pub supports_images: bool,
 }
 
 impl AgentRuntime {
-    /// Build the runtime from on-disk settings, env vars, and a working
-    /// directory. Mirrors the headless startup path but with ACP-specific
-    /// defaults (non-interactive, permission decisions routed back to the
-    /// connected client).
+    /// Build the runtime from the settings that apply to `working_dir`
+    /// (global merged with the project's `.claurst/settings.json`), env vars,
+    /// and the directory's AGENTS.md context. Mirrors the headless startup
+    /// path but with ACP-specific defaults (permission decisions routed back
+    /// to the connected client).
     pub async fn build(working_dir: PathBuf) -> anyhow::Result<Self> {
-        let settings = Settings::load_sync().unwrap_or_default();
+        let settings = match Settings::load_hierarchical(&working_dir).await {
+            Ok(settings) => settings,
+            Err(e) => {
+                tracing::warn!(error = %e, cwd = %working_dir.display(), "ACP: could not load settings, using defaults");
+                Settings::default()
+            }
+        };
         let mut config = settings.effective_config();
         // Plan mode requires interactive UI — fall back to Default so the
         // ACP permission bridge can route decisions to the client.
@@ -66,10 +78,9 @@ impl AgentRuntime {
 
         let cost_tracker = CostTracker::new();
 
-        // MCP servers from settings — connect upfront so their tools are
-        // visible to every session. Per-session MCP servers supplied via
-        // `session/new` params are additive on top of this (v1: ignored,
-        // tracked in plan/migration-todo).
+        // MCP servers from the settings for this directory — connect upfront
+        // so their tools are visible to every session here. Per-session MCP
+        // servers supplied via `session/new` params are not routed yet.
         let mcp_manager = build_mcp_manager(&config, &settings, &working_dir).await;
 
         // Build tools: built-ins + AgentTool + the tools of every MCP server
@@ -85,6 +96,18 @@ impl AgentRuntime {
         query_config.working_directory = Some(working_dir.display().to_string());
         query_config.provider_registry = Some(provider_registry.clone());
 
+        // System and user context (git status, AGENTS.md, ...) for this
+        // directory, assembled like the CLI does.
+        let context = claurst_core::context::ContextBuilder::new(working_dir.clone())
+            .disable_claude_mds(config.disable_claude_mds);
+        let mut system_parts: Vec<String> = config.custom_system_prompt.iter().cloned().collect();
+        system_parts.push(context.build_system_context().await);
+        system_parts.push(context.build_user_context().await);
+        query_config.system_prompt = Some(system_parts.join("\n\n"));
+        query_config.append_system_prompt = config.append_system_prompt.clone();
+
+        let supports_images = provider_accepts_images(&config, &provider_registry);
+
         Ok(Self {
             config,
             settings,
@@ -95,8 +118,20 @@ impl AgentRuntime {
             query_config,
             mcp_manager,
             working_dir,
+            supports_images,
         })
     }
+}
+
+/// Whether the provider `config` selects accepts image input.
+pub(crate) fn provider_accepts_images(
+    config: &Config,
+    registry: &claurst_api::ProviderRegistry,
+) -> bool {
+    let id = claurst_core::provider_id::ProviderId::new(config.selected_provider_id());
+    registry
+        .get(&id)
+        .is_some_and(|provider| provider.capabilities().image_input)
 }
 
 pub(crate) async fn build_mcp_manager(
@@ -108,10 +143,10 @@ pub(crate) async fn build_mcp_manager(
         return None;
     }
     // SECURITY (issue #123): never auto-launch project-defined MCP servers in
-    // this non-interactive runtime unless they have been trusted. The ACP
-    // runtime loads only global settings today (so all servers are user-origin
-    // and pass through), but gating here keeps the invariant if project config
-    // is ever merged in.
+    // this non-interactive runtime unless they have been trusted. The settings
+    // for the session's directory include the project's own
+    // `.claurst/settings.json`, whose servers are project-origin and are held
+    // back here until the user approves them (TUI) or trusts them globally.
     let project_root = claurst_core::mcp_trust::project_root_for(working_dir);
     let store = claurst_core::mcp_trust::McpTrustStore::load();
     let decision = claurst_core::mcp_trust::partition_mcp_servers(

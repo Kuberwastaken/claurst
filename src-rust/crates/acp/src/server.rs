@@ -1,5 +1,7 @@
 //! Top-level ACP request / notification dispatcher.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_client_protocol_schema as acp;
@@ -12,22 +14,42 @@ use crate::connection::{Connection, Inbound};
 use crate::runtime::AgentRuntime;
 use crate::sessions::{SessionRegistry, SessionState};
 
-/// The ACP agent: owns the connection, the runtime, and the session registry.
+/// The ACP agent: owns the connection, the per-directory runtimes, and the
+/// session registry.
 pub struct AgentServer {
     pub connection: Arc<Connection>,
-    pub runtime: Arc<AgentRuntime>,
+    /// One runtime per session working directory, built on first use.
+    pub runtimes: tokio::sync::Mutex<HashMap<PathBuf, Arc<AgentRuntime>>>,
     pub sessions: Arc<SessionRegistry>,
     pub client_capabilities: parking_lot::RwLock<acp::ClientCapabilities>,
 }
 
 impl AgentServer {
-    pub fn new(connection: Arc<Connection>, runtime: Arc<AgentRuntime>) -> Arc<Self> {
+    pub fn new(connection: Arc<Connection>) -> Arc<Self> {
         Arc::new(Self {
             connection,
-            runtime,
+            runtimes: tokio::sync::Mutex::new(HashMap::new()),
             sessions: Arc::new(SessionRegistry::new()),
             client_capabilities: parking_lot::RwLock::new(acp::ClientCapabilities::default()),
         })
+    }
+
+    /// The runtime for `cwd`, building it (settings, context, MCP servers
+    /// for that directory) the first time a session opens there.
+    async fn runtime_for(&self, cwd: &std::path::Path) -> Result<Arc<AgentRuntime>, acp::Error> {
+        let mut runtimes = self.runtimes.lock().await;
+        if let Some(runtime) = runtimes.get(cwd) {
+            return Ok(runtime.clone());
+        }
+        let runtime = AgentRuntime::build(cwd.to_path_buf()).await.map_err(|e| {
+            acp::Error::new(
+                i32::from(acp::ErrorCode::InternalError),
+                format!("Failed to start the agent for {}: {e}", cwd.display()),
+            )
+        })?;
+        let runtime = Arc::new(runtime);
+        runtimes.insert(cwd.to_path_buf(), runtime.clone());
+        Ok(runtime)
     }
 
     /// Dispatch a single inbound message. Spawns the actual handler on a
@@ -141,7 +163,9 @@ impl AgentServer {
             .agent_capabilities(
                 acp::AgentCapabilities::new()
                     .load_session(false)
-                    .prompt_capabilities(acp::PromptCapabilities::new())
+                    // Images pass through when the session's provider accepts
+                    // them and are replaced by a short note otherwise.
+                    .prompt_capabilities(acp::PromptCapabilities::new().image(true))
                     .mcp_capabilities(acp::McpCapabilities::new()),
             );
         response = response.agent_info(Some(agent_info));
@@ -156,25 +180,26 @@ impl AgentServer {
             return Err(acp::Error::invalid_params()
                 .data(Some(serde_json::json!({ "reason": "cwd must be absolute" }))));
         }
+        let runtime = self.runtime_for(&req.cwd).await?;
         let session_id = acp::SessionId::new(format!("acp-{}", uuid::Uuid::new_v4()));
         // Permission rules live only in the global settings; read them fresh
         // so "Allow always" answers from earlier sessions apply here too.
-        let mode = self.runtime.config.permission_mode.clone();
+        let mode = runtime.config.permission_mode.clone();
         let permission_manager = match Settings::load_sync() {
             Ok(settings) => PermissionManager::new(mode, &settings),
             Err(e) => {
-                warn!(error = %e, "ACP: could not reload settings, using startup permission rules");
-                PermissionManager::new(mode, &self.runtime.settings)
+                warn!(error = %e, "ACP: could not reload settings, using the runtime's permission rules");
+                PermissionManager::new(mode, &runtime.settings)
             }
         };
-        let state = SessionState::new(session_id.clone(), req.cwd.clone(), permission_manager);
+        let state = SessionState::new(session_id.clone(), runtime, permission_manager);
         info!(session_id = %session_id, cwd = %req.cwd.display(), "ACP: new session");
 
         // v1: ignore req.mcp_servers — agent uses settings.json MCP roster.
         if !req.mcp_servers.is_empty() {
             warn!(
                 count = req.mcp_servers.len(),
-                "ACP: session-specific MCP servers are not yet routed (v1) — using global config"
+                "ACP: session-specific MCP servers are not yet routed (v1) — using the configured servers for this directory"
             );
         }
 
@@ -195,13 +220,7 @@ impl AgentServer {
                 }))));
             }
         };
-        crate::prompt::handle(
-            self.runtime.clone(),
-            self.connection.clone(),
-            session,
-            req,
-        )
-        .await
+        crate::prompt::handle(self.connection.clone(), session, req).await
     }
 }
 
