@@ -60,10 +60,10 @@ Shell commands that run before and after tool calls, on prompt submit, on stop a
 `AGENTS.md` and `CLAUDE.md` files from the git root down to the working directory are added to the system prompt. Skills in `.claurst/skills`, `.agents/skills` or `.claude/skills` are listed to the model and run with the Skill tool or as slash commands. See [Instruction files](configuration#instruction-files-agentsmd--claudemd) and [Skills](configuration#skills).
 
 ### Plugin system
-Extend Claurst with plugins (`plugin.toml` or `plugin.json`) that add slash commands, agents, skills, MCP and LSP servers, hooks, and output styles.
+Extend Claurst with plugins (`plugin.toml` or `plugin.json`) that add slash commands, MCP servers and hooks (agents feed sub-agent prompts; skills, LSP servers and output styles are accepted in the manifest but not loaded yet).
 
 ### Multi-agent orchestration
-Run named agents (`build`, `plan`, `explore`) or spawn parallel sub-agents in coordinator mode. Agents communicate via a shared task registry and message channels.
+Run named agents (`build`, `plan`, `explore`) or spawn sub-agents with the `Agent` tool. Agents communicate via a shared task registry and message channels.
 
 ### Goal system
 Set a durable objective with `/goal` and Claurst works autonomously across turns until the goal is verified complete — using the `GoalCompleteTool` for audited completion rather than just stopping.
