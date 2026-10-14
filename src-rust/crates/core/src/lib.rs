@@ -2770,22 +2770,11 @@ pub mod context {
             self
         }
 
-        /// System context (date, platform, git status, IDE). Changes between
-        /// sessions, so it belongs in the dynamic system block.
+        /// System context (git status, IDE). Changes between sessions, so it
+        /// belongs in the dynamic system block. Date, platform and working
+        /// directory are in the prompt's `<environment_context>`.
         pub async fn build_system_context(&self) -> String {
             let mut parts = vec![];
-
-            let date = chrono::Local::now()
-                .format("%A, %B %d, %Y")
-                .to_string();
-            parts.push(format!("Today's date is {}.", date));
-
-            // Platform information
-            parts.push(format!("Platform: {}", std::env::consts::OS));
-            parts.push(format!(
-                "Working directory: {}",
-                self.cwd.display()
-            ));
 
             if let Some(git_context) = self.get_git_context().await {
                 parts.push(git_context);

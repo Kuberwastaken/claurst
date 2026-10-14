@@ -613,7 +613,7 @@ async fn main() -> anyhow::Result<()> {
     // Session-stable additions to the default prompt, which
     // `claurst_core::system_prompt::build_system_prompt` assembles on its own
     // (identity, capabilities, guidelines). Only session-stable text goes here
-    // (it lands in the cached system block); `system_ctx` (date, git status, IDE
+    // (it lands in the cached system block); `system_ctx` (git status, IDE
     // context) is passed separately as `session_context` and sent in the
     // dynamic block.
     let system_prompt = [config.custom_system_prompt.clone(), Some(user_ctx), config.append_system_prompt.clone()]
@@ -4213,6 +4213,7 @@ async fn run_interactive(
             if let Some((handle, msgs_arc)) = current_query.take() {
                 // Get the outcome and handle errors
                 let result = handle.await;
+                let aborted = matches!(result, Ok(QueryOutcome::Cancelled));
                 app.last_turn_outcome = claurst_tui::TurnOutcome::from_query_result(&result);
                 if let Ok(QueryOutcome::Error(err)) = result {
                     while app.notifications.current_is_error() {
@@ -4226,6 +4227,12 @@ async fn run_interactive(
                 }
                 // Sync the updated conversation back to our local vector
                 messages = msgs_arc.lock().await.clone();
+                // Tell the next turn that this one was interrupted on purpose.
+                if aborted {
+                    messages.push(claurst_core::types::Message::user(
+                        claurst_core::system_prompt::TURN_ABORTED_MESSAGE,
+                    ));
+                }
                 session.messages = messages.clone();
                 session.updated_at = chrono::Utc::now();
                 session.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);

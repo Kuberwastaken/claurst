@@ -32,6 +32,7 @@ pub(crate) fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
         // are only emitted for tools that are actually loaded (issue #233).
         enabled_tools: config.enabled_tools.clone(),
         permission_mode: config.permission_mode.clone(),
+        additional_dirs: config.additional_dirs.clone(),
         ..Default::default()
     };
 

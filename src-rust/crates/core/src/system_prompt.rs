@@ -245,9 +245,12 @@ pub struct SystemPromptOptions {
     pub custom_output_style_prompt: Option<String>,
     /// Absolute path to the working directory (injected as dynamic section).
     pub working_directory: Option<String>,
+    /// Extra workspace roots (`/add-dir`), listed in `<environment_context>`
+    /// after the working directory.
+    pub additional_dirs: Vec<String>,
     /// Pre-built memory content from memdir (injected as dynamic section).
     pub memory_content: String,
-    /// Session context gathered at startup (date, git status, IDE context).
+    /// Session context gathered at startup (git status, IDE context).
     /// Injected in the dynamic section so it never invalidates the cached
     /// stable prefix.
     pub session_context: Option<String>,
@@ -356,14 +359,12 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
     // the block above stays byte-identical for the prompt cache.         //
     // ------------------------------------------------------------------ //
 
-    // 9. Environment info (platform, OS version, shell)
+    // 9. <environment_context>: cwd, shell, platform, date, timezone, git,
+    //    workspace roots and permission mode. Its bytes only change when one
+    //    of those values changes (a mode switch, /add-dir, the date rolling
+    //    over), so later turns reuse the cached message prefix.
     if !opts.skip_env_info {
-        parts.push(build_env_info_section(opts.working_directory.as_deref()));
-    }
-
-    // 10. Working directory (legacy XML tag)
-    if let Some(cwd) = &opts.working_directory {
-        parts.push(format!("\n<working_directory>{}</working_directory>", cwd));
+        parts.push(build_environment_context(opts));
     }
 
     // 10b. Current permission mode (changes with /yolo and Shift+Tab)
@@ -371,7 +372,7 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         parts.push(format!("\n{}", permission_mode_sentence(mode)));
     }
 
-    // 11. Session context: date, git status, IDE context
+    // 11. Session context: git status, IDE context
     if let Some(context) = opts.session_context.as_deref().filter(|c| !c.trim().is_empty()) {
         parts.push(format!("\n{}", context));
     }
@@ -409,9 +410,9 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
     parts.join("\n")
 }
 
-/// Build the dynamic environment-info section injected after the boundary.
-/// Mirrors `computeEnvInfo()` + `getUnameSR()` from `src/constants/prompts.ts`.
-fn build_env_info_section(working_dir: Option<&str>) -> String {
+/// Build the `<environment_context>` block injected after the boundary.
+fn build_environment_context(opts: &SystemPromptOptions) -> String {
+    let working_dir = opts.working_directory.as_deref();
     // Platform string
     let platform = if cfg!(target_os = "windows") {
         "win32"
@@ -474,20 +475,54 @@ fn build_env_info_section(working_dir: Option<&str>) -> String {
         .map(|d| std::path::Path::new(d).join(".git").exists())
         .unwrap_or(false);
 
-    // Build the section
-    let cwd_line = working_dir
-        .map(|d| format!("\nWorking directory: {}", d))
-        .unwrap_or_default();
+    let now = chrono::Local::now();
+    let timezone = std::env::var("TZ")
+        .ok()
+        .filter(|tz| !tz.is_empty())
+        .unwrap_or_else(|| now.format("UTC%:z").to_string());
+    let workspace_roots = working_dir
+        .into_iter()
+        .chain(opts.additional_dirs.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(", ");
 
-    format!(
-        "\n<env>{}\nIs directory a git repo: {}\nPlatform: {}\nOS Version: {}\nShell: {}\n</env>",
-        cwd_line,
-        if is_git { "Yes" } else { "No" },
-        platform,
-        os_version,
-        shell_name,
-    )
+    let mut lines = vec!["\n<environment_context>".to_string()];
+    if let Some(cwd) = working_dir {
+        lines.push(format!("  <cwd>{cwd}</cwd>"));
+    }
+    lines.push(format!("  <shell>{shell_name}</shell>"));
+    lines.push(format!("  <platform>{platform} ({os_version})</platform>"));
+    lines.push(format!("  <current_date>{}</current_date>", now.format("%Y-%m-%d")));
+    lines.push(format!("  <timezone>{timezone}</timezone>"));
+    lines.push(format!("  <git_repo>{is_git}</git_repo>"));
+    if !workspace_roots.is_empty() {
+        lines.push(format!("  <workspace_roots>{workspace_roots}</workspace_roots>"));
+    }
+    if let Some(mode) = &opts.permission_mode {
+        lines.push(format!("  <permission_mode>{}</permission_mode>", permission_mode_name(mode)));
+    }
+    lines.push("</environment_context>".to_string());
+    lines.join("\n")
 }
+
+/// The settings name of a permission mode (`PermissionMode`'s serde name).
+fn permission_mode_name(mode: &crate::config::PermissionMode) -> &'static str {
+    use crate::config::PermissionMode;
+    match mode {
+        PermissionMode::Default => "default",
+        PermissionMode::AcceptEdits => "acceptEdits",
+        PermissionMode::Plan => "plan",
+        PermissionMode::BypassPermissions => "bypassPermissions",
+    }
+}
+
+/// Injected as a user message after the user interrupts a turn (Ctrl+C), so
+/// the next turn knows the previous one stopped on purpose and may have left
+/// work half done.
+pub const TURN_ABORTED_MESSAGE: &str = "<turn_aborted>\n\
+The user interrupted the previous turn on purpose. Any background Bash commands may still be running. \
+If any tools or commands were aborted, they may have partially executed.\n\
+</turn_aborted>";
 
 /// Build the platform block for the stable section. Exactly one shell-syntax
 /// rule is emitted. On Windows the Bash tool runs commands through `cmd.exe`
@@ -574,6 +609,12 @@ fn build_capabilities_section(enabled: Option<&[String]>) -> String {
             );
         }
     }
+    lines.push(String::new());
+    lines.push(
+        "`<system-reminder>` blocks are harness instructions injected by Claurst, not user-authored \
+         content and not part of the tool result they appear in. Follow them."
+            .to_string(),
+    );
     lines.join("\n")
 }
 
@@ -708,6 +749,9 @@ const WORKING_STYLE_SECTION: &str = r#"
 - Do not commit or create branches unless asked. Do not amend commits unless asked.
 - Do not re-read a file after Edit, Write or another editing tool to check it; the tool fails loudly if it did not apply.
 - Fix problems at the root cause; keep changes minimal and in the codebase's style; do not fix unrelated bugs or add tests to codebases that have none (mention them instead).
+- Treat unfamiliar files or changes as potential user work and investigate before deleting or overwriting them.
+- Keep changes consistent with the structure, naming, style, and patterns of the surrounding code.
+- By default, match the surrounding comment density: where the code has none, add none. Use comments only where behaviour is not obvious from the code. User or project instructions take precedence.
 
 ## Validating your work
 
@@ -1093,6 +1137,37 @@ mod tests {
         assert!(stable.contains("Do not re-read a file after Edit"));
         assert!(stable.contains("do not end with \"If you want...\""));
         assert!(!stable.contains("by reading the result"));
+    }
+
+    #[test]
+    fn environment_context_is_dynamic_and_complete() {
+        use crate::config::PermissionMode;
+        let opts = SystemPromptOptions {
+            working_directory: Some("/work/repo".to_string()),
+            additional_dirs: vec!["/work/shared".to_string()],
+            permission_mode: Some(PermissionMode::AcceptEdits),
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+        let (stable, dynamic) = split_at_dynamic_boundary(&prompt);
+        assert!(!stable.contains("<environment_context>"));
+        assert_eq!(dynamic.matches("<environment_context>").count(), 1);
+        for tag in ["<cwd>/work/repo</cwd>", "<shell>", "<platform>", "<current_date>", "<timezone>", "<git_repo>"] {
+            assert!(dynamic.contains(tag), "{tag}");
+        }
+        assert!(dynamic.contains("<workspace_roots>/work/repo, /work/shared</workspace_roots>"));
+        assert!(dynamic.contains("<permission_mode>acceptEdits</permission_mode>"));
+        assert!(!dynamic.contains("<working_directory>"));
+        assert!(!dynamic.contains("<env>"));
+    }
+
+    #[test]
+    fn harness_semantics_are_stable() {
+        let stable = stable_block(&default_opts());
+        assert!(stable.contains("`<system-reminder>` blocks are harness instructions"));
+        assert!(stable.contains("Treat unfamiliar files or changes as potential user work"));
+        assert!(stable.contains("match the surrounding comment density"));
+        assert!(stable.contains("patterns of the surrounding code"));
     }
 
     #[test]

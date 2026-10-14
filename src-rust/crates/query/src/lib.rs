@@ -106,7 +106,7 @@ pub struct QueryConfig {
     pub degradation_enabled: bool,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
-    /// Session context gathered at startup (date, git status, IDE context).
+    /// Session context gathered at startup (git status, IDE context).
     /// Sent in the dynamic system block, after the cached stable block.
     pub session_context: Option<String>,
     pub output_style: claurst_core::system_prompt::OutputStyle,
@@ -175,6 +175,9 @@ pub struct QueryConfig {
     /// `None`, `run_query_loop` fills it from the live `ToolContext` config
     /// each turn, so a mode change (/yolo, Shift+Tab) reaches the next request.
     pub permission_mode: Option<claurst_core::config::PermissionMode>,
+    /// Extra workspace roots (`/add-dir`) for `<environment_context>`. When
+    /// empty, `run_query_loop` fills it from the live `ToolContext` config.
+    pub additional_dirs: Vec<String>,
     /// End-of-turn continuation policy (issue #230 / MI-3).
     ///
     /// `Default` stops after one turn (normal, non-goal behaviour). Goal-driven
@@ -213,6 +216,7 @@ impl Default for QueryConfig {
             managed_agents: None,
             enabled_tools: None,
             permission_mode: None,
+            additional_dirs: Vec::new(),
             continuation: crate::continuation::ContinuationMode::Default,
         }
     }
@@ -698,6 +702,14 @@ pub async fn run_query_loop(
             }
             if patched.permission_mode.is_none() {
                 patched.permission_mode = Some(tool_ctx.config.permission_mode.clone());
+            }
+            if patched.additional_dirs.is_empty() {
+                patched.additional_dirs = tool_ctx
+                    .config
+                    .additional_dirs
+                    .iter()
+                    .map(|dir| dir.display().to_string())
+                    .collect();
             }
 
             // Apply agent system-prompt prefix: prepend before the main system prompt.
@@ -2229,6 +2241,7 @@ mod tests {
             managed_agents: None,
             enabled_tools: None,
             permission_mode: None,
+            additional_dirs: Vec::new(),
             continuation: crate::continuation::ContinuationMode::Default,
         }
     }
