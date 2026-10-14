@@ -335,7 +335,8 @@ preferences.
 Files are loaded in this order; later files are more specific and win when
 two conflict:
 
-1. **Global**: `~/.claurst/` (the Claurst config directory).
+1. **Global**: `~/.claurst/` (the Claurst config directory), then `~/.claude/`
+   (Claude Code's global `CLAUDE.md`).
 2. **Project**: each directory from the git root down to the working
    directory, outermost first.
 
@@ -350,7 +351,12 @@ In each directory:
 |------|-----------|
 | `AGENTS.override.md` | When present, it is the only file loaded from that directory. Use it for local overrides you do not commit. |
 | `AGENTS.md` | Loaded first. |
-| `CLAUDE.md` | Loaded after `AGENTS.md`, for compatibility with Claude Code. Skipped when it is the same file as, or has the same content as, a file already loaded. |
+| `CLAUDE.md` | Loaded second, for compatibility with Claude Code. |
+| `.claude/CLAUDE.md` | Loaded third (Claude Code's alternative project location). |
+| `.claurst/AGENTS.md` | Loaded last. Session memories are saved here. |
+
+A file that is the same file as, or has the same content as, a file already
+loaded is skipped (for example a `CLAUDE.md` symlinked to `AGENTS.md`).
 
 Each file is sent as its own block, labelled with its path:
 
@@ -384,12 +390,15 @@ Instruction files can pull in other files with `@include` lines:
 
 Paths may be relative to the including file, absolute, or `~/`-prefixed, but
 the target must stay inside the project root (the git root, or the working
-directory without git) for project files, or inside `~/.claurst/` for global
-files. Anything outside is skipped with a comment, so a repository cannot pull
+directory without git) for project files, or inside the global directory the
+file came from (`~/.claurst/` or `~/.claude/`) for global files. Anything outside is skipped with a comment, so a repository cannot pull
 files such as `~/.ssh/config` into the prompt. Circular includes are detected
 and skipped, nesting stops after 10 levels, and included files larger than
 40 KB are skipped with a comment. Included content counts toward the 32 KiB
 budget.
+
+Claude Code's bare `@path` import syntax is not recognised; only lines
+starting with `@include ` are expanded.
 
 ### Disabling instruction files
 
@@ -399,7 +408,8 @@ To skip all instruction files for a session:
 claurst --no-claude-md "your prompt"
 ```
 
-The `--bare` flag also disables them (together with hooks and plugins).
+The `--bare` flag also disables them (together with hooks, plugins and
+project skill directories).
 
 ---
 
@@ -436,8 +446,10 @@ directory, with a note that relative paths in the skill (for example
 
 ### Search locations
 
-Skills are discovered once at session start. For a given name the first match
-wins, in this order:
+Skills are discovered once at session start, in the background: the TUI
+opens at once, and the first request waits for discovery to finish (only a
+first-time `skills.urls` clone takes noticeable time). For a given name the
+first match wins, in this order:
 
 1. Project: `.claurst/skills/`, `.agents/skills/` and `.claude/skills/` in
    each directory from the working directory up to the git root (nearer
@@ -459,7 +471,11 @@ wins, in this order:
 ```
 
 `skills.urls` is global-only (see above); `skills.paths` from a project file
-is merged with the global list.
+is merged with the global list. `--bare` skips the project skill directories
+(step 1); global, configured and bundled skills stay.
+
+`.claurst/commands/*.md` files are no longer read as skills; move them to
+`.claurst/skills/`.
 
 ### Listing budget
 

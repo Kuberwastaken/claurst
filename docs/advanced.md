@@ -506,11 +506,9 @@ SSH sessions work similarly: `claurst --ssh` enables a remote-accessible session
 
 ## Instruction files
 
-Claurst loads `AGENTS.md` / `CLAUDE.md` instruction files once at session start: the global `~/.claurst/` directory first, then each directory from the git root down to the working directory (never above the git root; only the working directory when there is no `.git`). In each directory `AGENTS.override.md` replaces the other files; otherwise `AGENTS.md` then `CLAUDE.md` are loaded. `@include` lines are expanded within the project root, and all files share a 32 KiB budget. Each file is sent as an `Instructions from: <path>` block in the cached part of the system prompt.
+Claurst loads `AGENTS.md` / `CLAUDE.md` instruction files once at session start: the global `~/.claurst/` and `~/.claude/` directories first, then each directory from the git root down to the working directory (never above the git root; only the working directory when there is no `.git`). In each directory `AGENTS.override.md` replaces the other files; otherwise `AGENTS.md`, `CLAUDE.md`, `.claude/CLAUDE.md` and `.claurst/AGENTS.md` are loaded. `@include` lines are expanded within the project root, and all files share a 32 KiB budget. Each file is sent as an `Instructions from: <path>` block in the cached part of the system prompt.
 
 See [Instruction Files](configuration.md#instruction-files-agentsmd--claudemd) for the full rules.
-
-The `InstructionsLoaded` hook event fires for every file that is loaded, with the `load_reason` field indicating why (e.g. `session_start`, `nested_traversal`, `path_glob_match`, `include`, `compact`).
 
 The `/memory` command opens the memory management UI for viewing, editing, and organising instruction files.
 
