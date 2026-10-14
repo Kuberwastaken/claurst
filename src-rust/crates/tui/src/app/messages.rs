@@ -5,6 +5,39 @@ use crate::notifications::NotificationKind;
 use super::App;
 use super::types::{SystemAnnotation, SystemMessageStyle};
 
+/// True for the harness-only note that `replace_messages` hides from the
+/// transcript.
+fn is_turn_aborted_marker(m: &Message) -> bool {
+    m.role == Role::User
+        && m.get_text() == Some(claurst_core::system_prompt::TURN_ABORTED_MESSAGE)
+}
+
+/// Map a `/rewind` display index onto the model history.
+///
+/// The rewind overlay is opened right after `replace_messages(history)`, so
+/// the display list is the model history minus the `TURN_ABORTED_MESSAGE`
+/// markers. Returns the history length to truncate to so that exactly
+/// `display_idx` visible messages survive, snapped backwards so the cut never
+/// leaves an assistant `tool_use` without its `tool_result`.
+pub fn rewind_cut_index(history: &[Message], display_idx: usize) -> usize {
+    let mut visible = 0;
+    let mut cut = history.len();
+    for (i, m) in history.iter().enumerate() {
+        if is_turn_aborted_marker(m) {
+            continue;
+        }
+        if visible == display_idx {
+            cut = i;
+            break;
+        }
+        visible += 1;
+    }
+    while cut > 0 && !history[cut - 1].get_tool_use_blocks().is_empty() {
+        cut -= 1;
+    }
+    cut
+}
+
 impl App {
     /// Add a message directly (e.g. from a non-streaming source).
     pub fn add_message(&mut self, role: Role, text: String) {
@@ -22,10 +55,7 @@ impl App {
 
     pub fn replace_messages(&mut self, mut messages: Vec<Message>) {
         // Harness notes sent to the model are not part of the visible transcript.
-        messages.retain(|m| {
-            m.role != Role::User
-                || m.get_text() != Some(claurst_core::system_prompt::TURN_ABORTED_MESSAGE)
-        });
+        messages.retain(|m| !is_turn_aborted_marker(m));
         self.messages = messages;
         self.sync_turn_metadata_to_messages();
         self.invalidate_transcript();

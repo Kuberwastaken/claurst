@@ -18,6 +18,7 @@ pub use types::{
     RecentSession, SystemAnnotation, SystemMessageStyle, ToolStatus,
     ToolUseBlock, TurnMetadata, recent_session_label,
 };
+pub use messages::rewind_cut_index;
 
 use std::cell::{Cell, RefCell};
 use std::sync::{Arc, Mutex};
@@ -237,6 +238,9 @@ pub struct App {
     pub message_selector: MessageSelectorOverlay,
     /// Multi-step rewind flow overlay.
     pub rewind_flow: RewindFlowOverlay,
+    /// Display index confirmed in the rewind flow, waiting for the host loop
+    /// to truncate the model history (see `rewind_cut_index`).
+    pub pending_rewind: Option<usize>,
     /// Bridge connection state.
     pub bridge_state: BridgeConnectionState,
     /// Active notification queue.
@@ -661,6 +665,7 @@ impl App {
             global_search: GlobalSearchState::default(),
             message_selector: MessageSelectorOverlay::new(),
             rewind_flow: RewindFlowOverlay::new(),
+            pending_rewind: None,
             bridge_state: BridgeConnectionState::Disconnected,
             notifications: NotificationQueue::new(),
             error_modal_scroll_offset: 0,

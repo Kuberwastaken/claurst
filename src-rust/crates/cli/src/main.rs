@@ -3292,10 +3292,17 @@ async fn run_interactive(
                         }
                         tools_arc = tools_for_session(tool_ctx.mcp_manager.clone(), &base_query_config);
                     }
-                    if !app.is_streaming && app.messages.len() < messages.len() {
-                        messages = app.messages.clone();
-                        session.messages = messages.clone();
-                        session.updated_at = chrono::Utc::now();
+                    // Apply a confirmed /rewind. The model history is never
+                    // derived from the display list: that list omits tool
+                    // steps and harness notes (#484).
+                    if !app.is_streaming {
+                        if let Some(idx) = app.pending_rewind.take() {
+                            let cut = claurst_tui::app::rewind_cut_index(&messages, idx);
+                            messages.truncate(cut);
+                            app.replace_messages(messages.clone());
+                            session.messages = messages.clone();
+                            session.updated_at = chrono::Utc::now();
+                        }
                     }
                 }
                 Event::Paste(data) => {
