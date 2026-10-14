@@ -275,6 +275,9 @@ pub struct SystemPromptOptions {
     pub enabled_tools: Option<Vec<String>>,
     /// Platform for the platform block; `None` means [`PromptPlatform::current`].
     pub platform: Option<PromptPlatform>,
+    /// Current permission mode. It can change mid-session (/yolo, Shift+Tab),
+    /// so its sentence goes in the dynamic section; `None` omits it.
+    pub permission_mode: Option<crate::config::PermissionMode>,
 }
 
 // ---------------------------------------------------------------------------
@@ -323,8 +326,8 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         ),
         // 4. Executing actions with care
         ACTIONS_SECTION.to_string(),
-        // 5. Safety guidelines
-        SAFETY_GUIDELINES.to_string(),
+        // 5. Permissions and approvals (the mode itself is in the dynamic section)
+        PERMISSIONS_SECTION.to_string(),
         // 6. Cyber-risk instruction (owned by safeguards — do not edit)
         CYBER_RISK_INSTRUCTION.to_string(),
     ];
@@ -359,6 +362,11 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
     // 10. Working directory (legacy XML tag)
     if let Some(cwd) = &opts.working_directory {
         parts.push(format!("\n<working_directory>{}</working_directory>", cwd));
+    }
+
+    // 10b. Current permission mode (changes with /yolo and Shift+Tab)
+    if let Some(mode) = &opts.permission_mode {
+        parts.push(format!("\n{}", permission_mode_sentence(mode)));
     }
 
     // 11. Session context: date, git status, IDE context
@@ -676,15 +684,46 @@ the scope specified, not beyond. Match the scope of your actions to what was
 actually requested.
 "#;
 
-const SAFETY_GUIDELINES: &str = r#"
-## Safety guidelines
+const PERMISSIONS_SECTION: &str = r#"
+## Permissions and approvals
 
-- Never delete files without explicit user confirmation
-- Don't modify protected files (.gitconfig, .bashrc, .zshrc, .mcp.json, .claude.json)
-- Be careful with destructive operations (rm -rf, DROP TABLE, etc.)
-- Don't commit secrets, credentials, or API keys
-- For ambiguous destructive actions, ask before proceeding
+Tool calls that change files, run commands or reach the network may need the user's approval, depending on the current permission mode (stated after these instructions). Reading files inside the workspace never needs approval.
+- Every Bash call's `description` is shown to the user as the approval question. Write it as a short question the user can answer, e.g. "Install the project's npm dependencies?", not a restatement of the command.
+- If a tool call is denied, do not retry it with a different wrapper, shell, or path. Either continue with a safer alternative that does not need the denied capability, or explain what was blocked and ask the user.
+- Saved approvals match a tool name, optionally with a glob over the whole Bash command string; a command is not split into segments for matching.
+- Never request or rely on broad standing approvals (e.g. "always allow Bash"). Prefer narrow, categorical ones ("cargo test", "npm run dev"). Never ask for a standing approval for destructive commands.
+- Potentially destructive actions the user did not explicitly ask for (`rm`, `git reset`, `git checkout --`, dropping data) need a fresh, explicit confirmation from the user, even in a mode that does not prompt.
+- Bash commands rated critical risk (e.g. `rm -rf /`, `mkfs`, a download piped into a shell) are refused in every mode.
+- Commands run with the user's privileges; there is no OS-level sandbox.
+- Do not modify the user's shell or tool configuration (.gitconfig, .bashrc, .zshrc, .mcp.json, .claude.json) unless asked, and never commit secrets, credentials, or API keys.
 "#;
+
+/// The dynamic-section sentence describing what the current permission mode
+/// means. Mirrors `PermissionManager::evaluate`.
+fn permission_mode_sentence(mode: &crate::config::PermissionMode) -> &'static str {
+    use crate::config::PermissionMode;
+    match mode {
+        PermissionMode::Default => {
+            "Current permission mode: `default`. Reading files inside the workspace is allowed; \
+             edits, writes, shell commands and network access ask the user first unless a \
+             saved approval covers them (in non-interactive runs, where no one can answer, \
+             they are denied)."
+        }
+        PermissionMode::AcceptEdits => {
+            "Current permission mode: `acceptEdits`. Edit calls are approved automatically; \
+             writes, shell commands and network access still ask the user first unless a \
+             saved approval covers them."
+        }
+        PermissionMode::Plan => {
+            "Current permission mode: `plan`. Read-only: investigate and propose a plan; \
+             tools that write, execute commands or reach the network are denied."
+        }
+        PermissionMode::BypassPermissions => {
+            "Current permission mode: `bypassPermissions`. Tool calls run without approval \
+             prompts, so exercise the caution the user has delegated to you."
+        }
+    }
+}
 
 /// Security / cyber-risk instruction.
 /// No security guardrails injected.
@@ -992,6 +1031,31 @@ mod tests {
             ..Default::default()
         });
         assert!(!windows_no_ps.contains("PowerShell tool for"));
+    }
+
+    #[test]
+    fn permission_mode_sentence_is_dynamic_and_stable_block_is_unchanged() {
+        use crate::config::PermissionMode;
+        let build = |mode: PermissionMode| {
+            build_system_prompt(&SystemPromptOptions {
+                permission_mode: Some(mode),
+                enabled_tools: Some(vec!["Bash".to_string(), "Read".to_string()]),
+                platform: Some(PromptPlatform::Linux),
+                skip_env_info: true,
+                ..Default::default()
+            })
+        };
+        let default_prompt = build(PermissionMode::Default);
+        let yolo_prompt = build(PermissionMode::BypassPermissions);
+        let (default_stable, default_dynamic) = split_at_dynamic_boundary(&default_prompt);
+        let (yolo_stable, yolo_dynamic) = split_at_dynamic_boundary(&yolo_prompt);
+
+        assert_eq!(default_stable, yolo_stable, "the stable block must not depend on the mode");
+        assert!(default_stable.contains("## Permissions and approvals"));
+        assert!(!default_stable.contains("Current permission mode"));
+        assert!(default_dynamic.contains("Current permission mode: `default`"));
+        assert!(yolo_dynamic.contains("Current permission mode: `bypassPermissions`"));
+        assert_ne!(default_dynamic, yolo_dynamic);
     }
 
     #[test]

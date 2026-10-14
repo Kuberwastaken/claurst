@@ -373,6 +373,8 @@ impl Tool for AgentTool {
             // Progressive tool disclosure (issue #233): the sub-agent's system
             // prompt only needs guideline blocks for the tools it actually has.
             enabled_tools: Some(agent_tools.iter().map(|t| t.name().to_string()).collect()),
+            // Filled from the sub-agent's tool context by the query loop.
+            permission_mode: None,
             // Sub-agents run to their own completion and never drive goal
             // continuation — stop after one turn like every non-goal run.
             continuation: crate::continuation::ContinuationMode::Default,

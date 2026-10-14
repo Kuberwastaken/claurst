@@ -171,6 +171,10 @@ pub struct QueryConfig {
     // both the tool vec and the config (e.g. sub-agents) may still set it
     // explicitly; the loop only fills an unset field.
     pub enabled_tools: Option<Vec<String>>,
+    /// Current permission mode, described in the dynamic system block. When
+    /// `None`, `run_query_loop` fills it from the live `ToolContext` config
+    /// each turn, so a mode change (/yolo, Shift+Tab) reaches the next request.
+    pub permission_mode: Option<claurst_core::config::PermissionMode>,
     /// End-of-turn continuation policy (issue #230 / MI-3).
     ///
     /// `Default` stops after one turn (normal, non-goal behaviour). Goal-driven
@@ -208,6 +212,7 @@ impl Default for QueryConfig {
             model_registry: None,
             managed_agents: None,
             enabled_tools: None,
+            permission_mode: None,
             continuation: crate::continuation::ContinuationMode::Default,
         }
     }
@@ -690,6 +695,9 @@ pub async fn run_query_loop(
             if patched.enabled_tools.is_none() {
                 patched.enabled_tools =
                     Some(tools.iter().map(|t| t.name().to_string()).collect());
+            }
+            if patched.permission_mode.is_none() {
+                patched.permission_mode = Some(tool_ctx.config.permission_mode.clone());
             }
 
             // Apply agent system-prompt prefix: prepend before the main system prompt.
@@ -2220,6 +2228,7 @@ mod tests {
             model_registry: None,
             managed_agents: None,
             enabled_tools: None,
+            permission_mode: None,
             continuation: crate::continuation::ContinuationMode::Default,
         }
     }
@@ -2356,6 +2365,22 @@ mod tests {
         let (stable, dynamic) = prompt_halves(build_system_prompt(&cfg));
         assert!(!stable.contains("Answer like a pirate."));
         assert!(dynamic.contains("Answer like a pirate."));
+    }
+
+    #[test]
+    fn permission_mode_change_only_touches_the_dynamic_block() {
+        use claurst_core::config::PermissionMode;
+        let mut cfg = make_config(Some("Project rules."), None);
+        cfg.enabled_tools = Some(vec!["Bash".to_string(), "Edit".to_string()]);
+        cfg.permission_mode = Some(PermissionMode::Default);
+        let (stable_default, dynamic_default) = prompt_halves(build_system_prompt(&cfg));
+        cfg.permission_mode = Some(PermissionMode::Plan);
+        let (stable_plan, dynamic_plan) = prompt_halves(build_system_prompt(&cfg));
+
+        assert_eq!(stable_default, stable_plan, "the cached block must stay byte-identical");
+        assert!(dynamic_default.contains("Current permission mode: `default`"));
+        assert!(dynamic_plan.contains("Current permission mode: `plan`"));
+        assert!(!dynamic_plan.contains("`default`"));
     }
 
     // ---- QueryConfig tests --------------------------------------------------
