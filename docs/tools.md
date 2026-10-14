@@ -548,14 +548,14 @@ Trigger a remote agent or scheduled workflow by name. Used by the cron/schedule 
 
 ### SkillTool
 
-**Permission level:** Execute
+**Permission level:** Read-only
 
-Invoke a named skill (bundled prompt-command) programmatically from within a tool call chain.
+Load a skill's instructions by name. The available skills are listed to the model in the system prompt (`<available_skills>`); `skill="list"` enumerates them. The body is returned wrapped in `<skill_content name="..." base_dir="...">` (no `base_dir` for bundled skills), with `$ARGUMENTS` replaced by `args`. See [Skills](configuration.md#skills) for where skills are discovered.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `skill` | string | yes | Skill name |
-| `args` | string | no | Arguments to pass to the skill |
+| `skill` | string | yes | Skill name, or `list` |
+| `args` | string | no | Arguments; replaces `$ARGUMENTS` in the skill |
 
 ---
 

@@ -172,7 +172,7 @@ marketplace_id = "you/my-plugin"
 |---|---|---|
 | `commands` | array of strings | Paths to extra slash command `.md` files or directories, relative to the plugin root. Supplements the `commands/` directory. |
 | `agents` | array of strings | Paths to extra agent `.md` files. Supplements the `agents/` directory. |
-| `skills` | array of strings | Paths to extra skill directories (each must contain a `SKILL.md`). Supplements the `skills/` directory. |
+| `skills` | array of strings | Paths to extra skill directories (each must contain a `SKILL.md`). Supplements the `skills/` directory. Plugin skill directories are not yet part of the session skill registry; to use a plugin's skills today, add its `skills/` directory to `skills.paths` (see [Skills](configuration.md#skills)). |
 | `output_styles` | array of strings | Paths to extra output style definitions. |
 
 ### mcp_servers

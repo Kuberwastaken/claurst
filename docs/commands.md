@@ -839,14 +839,10 @@ Documented above under [Configuration & Settings](#configuration--settings).
 
 ### /skills
 
-List and manage skills. Skills are bundled prompt-commands that extend Claurst's capabilities without writing code. They appear alongside built-in commands in the registry.
+List the skills available to this session (discovered and bundled) with each skill's description and source file. Skills loaded from disk can be run as `/<name> args`; the model loads any listed skill with the `Skill` tool. See [Skills](configuration.md#skills).
 
 ```
 /skills
-/skills list
-/skills enable <skill-name>
-/skills disable <skill-name>
-/skills reload
 ```
 
 ---

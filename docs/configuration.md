@@ -161,7 +161,7 @@ See [Permission Modes](#permission-modes) for a full description of each value.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `custom_system_prompt` | string \| null | null | Replace the default Claurst system prompt entirely with this text. |
-| `append_system_prompt` | string \| null | null | Append this text to the end of the assembled system prompt (after AGENTS.md content). |
+| `append_system_prompt` | string \| null | null | Append this text to the base system prompt (before the instruction files and the skill listing). |
 
 ### Tool access
 
@@ -323,85 +323,151 @@ claurst --dangerously-skip-permissions "..."  # equivalent to bypassPermissions
 
 ---
 
-## AGENTS.md Memory Files
+## Instruction Files (AGENTS.md / CLAUDE.md)
 
-AGENTS.md files are plain Markdown documents that Claurst injects into the
-system prompt at startup. They let you give the model persistent context about
-your project, coding standards, or personal preferences without repeating
-yourself in every session.
+Instruction files are plain Markdown documents that Claurst loads once at
+session start and sends in the cached part of the system prompt. They give the
+model standing context about your project, coding standards, or personal
+preferences.
 
-### File locations and priority
+### File locations and order
 
-Claurst loads AGENTS.md files from four locations. They are processed in the
-following order (earlier = higher priority, later content is appended below):
+Files are loaded in this order; later files are more specific and win when
+two conflict:
 
-| Scope | Path | Description |
-|-------|------|-------------|
-| Managed | `~/.claurst/rules/*.md` | Global policy files. All `.md` files in this directory are loaded in alphabetical order. |
-| User | `~/.claurst/AGENTS.md` | Your personal preferences and instructions, applied to all projects. |
-| Project | `<project-root>/AGENTS.md` | Project-level context: architecture notes, conventions, workflows. Typically committed to version control. |
-| Local | `<project-root>/.claurst/AGENTS.md` | Local overrides not committed to version control (add `.claurst/` to `.gitignore`). |
+1. **Global**: `~/.claurst/` (the Claurst config directory).
+2. **Project**: each directory from the git root down to the working
+   directory, outermost first.
 
-Files from all four locations are concatenated (separated by blank lines) into
-a single system-prompt fragment. If the same instruction appears at multiple
-levels, the narrower scope (Project/Local) effectively wins because it appears
-later in the prompt.
+The project walk stops at the directory that contains `.git` and never goes
+above it. When the working directory is not inside a git repository, only the
+working directory itself is read, so a stray `~/AGENTS.md` or `/AGENTS.md` is
+never picked up.
 
-### CLAUDE.md compatibility
+In each directory:
 
-Files named `CLAUDE.md` in the same locations are treated identically to
-`AGENTS.md`. Both names are supported for compatibility with the TypeScript
-Claude Code CLI.
+| File | Behaviour |
+|------|-----------|
+| `AGENTS.override.md` | When present, it is the only file loaded from that directory. Use it for local overrides you do not commit. |
+| `AGENTS.md` | Loaded first. |
+| `CLAUDE.md` | Loaded after `AGENTS.md`, for compatibility with Claude Code. Skipped when it is the same file as, or has the same content as, a file already loaded. |
+
+Each file is sent as its own block, labelled with its path:
+
+```
+Instructions from: /home/me/project/AGENTS.md
+<file content>
+```
+
+### Size budget
+
+All instruction files together are limited to 32 KiB. The file that crosses
+the limit is truncated with a note telling the model to read the rest from
+disk; files after it are replaced by a note naming them. Global files are
+loaded first, so a large global file leaves less room for project files.
 
 ### YAML frontmatter
 
-AGENTS.md files may begin with optional YAML frontmatter to control loading:
-
-```markdown
----
-memory_type: project
-priority: 10
-scope: project
----
-
-# My Project Notes
-
-Always use 4-space indentation. Prefer `anyhow` for error handling.
-```
-
-Frontmatter fields:
-
-| Field | Description |
-|-------|-------------|
-| `memory_type` | Informal label (currently informational only). |
-| `priority` | Integer sort priority (lower numbers are prepended first within the same scope). |
-| `scope` | Informational label for documentation purposes. |
+A leading YAML frontmatter block (`---` ... `---`) is stripped before the file
+is sent. Its fields are ignored.
 
 ### @include directives
 
-AGENTS.md files support `@include` to pull in content from other files:
+Instruction files can pull in other files with `@include` lines:
 
 ```markdown
 # Project Guide
 
 @include ./docs/architecture.md
-@include ~/shared-notes/coding-standards.md
+@include docs/coding-standards.md
 ```
 
-Paths may be relative to the including file, absolute, or tilde-expanded.
-Circular includes are detected and skipped. Files larger than 40 KB are
-skipped with a warning comment.
+Paths may be relative to the including file, absolute, or `~/`-prefixed, but
+the target must stay inside the project root (the git root, or the working
+directory without git) for project files, or inside `~/.claurst/` for global
+files. Anything outside is skipped with a comment, so a repository cannot pull
+files such as `~/.ssh/config` into the prompt. Circular includes are detected
+and skipped, nesting stops after 10 levels, and included files larger than
+40 KB are skipped with a comment. Included content counts toward the 32 KiB
+budget.
 
-### Disabling AGENTS.md loading
+### Disabling instruction files
 
-To skip all AGENTS.md files for a session:
+To skip all instruction files for a session:
 
 ```bash
 claurst --no-claude-md "your prompt"
 ```
 
-Or in a session, use the `--bare` flag to disable AGENTS.md, hooks, and
-plugins simultaneously.
+The `--bare` flag also disables them (together with hooks and plugins).
+
+---
+
+## Skills
+
+A skill is a Markdown file of instructions for a specific task. Claurst
+lists every available skill (name and one-line description) to the model in
+the cached part of the system prompt, inside an `<available_skills>` block, and
+the model loads one with the `Skill` tool when a task matches. Skills loaded
+from disk can also be run directly as slash commands (`/<name> args`).
+
+### Skill files
+
+A skill is either a directory with a `SKILL.md` file (`deploy/SKILL.md`, named
+after the directory) or a flat `<name>.md` file. Optional frontmatter sets the
+name and description:
+
+```markdown
+---
+name: deploy
+description: Deploy the service to staging or production.
+---
+
+Run `scripts/deploy.sh $ARGUMENTS` and report the result.
+```
+
+`$ARGUMENTS` is replaced with the arguments passed to the skill. Without a
+`description`, the skill is listed as "Custom skill".
+
+When the model loads a skill, the `Skill` tool returns the body wrapped in
+`<skill_content name="..." base_dir="...">`, where `base_dir` is the skill's
+directory, with a note that relative paths in the skill (for example
+`scripts/`) resolve against it.
+
+### Search locations
+
+Skills are discovered once at session start. For a given name the first match
+wins, in this order:
+
+1. Project: `.claurst/skills/`, `.agents/skills/` and `.claude/skills/` in
+   each directory from the working directory up to the git root (nearer
+   directories win; without git, only the working directory).
+2. Global: `~/.claurst/skills/`, `~/.agents/skills/`, `~/.claude/skills/`.
+3. `skills.paths`: extra directories (relative paths resolve against the
+   working directory; `~/` is expanded).
+4. `skills.urls`: git repositories, cloned once (`--depth=1`) into the system
+   cache directory; skills are read from the repository root and its
+   `skills/` subdirectory.
+5. Bundled skills shipped with Claurst (`simplify`, `debug`, `batch`, ...). A
+   skill found on disk with the same name replaces the bundled one.
+
+```json
+"skills": {
+  "paths": ["~/my-skills", "tools/skills"],
+  "urls": ["https://github.com/example/skills.git"]
+}
+```
+
+`skills.urls` is global-only (see above); `skills.paths` from a project file
+is merged with the global list.
+
+### Listing budget
+
+The `<available_skills>` block uses the first line of each description,
+capped at 250 characters, and stops adding descriptions at about 3k tokens;
+the remaining skills are listed by name only. The block is omitted when the
+`Skill` tool is not enabled for the session. `/skills` lists every skill with
+its source file.
 
 ---
 
