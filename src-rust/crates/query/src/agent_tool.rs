@@ -353,6 +353,7 @@ impl Tool for AgentTool {
             max_turns_override: None,
             system_prompt: Some(system_prompt),
             append_system_prompt: None,
+            session_context: None,
             output_style: ctx.config.effective_output_style(),
             output_style_prompt: ctx.config.resolve_output_style_prompt(),
             working_directory: Some(working_dir_str),

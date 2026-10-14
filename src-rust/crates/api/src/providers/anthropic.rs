@@ -96,8 +96,15 @@ impl AnthropicProvider {
         if let Some(tc) = request.thinking.clone() {
             builder = builder.thinking(tc);
         }
+        // `output_config.effort` for adaptive-thinking models; the query loop
+        // fills it from `claurst_api::anthropic_reasoning`.
+        if let Some(effort) = request.provider_options.get("effort").and_then(|v| v.as_str()) {
+            builder = builder.effort(effort);
+        }
 
-        builder.build()
+        let mut api_request = builder.build();
+        api_request.apply_cache_breakpoints();
+        api_request
     }
 
     /// Map a string stop_reason from Anthropic wire format to [`StopReason`].

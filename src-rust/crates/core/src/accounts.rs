@@ -321,6 +321,8 @@ pub(crate) fn set_user_only_dir_perms(path: &std::path::Path) {
 pub struct JwtIdentity {
     pub email: Option<String>,
     pub account_id: Option<String>,
+    /// Standard `exp` claim: unix seconds at which the token expires.
+    pub exp: Option<u64>,
 }
 
 /// Decode the payload of a JWT (`header.payload.signature`) and pull out the
@@ -361,15 +363,17 @@ pub fn jwt_identity(token: &str) -> JwtIdentity {
         }
     }
 
-    // OpenAI puts account_id under the custom auth claim.
-    if let Some(auth) = json
-        .get("https://api.openai.com/auth")
-        .and_then(|v| v.as_object())
-    {
-        if let Some(id) = auth.get("account_id").and_then(|v| v.as_str()) {
-            out.account_id = Some(id.to_string());
-        }
-    }
+    out.exp = json.get("exp").and_then(|v| v.as_u64());
+
+    // The ChatGPT workspace id sent as `ChatGPT-Account-Id`: the
+    // `chatgpt_account_id` field of the custom auth claim (official Codex
+    // `login/src/token_data.rs`), or the same name at top level.
+    out.account_id = json
+        .pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id")
+        .or_else(|| json.get("chatgpt_account_id"))
+        .and_then(|v| v.as_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
 
     out
 }
@@ -436,7 +440,7 @@ mod tests {
         let payload = serde_json::json!({
             "email": "kuber@example.com",
             "https://api.openai.com/auth": {
-                "account_id": "acc_abc123"
+                "chatgpt_account_id": "acc_abc123"
             }
         });
         let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -447,6 +451,35 @@ mod tests {
         assert_eq!(identity.account_id.as_deref(), Some("acc_abc123"));
 
         assert_eq!(id_from_identity(&identity), "kuber");
+    }
+
+    #[test]
+    fn jwt_identity_ignores_non_chatgpt_account_id_claims() {
+        use base64::Engine;
+        let payload = serde_json::json!({
+            "https://api.openai.com/auth": { "account_id": "not-the-workspace" }
+        });
+        let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_string(&payload).unwrap());
+        let identity = jwt_identity(&format!("header.{}.signature", payload_b64));
+        assert!(identity.account_id.is_none());
+
+        let top_level = serde_json::json!({ "chatgpt_account_id": "acc_top" });
+        let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_string(&top_level).unwrap());
+        let identity = jwt_identity(&format!("header.{}.signature", payload_b64));
+        assert_eq!(identity.account_id.as_deref(), Some("acc_top"));
+    }
+
+    #[test]
+    fn jwt_identity_reads_exp_claim() {
+        use base64::Engine;
+        let payload = serde_json::json!({ "exp": 1_900_000_000u64 });
+        let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_string(&payload).unwrap());
+        let identity = jwt_identity(&format!("header.{}.signature", payload_b64));
+        assert_eq!(identity.exp, Some(1_900_000_000));
+        assert!(jwt_identity("not.a.jwt").exp.is_none());
     }
 
     #[test]

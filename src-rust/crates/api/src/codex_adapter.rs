@@ -175,6 +175,7 @@ mod tests {
             stop_sequences: None,
             stream: false,
             thinking: None,
+            output_config: None,
         };
 
         let openai_req = anthropic_to_openai_request(&request);

@@ -2770,9 +2770,15 @@ pub mod context {
             self
         }
 
-        /// System context (git status, platform, IDE, etc.)
+        /// System context (date, platform, git status, IDE). Changes between
+        /// sessions, so it belongs in the dynamic system block.
         pub async fn build_system_context(&self) -> String {
             let mut parts = vec![];
+
+            let date = chrono::Local::now()
+                .format("%A, %B %d, %Y")
+                .to_string();
+            parts.push(format!("Today's date is {}.", date));
 
             // Platform information
             parts.push(format!("Platform: {}", std::env::consts::OS));
@@ -2794,22 +2800,13 @@ pub mod context {
             parts.join("\n\n")
         }
 
-        /// User context (date, AGENTS.md memories, etc.)
+        /// User context (AGENTS.md memories). Stable within a project, so it
+        /// belongs in the cached system block.
         pub async fn build_user_context(&self) -> String {
-            let mut parts = vec![];
-
-            let date = chrono::Local::now()
-                .format("%A, %B %d, %Y")
-                .to_string();
-            parts.push(format!("Today's date is {}.", date));
-
-            if !self.disable_claude_mds {
-                if let Some(claude_md) = self.find_and_read_claude_md().await {
-                    parts.push(claude_md);
-                }
+            if self.disable_claude_mds {
+                return String::new();
             }
-
-            parts.join("\n\n")
+            self.find_and_read_claude_md().await.unwrap_or_default()
         }
 
         /// Gather short git status + recent log.

@@ -17,6 +17,16 @@ use std::collections::HashMap;
 /// Matches the TypeScript constant `SYSTEM_PROMPT_DYNAMIC_BOUNDARY`.
 pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
 
+/// Split an assembled system prompt into `(stable, dynamic)` at
+/// [`SYSTEM_PROMPT_DYNAMIC_BOUNDARY`]. The marker is dropped and the newlines
+/// around it are trimmed. A prompt without the marker is entirely stable.
+pub fn split_at_dynamic_boundary(prompt: &str) -> (&str, &str) {
+    match prompt.split_once(SYSTEM_PROMPT_DYNAMIC_BOUNDARY) {
+        Some((stable, dynamic)) => (stable.trim_end(), dynamic.trim_start()),
+        None => (prompt, ""),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Section cache (mirrors bootstrap/state.ts systemPromptSectionCache)
 // ---------------------------------------------------------------------------
@@ -209,6 +219,10 @@ pub struct SystemPromptOptions {
     pub working_directory: Option<String>,
     /// Pre-built memory content from memdir (injected as dynamic section).
     pub memory_content: String,
+    /// Session context gathered at startup (date, git status, IDE context).
+    /// Injected in the dynamic section so it never invalidates the cached
+    /// stable prefix.
+    pub session_context: Option<String>,
     /// Custom system prompt (--system-prompt flag or settings).
     pub custom_system_prompt: Option<String>,
     /// Additional text appended after everything else (--append-system-prompt).
@@ -218,7 +232,7 @@ pub struct SystemPromptOptions {
     pub replace_system_prompt: bool,
     /// Inject the coordinator-mode section.
     pub coordinator_mode: bool,
-    /// Skip auto-injecting platform/shell/date env info (set true only in tests).
+    /// Skip auto-injecting platform/shell env info (set true only in tests).
     pub skip_env_info: bool,
     /// Active goal addendum (injected in dynamic section when a goal is running).
     pub active_goal_addendum: Option<String>,
@@ -240,9 +254,9 @@ pub struct SystemPromptOptions {
 /// Build the complete system prompt string.
 ///
 /// The returned string contains `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` as an
-/// internal marker.  Callers (e.g. `buildSystemPromptBlocks` in cc-query)
-/// split on this marker to determine which portions are eligible for
-/// Anthropic prompt-caching.
+/// internal marker. It must never be sent to a model: callers split on it
+/// with [`split_at_dynamic_boundary`] and send the halves as separate system
+/// blocks, the first of which is eligible for Anthropic prompt caching.
 pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
     // Replace mode: skip all default sections.
     if opts.replace_system_prompt {
@@ -278,22 +292,12 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         CYBER_RISK_INSTRUCTION.to_string(),
     ];
 
-    // 7. Output style (cacheable when non-Default; its content is stable)
-    if let Some(style_text) = opts
-        .custom_output_style_prompt
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| opts.output_style.prompt_suffix())
-    {
-        parts.push(format!("\n## Output Style\n{}", style_text));
-    }
-
-    // 8. Coordinator mode (cacheable: content is constant)
+    // 7. Coordinator mode (cacheable: content is constant)
     if opts.coordinator_mode {
         parts.push(COORDINATOR_SYSTEM_PROMPT.to_string());
     }
 
-    // 9. Custom system prompt addition (appended to cacheable block)
+    // 8. Custom system prompt addition (appended to cacheable block)
     if let Some(custom) = &opts.custom_system_prompt {
         parts.push(format!(
             "\n<custom_instructions>\n{}\n</custom_instructions>",
@@ -306,19 +310,37 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
 
     // ------------------------------------------------------------------ //
     // DYNAMIC / UNCACHEABLE sections (after the boundary)                //
+    // Everything that can differ between sessions or turns goes here so  //
+    // the block above stays byte-identical for the prompt cache.         //
     // ------------------------------------------------------------------ //
 
-    // 10. Environment info (platform, OS version, shell, date)
+    // 9. Environment info (platform, OS version, shell)
     if !opts.skip_env_info {
         parts.push(build_env_info_section(opts.working_directory.as_deref()));
     }
 
-    // 11. Working directory (legacy XML tag kept for caching compat)
+    // 10. Working directory (legacy XML tag)
     if let Some(cwd) = &opts.working_directory {
         parts.push(format!("\n<working_directory>{}</working_directory>", cwd));
     }
 
-    // 12. Memory injection (from memdir)
+    // 11. Session context: date, git status, IDE context
+    if let Some(context) = opts.session_context.as_deref().filter(|c| !c.trim().is_empty()) {
+        parts.push(format!("\n{}", context));
+    }
+
+    // 12. Output style (dynamic: an inline persona keyword overrides it for
+    //     a single turn)
+    if let Some(style_text) = opts
+        .custom_output_style_prompt
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| opts.output_style.prompt_suffix())
+    {
+        parts.push(format!("\n## Output Style\n{}", style_text));
+    }
+
+    // 13. Memory injection (from memdir)
     if !opts.memory_content.is_empty() {
         parts.push(format!(
             "\n<memory>\n{}\n</memory>",
@@ -326,12 +348,13 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         ));
     }
 
-    // 13. Active goal addendum (dynamic — changes each session)
+    // 14. Active goal addendum (dynamic — changes each turn)
     if let Some(goal_text) = &opts.active_goal_addendum {
         parts.push(goal_text.clone());
     }
 
-    // 14. Appended system prompt (--append-system-prompt)
+    // 15. Appended system prompt: --append-system-prompt plus per-turn
+    //     addenda (todo nudge, ultracode procedure, managed-agent prompt)
     if let Some(append) = &opts.append_system_prompt {
         parts.push(format!("\n{}", append));
     }
@@ -410,23 +433,6 @@ fn build_env_info_section(working_dir: Option<&str>) -> String {
     let is_git = working_dir
         .map(|d| std::path::Path::new(d).join(".git").exists())
         .unwrap_or(false);
-
-    // Today's date
-    let today = {
-        // Use chrono if available; otherwise fall back to env or skip
-        // We avoid adding a new dep just for formatting, so use a rough ISO format.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        // Simple YYYY-MM-DD from seconds since epoch
-        let days = now / 86400;
-        let year_approx = 1970 + days / 365;
-        // Not perfectly accurate but good enough for the system prompt context.
-        // For exact dates a chrono dep would be needed; use SystemTime string as fallback.
-        format!("{}", year_approx)
-    };
-    let _ = today; // suppress unused warning — date is included below via SystemTime
 
     // Build the section
     let cwd_line = working_dir
@@ -524,7 +530,7 @@ const GUIDELINE_TOOLS: &[&str] = &[
 fn tool_specific_guideline(tool: &str) -> Option<&'static str> {
     Some(match tool {
         "Bash" => "- Bash commands time out after 2 minutes; use background mode for long-running operations.",
-        "Read" => "- Read a file with the Read tool before editing it; Read also handles images and large files.",
+        "Read" => "- Read a file with the Read tool before editing it; Read returns text only, a capped page at a time (continue with offset/limit), and cannot show you image or PDF content.",
         "Edit" => "- For edits, read the file first, then make targeted string replacements with Edit.",
         "Write" => "- Use Write to create new files or fully overwrite; prefer Edit for partial changes.",
         "Glob" => "- To find files by name or pattern, prefer the Glob tool over `find`/`ls`.",
@@ -630,6 +636,22 @@ mod tests {
     }
 
     #[test]
+    fn split_at_dynamic_boundary_drops_the_marker() {
+        let opts = SystemPromptOptions {
+            working_directory: Some("/home/user/project".to_string()),
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+        let (stable, dynamic) = split_at_dynamic_boundary(&prompt);
+        assert!(!stable.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
+        assert!(!dynamic.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
+        assert!(stable.contains("Claurst"));
+        assert!(dynamic.contains("/home/user/project"));
+        assert!(!stable.contains("/home/user/project"));
+        assert_eq!(split_at_dynamic_boundary("no marker"), ("no marker", ""));
+    }
+
+    #[test]
     fn test_default_prompt_contains_attribution() {
         let prompt = build_system_prompt(&default_opts());
         assert!(prompt.contains("Claurst"), "Default prompt must contain attribution");
@@ -686,6 +708,21 @@ mod tests {
         };
         let prompt = build_system_prompt(&opts);
         assert!(prompt.contains("maximally concise"));
+    }
+
+    #[test]
+    fn output_style_and_session_context_are_dynamic() {
+        let opts = SystemPromptOptions {
+            output_style: OutputStyle::Concise,
+            session_context: Some("# Git Status\n## main".to_string()),
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+        let (stable, dynamic) = split_at_dynamic_boundary(&prompt);
+        assert!(!stable.contains("maximally concise"));
+        assert!(!stable.contains("# Git Status"));
+        assert!(dynamic.contains("maximally concise"));
+        assert!(dynamic.contains("# Git Status"));
     }
 
     #[test]
