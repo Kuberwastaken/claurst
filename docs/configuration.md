@@ -7,15 +7,28 @@ variables, and command-line flags. This document describes every option.
 
 ## Configuration File Location
 
-The global settings file lives at:
+The global settings file is `settings.json` in the Claurst config directory,
+the first of:
 
-```
-~/.claurst/settings.json
-```
+1. `$CLAURST_HOME`, when set and non-empty.
+2. `~/.claurst/`, when that directory already exists.
+3. `$XDG_CONFIG_HOME/claurst/` (when `XDG_CONFIG_HOME` is an absolute path),
+   otherwise `~/.config/claurst/`.
 
-The directory `~/.claurst/` is created automatically on first run if it does
-not exist. The file is standard JSON (or JSONC — comments are stripped before
-parsing).
+The rest of the docs write this directory as `~/.claurst/`. It is created when
+Claurst first saves settings.
+
+The global file must be plain JSON: comments are not stripped from it. A file
+that does not parse is reported at startup and left unchanged, and Claurst runs
+with default settings.
+
+When the `config` object is present it must contain every key that has no
+default: `permission_mode`, `theme`, `auto_compact`, `compact_threshold`,
+`verbose`, `output_format`, `mcp_servers`, `allowed_tools`,
+`disallowed_tools`, `env`, `enable_all_mcp_servers` and
+`disable_claude_mds`. A `config` object missing any of them fails to parse.
+The file Claurst writes itself always has them, so edit that file rather than
+starting from an empty one.
 
 ### Per-project settings
 
@@ -30,6 +43,8 @@ global settings):
 
 Settings that appear in the project file override the corresponding global
 values. Keys absent from the project file fall back to the global value.
+Project files may contain `//` and `/* */` comments. A project file that does
+not parse is ignored without a message, and the search stops at it.
 
 A project settings file comes from the repository and is treated as untrusted.
 Settings that run commands, fetch URLs, redirect provider traffic, or widen what
@@ -124,8 +139,8 @@ The `config` object holds runtime behaviour options.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `api_key` | string \| null | null | Anthropic API key. Overrides `ANTHROPIC_API_KEY` env var. Prefer the env var in shared environments. |
-| `model` | string \| null | provider default | Model ID to use. When absent, the provider's default is used (e.g. `claude-sonnet-4-6` for Anthropic, `gpt-4o` for OpenAI). |
-| `max_tokens` | integer \| null | 8192 | Maximum tokens per model response. |
+| `model` | string \| null | provider default | Model ID to use. When absent, the provider's default is used (e.g. `claude-opus-4-6` for Anthropic, `gpt-4o` for OpenAI). |
+| `max_tokens` | integer \| null | 32000 | Maximum tokens per model response. `--max-tokens` overrides it. |
 | `provider` | string \| null | `"anthropic"` | Active provider. See the [Providers](#providers) section. |
 | `effort` | string \| null | unset | Reasoning effort for new turns: `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`, or `"ultracode"`. When unset, no thinking-budget or temperature override is applied at all — this is not the same as `"medium"`, which has its own explicit values. |
 | `maxRetries` | integer \| null | null (5) | Retries after a model request fails transiently: HTTP 408/409/425/429/5xx, dropped connections, and streams that stall or end before completion. Waits follow the server's `retry-after-ms` / `Retry-After` header, otherwise exponential back-off with jitter, each capped at 60 s. Auth, quota/billing and invalid-request errors are never retried. `0` disables retrying. Note the camelCase key. |
@@ -135,7 +150,7 @@ The `config` object holds runtime behaviour options.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `permission_mode` | string | `"default"` | Controls how tool permissions are enforced. One of `"default"`, `"acceptEdits"`, `"bypassPermissions"`, `"plan"`. |
+| `permission_mode` | string | `"default"` | Controls how tool permissions are enforced. One of `"default"`, `"acceptEdits"`, `"bypassPermissions"`, `"plan"`. Currently replaced at startup by `--permission-mode` (default `default`), so set the mode with the flag or `yoloMode`. |
 | `yoloMode` | boolean | `false` | Persistent YOLO mode: the effective permission mode is `bypassPermissions`. Global-only in the settings merge: a project settings file cannot enable it. |
 
 See [Permission Modes](#permission-modes) for a full description of each value.
@@ -145,16 +160,18 @@ See [Permission Modes](#permission-modes) for a full description of each value.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `theme` | string | `"default"` | Color theme for the TUI. One of `"default"`, `"dark"`, `"light"`, `"deuteranopia"`. |
-| `output_style` | string \| null | null | Named output style. Built-in values: `"default"`, `"concise"`, `"verbose"`. Custom styles can be added as Markdown files under `~/.claurst/output-styles/`. |
+| `output_style` | string \| null | null | Named output style. Built-in values: `"default"`, `"concise"`, `"explanatory"`, `"learning"`, `"caveman"`, `"rocky"`. Custom styles can be added as `.md` or `.json` files under `~/.claurst/output-styles/`. Set by `/output-style`, `/caveman`, `/rocky` and `/normal`. |
 | `output_format` | string | `"text"` | Not used by headless runs: `--output-format` (default `text`) decides. See [Headless mode](advanced.md#headless-mode) for the `json` and `stream-json` shapes. |
-| `verbose` | boolean | false | Enable debug-level log output. |
+| `verbose` | boolean | false | Not used: replaced at startup by `--verbose`, which sets the log level to `debug` (default `warn`). |
 
 ### Context compaction
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `auto_compact` | boolean | true | Automatically compact the conversation context when the context window nears capacity. |
-| `compact_threshold` | float | 0.85 | Fraction of the context window that triggers auto-compaction (0.0–1.0). |
+| `auto_compact` | boolean | — | Not read by the query loop: auto-compaction is on unless `--no-auto-compact` is passed. The top-level `autoCompact` key is not read either. |
+| `compact_threshold` | float | — | Not used: the trigger point is fixed. |
+
+See [Auto-compaction](advanced.md#auto-compaction) for when compaction runs.
 
 ### System prompt
 
@@ -178,7 +195,8 @@ in the form `mcp__<server>__<tool>` (see [MCP tool names](mcp.md#mcp-tool-names)
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `additional_dirs` | array of strings | [] | Additional filesystem paths Claurst is allowed to read and write. Equivalent to passing `--add-dir` on the command line. |
+| `additional_dirs` | array of strings | [] | Directories outside the working directory whose files can be read without a prompt; writes there still follow the permission mode. Currently replaced at startup by the `--add-dir` values, so pass the flag instead. |
+| `workspace_paths` | array of strings | [] | Same read allowance as `additional_dirs`, kept across sessions. `/add-dir <path>` (or `claurst add-dir <path>`) appends to it. |
 
 ### MCP servers
 
@@ -198,14 +216,15 @@ Each `McpServerConfig` object:
 }
 ```
 
-`type` can be `"stdio"` (default) or `"http"` (for HTTP-SSE servers, in which
-case `command` is the base URL).
+`type` can be `"stdio"` (default), `"http"` (streamable HTTP) or `"sse"`
+(legacy SSE). Remote servers set `url` instead of `command`. See
+[McpServerConfig Fields](mcp.md#mcpserverconfig-fields) for every field.
 
-### Environment variables injected into tools
+### Environment variables for remote sessions
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `env` | object (string → string) | {} | Environment variables injected into every tool execution. Useful for setting project-specific tokens without polluting the system environment. Values may reference existing env vars using `{env:VARNAME}` syntax. |
+| `env` | object (string → string) | {} | Variables managed by `/remote-env` (`set`, `unset`, `list`) for remote sessions. They are not injected into local tool executions (Bash, MCP servers or LSP servers). |
 
 ### Hooks
 
@@ -261,6 +280,31 @@ the row. `statusLine` is only read from the global `~/.claurst/settings.json`;
 a project `.claurst/settings.json` cannot set or override it. The legacy
 `CLAUDE_STATUS_COMMAND` environment variable is used when `statusLine` is unset.
 Run `/cc-statusline` to show the active configuration.
+
+### Other keys
+
+Inside `config`:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `lsp_servers` | array | [] | Language servers for the `LSP` tool. See [LSP integration](advanced.md#lsp-integration). |
+| `requestTimeoutSecs` | integer \| null | 600 | Total HTTP request timeout for model requests, in seconds. A provider entry's `requestTimeoutSecs` overrides it. |
+| `autoCommits` | boolean \| null | null | Shadow-git snapshots after changes (`/revert`, `/checkpoints`, `/snapshot`). Same as `--auto-commits`. |
+| `mouseCapture` | boolean \| null | null (on) | `false` releases the mouse to the terminal for native selection. |
+| `cursorBlinkEnabled` | boolean | false | Blink the prompt cursor. |
+| `fileAutocompleteLimit` | integer | 15 | Maximum `@` file suggestions. |
+| `fileAutocompleteShowHiddenFiles` | boolean | false | Include hidden files in `@` suggestions. |
+| `fileInjectionEnabled` | boolean | true | Inject the contents of `@file` references into the message. |
+| `fileInjectionMaxSize` | integer | 100 | Size limit in KB for an injected file; `0` means no limit. |
+
+Top-level:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `remoteControlAtStartup` | boolean | false | Start the remote-control bridge with the session. Global-only. |
+| `trustProjectMcpServers` | boolean | false | Launch project MCP servers without approval. Global-only. Same as `--trust-project-mcp`. |
+| `showCwd` | boolean | true | Show the working directory in the footer. |
+| `showGitBranch` | boolean | true | Show the git branch in the footer. |
 
 ---
 
@@ -481,23 +525,25 @@ via the `provider` key in settings or the `--provider` CLI flag.
 
 | Provider ID | Default model |
 |-------------|--------------|
-| `anthropic` | `claude-sonnet-4-6` (or latest) |
+| `anthropic` | `claude-opus-4-6` |
 | `openai` | `gpt-4o` |
 | `google` | `gemini-2.5-flash` |
 | `groq` | `llama-3.3-70b-versatile` |
 | `cerebras` | `llama-3.3-70b` |
-| `deepseek` | `deepseek-chat` |
+| `deepseek` | `deepseek-v4-pro` |
 | `mistral` | `mistral-large-latest` |
 | `xai` | `grok-2` |
 | `openrouter` | `anthropic/claude-sonnet-4` |
 | `togetherai` | `meta-llama/Llama-3.3-70B-Instruct-Turbo` |
 | `perplexity` | `sonar-pro` |
 | `cohere` | `command-r-plus` |
+| `qwen` | `qwen3-max` |
 | `deepinfra` | `meta-llama/Llama-3.3-70B-Instruct` |
 | `github-copilot` | `gpt-4o` |
 | `ollama` | `llama3.2` |
 | `lmstudio` | `default` |
 | `llamacpp` | `default` |
+| `custom-openai` | `default` |
 | `azure` | `gpt-4o` |
 | `amazon-bedrock` | `anthropic.claude-sonnet-4-6-v1` |
 | `venice` | `llama-3.3-70b` |
@@ -532,12 +578,13 @@ and `api_base` override the corresponding environment variables.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `api_key` | string \| null | API key for this provider. |
-| `api_base` | string \| null | Override the default API base URL. |
+| `api_key` | string \| null | API key for this provider. `{env:VARNAME}` is replaced with that variable's value. |
+| `api_base` | string \| null | Override the default API base URL. `{env:VARNAME}` is replaced as for `api_key`. |
 | `enabled` | boolean | Whether this provider is active. Default: true. |
 | `models_whitelist` | array | If non-empty, only these model IDs are offered. |
 | `models_blacklist` | array | These model IDs are never offered. |
 | `options` | object | Provider-specific passthrough options. |
+| `requestTimeoutSecs` | integer \| null | Request timeout for this provider, overriding `config.requestTimeoutSecs`. |
 
 ---
 
@@ -545,10 +592,13 @@ and `api_base` override the corresponding environment variables.
 
 | Variable | Description |
 |----------|-------------|
-| `ANTHROPIC_API_KEY` | Anthropic API key. Checked after the `config.api_key` setting. |
+| `CLAURST_HOME` | Config directory (settings, sessions, skills). See [Configuration File Location](#configuration-file-location). |
+| `XDG_CONFIG_HOME` | Used for the config directory (`$XDG_CONFIG_HOME/claurst`) when `CLAURST_HOME` is unset and `~/.claurst` does not exist. |
+| `ANTHROPIC_API_KEY` | Anthropic API key. Checked after the `config.api_key` and `providers.anthropic.api_key` settings. |
 | `ANTHROPIC_BASE_URL` | Override the Anthropic API base URL. |
+| `OPENAI_BASE_URL`, `OLLAMA_HOST`, `LM_STUDIO_HOST`, `LLAMA_CPP_HOST`, `MINIMAX_BASE_URL` | Override the base URL of the `openai`, `ollama`, `lmstudio`, `llamacpp` and `minimax` providers. |
 | `CLAURST_PROVIDER` | Active provider. Equivalent to `--provider`. |
-| `CLAURST_API_BASE` | Override the API base URL for the active provider. Equivalent to `--api_base`. |
+| `CLAURST_API_BASE` | Override the API base URL for the active provider. Equivalent to `--api-base`. |
 | `CLAURST_GOALS` | Set to `0` to disable the goal system (`/goal` command and `GoalCompleteTool`). |
 | `OPENAI_API_KEY` | API key for the `openai` provider. |
 | `GOOGLE_API_KEY` | API key for the `google` provider. |
@@ -564,8 +614,20 @@ and `api_base` override the corresponding environment variables.
 | `AZURE_API_KEY` | API key for the `azure` provider. |
 | `HF_TOKEN` | Token for the `huggingface` provider. |
 | `NVIDIA_API_KEY` | API key for the `nvidia` provider. |
+| `CLAURST_DISABLE_MODELS_FETCH` | When set, never refresh the models.dev catalog. |
+| `CLAURST_MODELS_URL` / `MODELS_DEV_URL` | Catalog URL (default `https://models.dev/api.json`). |
+| `CLAURST_MODELS_PATH` | Load the model catalog from this file instead of the cache. |
+| `CLAURST_ENABLE_EXPERIMENTAL_MODELS` | `1` lists alpha and deprecated models in the picker. |
+| `CLAURST_DISABLE_AUTO_MEMORY` | A truthy value turns off automatic memory. |
+| `CLAURST_SKIP_PROMPT_HISTORY` | `1`, `true` or `yes`: do not record prompts in the prompt history. |
+| `CLAURST_NO_HYPERLINKS` | `1`, `true`, `yes` or `on`: no OSC 8 hyperlinks in the TUI. |
+| `CLAURST_VOICE_ENABLED` | `1` or `true`: start with voice input enabled. |
+| `WHISPER_ENDPOINT_URL` | Speech-to-text endpoint for voice input (default OpenAI's transcription API). |
+| `CLAURST_MCP_TOKENS_DIR` | Directory for stored MCP OAuth tokens (default `<config dir>/mcp-tokens`). |
+| `CLAURST_SHARE_NO_OPEN` | Do not open the browser after `/share`. |
+| `CLAUDE_STATUS_COMMAND` | Legacy status line command, used when `statusLine` is unset. |
 | `CLAURST_BRIDGE_URL` | Enable the remote-control bridge by setting the server URL. |
-| `CLAURST_BRIDGE_TOKEN` | Bearer token for the remote-control bridge. |
+| `CLAURST_BRIDGE_TOKEN` | Bearer token for the remote-control bridge (`CLAUDE_BRIDGE_OAUTH_TOKEN` is also read). |
 | `RUST_LOG` | Tracing filter (e.g. `debug`, `claurst_core=trace`). In the interactive TUI, logs go to `<config dir>/logs/claurst.log` (rotated to `claurst.log.old` at 5 MB) so they never draw over the screen; in headless (`--print`) mode they go to stderr. `/doctor` shows the log file path. |
 
 ---
@@ -589,12 +651,13 @@ User-defined slash commands can be added to the `commands` map:
 
 | Field | Description |
 |-------|-------------|
-| `template` | Template string. `$ARGUMENTS` is replaced with whatever the user types after the command name. |
+| `template` | Template string. `$ARGUMENTS` is replaced with whatever the user types after the command name, `$1` and `$2` with its first and second words. |
 | `description` | Short description shown in `/help`. |
-| `agent` | Optional named agent to use (e.g. `"plan"`, `"build"`, `"explore"`). |
-| `model` | Optional model override for this command. |
+| `agent` | Parsed but not applied yet. |
+| `model` | Parsed but not applied yet. |
 
-Use the command with `/review path/to/file.rs`.
+Use the command with `/review path/to/file.rs`. A built-in command with the
+same name takes precedence.
 
 ---
 
@@ -645,7 +708,7 @@ Invoke an agent with `@agentname` in the TUI or `--agent agentname` on the CLI.
 
 ## Managed Agents Configuration
 
-The `managed_agents` key stores the managed-agents architecture configuration set via `/managed-agents configure`. It is written automatically by the command and rarely needs to be edited manually.
+The `managed_agents` key stores the managed-agents architecture configuration set via `/managed-agents configure`. The command writes it both at the top level and inside `config`; the copy inside `config` is the one read. It rarely needs to be edited manually.
 
 ```json
 "managed_agents": {
@@ -653,23 +716,26 @@ The `managed_agents` key stores the managed-agents architecture configuration se
   "manager_model": "anthropic/claude-opus-4-6",
   "executor_model": "anthropic/claude-sonnet-4-6",
   "executor_max_turns": 20,
-  "max_concurrent": 3,
+  "max_concurrent_executors": 3,
   "executor_isolation": true,
   "budget_split": {
-    "type": "Percentage",
+    "type": "percentage",
     "manager_pct": 20
   },
-  "total_budget_usd": 5.00
+  "total_budget_usd": 5.00,
+  "preset_name": null
 }
 ```
+
+`executor_max_turns` defaults to 10 and `max_concurrent_executors` to 4.
 
 `budget_split` types:
 
 | Type | JSON | Description |
 |------|------|-------------|
-| `SharedPool` | `{ "type": "SharedPool" }` | All agents draw from a single pool |
-| `Percentage` | `{ "type": "Percentage", "manager_pct": 20 }` | Manager gets N% of total budget |
-| `FixedCaps` | `{ "type": "FixedCaps", "manager_usd": 0.50, "executor_usd": 2.00 }` | Hard USD caps per role |
+| `shared_pool` | `{ "type": "shared_pool" }` | All agents draw from a single pool (default) |
+| `percentage` | `{ "type": "percentage", "manager_pct": 20 }` | Manager gets N% of total budget |
+| `fixed_caps` | `{ "type": "fixed_caps", "manager_usd": 0.50, "executor_usd": 2.00 }` | Hard USD caps per role |
 
 Configure via `/managed-agents configure` or `/managed-agents preset <name>`. Set `enabled: false` to disable without removing the configuration.
 
@@ -697,13 +763,19 @@ matches. They are defined in the `formatter` map:
 
 | Field | Description |
 |-------|-------------|
-| `command` | Command array. The filename is appended as the final argument. |
+| `command` | Command array. A `$FILE` or `{file}` argument is replaced with the file path; without one, the path is appended as the final argument. |
 | `extensions` | File extensions this formatter handles (include the leading dot). |
 | `disabled` | Set to true to temporarily disable without removing the entry. |
+
+Only the first matching formatter runs. It has 30 seconds, and its failures
+are ignored.
 
 ---
 
 ## Annotated Example `settings.json`
+
+The comments below are explanations only. Remove them before using the
+example as the global file, which must be plain JSON.
 
 ```json
 {
@@ -723,18 +795,24 @@ matches. They are defined in the `formatter` map:
     // Cap responses at 8 192 tokens
     "max_tokens": 8192,
 
-    // In the TUI, ask before writing files or running commands
+    // Required key; --permission-mode decides the mode at startup
     "permission_mode": "default",
 
     // Dark theme for the TUI
     "theme": "dark",
 
-    // Compact when context window is 85% full
+    // Required keys; auto-compaction is controlled by --no-auto-compact
     "auto_compact": true,
-    "compact_threshold": 0.85,
+    "compact_threshold": 0.9,
 
-    // Show debug logs
+    // Required keys; --verbose and --output-format decide at startup
     "verbose": false,
+    "output_format": "text",
+
+    // Required keys
+    "allowed_tools": [],
+    "enable_all_mcp_servers": false,
+    "disable_claude_mds": false,
 
     // Add a custom instruction to every session
     "append_system_prompt": "Always explain your reasoning before making changes.",
@@ -742,10 +820,8 @@ matches. They are defined in the `formatter` map:
     // Block the Bash tool globally
     "disallowed_tools": ["Bash"],
 
-    // Inject a variable into every tool execution
-    "env": {
-      "MY_PROJECT_TOKEN": "{env:HOME}/.project_token"
-    },
+    // Variables for remote sessions (/remote-env); not injected into local tools
+    "env": {},
 
     // Run a script after every tool use (see docs/hooks.md)
     "hooks": {

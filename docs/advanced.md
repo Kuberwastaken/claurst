@@ -11,35 +11,29 @@ Extended thinking gives the model additional computation budget to reason throug
 ### Commands
 
 ```
-/thinking          Toggle extended thinking on or off for the session
-/effort <level>    Set the effort level: low, medium, high, or max
+/thinking          Toggle extended thinking on or off for the session (alias /think)
+/effort            Open the effort picker
+/effort <level>    Set the effort level: low, normal, or high
 ```
 
 ### CLI flags
 
 ```
 claurst --thinking <tokens>    Set a specific token budget for thinking
-claurst --effort <level>       Set the effort level (low/medium/high/max)
+claurst --effort <level>       Set the effort level for the session
 ```
 
 ### Effort levels
 
-| Level | Description |
-|---|---|
-| `low` | Minimal thinking; fastest responses |
-| `medium` | Moderate reasoning; balanced speed and quality |
-| `high` | Deep reasoning; best quality for most tasks |
-| `max` | Maximum available budget; reserved for Opus-class models |
+The levels are `none`, `minimal`, `low`, `medium` (alias `normal`), `high`, `xhigh`, `max` and `ultracode`; `--effort` accepts any of them. The `/effort` picker offers only the levels the current model supports: a model with reasoning variants gets its own tiers (for example `low` to `max` on recent Opus models), other models get `low`, `medium` and `high`, and `ultracode` is always offered last.
 
-The `max` level is only supported by models that expose it in the API (currently the Opus 4.6 generation). Attempting to set `max` on an unsupported model will fall back to `high`.
+`/effort low`, `/effort normal` and `/effort high` also set the response token cap (4,096 for `low`, 32,768 for `high`, the default for `normal`).
 
-Effort levels `low`, `medium`, and `high` persist to `~/.claude.json` across sessions. The `max` level is session-scoped for regular users. Numeric budget values (raw token counts) are always session-scoped.
+The level lasts for the session and is not saved.
 
-**Environment variable override:** `CLAUDE_CODE_EFFORT_LEVEL` overrides the persisted setting for the current process. If this variable is set and conflicts with a `/effort` command, Claurst displays a warning.
+### How levels are sent
 
-### How the API maps levels
-
-The effort parameter is passed directly to the Anthropic API for supported models. When no effort parameter is sent (the default), the API uses `high`. The displayed status bar reflects the effective level as `resolveAppliedEffort` computes it: env override, then session state, then persisted setting.
+Claude 4.6 and later models use adaptive thinking, and the level is sent as `output_config.effort` (`none` and `minimal` map to the lowest effort). Older Claude models get a `budget_tokens` thinking budget instead.
 
 ---
 
@@ -49,37 +43,21 @@ The context window has a finite size. Auto-compaction automatically summarises t
 
 ### How it works
 
-Claurst tracks token usage after every model turn. When usage crosses the auto-compact threshold — which is the effective context window size minus a 13,000-token buffer — it runs `compactConversation` to summarise the history and replaces the messages with a compact summary plus any trailing context.
+Before every model request, including the one after each batch of tool results, Claurst estimates the prompt size: the prompt tokens the provider last reported plus an estimate of what was appended since. When that reaches the threshold, the head of the conversation is summarised through the active provider and replaced by the summary; the most recent messages (about 16,000 tokens) are kept verbatim.
+
+The threshold is the lower of 90% of the context window and the window minus the response reserve (`max_tokens`, capped at a quarter of the window). For a 200,000-token window and `max_tokens` 32,000 that is 168,000 tokens.
+
+If the provider still rejects a request as too long, Claurst compacts once and retries the request. A second overflow on the same request is reported as an error.
 
 The `PreCompact` hook fires before compaction, with `trigger` set to `auto` or `manual`; it cannot block it. There is no `PostCompact` hook. See [Hooks](hooks.md).
 
 ### Controlling auto-compaction
 
-**Disable for a process:**
-
 ```bash
-DISABLE_AUTO_COMPACT=1 claurst
+claurst --no-auto-compact
 ```
 
-This disables automatic compaction while keeping `/compact` available manually.
-
-**Disable compaction entirely:**
-
-```bash
-DISABLE_COMPACT=1 claurst
-```
-
-**Override the threshold window (for testing):**
-
-```bash
-CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80 claurst
-```
-
-Sets the threshold to 80% of the effective context window instead of the default buffer-based calculation.
-
-**Toggle in global config:**
-
-`autoCompactEnabled` in `~/.claude.json` (boolean, default `true`). The `/compact` command respects this; auto-compact also checks it via `getGlobalConfig().autoCompactEnabled`.
+`--no-auto-compact` turns off both the threshold check and the overflow retry for the session; `/compact` still works. It is the only switch: the `auto_compact` and `compact_threshold` keys in `config` and the top-level `autoCompact` key are not read by the query loop.
 
 ### Manual compaction
 
@@ -99,19 +77,17 @@ Runs compaction immediately. Optionally pass custom instructions to guide the su
 /context
 ```
 
-Displays the current token usage relative to the model's context window. Shows the percentage remaining and warns when approaching the warning or error thresholds.
+Displays the current token usage relative to the model's context window. In the TUI it toggles the context overlay.
 
-- **Warning threshold:** 20,000 tokens before the effective window limit.
-- **Error threshold:** 20,000 tokens before the effective window limit (triggers a more prominent visual).
-- **Blocking limit:** 3,000 tokens before the effective window — further input is blocked until compaction.
+The TUI's token warning turns yellow at 80% of the context window (or with 20,000 tokens or fewer left) and red at 95%. Input is never blocked; auto-compaction runs before the window fills (see [Auto-compaction](#auto-compaction)).
 
 ### ctx-viz
 
 ```
-/ctx_viz
+/ctx-viz
 ```
 
-Opens an interactive visualisation of which parts of the context are consuming the most tokens. Useful for identifying large files or long tool outputs that could be trimmed.
+Aliases: `/ctx`, `/context-visualizer`. Prints an estimated breakdown of the context by category (system prompt, conversation messages, tool results) against a 200,000-token window.
 
 ---
 
@@ -153,12 +129,12 @@ The public SDK exports `getSessionMessages`, `listSessions`, `getSessionInfo`, `
 
 ## Worktree support
 
-Subagents spawned via the `Agent` tool can operate in isolated git worktrees to avoid interfering with the main working tree.
+The model can move the session into an isolated git worktree to avoid interfering with the main working tree.
 
 ### Tools
 
-- `EnterWorktreeTool` — checks out a new worktree and switches the agent's working directory to it.
-- `ExitWorktreeTool` — removes the worktree and returns the agent to the original directory.
+- `EnterWorktree` — creates a git worktree (default branch `claurst-<timestamp>`, default path `.worktrees/<branch>`), optionally runs a setup command in it, and switches the session's working directory to it.
+- `ExitWorktree` — returns to the original directory; `action: "keep"` leaves the worktree on disk, `"remove"` deletes it and its branch.
 
 ---
 
@@ -174,11 +150,11 @@ claurst --permission-mode plan
 ```
 
 When in plan mode:
-- Write and execute operations require explicit permission.
+- Write and execute operations are denied.
 - The model can read files, search, and reason freely.
-- Exiting plan mode (via `ExitPlanModeTool`) returns to the normal permission model.
+- Exiting plan mode (via the `ExitPlanMode` tool) returns to the normal permission model.
 
-The `EnterPlanModeTool` and `ExitPlanModeTool` internal tools manage transitions. A `plan_mode_exit` attachment is injected into the conversation when the mode changes to guide the model's next steps.
+The `EnterPlanMode` and `ExitPlanMode` tools manage transitions.
 
 ---
 
@@ -195,10 +171,10 @@ The goal system lets Claurst work autonomously across multiple turns toward a si
 
 Once a goal is set, Claurst begins working immediately. It continues across turns without waiting for user input until one of these conditions is met:
 
-- The model calls `GoalCompleteTool` with an audit summary and evidence
+- The model calls the `GoalComplete` tool with an audit summary and evidence
 - You run `/goal pause` or `/goal clear`
-- The runaway guard fires (200-turn hard limit)
-- A token budget is set and exhausted
+- The runaway guard fires after 200 turns (the goal is paused; `/goal resume` continues)
+- A token budget is set and exhausted (the goal stops as `budget_limited`)
 
 ### Monitoring and controlling goals
 
@@ -213,7 +189,7 @@ Once a goal is set, Claurst begins working immediately. It continues across turn
 
 ### How completion works
 
-When the model believes the objective has been met, it calls `GoalCompleteTool` rather than simply responding. This tool requires two arguments:
+When the model believes the objective has been met, it calls the `GoalComplete` tool rather than simply responding. This tool requires two arguments:
 
 - `audit_summary` — a concise description of what was accomplished
 - `evidence` — specific, verifiable evidence (files changed, tests passing, output produced)
@@ -224,10 +200,10 @@ Claurst displays both to the user before marking the goal complete. The model is
 
 | Status | Meaning |
 |--------|---------|
-| `Active` | Goal is set and work is ongoing |
-| `Paused` | Work paused by user; goal is preserved |
-| `Completed` | Model called `GoalCompleteTool` with accepted audit |
-| `Failed` | Runaway guard fired or budget exhausted |
+| `active` | Goal is set and work is ongoing |
+| `paused` | Paused by the user or by the 200-turn runaway guard; goal is preserved |
+| `budget_limited` | The `--tokens` budget was reached |
+| `complete` | Model called `GoalComplete` with an accepted audit |
 
 ### Disabling the goal system
 
@@ -235,7 +211,7 @@ Claurst displays both to the user before marking the goal complete. The model is
 CLAURST_GOALS=0 claurst
 ```
 
-Set `CLAURST_GOALS=0` in the environment to completely disable goal-related commands and the `GoalCompleteTool`. Useful in environments where autonomous multi-turn execution is undesirable.
+Set `CLAURST_GOALS=0` (or `false`) in the environment to completely disable goal-related commands and the `GoalComplete` tool. Useful in environments where autonomous multi-turn execution is undesirable.
 
 ---
 
@@ -285,9 +261,9 @@ Control how the total token/cost budget is divided between the manager and execu
 
 | Policy | Command | Description |
 |--------|---------|-------------|
-| `shared` | `budget-split shared` | All agents draw from a single shared pool |
-| `percentage` | `budget-split percentage:20` | Manager gets 20%, executors share the rest |
-| `fixed` | `budget-split fixed:0.50:2.00` | Manager capped at $0.50, each executor at $2.00 |
+| `shared` | `configure budget-split shared` | All agents draw from a single shared pool |
+| `percentage` | `configure budget-split percentage:20` | Manager gets 20%, executors share the rest |
+| `fixed` | `configure budget-split fixed:0.50:2.00` | Manager capped at $0.50, each executor at $2.00 |
 
 ```
 /managed-agents budget 5.00           — set a total $5 budget (0 to clear)
@@ -299,7 +275,9 @@ Control how the total token/cost budget is divided between the manager and execu
 /managed-agents status
 ```
 
-Configuration persists to `~/.claurst/settings.json` under `managed_agents`.
+`/managed-agents setup` prints the presets and the manual configuration steps, `disable` turns managed agents off without removing the configuration, and `reset` removes it. `enable` requires both models to be set.
+
+Configuration persists to `~/.claurst/settings.json` under `managed_agents` (see [Managed Agents Configuration](configuration.md#managed-agents-configuration)).
 
 > **Preview feature.** The managed-agents API is under active development and may change in future releases.
 
@@ -307,17 +285,14 @@ Configuration persists to `~/.claurst/settings.json` under `managed_agents`.
 
 ## Speech modes
 
-Speech modes change how the model structures its responses, trading naturalness for brevity. Useful in long sessions where verbose responses consume too many tokens or take too long to read.
+Speech modes are the `caveman` and `rocky` output styles. `/caveman` and `/rocky` select them and save the choice to `config.output_style`, exactly like `/output-style caveman`; they take no arguments. Typing the single word `caveman`, `rocky` or `normal` inline in a prompt applies it to that one turn only.
 
 ### Caveman mode
 
 Strips pleasantries, hedging phrases, transitional sentences, and articles. Output is dense and telegraphic.
 
 ```
-/caveman             — full caveman mode (~75% token reduction)
-/caveman lite        — remove pleasantries only (~40% reduction)
-/caveman full        — compress sentences, drop articles (~75% reduction, default)
-/caveman ultra       — maximum compression, imperative only (~85% reduction)
+/caveman
 ```
 
 **Example (normal mode):**
@@ -331,10 +306,7 @@ Strips pleasantries, hedging phrases, transitional sentences, and articles. Outp
 The model adopts the communication style of Rocky from *Project Hail Mary* — an Eridian alien engineer with a distinctive grammar, heavy emphasis, and alien perspective on human tasks.
 
 ```
-/rocky             — full Rocky mode (~75% token reduction)
-/rocky lite        — grammar rules only, minimal emphasis (~40% reduction)
-/rocky full        — full grammar + regular emphasis (~75% reduction, default)
-/rocky ultra       — maximum personality, frequent emphasis, alien observations
+/rocky
 ```
 
 **Example (rocky full):**
@@ -346,7 +318,7 @@ The model adopts the communication style of Rocky from *Project Hail Mary* — a
 /normal
 ```
 
-Resets to the model's standard response style. Any active mode (caveman or rocky) is immediately deactivated.
+Resets the output style to `default`, the same as `/output-style default`.
 
 ---
 
@@ -460,13 +432,13 @@ claurst -p --max-tokens 8000 "..."       # cap each response at 8,000 output tok
 
 ## The Buddy companion system
 
-Every Claurst user gets a persistent companion derived deterministically from their user ID. The companion appears as a small sprite in the terminal UI and occasionally comments on activity.
+The `claurst-buddy` crate implements a companion derived deterministically from a user ID. It is not wired into the TUI or any command yet, so no companion is shown. This section describes the crate.
 
 ### How companions are generated
 
-The companion's visual traits (species, eyes, hat, rarity, shiny status, stats) are generated by hashing the user ID with a seeded PRNG (Mulberry32). This means the companion is always the same for a given user — it cannot be faked by editing config files, because the bones are regenerated from the hash on every read.
+The companion's visual traits (species, eyes, hat, rarity, shiny status, stats) are generated by hashing the user ID (FNV-1a) into a seeded PRNG (Mulberry32). The bones are regenerated from the hash on every read, so they cannot be faked by editing a file.
 
-Only the soul (name, personality) is persisted to `~/.claude.json` under the `companion` key, and only after it has been "hatched" (named by the model on first encounter).
+Only the soul (name, personality, hatch time) is persisted, to `<config dir>/companion.json`, after it has been "hatched".
 
 ### Species
 
@@ -490,19 +462,17 @@ Each companion has five stats: DEBUGGING, PATIENCE, CHAOS, WISDOM, SNARK. One st
 
 ### Persistence
 
-The stored companion format in `~/.claude.json`:
+The stored format in `<config dir>/companion.json`:
 
 ```json
 {
-  "companion": {
-    "name": "Vortox",
-    "personality": "a chaotic little axolotl who celebrates every bug as a feature",
-    "hatchedAt": 1712345678901
-  }
+  "name": "Vortox",
+  "personality": "a chaotic little axolotl who celebrates every bug as a feature",
+  "hatched_at": "2026-04-05T12:34:56Z"
 }
 ```
 
-The bones (species, rarity, stats, eyes, hat, shiny) are never stored and are always recomputed from `hash(userId)`.
+The bones (species, rarity, stats, eyes, hat, shiny) are never stored and are always recomputed from the user ID.
 
 ---
 
@@ -512,9 +482,9 @@ The bones (species, rarity, stats, eyes, hat, shiny) are never stored and are al
 /voice
 ```
 
-Experimental voice input using the device microphone. When active, spoken input is transcribed and submitted as a prompt. The integration uses the Deepgram streaming STT API.
+Experimental voice input using the device microphone. When voice mode is on, press Alt+V to record; Esc cancels a recording. The audio is transcribed through a Whisper-compatible API: OpenAI's transcription endpoint with `OPENAI_API_KEY` by default, or the server at `WHISPER_ENDPOINT_URL` (for example a local whisper.cpp).
 
-The `/voice` command is a toggle. `CLAUDE_CODE_ENABLE_VOICE=1` can be used to pre-enable voice mode.
+`/voice` toggles voice mode; `/voice on`, `/voice off` and `/voice status` set or show it. `CLAURST_VOICE_ENABLED=1` starts with voice mode on.
 
 ---
 
@@ -524,27 +494,23 @@ The `/voice` command is a toggle. `CLAUDE_CODE_ENABLE_VOICE=1` can be used to pr
 /vim
 ```
 
-Toggles vim-style modal keybindings for the input buffer. When enabled, the prompt input operates in normal/insert/visual modes, allowing navigation and editing with standard vim motions.
+Toggles vim-style modal keybindings for the input buffer (alias `/vi`; `/vim on` and `/vim off` set it). When enabled, Esc switches between insert and normal mode, and normal mode accepts vim motions.
 
-The setting persists to user settings. The `--vim` CLI flag enables vim mode for the session without persisting.
+The setting is saved to `<config dir>/ui-settings.json`. There is no CLI flag for it.
 
 ---
 
 ## Bridge and remote sessions
 
-Claurst can be controlled remotely through a web interface at claude.ai. This "bridge" mode keeps a WebSocket connection open that allows a remote UI to send prompts and receive streaming responses.
+The remote-control bridge lets a remote UI send prompts to a running Claurst session and receive its responses.
 
 ```
-/session
+/remote-control [start|stop|status]     (alias /rc)
 ```
 
-Shows the current remote session URL and a QR code for scanning on mobile.
+`start` starts the bridge listener, `stop` stops it, and no argument or `status` shows the bridge status and connection URL. Set `remoteControlAtStartup: true` in the global settings to start it with every session. `CLAURST_BRIDGE_URL` sets the server URL and enables the bridge; `CLAURST_BRIDGE_TOKEN` sets its bearer token.
 
-The bridge operates in two topologies:
-- **In-process bridge** — the WebSocket lives inside the Claurst process. If the process dies, the connection is lost.
-- **Daemon bridge** — the WebSocket lives in a parent daemon process. The agent can be respawned while the claude.ai session stays connected. This is the `connectRemoteControl` SDK primitive.
-
-SSH sessions work similarly: `claurst --ssh` enables a remote-accessible session that can be connected to from another machine.
+There is no `--ssh` flag.
 
 ---
 
@@ -565,11 +531,11 @@ The `/memory` command opens the memory management UI for viewing, editing, and o
 | Mode | Description |
 |---|---|
 | `default` | Prompts the user before executing dangerous or write operations. |
-| `plan` | Read-only; write and execute require explicit approval. |
-| `autoAccept` | Accepts all tool calls without prompting. Use with caution. |
-| `bypassPermissions` | Skips the permission system entirely. Intended for trusted automation only. |
+| `plan` | Read-only; write and execute operations are denied. |
+| `acceptEdits` | Accepts file edits without prompting; other calls behave as in `default`. |
+| `bypassPermissions` | Skips the permission prompts. Intended for trusted automation only. |
 
-The active mode is set with `--permission-mode <mode>`.
+The active mode is set with `--permission-mode <mode>` (`--dangerously-skip-permissions`, alias `--yolo`, selects `bypassPermissions`). See [Permission Modes](configuration.md#permission-modes).
 
 ### Tool risk classification
 
@@ -577,15 +543,16 @@ Every tool is classified into a risk tier that determines the default permission
 
 | Tier | Examples | Default behaviour |
 |---|---|---|
-| `forbidden` | Directly destructive operations | Always blocked |
-| `dangerous` | Broad filesystem writes, network access | Prompt required |
-| `execute` | Bash, shell commands | Prompt required |
-| `write` | FileWrite, FileEdit, TodoWrite | Prompt in default mode |
-| `readonly` | FileRead, Glob, Grep, WebFetch | Allowed automatically |
+| `forbidden` | A Bash command classified as Critical | Always blocked |
+| `dangerous` | `computer` (computer use) | Prompt required |
+| `execute` | Bash, PowerShell | Prompt required |
+| `write` | Write, Edit | Prompt in default mode |
+| `readonly` | Read, Glob, Grep | Reads inside the workspace are allowed automatically |
+| `none` | TodoWrite | No permission needed |
 
 ### Bash command risk classification
 
-Within `BashTool`, commands are further classified by analysing the command string against known patterns. Commands matching dangerous patterns (e.g. `rm -rf`, `dd if=`, pipe chains with destructive intent) receive a higher risk rating and may be blocked depending on the active permission mode.
+The `Bash` tool classifies each command as Safe, Low, Medium, High or Critical by matching the command string against known patterns. Critical commands (`rm -rf /`, `dd if=...`, `mkfs`, fork bombs) are refused in every permission mode.
 
 A `PreToolUse` hook can decide a tool call before the permission prompt: `allow` skips the prompt, `ask` forces it, `deny` blocks the call. See [Hooks](hooks.md).
 
@@ -597,40 +564,38 @@ A `PreToolUse` hook can decide a tool call before the permission prompt: `allow`
 /output-style [style]
 ```
 
-Controls how Claurst formats its responses. Available styles vary by configuration; the command opens an interactive picker when called without arguments.
+An output style adds instructions to the system prompt that shape how the model writes its responses. Without an argument the command lists the available styles; `/output-style <name>` switches and saves the choice to `config.output_style`. Changes apply from the next request.
 
-Output styles affect markdown rendering, code block formatting, and verbosity of tool call summaries in the terminal UI.
+Built-in styles: `default`, `concise`, `explanatory`, `learning`, `caveman`, `rocky`. Custom styles are `.md` or `.json` files in `<config dir>/output-styles/`; plugins can add more.
 
 ---
 
 ## Custom commands
 
-Custom slash commands can be defined in `.claude/settings.json` under a `customCommands` key. A custom command is a template that expands to a prompt when invoked.
+Custom slash commands are defined in `settings.json` under the `commands` map, keyed by command name. A custom command is a template that expands to a prompt when invoked.
 
 ```json
 {
-  "customCommands": [
-    {
-      "name": "review",
-      "description": "Review the staged git diff",
-      "command": "Review the output of `git diff --staged`. Focus on correctness, edge cases, and naming."
-    },
-    {
-      "name": "standup",
+  "commands": {
+    "standup": {
       "description": "Summarise today's work",
-      "command": "Summarise what I worked on today based on the git log since midnight."
+      "template": "Summarise what I worked on today based on the git log since midnight."
+    },
+    "explain": {
+      "description": "Explain a file",
+      "template": "Explain what $ARGUMENTS does."
     }
-  ]
+  }
 }
 ```
 
-Custom commands appear alongside built-in commands in the `/` menu.
+A built-in command with the same name takes precedence. See [Custom Slash Commands](configuration.md#custom-slash-commands) for the fields. Skills are also run as slash commands (`/<skill-name>`); see [Skills](configuration.md#skills).
 
 ---
 
 ## Formatters
 
-Auto-formatters run automatically after file writes when configured. A `PostToolUse` hook on `Write` and `Edit` works too:
+Auto-formatters run automatically after file writes when configured in the `formatter` map (see [File Formatters](configuration.md#file-formatters)). A `PostToolUse` hook on `Write` and `Edit` works too:
 
 ```json
 {
@@ -669,28 +634,19 @@ A `PostToolUse` hook cannot undo the tool call; a non-zero exit other than 2 is 
 claurst --add-dir /path/to/additional/project "..."
 ```
 
-Grants Claurst read access to an additional directory outside the working directory. Useful when a task spans multiple repositories or when config files live outside the project root.
+Lets Claurst read files in an additional directory outside the working directory without a prompt; writes there still follow the permission mode. Useful when a task spans multiple repositories or when config files live outside the project root.
 
-Multiple `--add-dir` flags can be combined.
+Multiple `--add-dir` flags can be combined. `/add-dir <path>` adds a directory permanently (to `config.workspace_paths`).
 
 ### Environment variables in config
 
-Environment variables can be set in `.claude/settings.json` under an `env` key. These are injected into tool executions:
-
-```json
-{
-  "env": {
-    "NODE_ENV": "development",
-    "DATABASE_URL": "postgres://localhost/mydb"
-  }
-}
-```
+The `config.env` map holds variables for remote sessions, managed with `/remote-env`. It is not injected into local tool executions. To give a tool a variable, export it in the shell that starts Claurst.
 
 ---
 
 ## LSP integration
 
-The `LspTool` provides code intelligence by communicating with a Language Server Protocol server for the current file.
+The `LSP` tool provides code intelligence by communicating with a Language Server Protocol server for the current file.
 
 ### Operations
 
@@ -722,23 +678,31 @@ The `symbols` and `diagnostics` actions only require `action` and `file`.
 
 ### Configuration
 
-LSP servers must be configured in `settings.json`:
+LSP servers must be configured in the `config` object of the global `settings.json` (`lsp_servers` is global-only):
 
 ```json
 {
-  "lsp_servers": [
-    {
-      "language": "rust",
-      "command": "rust-analyzer",
-      "args": []
-    },
-    {
-      "language": "typescript",
-      "command": "typescript-language-server",
-      "args": ["--stdio"]
-    }
-  ]
+  "config": {
+    "lsp_servers": [
+      {
+        "name": "rust-analyzer",
+        "command": "rust-analyzer",
+        "args": [],
+        "file_patterns": ["*.rs"],
+        "extension_to_language": { ".rs": "rust" }
+      },
+      {
+        "name": "typescript",
+        "command": "typescript-language-server",
+        "args": ["--stdio"],
+        "file_patterns": ["*.ts", "*.tsx"],
+        "extension_to_language": { ".ts": "typescript", ".tsx": "typescriptreact" }
+      }
+    ]
+  }
 }
 ```
+
+`name`, `command`, `args` and `file_patterns` are required; `initialization_options` (passed in `initialize`), `extension_to_language` and `env` are optional.
 
 If no LSP server is configured for the file's language, the tool returns an informative error. Path resolution is relative to the current working directory.
