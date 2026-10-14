@@ -26,7 +26,9 @@ The provider can also be set persistently in `~/.claurst/settings.json`:
 }
 ```
 
-When no provider is specified, Claurst defaults to **Anthropic**.
+When no provider is specified, Claurst defaults to **Anthropic**, unless the model id is written as `provider/model` (for example `--model openai/gpt-4o`), which selects that provider.
+
+**Default models:** when a provider is selected but no model is set, Claurst picks the highest-priority model for that provider from the model catalog (see [Model Registry](#model-registry)). The **Default model** values below are the fallbacks used when the catalog has no entry for the provider.
 
 ---
 
@@ -36,19 +38,19 @@ When no provider is specified, Claurst defaults to **Anthropic**.
 
 The default provider. Uses the `/v1/messages` streaming endpoint.
 
-**Authentication:** `ANTHROPIC_API_KEY` environment variable, or set `api_key` in `settings.json`.
+**Authentication:** `ANTHROPIC_API_KEY` environment variable, `api_key` in `settings.json`, or OAuth login (`claurst auth login`). See [Authentication](auth).
 
-**Default model:** `claude-sonnet-4-6`
+**Default model:** `claude-opus-4-6`
 
-**Available models (bundled snapshot):**
+**Selected models (bundled snapshot; the catalog lists other Claude models too):**
 
 | Model ID | Context Window | Max Output | Input ($/1M) | Output ($/1M) |
 |---|---|---|---|---|
-| `claude-opus-4-6` | 200,000 | 32,000 | $15.00 | $75.00 |
-| `claude-sonnet-4-6` | 200,000 | 16,000 | $3.00 | $15.00 |
-| `claude-haiku-4-5-20251001` | 200,000 | 8,096 | $0.80 | $4.00 |
+| `claude-opus-4-6` | 1,000,000 | 128,000 | $5.00 | $25.00 |
+| `claude-sonnet-4-6` | 1,000,000 | 64,000 | $3.00 | $15.00 |
+| `claude-haiku-4-5-20251001` | 200,000 | 64,000 | $1.00 | $5.00 |
 
-All Anthropic models support tool calling, vision, and extended reasoning.
+These models support tool calling, vision, and extended reasoning. The `/model` picker intersects the catalog with the models `GET /v1/models` returns for the active credential.
 
 **Configuration:**
 
@@ -70,9 +72,11 @@ All Anthropic models support tool calling, vision, and extended reasoning.
 
 ### OpenAI
 
-Uses the OpenAI Chat Completions API (`/v1/chat/completions`).
+Uses the OpenAI Chat Completions API (`/v1/chat/completions`); model ids starting with `o3`, `o4`, or `gpt-5` use the Responses API instead.
 
 **Authentication:** `OPENAI_API_KEY` environment variable.
+
+**Base URL override:** `OPENAI_BASE_URL` or `api_base`; a trailing `/v1` is accepted.
 
 **Default model:** `gpt-4o`
 
@@ -103,9 +107,9 @@ Uses the OpenAI Chat Completions API (`/v1/chat/completions`).
 
 ### Google (Gemini)
 
-Uses the Google Generative Language / Vertex AI API.
+Uses the Google Generative Language API (`generativelanguage.googleapis.com`). Vertex AI is not supported.
 
-**Authentication:** `GOOGLE_API_KEY` environment variable (for AI Studio) or `GOOGLE_APPLICATION_CREDENTIALS` (for Vertex AI).
+**Authentication:** `GOOGLE_API_KEY` or `GOOGLE_GENERATIVE_AI_API_KEY` environment variable.
 
 **Default model:** `gemini-2.5-flash`
 
@@ -136,10 +140,10 @@ Uses the Google Generative Language / Vertex AI API.
 
 Uses the Azure OpenAI Chat Completions endpoint. The deployment name acts as the model identifier.
 
-**Authentication:** Three environment variables are required:
-- `AZURE_API_KEY` — your Azure OpenAI API key
-- `AZURE_RESOURCE_NAME` — your Azure resource name (the subdomain of `.openai.azure.com`)
-- `AZURE_API_VERSION` — API version (defaults to `2024-08-01-preview`)
+**Authentication:**
+- `AZURE_API_KEY` — your Azure OpenAI API key (or `api_key` in settings)
+- `AZURE_RESOURCE_NAME` — your Azure resource name (the subdomain of `.openai.azure.com`), or `options.resource_name` in settings
+- `AZURE_API_VERSION` — optional API version, read only when the provider is built from the environment; defaults to `2024-08-01-preview`
 
 **Default model:** `gpt-4o`
 
@@ -158,8 +162,7 @@ https://{AZURE_RESOURCE_NAME}.openai.azure.com/openai/deployments/{deployment}/c
     "azure": {
       "api_key": "...",
       "options": {
-        "resource_name": "my-azure-resource",
-        "api_version": "2024-08-01-preview"
+        "resource_name": "my-azure-resource"
       }
     }
   }
@@ -181,20 +184,13 @@ Uses the Bedrock Converse Streaming API. Supports all Claude models deployed on 
 
 **Default model:** `anthropic.claude-sonnet-4-6-v1`
 
-The adapter automatically prepends regional cross-inference prefixes (e.g. `us.anthropic.claude-...`) for US-region deployments.
+For model ids that contain no `.`, the adapter adds a cross-region inference prefix: `us.` for Claude and Nova models in non-GovCloud `us-*` regions, `eu.` for Claude models in `eu-*` regions. Ids that already contain a `.` (such as `anthropic.claude-...`) are sent unchanged.
 
-**Configuration:**
+**Configuration:** Bedrock is configured only through the environment variables above; `providers.amazon-bedrock` settings are not read. Select it with:
 
 ```json
 {
-  "provider": "amazon-bedrock",
-  "providers": {
-    "amazon-bedrock": {
-      "options": {
-        "region": "us-east-1"
-      }
-    }
-  }
+  "provider": "amazon-bedrock"
 }
 ```
 
@@ -204,7 +200,7 @@ The adapter automatically prepends regional cross-inference prefixes (e.g. `us.a
 
 Uses the GitHub Copilot Chat Completions API (`https://api.githubcopilot.com/chat/completions`).
 
-**Authentication:** `GITHUB_TOKEN` environment variable.
+**Authentication:** `GITHUB_TOKEN` environment variable, `api_key` in settings, or the GitHub device-code login in `/connect` (stored in `~/.claurst/auth.json`).
 
 **Default model:** `gpt-4o`
 
@@ -219,6 +215,20 @@ Uses the GitHub Copilot Chat Completions API (`https://api.githubcopilot.com/cha
     }
   }
 }
+```
+
+---
+
+### OpenAI Codex (ChatGPT subscription)
+
+Uses a ChatGPT subscription login against the Codex Responses endpoint (`https://chatgpt.com/backend-api/codex/responses`). Provider id `codex` (alias `openai-codex`).
+
+**Authentication:** OAuth only. Run `claurst codex login` or choose OpenAI Codex in `/connect`. Tokens are stored per profile under `~/.claurst/accounts/codex/` and refreshed automatically; see [Authentication](auth).
+
+**Default model:** `gpt-5.5`. The model list is the models.dev `openai` catalog filtered to `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`, and newer `gpt-<major>.<minor>` releases (`gpt-5.5-pro` excluded).
+
+```
+claurst --provider codex --model gpt-5.5
 ```
 
 ---
@@ -364,6 +374,8 @@ Connects to a locally running LM Studio server. No API key required.
 
 **Default model:** `default` (whichever model is loaded in LM Studio)
 
+Provider id `lmstudio` (alias `lm-studio`).
+
 **Configuration:**
 
 ```json
@@ -387,6 +399,8 @@ Connects to a locally running llama.cpp HTTP server. No API key required.
 
 **Default model:** `default`
 
+Provider id `llamacpp` (aliases `llama-cpp`, `llama-server`).
+
 **Configuration:**
 
 ```json
@@ -400,7 +414,7 @@ Connects to a locally running llama.cpp HTTP server. No API key required.
 }
 ```
 
-Start llama.cpp with the `--server` flag before use.
+Start the llama.cpp server (`llama-server`) before use.
 
 For recommended `llama-server` flags (tool calling, context sizing, prompt
 caching), model guidance, and cache-accounting details, see the
@@ -441,7 +455,7 @@ OpenAI-compatible API with extended reasoning output via a `reasoning_content` f
 
 **Base URL:** `https://api.deepseek.com/v1`
 
-**Default model:** `deepseek-chat`
+**Default model:** `deepseek-v4-pro`
 
 **Configuration:**
 
@@ -535,7 +549,7 @@ Model identifiers use OpenRouter's routing format: `provider/model-name`.
 
 ### Together AI
 
-Hosted open-source models.
+Hosted open-source models. Provider id `together-ai`; `togetherai` is not accepted by `--provider`.
 
 **Authentication:** `TOGETHER_API_KEY` environment variable.
 
@@ -547,9 +561,9 @@ Hosted open-source models.
 
 ```json
 {
-  "provider": "togetherai",
+  "provider": "together-ai",
   "providers": {
-    "togetherai": {
+    "together-ai": {
       "api_key": "..."
     }
   }
@@ -658,6 +672,35 @@ Wafer-scale inference hardware.
 
 ---
 
+### Other OpenAI-compatible providers
+
+These ids are also accepted by `--provider`. Each reads the listed environment variable, `api_key` in settings, or a key stored by `/connect`.
+
+| Provider id | Environment variable | Base URL |
+|---|---|---|
+| `sambanova` | `SAMBANOVA_API_KEY` | `https://api.sambanova.ai/v1` |
+| `huggingface` | `HF_TOKEN` | `https://router.huggingface.co/v1` |
+| `nvidia` | `NVIDIA_API_KEY` | `https://integrate.api.nvidia.com/v1` |
+| `qwen` (alias `alibaba`) | `DASHSCOPE_API_KEY` | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| `siliconflow` | `SILICONFLOW_API_KEY` | `https://api.siliconflow.com/v1` |
+| `moonshotai` (alias `moonshot`) | `MOONSHOT_API_KEY` | `https://api.moonshot.ai/v1` |
+| `zhipuai` (alias `zhipu`) | `ZHIPU_API_KEY` | `https://open.bigmodel.cn/api/paas/v4` |
+| `zai` | `ZAI_API_KEY` | `https://api.z.ai/api/coding/paas/v4` |
+| `nebius` | `NEBIUS_API_KEY` | `https://api.tokenfactory.nebius.com/v1` |
+| `novita` | `NOVITA_API_KEY` | `https://api.novita.ai/v3/openai` |
+| `ovhcloud` | `OVHCLOUD_API_KEY` | `https://oai.endpoints.kepler.ai.cloud.ovh.net/v1` |
+| `scaleway` | `SCALEWAY_API_KEY` | `https://api.scaleway.ai/v1` |
+| `vultr` | `VULTR_API_KEY` | `https://api.vultrinference.com/v1` |
+| `baseten` | `BASETEN_API_KEY` | `https://inference.baseten.co/v1` |
+| `friendli` | `FRIENDLI_TOKEN` | `https://api.friendli.ai/serverless/v1` |
+| `upstage` | `UPSTAGE_API_KEY` | `https://api.upstage.ai/v1/solar` |
+| `stepfun` | `STEPFUN_API_KEY` | `https://api.stepfun.com/v1` |
+| `fireworks` | `FIREWORKS_API_KEY` | `https://api.fireworks.ai/inference/v1` |
+
+`custom-openai` is a generic OpenAI-compatible provider: configure it in `/connect` (Custom OpenAI-Compatible: URL + API key), or set `providers.custom-openai.api_base` (default `http://localhost:11434/v1`) and `api_key` in settings. It is only registered when an API key is configured.
+
+---
+
 ## Per-Provider Configuration in settings.json
 
 The `providers` map in `~/.claurst/settings.json` accepts per-provider `ProviderConfig` objects:
@@ -690,33 +733,22 @@ The `providers` map in `~/.claurst/settings.json` accepts per-provider `Provider
 
 | Field | Type | Description |
 |---|---|---|
-| `api_key` | string | Override the environment variable API key |
-| `api_base` | string | Override the default base URL |
+| `api_key` | string | Takes precedence over the environment variable API key |
+| `api_base` | string | Override the default base URL. Applied for `anthropic`, `openai`, `minimax`, `ollama`, `lmstudio`, `llamacpp`, `deepseek`, `groq`, `xai`, `openrouter`, and `custom-openai`; other providers use their built-in URL. |
 | `enabled` | bool | Enable or disable the provider (default: `true`) |
-| `models_whitelist` | array of strings | If non-empty, only listed model IDs are allowed |
-| `models_blacklist` | array of strings | Listed model IDs are refused |
-| `options` | object | Provider-specific pass-through options |
-
-## Model Whitelist and Blacklist
-
-When `models_whitelist` is non-empty for a provider, only the listed model IDs can be selected for that provider. Any model ID in `models_blacklist` is rejected regardless of the whitelist:
-
-```json
-{
-  "providers": {
-    "openai": {
-      "models_whitelist": ["gpt-4o", "gpt-4o-mini"],
-      "models_blacklist": ["gpt-4o-mini"]
-    }
-  }
-}
-```
-
-The above example allows only `gpt-4o` (whitelist minus blacklist).
+| `models_whitelist` | array of strings | Parsed but not currently enforced |
+| `models_blacklist` | array of strings | Parsed but not currently enforced |
+| `options` | object | Provider-specific options. Keys read today: `resource_name` (azure), `service_tier` (minimax). |
+| `requestTimeoutSecs` | integer | Per-provider request timeout override (alias `request_timeout_secs`) |
 
 ## Model Registry
 
-Claurst ships a bundled snapshot of models for Anthropic, OpenAI, and Google. At runtime it optionally refreshes from the public `https://models.dev/api.json` API (cached to `~/.claurst/models_cache.json`, refreshed at most every 5 minutes). Network failures are swallowed silently; the bundled snapshot is always sufficient for normal operation.
+Claurst embeds a snapshot of the `https://models.dev/api.json` catalog (about 118 providers). At runtime it refreshes the catalog in the background into the OS cache directory (`<cache dir>/claurst/models.json`, for example `~/.cache/claurst/models.json` on Linux or `~/Library/Caches/claurst/models.json` on macOS), at most once every 5 minutes, and hourly during a long TUI session. Network failures are ignored; the embedded snapshot is always available.
+
+- `CLAURST_DISABLE_MODELS_FETCH` disables the network refresh.
+- `CLAURST_MODELS_URL` (or `MODELS_DEV_URL`) points the refresh at another URL.
+- `CLAURST_MODELS_PATH` loads the catalog from a local file instead of the cache.
+- `claurst models [provider] [--refresh] [--verbose] [--json]` lists the catalog.
 
 When no model is explicitly set, Claurst scores available models by priority patterns to pick the best default. Well-known model prefixes (`claude-*`, `gpt-*`, `gemini-*`, etc.) are always routed to their canonical provider regardless of gateway entries in the remote cache.
 

@@ -8,7 +8,8 @@ completions API** (`POST /v1/chat/completions`). That includes:
 - **Ollama** (via its `/v1` OpenAI shim) — provider id `ollama`
 - **vLLM**, **text-generation-webui**, **LocalAI**, and anything else that
   exposes `/v1/chat/completions` — use the generic `openai` provider with a
-  custom base URL
+  custom base URL, or the `custom-openai` provider (see
+  [Providers](providers))
 
 No API key is required for a local server. The rest of this page focuses on
 `llama-server` because it exposes the most tuning knobs, but the caching and
@@ -69,9 +70,10 @@ OPENAI_BASE_URL=http://localhost:8000/v1 \
   claurst --provider openai --model my-model "..."
 ```
 
-Claurst posts to `{base_url}/v1/chat/completions`, so set the base URL to the
-host root (Claurst appends `/v1`) or to a value already ending in `/v1`
-depending on the provider — match the examples above.
+Claurst normalizes the base URL, so the host root (`http://localhost:8000`) and
+a value ending in `/v1` both work; requests go to `<host>/v1/chat/completions`.
+The `openai` provider switches to the Responses API for model ids starting with
+`o3`, `o4`, or `gpt-5`, so give a local model a different id.
 
 ---
 
@@ -262,9 +264,8 @@ nothing — don't cargo-cult it for local models (or any models).**
 Details, from grepping this repository:
 
 - The string `CLAURST_COORDINATOR_MODE` appears exactly once in the Rust
-  runtime, as a constant in `crates/query/src/coordinator.rs`. There is a
-  `coordinator` module (multi-worker orchestration) and a [Agents](agents) doc
-  page describing a coordinator/worker model.
+  runtime, as a constant in `crates/query/src/coordinator.rs`, which holds an
+  unwired `coordinator` module (multi-worker orchestration).
 - **But nothing in the live agent loop reads it.** `is_coordinator_mode()` (the
   function that would check the env var) has no callers outside the module's own
   unit tests, and the system-prompt builder hardcodes `coordinator_mode: false`.

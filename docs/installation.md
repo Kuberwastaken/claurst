@@ -52,12 +52,14 @@ Both installers:
 
 1. Detect your platform and architecture.
 2. Download the matching archive from the latest GitHub release.
-3. Extract `claurst` into `~/.local/bin/` on Linux/macOS, or
-   `%LOCALAPPDATA%\Programs\claurst` on Windows (`install.sh` under Git Bash
-   uses this same Windows default).
-4. Append that directory to your shell config (`.bashrc`, `.zshrc`,
+3. Verify it against the release's `SHA256SUMS` asset (skipped with a warning
+   if the checksum file or a hashing tool is unavailable).
+4. Extract `claurst` into `~/.local/bin/` on Linux/macOS (`$XDG_BIN_HOME` if
+   set), or `%LOCALAPPDATA%\Programs\claurst` on Windows (`install.sh` under
+   Git Bash uses this same Windows default).
+5. Append that directory to your shell config (`.bashrc`, `.zshrc`,
    `.config/fish/config.fish`) on Unix, or to your Windows user `PATH`.
-5. On macOS, strip the quarantine attribute so Gatekeeper does not block the
+6. On macOS, strip the quarantine attribute so Gatekeeper does not block the
    unsigned binary.
 
 Open a new terminal afterwards (or `source` the modified shell config) so
@@ -69,12 +71,12 @@ Both scripts accept the same flags:
 
 | Flag (sh) | Flag (ps1) | Effect |
 |---|---|---|
-| `--version 0.1.0` | `-Version 0.1.0` | Install a specific version |
-| `--binary <path>` | `-Binary <path>` | Install from a local file (skip download) |
+| `--version 0.1.0` (`-v`) | `-Version 0.1.0` | Install a specific version |
+| `--binary <path>` (`-b`) | `-Binary <path>` | Install from a local file (skip download) |
 | `--install-dir <path>` | `-InstallDir <path>` | Override the install directory |
 | `--token <token>` | `-Token <token>` | GitHub token for API/downloads |
 | `--no-modify-path` | `-NoModifyPath` | Don't touch shell config / user PATH |
-| `--help` | `-Help` | Show usage |
+| `--help` (`-h`) | `-Help` | Show usage |
 
 Example: `curl -fsSL https://.../install.sh | bash -s -- --version 0.1.0`
 
@@ -228,8 +230,9 @@ where claurst          # Windows (Command Prompt)
 
 ## Building from Source
 
-Building from source requires the Rust toolchain (stable channel, 1.75 or
-later). Install Rust via [rustup](https://rustup.rs/):
+Building from source requires a recent stable Rust toolchain (1.82 or later;
+the code uses `Option::is_none_or`, and CI builds with the current stable).
+Install Rust via [rustup](https://rustup.rs/):
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -238,11 +241,13 @@ source "$HOME/.cargo/env"
 
 ### Option A: Install via Cargo
 
+Claurst is not published on crates.io. Install from the Git repository:
+
 ```bash
-cargo install claurst --force
+cargo install --git https://github.com/Kuberwastaken/claurst --locked claurst
 ```
 
-This downloads, compiles, and installs the binary to `~/.cargo/bin/claurst`.
+This clones, compiles, and installs the binary to `~/.cargo/bin/claurst`.
 That directory is added to `PATH` automatically by `rustup`.
 
 ### Option B: Clone and Build
@@ -269,33 +274,40 @@ Copy it to a directory on your `PATH` as described above.
 
 ### Linux system dependencies
 
-On Linux, the build requires ALSA development headers (for the optional voice
-feature) and OpenSSL:
+On Linux, the default build needs ALSA development headers (for the `voice`
+feature, on by default) and `pkg-config`. OpenSSL is not needed: TLS uses
+rustls and a bundled BoringSSL, which needs a C/C++ compiler and CMake. The
+release workflow installs only `libasound2-dev pkg-config` on Ubuntu.
 
 ```bash
 # Debian / Ubuntu
-sudo apt-get install -y libasound2-dev libssl-dev pkg-config
+sudo apt-get install -y libasound2-dev pkg-config
 
 # Fedora / RHEL
-sudo dnf install -y alsa-lib-devel openssl-devel
+sudo dnf install -y alsa-lib-devel pkgconf-pkg-config
 
 # Arch
-sudo pacman -S alsa-lib openssl
+sudo pacman -S alsa-lib pkgconf
 ```
+
+To skip ALSA, build without default features:
+`cargo build --release --package claurst --no-default-features`.
 
 ### Optional cargo features
 
 | Feature | Description |
 |---------|-------------|
-| `voice` | Microphone input / voice prompting |
-| `computer-use` | Screenshot capture and mouse/keyboard control |
-| `dev_full` | All experimental features combined |
+| `voice` | Microphone input / voice prompting (enabled by default) |
+| `claurst-tools/computer-use` | Screenshot capture and mouse/keyboard control |
+| `claurst-core/dev_full` | All experimental core feature flags combined |
 
-To enable a feature:
+The `claurst` package itself defines only `voice`; the others are features of
+workspace crates and are enabled with the `crate/feature` syntax from
+`src-rust/`:
 
 ```bash
-cargo build --release --package claurst --features voice
-cargo build --release --package claurst --features dev_full
+cargo build --release --package claurst --features claurst-tools/computer-use
+cargo build --release --package claurst --features claurst-core/dev_full
 ```
 
 ### Cross-compiling for Linux aarch64
@@ -306,26 +318,35 @@ aarch64 Linux builds. To reproduce it locally:
 ```bash
 cargo install cross --git https://github.com/cross-rs/cross
 cd src-rust
+cat > Cross.toml <<'EOF'
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+  "dpkg --add-architecture $CROSS_DEB_ARCH",
+  "apt-get update",
+  "apt-get install -y pkg-config libasound2-dev:$CROSS_DEB_ARCH"
+]
+EOF
 cross build --release --locked --package claurst --target aarch64-unknown-linux-gnu
 ```
 
-`cross` manages the Docker sysroot, OpenSSL, and ALSA headers automatically.
+`cross` provides the Docker sysroot; the `Cross.toml` pre-build step (the same
+one the release workflow writes) installs the arm64 ALSA headers.
 
 ---
 
 ## Shell Completions
 
 Claurst does not currently ship a dedicated `completions` subcommand. All
-flags can be discovered via `claurst --help`. If you want basic tab completion
-in bash or zsh you can use the generic completion helper built into your shell:
+flags can be discovered via `claurst --help`. In zsh you can use the generic
+`--help` parser:
 
 ```bash
-# bash — add to ~/.bashrc
-complete -C claurst claurst
-
 # zsh — add to ~/.zshrc (requires compinit)
 compdef _gnu_generic claurst
 ```
+
+Do not use bash's `complete -C claurst claurst`: it runs `claurst` itself as
+the completer, which starts a session.
 
 Richer completion scripts may be added in a future release.
 
@@ -334,7 +355,7 @@ Richer completion scripts may be added in a future release.
 ## Upgrading a source install
 
 ```bash
-cargo install claurst --force
+cargo install --git https://github.com/Kuberwastaken/claurst --locked --force claurst
 ```
 
 For binary installs (the recommended path), use `claurst upgrade` — see

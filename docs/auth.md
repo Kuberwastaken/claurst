@@ -12,16 +12,17 @@ and how to authenticate with non-Anthropic providers.
 Claurst checks for credentials in the following priority order:
 
 1. `--api-key` flag (highest priority, session-only)
-2. `api_key` field in `~/.claurst/settings.json`
-3. `ANTHROPIC_API_KEY` environment variable
-4. Tokens for the **active Anthropic profile** under
+2. `config.api_key` in `~/.claurst/settings.json`
+3. `providers.anthropic.api_key` in `~/.claurst/settings.json`
+4. `ANTHROPIC_API_KEY` environment variable
+5. Tokens for the **active Anthropic profile** under
    `~/.claurst/accounts/anthropic/<id>/oauth_tokens.json`
-5. Legacy `~/.claurst/oauth_tokens.json` (auto-migrated to a profile on first
+6. Legacy `~/.claurst/oauth_tokens.json` (auto-migrated to a profile on first
    read)
 
-The first non-empty credential found is used. Provider-specific credentials
-(OpenAI, Google, etc.) follow the same pattern but use their own environment
-variables and provider config entries.
+The first non-empty credential found is used, so any configured API key wins
+over stored OAuth tokens. Other providers use their own order; see
+[Multiple Providers](#multiple-providers).
 
 Codex (OpenAI ChatGPT subscription) accounts follow a parallel system —
 multiple profiles stored under `~/.claurst/accounts/codex/<id>/`, with the
@@ -369,15 +370,20 @@ This file is keyed by provider ID and contains either an `api` credential
 claurst auth status
 ```
 
-Prints a human-readable summary:
+Prints a human-readable summary for the active provider:
 
 ```
 Logged in.
   API provider: Anthropic
+  Billing: API
   Login method: API Key
-  Billing mode: API
-  Key source:   ANTHROPIC_API_KEY
+  API key: ANTHROPIC_API_KEY
+  Organization ID: unavailable for direct API key auth
 ```
+
+OAuth logins also print `Auth token`, `Email`, `Organization ID`, and
+`Subscription` lines. `claurst auth status` reports only the active provider;
+use `claurst codex status` for Codex.
 
 For machine-readable output:
 
@@ -412,7 +418,9 @@ fi
 
 By default, `logout` removes the **active** account's tokens and drops that
 profile from the registry; other stored profiles are untouched, so a stored
-secondary profile becomes the candidate for next selection.
+secondary profile becomes the candidate for next selection. The Anthropic
+logout (`claurst auth logout` and `/logout`) also clears `config.api_key` in
+`settings.json`.
 
 ```bash
 # Remove the active Anthropic profile
@@ -426,8 +434,8 @@ claurst codex logout
 /logout --codex
 ```
 
-To purge every stored profile for a provider (and clear any API key in
-`settings.json`):
+To purge every stored profile for a provider (`--all` without `--codex` also
+clears `config.api_key` in `settings.json`):
 
 ```
 /logout --all          # Anthropic
@@ -448,19 +456,42 @@ claurst codex remove personal
 
 ## Token Refresh
 
-When Claurst loads OAuth tokens for the active profile and the access token
-is expired, it automatically attempts a silent refresh:
+### Anthropic
 
-1. A `POST` request is sent to the provider's token endpoint with the stored
-   refresh token.
-2. If successful, the new access token (and optionally a new refresh token)
-   is written back to the same per-profile token file.
-3. The refreshed token is used for the current session.
+Anthropic OAuth tokens are only consulted when no API key is configured (see
+[Authentication Methods](#authentication-methods)). When Claurst resolves
+credentials (at startup and when the provider runtime is rebuilt) and the
+active profile's access token expires within 5 minutes, it refreshes it:
 
-If the refresh fails (network error, expired refresh token, revoked grant),
-Claurst falls back to any configured API key. If no API key is available,
-authentication fails and you must run `claurst auth login` (optionally with
-`--label <name>` to reuse a profile id) again.
+1. A `POST` request is sent to the token endpoint with the stored refresh
+   token.
+2. If successful, the new access token (and new refresh token, if returned)
+   is written back to the same per-profile token file and used for the session.
+
+If the refresh fails (network error, expired or revoked refresh token), the
+stored token is used unchanged and requests fail authentication once it has
+expired. Run `claurst auth login` again (optionally with `--label <name>` to
+reuse a profile id).
+
+### Codex
+
+The Codex provider checks the access token before every request. Expiry is
+read from the token's JWT `exp` claim, falling back to the stored
+`expires_at`. When the token expires within 5 minutes:
+
+1. Under a process-wide lock, Claurst re-reads the active profile's
+   `codex_tokens.json`. If another instance (a subagent, a cron task, an
+   earlier request) already refreshed it, that token is used and the
+   single-use refresh token is not spent again.
+2. Otherwise it posts `grant_type=refresh_token` to
+   `https://auth.openai.com/oauth/token` and writes the new access token,
+   refresh token, expiry, and account id back to the profile file.
+
+If the refresh token is rejected (HTTP 401, `invalid_grant`,
+`refresh_token_expired`, `refresh_token_reused`, or
+`refresh_token_invalidated`), the request fails with an authentication error;
+sign in again with `claurst codex login` or `/connect`. If no refresh token is
+stored, the expired token is sent as-is.
 
 ---
 
@@ -469,9 +500,12 @@ authentication fails and you must run `claurst auth login` (optionally with
 Claurst supports simultaneous configuration of credentials for multiple
 providers. Each provider looks for credentials in this order:
 
-1. `api_key` in the provider's entry under `providers` in `settings.json`
-2. The provider-specific environment variable (see table below)
-3. The credential stored in `~/.claurst/auth.json`
+1. `config.api_key` in `settings.json` (only for the selected provider)
+2. `api_key` in the provider's entry under `providers` in `settings.json`
+3. The provider-specific environment variable (see table below)
+4. The credential stored in `~/.claurst/auth.json` (written by `/connect`)
+
+Values may use `{env:VAR_NAME}` substitution.
 
 ### Provider environment variables
 
@@ -479,14 +513,14 @@ providers. Each provider looks for credentials in this order:
 |----------|---------------------|
 | `anthropic` | `ANTHROPIC_API_KEY` |
 | `openai` | `OPENAI_API_KEY` |
-| `google` | `GOOGLE_API_KEY` |
+| `google` | `GOOGLE_API_KEY`, then `GOOGLE_GENERATIVE_AI_API_KEY` |
 | `groq` | `GROQ_API_KEY` |
 | `cerebras` | `CEREBRAS_API_KEY` |
 | `deepseek` | `DEEPSEEK_API_KEY` |
 | `mistral` | `MISTRAL_API_KEY` |
 | `xai` | `XAI_API_KEY` |
 | `openrouter` | `OPENROUTER_API_KEY` |
-| `togetherai` | `TOGETHER_API_KEY` |
+| `together-ai` | `TOGETHER_API_KEY` |
 | `perplexity` | `PERPLEXITY_API_KEY` |
 | `cohere` | `COHERE_API_KEY` |
 | `deepinfra` | `DEEPINFRA_API_KEY` |
@@ -495,6 +529,27 @@ providers. Each provider looks for credentials in this order:
 | `azure` | `AZURE_API_KEY` |
 | `huggingface` | `HF_TOKEN` |
 | `nvidia` | `NVIDIA_API_KEY` |
+| `sambanova` | `SAMBANOVA_API_KEY` |
+| `qwen` (alias `alibaba`) | `DASHSCOPE_API_KEY` |
+| `moonshotai` | `MOONSHOT_API_KEY` |
+| `zhipuai` | `ZHIPU_API_KEY` |
+| `zai` | `ZAI_API_KEY` |
+| `siliconflow` | `SILICONFLOW_API_KEY` |
+| `nebius` | `NEBIUS_API_KEY` |
+| `novita` | `NOVITA_API_KEY` |
+| `minimax` | `MINIMAX_API_KEY` |
+| `ovhcloud` | `OVHCLOUD_API_KEY` |
+| `scaleway` | `SCALEWAY_API_KEY` |
+| `vultr` | `VULTR_API_KEY` |
+| `baseten` | `BASETEN_API_KEY` |
+| `friendli` | `FRIENDLI_TOKEN` |
+| `upstage` | `UPSTAGE_API_KEY` |
+| `stepfun` | `STEPFUN_API_KEY` |
+| `fireworks` | `FIREWORKS_API_KEY` |
+
+Azure also needs `AZURE_RESOURCE_NAME`; Amazon Bedrock reads AWS credentials
+from the environment (see [Providers](providers)). Codex uses the OAuth
+profiles above, not an API key.
 
 ### Example: multiple providers in settings.json
 
