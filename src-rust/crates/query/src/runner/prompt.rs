@@ -19,6 +19,7 @@ pub(crate) fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
     let opts = SystemPromptOptions {
         custom_system_prompt: config.system_prompt.clone(),
         append_system_prompt: config.append_system_prompt.clone(),
+        session_context: config.session_context.clone(),
         // All other fields use sensible defaults:
         // - prefix:                auto-detect from env
         // - memory_content:        empty (callers inject via append if needed)

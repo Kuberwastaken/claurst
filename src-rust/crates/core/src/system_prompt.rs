@@ -219,6 +219,10 @@ pub struct SystemPromptOptions {
     pub working_directory: Option<String>,
     /// Pre-built memory content from memdir (injected as dynamic section).
     pub memory_content: String,
+    /// Session context gathered at startup (date, git status, IDE context).
+    /// Injected in the dynamic section so it never invalidates the cached
+    /// stable prefix.
+    pub session_context: Option<String>,
     /// Custom system prompt (--system-prompt flag or settings).
     pub custom_system_prompt: Option<String>,
     /// Additional text appended after everything else (--append-system-prompt).
@@ -288,22 +292,12 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         CYBER_RISK_INSTRUCTION.to_string(),
     ];
 
-    // 7. Output style (cacheable when non-Default; its content is stable)
-    if let Some(style_text) = opts
-        .custom_output_style_prompt
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| opts.output_style.prompt_suffix())
-    {
-        parts.push(format!("\n## Output Style\n{}", style_text));
-    }
-
-    // 8. Coordinator mode (cacheable: content is constant)
+    // 7. Coordinator mode (cacheable: content is constant)
     if opts.coordinator_mode {
         parts.push(COORDINATOR_SYSTEM_PROMPT.to_string());
     }
 
-    // 9. Custom system prompt addition (appended to cacheable block)
+    // 8. Custom system prompt addition (appended to cacheable block)
     if let Some(custom) = &opts.custom_system_prompt {
         parts.push(format!(
             "\n<custom_instructions>\n{}\n</custom_instructions>",
@@ -316,19 +310,37 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
 
     // ------------------------------------------------------------------ //
     // DYNAMIC / UNCACHEABLE sections (after the boundary)                //
+    // Everything that can differ between sessions or turns goes here so  //
+    // the block above stays byte-identical for the prompt cache.         //
     // ------------------------------------------------------------------ //
 
-    // 10. Environment info (platform, OS version, shell)
+    // 9. Environment info (platform, OS version, shell)
     if !opts.skip_env_info {
         parts.push(build_env_info_section(opts.working_directory.as_deref()));
     }
 
-    // 11. Working directory (legacy XML tag kept for caching compat)
+    // 10. Working directory (legacy XML tag)
     if let Some(cwd) = &opts.working_directory {
         parts.push(format!("\n<working_directory>{}</working_directory>", cwd));
     }
 
-    // 12. Memory injection (from memdir)
+    // 11. Session context: date, git status, IDE context
+    if let Some(context) = opts.session_context.as_deref().filter(|c| !c.trim().is_empty()) {
+        parts.push(format!("\n{}", context));
+    }
+
+    // 12. Output style (dynamic: an inline persona keyword overrides it for
+    //     a single turn)
+    if let Some(style_text) = opts
+        .custom_output_style_prompt
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| opts.output_style.prompt_suffix())
+    {
+        parts.push(format!("\n## Output Style\n{}", style_text));
+    }
+
+    // 13. Memory injection (from memdir)
     if !opts.memory_content.is_empty() {
         parts.push(format!(
             "\n<memory>\n{}\n</memory>",
@@ -336,12 +348,13 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         ));
     }
 
-    // 13. Active goal addendum (dynamic — changes each session)
+    // 14. Active goal addendum (dynamic — changes each turn)
     if let Some(goal_text) = &opts.active_goal_addendum {
         parts.push(goal_text.clone());
     }
 
-    // 14. Appended system prompt (--append-system-prompt)
+    // 15. Appended system prompt: --append-system-prompt plus per-turn
+    //     addenda (todo nudge, ultracode procedure, managed-agent prompt)
     if let Some(append) = &opts.append_system_prompt {
         parts.push(format!("\n{}", append));
     }
@@ -695,6 +708,21 @@ mod tests {
         };
         let prompt = build_system_prompt(&opts);
         assert!(prompt.contains("maximally concise"));
+    }
+
+    #[test]
+    fn output_style_and_session_context_are_dynamic() {
+        let opts = SystemPromptOptions {
+            output_style: OutputStyle::Concise,
+            session_context: Some("# Git Status\n## main".to_string()),
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+        let (stable, dynamic) = split_at_dynamic_boundary(&prompt);
+        assert!(!stable.contains("maximally concise"));
+        assert!(!stable.contains("# Git Status"));
+        assert!(dynamic.contains("maximally concise"));
+        assert!(dynamic.contains("# Git Status"));
     }
 
     #[test]

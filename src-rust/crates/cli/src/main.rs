@@ -610,20 +610,19 @@ async fn main() -> anyhow::Result<()> {
     let system_ctx = ctx_builder.build_system_context().await;
     let user_ctx = ctx_builder.build_user_context().await;
 
-    // Build system prompt
-    let mut system_parts = vec![
-        include_str!("system_prompt.txt").to_string(),
-        system_ctx,
-        user_ctx,
-    ];
-    if let Some(ref custom) = config.custom_system_prompt {
-        // replace base system prompt
-        system_parts[0] = custom.clone();
-    }
-    if let Some(ref append) = config.append_system_prompt {
-        system_parts.push(append.clone());
-    }
-    let system_prompt = system_parts.join("\n\n");
+    // Build system prompt. Only session-stable text goes here (it lands in
+    // the cached system block); `system_ctx` (date, git status, IDE context)
+    // is passed separately as `session_context` and sent in the dynamic block.
+    let base_prompt = config
+        .custom_system_prompt
+        .clone()
+        .unwrap_or_else(|| include_str!("system_prompt.txt").to_string());
+    let system_prompt = [Some(base_prompt), Some(user_ctx), config.append_system_prompt.clone()]
+        .into_iter()
+        .flatten()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
 
     // Initialize API client.
     // Try config/env first; fall back to saved OAuth tokens.
@@ -852,6 +851,7 @@ async fn main() -> anyhow::Result<()> {
     query_config.max_turns = cli.max_turns;
     query_config.system_prompt = Some(system_prompt);
     query_config.append_system_prompt = None;
+    query_config.session_context = Some(system_ctx);
     query_config.working_directory = Some(cwd.display().to_string());
     if let Some(tokens) = cli.thinking {
         query_config.thinking_budget = Some(tokens);

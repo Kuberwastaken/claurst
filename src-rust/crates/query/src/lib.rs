@@ -106,6 +106,9 @@ pub struct QueryConfig {
     pub degradation_enabled: bool,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
+    /// Session context gathered at startup (date, git status, IDE context).
+    /// Sent in the dynamic system block, after the cached stable block.
+    pub session_context: Option<String>,
     pub output_style: claurst_core::system_prompt::OutputStyle,
     pub output_style_prompt: Option<String>,
     pub working_directory: Option<String>,
@@ -187,6 +190,7 @@ impl Default for QueryConfig {
             degradation_enabled: true,
             system_prompt: None,
             append_system_prompt: None,
+            session_context: None,
             output_style: claurst_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             working_directory: None,
@@ -667,8 +671,11 @@ pub async fn run_query_loop(
         let effective_effort_level =
             effective_effort_for_turn(config.effort_level, messages.as_slice());
 
-        // Verification nudge: if there are incomplete todos for this session
-        // and the conversation has more than 2 turns, append a reminder.
+        // Assemble the [stable, dynamic] system blocks. Everything that varies
+        // per turn (todo nudge, goal and ultracode addenda, the transient
+        // output-style persona) is routed into the dynamic block through
+        // `append_system_prompt` / `output_style`, so the stable block stays
+        // byte-identical across turns and keeps its prompt-cache entry.
         let system = {
             // Build a (possibly patched) config for system-prompt assembly.
             // Agent prompt prefix and todo nudge are both applied here.
@@ -710,7 +717,7 @@ pub async fn run_query_loop(
             if turn > 2 {
                 let nudge = build_todo_nudge(&tool_ctx.session_id);
                 if !nudge.is_empty() {
-                    patched.append_system_prompt = Some(match &config.append_system_prompt {
+                    patched.append_system_prompt = Some(match patched.append_system_prompt.take() {
                         Some(existing) => format!("{}\n\n{}", existing, nudge),
                         None => nudge,
                     });
@@ -2172,6 +2179,7 @@ mod tests {
             degradation_enabled: true,
             system_prompt: sys.map(String::from),
             append_system_prompt: append.map(String::from),
+            session_context: None,
             output_style: claurst_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             working_directory: None,
@@ -2323,7 +2331,8 @@ mod tests {
         let mut cfg = make_config(None, None);
         cfg.output_style_prompt = Some("Answer like a pirate.".to_string());
         let (stable, dynamic) = prompt_halves(build_system_prompt(&cfg));
-        assert!(stable.contains("Answer like a pirate.") || dynamic.contains("Answer like a pirate."));
+        assert!(!stable.contains("Answer like a pirate."));
+        assert!(dynamic.contains("Answer like a pirate."));
     }
 
     // ---- QueryConfig tests --------------------------------------------------
@@ -2783,6 +2792,8 @@ mod tests {
         id: claurst_core::provider_id::ProviderId,
         /// One entry per request: `true` when its tool set was empty.
         tools_empty_per_request: Arc<StdMutex<Vec<bool>>>,
+        /// One entry per request: the system prompt it carried.
+        systems_per_request: Arc<StdMutex<Vec<Option<SystemPrompt>>>>,
         /// When true, always end the turn with text (ignores tools). Otherwise
         /// emit a `tool_use` while tools are present and end the turn once
         /// they're gone (so the degradation turn ends the loop).
@@ -2826,6 +2837,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(tools_empty);
+            self.systems_per_request
+                .lock()
+                .unwrap()
+                .push(request.system_prompt.clone());
 
             let msg_id = uuid::Uuid::new_v4().to_string();
             let emit_tool_use = !self.always_end_turn && !tools_empty;
@@ -2948,6 +2963,7 @@ mod tests {
         let provider = Arc::new(RecordingProvider {
             id: claurst_core::provider_id::ProviderId::new("mockprov"),
             tools_empty_per_request: recorded.clone(),
+            systems_per_request: Arc::new(StdMutex::new(Vec::new())),
             always_end_turn,
         });
         let mut registry = claurst_api::ProviderRegistry::new();
@@ -3001,6 +3017,73 @@ mod tests {
 
         let recorded = recorded.lock().unwrap().clone();
         (outcome, recorded, messages)
+    }
+
+    /// Issue #440: across a scripted multi-turn run the stable system block is
+    /// byte-identical on every request and never carries the boundary marker,
+    /// while per-session and per-turn content stays in the dynamic block.
+    #[tokio::test]
+    async fn stable_system_block_is_byte_identical_across_turns() {
+        let systems = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(RecordingProvider {
+            id: claurst_core::provider_id::ProviderId::new("mockprov"),
+            tools_empty_per_request: Arc::new(StdMutex::new(Vec::new())),
+            systems_per_request: systems.clone(),
+            always_end_turn: false,
+        });
+        let mut registry = claurst_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+
+        let mut ctx = deny_all_context();
+        ctx.session_id = "cache-stability-test".to_string();
+        ctx.config.provider = Some("mockprov".to_string());
+
+        let mut config = make_config(Some("Project rules."), Some("Appended."));
+        config.model = "mock-model".to_string();
+        config.max_turns = 1;
+        config.session_context = Some("# Git Status\n## main".to_string());
+        config.output_style = claurst_core::system_prompt::OutputStyle::Concise;
+        config.provider_registry = Some(Arc::new(registry));
+
+        let mut messages = vec![Message::user("start")];
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &noop_tools(),
+                &ctx,
+                &config,
+                claurst_core::cost::CostTracker::new(),
+                None,
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+
+        // Turn 1 uses a tool, turn 2 is the tool-less summary turn.
+        let systems = systems.lock().unwrap().clone();
+        assert_eq!(systems.len(), 2, "expected a two-turn run");
+        let halves: Vec<(String, String)> = systems
+            .into_iter()
+            .map(|system| prompt_halves(system.expect("system prompt sent")))
+            .collect();
+        let (stable, dynamic) = &halves[0];
+        assert_eq!(stable, &halves[1].0, "stable block changed between turns");
+        assert!(stable.contains("Project rules."));
+        for volatile in ["# Git Status", "maximally concise", "Appended."] {
+            assert!(!stable.contains(volatile), "{volatile:?} leaked into the stable block");
+            assert!(dynamic.contains(volatile), "{volatile:?} missing from the dynamic block");
+        }
     }
 
     /// (a) A non-goal turn that ends with `end_turn` stops after exactly one
