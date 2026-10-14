@@ -1433,7 +1433,6 @@ Implements `Tool` for tools provided by MCP servers:
 5. Determines `working_dir` (from `--cwd` or `std::env::current_dir()`)
 6. Creates `Arc<CostTracker>`
 7. Builds system context strings:
-   - Reads `crates/cli/src/system_prompt.txt` (embedded at compile time via `include_str!`)
    - Calls `ContextBuilder::build_system_context()`
    - Calls `ContextBuilder::build_user_context()` (unless `--no-claude-md`)
    - Joins all parts
@@ -1473,20 +1472,11 @@ Interactive TUI REPL:
    - Re-renders via `terminal.draw(|f| render_app(f, &app))`
 5. Saves session to `cc_core::history::save_session()` after each completed turn
 
-### System Prompt (`system_prompt.txt`)
+### System Prompt
 
-Embedded in binary at compile time. Content:
-> You are Claude Code, an AI coding assistant by Anthropic.
-
-Guidelines:
-- Read files before editing them
-- Prefer editing existing files over creating new ones
-- Write clean, idiomatic code
-- Run tests after making changes
-- Use git log/diff for codebase context
-- Be concise in responses
-- Produce production-quality code
-- Never introduce security vulnerabilities
+The default prompt (identity, capabilities, guidelines) is assembled by
+`claurst_core::system_prompt::build_system_prompt`. The CLI only adds
+`--system-prompt`, AGENTS.md / CLAUDE.md content and `--append-system-prompt`.
 
 ### Relationship to TypeScript
 

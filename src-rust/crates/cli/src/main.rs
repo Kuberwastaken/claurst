@@ -610,14 +610,13 @@ async fn main() -> anyhow::Result<()> {
     let system_ctx = ctx_builder.build_system_context().await;
     let user_ctx = ctx_builder.build_user_context().await;
 
-    // Build system prompt. Only session-stable text goes here (it lands in
-    // the cached system block); `system_ctx` (date, git status, IDE context)
-    // is passed separately as `session_context` and sent in the dynamic block.
-    let base_prompt = config
-        .custom_system_prompt
-        .clone()
-        .unwrap_or_else(|| include_str!("system_prompt.txt").to_string());
-    let system_prompt = [Some(base_prompt), Some(user_ctx), config.append_system_prompt.clone()]
+    // Session-stable additions to the default prompt, which
+    // `claurst_core::system_prompt::build_system_prompt` assembles on its own
+    // (identity, capabilities, guidelines). Only session-stable text goes here
+    // (it lands in the cached system block); `system_ctx` (date, git status, IDE
+    // context) is passed separately as `session_context` and sent in the
+    // dynamic block.
+    let system_prompt = [config.custom_system_prompt.clone(), Some(user_ctx), config.append_system_prompt.clone()]
         .into_iter()
         .flatten()
         .filter(|part| !part.is_empty())
@@ -849,7 +848,7 @@ async fn main() -> anyhow::Result<()> {
     let mut query_config = claurst_query::QueryConfig::from_config_with_registry(&config, &model_registry);
     query_config.model_registry = Some(model_registry.clone());
     query_config.max_turns = cli.max_turns;
-    query_config.system_prompt = Some(system_prompt);
+    query_config.system_prompt = (!system_prompt.is_empty()).then_some(system_prompt);
     query_config.append_system_prompt = None;
     query_config.session_context = Some(system_ctx);
     query_config.working_directory = Some(cwd.display().to_string());
