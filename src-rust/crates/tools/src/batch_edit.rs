@@ -101,6 +101,11 @@ impl Tool for BatchEditTool {
             return ToolResult::error(e.to_string());
         }
 
+        // Lock every target file for the whole batch (#443).
+        let paths: Vec<std::path::PathBuf> =
+            params.edits.iter().map(|edit| ctx.resolve_path(&edit.file_path)).collect();
+        let _locks = crate::lock_files(paths.iter().map(|p| p.as_path())).await;
+
         // ----------------------------------------------------------------
         // Phase 1: read all files and validate every edit before writing
         // ----------------------------------------------------------------
@@ -110,8 +115,7 @@ impl Tool for BatchEditTool {
         let mut pre_check_errors: Vec<String> = Vec::new();
         let mut path_content: HashMap<String, String> = HashMap::new();
 
-        for (i, edit) in params.edits.iter().enumerate() {
-            let path = ctx.resolve_path(&edit.file_path);
+        for (i, (edit, path)) in params.edits.iter().zip(&paths).enumerate() {
             debug!(path = %path.display(), index = i, "BatchEdit pre-check");
 
             if edit.old_string.is_empty() {
@@ -123,7 +127,7 @@ impl Tool for BatchEditTool {
                 // use cached edited content if available
                 content.clone()
             } else {
-                match tokio::fs::read_to_string(&path).await {
+                match tokio::fs::read_to_string(path).await {
                     Ok(c) => c,
                     Err(e) => {
                         pre_check_errors.push(format!(

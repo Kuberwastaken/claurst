@@ -524,7 +524,7 @@ const GUIDELINE_TOOLS: &[&str] = &[
 fn tool_specific_guideline(tool: &str) -> Option<&'static str> {
     Some(match tool {
         "Bash" => "- Bash commands time out after 2 minutes; use background mode for long-running operations.",
-        "Read" => "- Read a file with the Read tool before editing it; Read also handles images and large files.",
+        "Read" => "- Read a file with the Read tool before editing it; Read returns text only, a capped page at a time (continue with offset/limit), and cannot show you image or PDF content.",
         "Edit" => "- For edits, read the file first, then make targeted string replacements with Edit.",
         "Write" => "- Use Write to create new files or fully overwrite; prefer Edit for partial changes.",
         "Glob" => "- To find files by name or pattern, prefer the Glob tool over `find`/`ls`.",
