@@ -15,7 +15,7 @@
 //   so we use the `CODEX_MODELS` constant from `claurst-core`.
 
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_stream::stream;
@@ -50,6 +50,33 @@ use crate::providers::copilot::CopilotProvider;
 /// client's `CHATGPT_ACCESS_TOKEN_REFRESH_WINDOW_MINUTES` = 5).
 const REFRESH_WINDOW_SECS: u64 = 5 * 60;
 
+/// Process-wide refresh guard (the official client's `AuthManager.refresh_lock`).
+/// Refresh tokens are single-use and the query path builds a fresh
+/// `CodexProvider` per request, so the lock cannot live on the instance.
+static REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// OAuth error codes meaning the refresh token is permanently unusable
+/// (official `classify_refresh_token_failure`).
+fn is_permanent_refresh_failure(status: u16, body: &str) -> bool {
+    let code = serde_json::from_str::<Value>(body).ok().and_then(|v| {
+        v.pointer("/error/code")
+            .or_else(|| v.get("error"))
+            .or_else(|| v.get("code"))
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase)
+    });
+    status == 401
+        || matches!(
+            code.as_deref(),
+            Some(
+                "invalid_grant"
+                    | "refresh_token_expired"
+                    | "refresh_token_reused"
+                    | "refresh_token_invalidated"
+            )
+        )
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -62,9 +89,6 @@ pub struct CodexProvider {
     http_client: reqwest::Client,
     /// Mutable token cache: updated in-place when a refresh succeeds.
     tokens: Arc<Mutex<CodexTokens>>,
-    /// Serialises refreshes: refresh tokens are single-use, so two concurrent
-    /// requests must not both spend the same one.
-    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl CodexProvider {
@@ -83,7 +107,6 @@ impl CodexProvider {
             id: ProviderId::new(ProviderId::CODEX),
             http_client,
             tokens: Arc::new(Mutex::new(tokens)),
-            refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -110,7 +133,7 @@ impl CodexProvider {
 
     /// Snapshot `(access_token, expired, refresh_token)` under the token lock.
     fn token_state(&self) -> (String, bool, Option<String>) {
-        let guard = self.tokens.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = self.tokens.lock().unwrap_or_else(PoisonError::into_inner);
         (
             guard.access_token.clone(),
             Self::is_expired(&guard, unix_now()),
@@ -125,9 +148,25 @@ impl CodexProvider {
             return Ok(token);
         }
 
-        // Re-check under the refresh lock: a concurrent request may already
-        // have refreshed (and spent the single-use refresh token).
-        let _refresh_guard = self.refresh_lock.lock().await;
+        // Under the process-wide lock, reload from disk: another provider
+        // instance (subagent, cron, a previous request) may already have
+        // refreshed and spent the single-use refresh token. Adopt its result
+        // instead of refreshing again (official `manager.rs` guarded reload).
+        let _refresh_guard = REFRESH_LOCK.lock().await;
+        if let Some(stored) = get_codex_tokens() {
+            if stored.access_token != token
+                && !stored.access_token.is_empty()
+                && !Self::is_expired(&stored, unix_now())
+            {
+                let fresh = stored.access_token.clone();
+                let mut guard = self.tokens.lock().unwrap_or_else(PoisonError::into_inner);
+                *guard = stored;
+                if guard.account_id.is_none() {
+                    guard.account_id = jwt_identity(&guard.access_token).account_id;
+                }
+                return Ok(fresh);
+            }
+        }
         let (token, needs_refresh, refresh_token) = self.token_state();
         if !needs_refresh {
             return Ok(token);
@@ -173,6 +212,14 @@ impl CodexProvider {
         })?;
 
         if !(200..300).contains(&(status as usize)) {
+            if is_permanent_refresh_failure(status, &text) {
+                return Err(ProviderError::AuthFailed {
+                    provider: self.id.clone(),
+                    message: "Codex refresh token was rejected (expired, revoked, or already \
+                              used); run /connect to sign in again"
+                        .to_string(),
+                });
+            }
             return Err(ProviderError::Other {
                 provider: self.id.clone(),
                 message: format!("Token refresh failed (HTTP {})", status),
@@ -216,7 +263,7 @@ impl CodexProvider {
 
         // Persist and cache the refreshed tokens.
         let mut updated = {
-            let guard = self.tokens.lock().unwrap();
+            let guard = self.tokens.lock().unwrap_or_else(PoisonError::into_inner);
             guard.clone()
         };
         updated.access_token = new_access.clone();
@@ -238,7 +285,7 @@ impl CodexProvider {
         }
 
         {
-            let mut guard = self.tokens.lock().unwrap();
+            let mut guard = self.tokens.lock().unwrap_or_else(PoisonError::into_inner);
             *guard = updated;
         }
 
@@ -294,7 +341,7 @@ impl CodexProvider {
     }
 
     fn account_id(&self) -> Option<String> {
-        self.tokens.lock().unwrap().account_id.clone()
+        self.tokens.lock().unwrap_or_else(PoisonError::into_inner).account_id.clone()
     }
 
     /// Build the Responses-API request body for Codex.
@@ -1076,7 +1123,7 @@ impl LlmProvider for CodexProvider {
 
     async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
         // Validate that a non-expired token exists without making a network call.
-        let guard = self.tokens.lock().unwrap();
+        let guard = self.tokens.lock().unwrap_or_else(PoisonError::into_inner);
         if guard.access_token.is_empty() {
             return Ok(ProviderStatus::Unavailable {
                 reason: "no Codex access token — run /connect to authenticate".to_string(),
@@ -1313,6 +1360,56 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(provider.account_id().as_deref(), Some("ws_123"));
+    }
+
+    #[tokio::test]
+    async fn access_token_adopts_fresh_tokens_refreshed_by_another_instance() {
+        let home = std::env::temp_dir().join(format!("claurst-codex-{}", uuid::Uuid::new_v4()));
+        let prev_home = std::env::var_os("CLAURST_HOME");
+        std::env::set_var("CLAURST_HOME", &home);
+
+        let stale = CodexProvider::new(CodexTokens {
+            access_token: jwt(json!({ "exp": 1 })),
+            refresh_token: Some("spent-refresh-token".into()),
+            ..Default::default()
+        });
+        let fresh_access = jwt(json!({ "exp": unix_now() + 3_600 }));
+        let saved = claurst_core::oauth_config::save_codex_tokens_and_register(
+            &CodexTokens {
+                access_token: fresh_access.clone(),
+                refresh_token: Some("new-refresh-token".into()),
+                ..Default::default()
+            },
+            None,
+        );
+        // No network: the expired in-memory token must be replaced by the
+        // one on disk without POSTing the spent refresh token.
+        let token = stale.access_token().await;
+
+        match prev_home {
+            Some(v) => std::env::set_var("CLAURST_HOME", v),
+            None => std::env::remove_var("CLAURST_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+
+        saved.unwrap();
+        assert_eq!(token.unwrap(), fresh_access);
+        assert_eq!(
+            stale.tokens.lock().unwrap().refresh_token.as_deref(),
+            Some("new-refresh-token")
+        );
+    }
+
+    #[test]
+    fn classifies_permanent_refresh_failures() {
+        assert!(is_permanent_refresh_failure(400, r#"{"error":"invalid_grant"}"#));
+        assert!(is_permanent_refresh_failure(
+            400,
+            r#"{"error":{"code":"refresh_token_reused","message":"x"}}"#
+        ));
+        assert!(is_permanent_refresh_failure(401, ""));
+        assert!(!is_permanent_refresh_failure(500, r#"{"error":"server_error"}"#));
+        assert!(!is_permanent_refresh_failure(400, "not json"));
     }
 
     #[test]
