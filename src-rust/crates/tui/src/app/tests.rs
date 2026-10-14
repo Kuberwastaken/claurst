@@ -1206,3 +1206,131 @@ use super::types::{ContextMenuItem, ContextMenuState};
         assert_eq!(u64::from(pin.context_window), app.context_window_size);
         assert_eq!(pin.max_output_tokens, 131_072);
     }
+
+    // ---- explicit rewind instead of display-list history sync (issue #484) ----
+
+    fn tool_use_msg(id: &str) -> Message {
+        Message::assistant_blocks(vec![claurst_core::types::ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: "Bash".to_string(),
+            input: serde_json::json!({"command": "ls"}),
+            thought_signature: None,
+        }])
+    }
+
+    fn tool_result_msg(id: &str) -> Message {
+        Message::user_blocks(vec![claurst_core::types::ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: claurst_core::types::ToolResultContent::Text("out".to_string()),
+            is_error: None,
+        }])
+    }
+
+    #[test]
+    fn idle_key_after_tool_step_requests_no_rewind() {
+        let mut app = make_app();
+        // Model history after one tool step. The display never receives the
+        // tool_use / tool_result messages, so it ends up shorter than this.
+        let history = [
+            Message::user("list files"),
+            tool_use_msg("t1"),
+            tool_result_msg("t1"),
+            Message::assistant("done"),
+        ];
+        app.push_message(Message::user("list files"));
+        app.is_streaming = true;
+        app.handle_query_event(claurst_query::QueryEvent::ToolStart {
+            tool_name: "Bash".to_string(),
+            tool_id: "t1".to_string(),
+            input_json: r#"{"command":"ls"}"#.to_string(),
+        });
+        app.handle_query_event(claurst_query::QueryEvent::ToolEnd {
+            tool_name: "Bash".to_string(),
+            tool_id: "t1".to_string(),
+            result: "out".to_string(),
+            is_error: false,
+        });
+        app.streaming_text = "done".to_string();
+        app.handle_query_event(claurst_query::QueryEvent::TurnComplete {
+            turn: 1,
+            stop_reason: "end_turn".to_string(),
+            usage: None,
+        });
+        assert!(!app.is_streaming);
+        assert!(app.messages.len() < history.len());
+
+        app.handle_key_event(press_key(KeyCode::Char('a'), KeyModifiers::NONE));
+        // The host loop touches the model history only on an explicit rewind.
+        assert_eq!(app.pending_rewind, None);
+    }
+
+    #[test]
+    fn confirmed_rewind_sets_pending_rewind() {
+        let mut app = make_app();
+        app.replace_messages(vec![
+            Message::user("one"),
+            Message::assistant("a1"),
+            Message::user("two"),
+            Message::assistant("a2"),
+        ]);
+        app.open_rewind_flow();
+        app.handle_key_event(press_key(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key_event(press_key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(app.pending_rewind, Some(2));
+        assert_eq!(app.messages.len(), 2);
+    }
+
+    #[test]
+    fn rewind_cut_index_plain_turns() {
+        let history = [
+            Message::user("one"),
+            Message::assistant("a1"),
+            Message::user("two"),
+            Message::assistant("a2"),
+        ];
+        assert_eq!(rewind_cut_index(&history, 0), 0);
+        assert_eq!(rewind_cut_index(&history, 2), 2);
+        assert_eq!(rewind_cut_index(&history, 4), 4);
+        assert_eq!(rewind_cut_index(&history, 9), 4);
+    }
+
+    #[test]
+    fn rewind_cut_index_keeps_tool_step_before_cut() {
+        let history = [
+            Message::user("one"),
+            tool_use_msg("t1"),
+            tool_result_msg("t1"),
+            Message::assistant("a1"),
+            Message::user("two"),
+            Message::assistant("a2"),
+        ];
+        // Rewinding to "two" keeps the whole first turn, tool pair included.
+        assert_eq!(rewind_cut_index(&history, 4), 4);
+    }
+
+    #[test]
+    fn rewind_cut_index_skips_aborted_marker() {
+        let history = [
+            Message::user("one"),
+            Message::assistant("partial"),
+            Message::user(claurst_core::system_prompt::TURN_ABORTED_MESSAGE),
+            Message::user("two"),
+            Message::assistant("a2"),
+        ];
+        // The display hides the marker: display index 2 is "two" (history 3).
+        assert_eq!(rewind_cut_index(&history, 2), 3);
+        assert_eq!(rewind_cut_index(&history, 3), 4);
+    }
+
+    #[test]
+    fn rewind_cut_index_snaps_off_unpaired_tool_use() {
+        let history = [
+            Message::user("one"),
+            tool_use_msg("t1"),
+            tool_result_msg("t1"),
+            Message::assistant("a1"),
+        ];
+        // Selecting the tool_result would orphan the tool_use: cut before it.
+        assert_eq!(rewind_cut_index(&history, 2), 1);
+    }
