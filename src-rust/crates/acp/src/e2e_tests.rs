@@ -717,9 +717,12 @@ async fn runtime_uses_settings_and_agents_md_of_the_session_cwd() {
     let runtime = AgentRuntime::build(cwd.clone()).await.expect("runtime builds");
     assert_eq!(runtime.working_dir, cwd);
     assert_eq!(runtime.query_config.model, "project-pinned-model");
-    let system_prompt = runtime.query_config.system_prompt.as_deref().unwrap_or_default();
     assert!(
-        system_prompt.contains("PROJECT-RULE-MARKER"),
+        runtime
+            .query_config
+            .instruction_files
+            .iter()
+            .any(|file| file.path == cwd.join("AGENTS.md") && file.content.contains("PROJECT-RULE-MARKER")),
         "AGENTS.md from the session cwd must reach the system prompt"
     );
 }

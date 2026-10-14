@@ -97,15 +97,31 @@ impl AgentRuntime {
         query_config.working_directory = Some(working_dir.display().to_string());
         query_config.provider_registry = Some(provider_registry.clone());
 
-        // System and user context (git status, AGENTS.md, ...) for this
-        // directory, assembled like the CLI does.
-        let context = claurst_core::context::ContextBuilder::new(working_dir.clone())
-            .disable_claude_mds(config.disable_claude_mds);
+        // System context (git status, ...) for this directory, assembled like
+        // the CLI does.
+        let context = claurst_core::context::ContextBuilder::new(working_dir.clone());
         let mut system_parts: Vec<String> = config.custom_system_prompt.iter().cloned().collect();
         system_parts.push(context.build_system_context().await);
-        system_parts.push(context.build_user_context().await);
         query_config.system_prompt = Some(system_parts.join("\n\n"));
         query_config.append_system_prompt = config.append_system_prompt.clone();
+
+        // AGENTS.md / CLAUDE.md instruction files and the skill listing, both
+        // fixed for the session (they go in the cached system block).
+        if !config.disable_claude_mds {
+            query_config.instruction_files = claurst_core::claudemd::load_instruction_files(
+                &working_dir,
+                &Settings::config_dir(),
+            );
+        }
+        let skill_registry = {
+            let cwd = working_dir.clone();
+            let skills_config = config.skills.clone();
+            tokio::task::spawn_blocking(move || {
+                claurst_core::SkillRegistry::discover(&cwd, &skills_config)
+            })
+            .await?
+        };
+        query_config.available_skills = skill_registry.listings();
 
         let supports_images = provider_accepts_images(&config, &provider_registry);
 

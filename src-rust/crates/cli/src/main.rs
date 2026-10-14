@@ -841,14 +841,7 @@ async fn main() -> anyhow::Result<()> {
             .await
             .context("Skill discovery failed")?
     };
-    query_config.available_skills = skill_registry
-        .skills()
-        .iter()
-        .map(|skill| claurst_core::system_prompt::SkillListing {
-            name: skill.name().to_string(),
-            description: skill.description().to_string(),
-        })
-        .collect();
+    query_config.available_skills = skill_registry.listings();
     if let Some(tokens) = cli.thinking {
         query_config.thinking_budget = Some(tokens);
     }

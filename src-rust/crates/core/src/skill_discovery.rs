@@ -427,6 +427,18 @@ impl SkillRegistry {
         })
     }
 
+    /// Name and description of every skill, in registry order, for the
+    /// `<available_skills>` block in the system prompt.
+    pub fn listings(&self) -> Vec<crate::system_prompt::SkillListing> {
+        self.skills
+            .iter()
+            .map(|skill| crate::system_prompt::SkillListing {
+                name: skill.name().to_string(),
+                description: skill.description().to_string(),
+            })
+            .collect()
+    }
+
     /// The skills loaded from disk or a skills repo (not bundled).
     pub fn discovered(&self) -> impl Iterator<Item = &DiscoveredSkill> {
         self.skills.iter().filter_map(|s| match s {
