@@ -109,9 +109,9 @@ A second claurst that opens a session another process is writing can read it, bu
 
 | Command | Description |
 |---|---|
-| `/resume [id or search]` | Resume a previous session by ID or fuzzy search term. Alias: `/continue`. |
-| `/session` | Show the remote session URL and QR code (available in remote mode). |
-| `/fork` | Fork the current session into a new branch with fresh UUIDs, preserving the full message history. |
+| `/resume <session-id>` | Load a saved session (TUI: opens the browser). Alias: `/continue`. |
+| `/session` | Session browser (TUI); text form shows the current and 5 most recent sessions, or the bridge URL. |
+| `/fork [N]` | Save the conversation up to message N as a new session titled "Fork of …". |
 | `/rename <title>` | Rename the current session. |
 | `/export` | Export the current session transcript. |
 | `/rewind` | Step back to an earlier point in the conversation, including messages an earlier compaction replaced (listed first, marked `[compacted]`). |
@@ -137,10 +137,6 @@ The snapshot records the `seq` of the last journal entry it includes (`journal_s
 A resumed session continues from the latest compaction summary forward, as before the crash.
 
 Sessions saved by older versions (a `<id>.json` with no journal) load unchanged. Their journal is created, starting with the full history, the first time they are written.
-
-### SDK access
-
-The public SDK exports `getSessionMessages`, `listSessions`, `getSessionInfo`, `renameSession`, `tagSession`, and `forkSession` for programmatic access to session data.
 
 ---
 
@@ -228,7 +224,7 @@ Claurst displays both to the user before marking the goal complete. The model is
 CLAURST_GOALS=0 claurst
 ```
 
-Set `CLAURST_GOALS=0` (or `false`) in the environment to completely disable goal-related commands and the `GoalComplete` tool. Useful in environments where autonomous multi-turn execution is undesirable.
+Set `CLAURST_GOALS=0` (or `false`) in the environment: this disables the `/goal` commands and the autonomous continuation loop; the `GoalComplete` tool stays registered. Useful in environments where autonomous multi-turn execution is undesirable.
 
 ---
 
@@ -501,7 +497,7 @@ The bones (species, rarity, stats, eyes, hat, shiny) are never stored and are al
 
 Experimental voice input using the device microphone. When voice mode is on, press Alt+V to record; Esc cancels a recording. The audio is transcribed through a Whisper-compatible API: OpenAI's transcription endpoint with `OPENAI_API_KEY` by default, or the server at `WHISPER_ENDPOINT_URL` (for example a local whisper.cpp).
 
-`/voice` toggles voice mode; `/voice on`, `/voice off` and `/voice status` set or show it. `CLAURST_VOICE_ENABLED=1` starts with voice mode on.
+`/voice` toggles voice mode for this session; `/voice on|off` only save the startup state (effective next start); `/voice status` shows it. `CLAURST_VOICE_ENABLED=1` starts with voice mode on.
 
 ---
 
@@ -525,7 +521,7 @@ The remote-control bridge lets a remote UI send prompts to a running Claurst ses
 /remote-control [start|stop|status]     (alias /rc)
 ```
 
-`start` starts the bridge listener, `stop` stops it, and no argument or `status` shows the bridge status and connection URL. Set `remoteControlAtStartup: true` in the global settings to start it with every session. `CLAURST_BRIDGE_URL` sets the server URL and enables the bridge; `CLAURST_BRIDGE_TOKEN` sets its bearer token.
+No argument or `status` shows the bridge status. `start` and `stop` set `remoteControlAtStartup`; the change applies on the next start. `/mobile session` shows a QR code that links to the active bridge session. Set `remoteControlAtStartup: true` in the global settings to start it with every session. `CLAURST_BRIDGE_URL` sets the server URL and enables the bridge; `CLAURST_BRIDGE_TOKEN` sets its bearer token.
 
 There is no `--ssh` flag.
 
@@ -583,7 +579,7 @@ A `PreToolUse` hook can decide a tool call before the permission prompt: `allow`
 
 An output style adds instructions to the system prompt that shape how the model writes its responses. Without an argument the command lists the available styles; `/output-style <name>` switches and saves the choice to `config.output_style`. Changes apply from the next request.
 
-Built-in styles: `default`, `concise`, `explanatory`, `learning`, `caveman`, `rocky`. Custom styles are `.md` or `.json` files in `<config dir>/output-styles/`; plugins can add more.
+Built-in styles: `default`, `concise`, `explanatory`, `learning`, `caveman`, `rocky`. Custom styles are `.md` or `.json` files in `<config dir>/output-styles/`.
 
 ---
 

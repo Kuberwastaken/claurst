@@ -77,13 +77,13 @@ These bindings are active when focus is in the chat input field.
 
 `Shift+Tab` (`reverseIndent`) cycles the permission mode (Default, Accept edits, Bypass permissions, back to Default; Plan goes to Default); it does not remove indentation. Most terminals send `Ctrl+I` as `Tab`, so `historyNext` on `Ctrl+I` only fires when the terminal reports it separately (kitty keyboard protocol).
 
-The defaults also bind `Ctrl+Left` / `Ctrl+Right` (`moveWordBackward` / `moveWordForward`), `Ctrl+F` (`findInMessage`), `Ctrl+Shift+F` (`globalSearch`), `Ctrl+]` (`findNext`), `Ctrl+[` (`findPrev`) and `Ctrl+G` (`goToLine`), but these actions are not implemented, so the keys do nothing. `F3` / `Shift+F3` are listed too, but function keys never reach the binding table. Use `Alt+B` / `Alt+F` to move by word and `Ctrl+P` for project search.
+The defaults also bind `Ctrl+Left` / `Ctrl+Right` (`moveWordBackward` / `moveWordForward`), `Ctrl+F` (`findInMessage`), `Ctrl+Shift+F` (`globalSearch`), `Ctrl+]` (`findNext`), `Ctrl+[` (`findPrev`) and `Ctrl+G` (`goToLine`), but these actions are not implemented, so the keys do nothing. `F3` / `Shift+F3` are listed too, but function keys never reach the binding table. Use `Alt+B` / `Alt+F` to move by word and `Ctrl+P` for project search. The `openSearch` action (no default key) also opens project search and can be bound; the default `globalSearch` name does nothing.
 
 > `Ctrl+A` previously opened the model picker; it now moves the cursor to the line start (matching Emacs/readline). The model picker is now `Ctrl+Shift+A`. Old `keybindings.json` files are auto-migrated.
 
 ### Fixed Keys
 
-These keys are hard-coded in the prompt and have no action names, so they cannot be remapped. A `keybindings.json` binding on the same key (other than `F1`) takes precedence over them.
+These keys are hard-coded in the prompt and have no action names, so they cannot be remapped. A `keybindings.json` binding on the same key (other than `F1` and `Shift+Insert`) takes precedence over them.
 
 | Key | Effect |
 |-----|--------|
@@ -113,7 +113,7 @@ Tool permission prompts handle their keys directly; these keys cannot be rebound
 | `1`-`9` | Select the option with that number |
 | `Up` / `Down` | Move the selection |
 | `Enter` | Choose the selected option |
-| `Escape` | Close the prompt |
+| `Escape` | Deny without a reason (Sandbox Denied: keep the denial) |
 
 Opaque Bash lines (substitutions, heredocs, `eval`, `sudo`, `bash -c` and similar) offer only `y`, `Y` and `n`. A **Sandbox Denied** prompt uses `y` (rerun outside the sandbox once), `Y` (this session), `P` (always for commands starting with this word) and `n`. See [The permission dialog](configuration.md#the-permission-dialog) and [Shell Sandbox](configuration.md#shell-sandbox).
 
@@ -125,7 +125,7 @@ Each binding belongs to a context. When a key is pressed, Claurst looks at bindi
 
 | Context | Takes effect |
 |---------|--------------|
-| `Global` | Always |
+| `Global` | Merged into every lookup (same situations as `Chat`) |
 | `Chat` | When the prompt has focus and no dialog or overlay is open |
 
 In practice only `Global` and `Chat` bindings take effect. The other accepted names (`Autocomplete`, `Confirmation`, `Help`, `Transcript`, `HistorySearch`, `Task`, `ThemePicker`, `Settings`, `Tabs`, `Attachments`, `Footer`, `MessageSelector`, `DiffDialog`, `ModelPicker`, `Select`, `Plugin`) carry default bindings, but every dialog, picker and overlay handles its own keys before the binding table is consulted, so bindings in those contexts are never used.
@@ -136,7 +136,7 @@ In practice only `Global` and `Chat` bindings take effect. The other accepted na
 
 ### Via /keybindings command
 
-`/keybindings` opens `~/.claurst/keybindings.json` in your editor. If the file does not exist it is first created from the default bindings, grouped by context:
+`/keybindings` opens `~/.claurst/keybindings.json` with the system's default application for the file (not `$EDITOR`). If the file does not exist it is first created from the default bindings, grouped by context:
 
 ```
 /keybindings
@@ -255,11 +255,15 @@ These keys are handled by fixed code in the TUI. If any of them appear as a `cho
 
 So overriding a protected key is a no-op in behavior, but you also get a clear signal in the logs that the binding was rejected.
 
+The check compares the lowercased chord string literally against `ctrl+c`, `ctrl+d` and `ctrl+m`, so another spelling such as `control+c` is not filtered and does rebind the key (a known bug).
+
+The action names behind the fixed keys still exist and can be bound to other chords: `interrupt` (cancel the running turn, or clear the prompt and exit on a second press within 2 seconds) and `exit` (exit when the prompt is empty).
+
 ---
 
 ## Vim Mode
 
-The prompt editor contains a vim emulation with insert, normal, visual (`v`, `V`, `Ctrl+V`), command-line (`:`) and search (`/`) modes.
+The prompt editor contains a vim emulation with insert, normal, visual (`v`, `V`), command-line (`:`) and search (`/`) modes.
 
 ### Enabling Vim Mode
 

@@ -273,7 +273,7 @@ Print whether the current model supports extended thinking. It changes no settin
 
 ### /effort
 
-Set the reasoning effort level. Without arguments, opens the effort picker; the levels offered depend on the provider and model (from `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultracode`). With an argument, sets the level directly (`normal` is accepted as `medium`). `/effort low` and `/effort high` also set the max output tokens to 4096 and 32768; `/effort normal` restores the default.
+Set the reasoning effort level. Without arguments, opens the effort picker; the levels offered depend on the provider and model (from `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultracode`). With an argument the level is applied (the TUI picker still opens; `normal` is accepted as `medium`). Only `low`, `normal` and `high` adjust the max output tokens (4096 / default / 32768).
 
 ```
 /effort
@@ -367,7 +367,7 @@ In the TUI, opens the settings screen. The text form prints the effective config
 
 ### /keybindings
 
-Open `~/.claurst/keybindings.json` in your editor, creating it from the default bindings if it does not exist. Edits take effect the next time Claurst starts.
+Open `~/.claurst/keybindings.json` with the system's default application for the file (not `$EDITOR`), creating it from the default bindings if it does not exist. Edits take effect the next time Claurst starts.
 
 ```
 /keybindings
@@ -510,7 +510,7 @@ Toggle vim mode in the prompt for this session; `/vim on` and `/vim off` set it 
 
 ### /voice
 
-Toggle voice input. When on, `Alt+V` starts recording and `Alt+V` again stops and transcribes into the prompt. Transcription uses a Whisper-compatible API: `OPENAI_API_KEY` (or `ANTHROPIC_API_KEY` as a fallback key), and `WHISPER_ENDPOINT_URL` to use a local server. The enabled state is saved to `~/.claurst/ui-settings.json` and restored at startup (`CLAURST_VOICE_ENABLED=1` also enables it). There is no text-to-speech.
+Toggle voice input. When on, `Alt+V` starts recording and `Alt+V` again stops and transcribes into the prompt. Transcription uses a Whisper-compatible API: `OPENAI_API_KEY` (or `ANTHROPIC_API_KEY` as a fallback key), and `WHISPER_ENDPOINT_URL` to use a local server. `/voice` toggles voice mode for this session; `/voice on|off` only save the startup state (effective next start); `/voice status` shows it. `CLAURST_VOICE_ENABLED=1` also enables it at startup. There is no text-to-speech.
 
 ```
 /voice
@@ -589,7 +589,7 @@ Revert all file changes made during the most recent assistant turn; same as `/re
 
 ### /revert
 
-Restore the files changed during an assistant turn from the shadow-git snapshot and remove that turn and every later turn from the transcript. Requires git.
+Restore the files changed during an assistant turn from the shadow-git snapshot and move the transcript's active leaf to just before that turn; the reverted turn and later turns are kept on a sibling branch. Requires git.
 
 ```
 /revert           — the most recent turn
@@ -811,7 +811,7 @@ Show the account's plan type and rate-limit tier information.
 
 ### /agents
 
-Open the agents menu: agent definitions and running agents. See [The /agent and /agents Commands](agents.md#the-agent-and-agents-commands).
+Open the agents menu: agent definitions and running agents. `/agents list` prints the definitions (visible outside the TUI menu). See [The /agent and /agents Commands](agents.md#the-agent-and-agents-commands).
 
 ```
 /agents

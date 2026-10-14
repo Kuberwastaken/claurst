@@ -819,7 +819,7 @@ and `api_base` override the corresponding environment variables.
 | `OPENAI_BASE_URL`, `OLLAMA_HOST`, `LM_STUDIO_HOST`, `LLAMA_CPP_HOST`, `MINIMAX_BASE_URL` | Override the base URL of the `openai`, `ollama`, `lmstudio`, `llamacpp` and `minimax` providers. |
 | `CLAURST_PROVIDER` | Active provider. Equivalent to `--provider`. |
 | `CLAURST_API_BASE` | Override the API base URL for the active provider. Equivalent to `--api-base`. |
-| `CLAURST_GOALS` | Set to `0` to disable the goal system (`/goal` command and `GoalCompleteTool`). |
+| `CLAURST_GOALS` | `0` disables the `/goal` commands and the autonomous continuation loop; the `GoalComplete` tool stays registered. |
 | `OPENAI_API_KEY` | API key for the `openai` provider. |
 | `GOOGLE_API_KEY` | API key for the `google` provider. |
 | `GROQ_API_KEY` | API key for the `groq` provider. |
