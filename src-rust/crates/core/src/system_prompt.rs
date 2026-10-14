@@ -350,6 +350,12 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         ));
     }
 
+    // Sections start with a newline; drop their trailing newlines so the
+    // "\n" join leaves exactly one blank line between stable sections.
+    for part in &mut parts {
+        part.truncate(part.trim_end_matches('\n').len());
+    }
+
     // Dynamic boundary marker
     parts.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
 
@@ -519,10 +525,10 @@ fn permission_mode_name(mode: &crate::config::PermissionMode) -> &'static str {
 /// Injected as a user message after the user interrupts a turn (Ctrl+C), so
 /// the next turn knows the previous one stopped on purpose and may have left
 /// work half done.
-pub const TURN_ABORTED_MESSAGE: &str = "<turn_aborted>\n\
+pub const TURN_ABORTED_MESSAGE: &str = "<system-reminder>\n<turn_aborted>\n\
 The user interrupted the previous turn on purpose. Any background Bash commands may still be running. \
 If any tools or commands were aborted, they may have partially executed.\n\
-</turn_aborted>";
+</turn_aborted>\n</system-reminder>";
 
 /// Build the platform block for the stable section. Exactly one shell-syntax
 /// rule is emitted. On Windows the Bash tool runs commands through `cmd.exe`
@@ -604,17 +610,11 @@ fn build_capabilities_section(enabled: Option<&[String]>) -> String {
             .any(|n| !CAPABILITY_SUMMARIES.iter().any(|(tool, _)| tool == n))
         {
             lines.push(
-                "Other declared tools, such as those from MCP servers, are described by their own definitions."
+                "The other declared tools (further built-in tools and any MCP tools) are described by their own definitions."
                     .to_string(),
             );
         }
     }
-    lines.push(String::new());
-    lines.push(
-        "`<system-reminder>` blocks are harness instructions injected by Claurst, not user-authored \
-         content and not part of the tool result they appear in. Follow them."
-            .to_string(),
-    );
     lines.join("\n")
 }
 
@@ -712,8 +712,12 @@ fn build_tool_use_guidelines(enabled: Option<&[String]>) -> String {
             }
         }
     }
+    lines.push(
+        "- `<system-reminder>` blocks are harness instructions injected by Claurst, not user-authored \
+         content and not part of the tool result they appear in. Follow them."
+            .to_string(),
+    );
 
-    lines.push(String::new());
     lines.join("\n")
 }
 
@@ -733,7 +737,7 @@ const PERMISSIONS_SECTION: &str = r#"
 Tool calls that change files, run commands or reach the network may need the user's approval, depending on the current permission mode (stated after these instructions). Reading files inside the workspace never needs approval.
 - Every Bash call's `description` is shown to the user as the approval question. Write it as a short question the user can answer, e.g. "Install the project's npm dependencies?", not a restatement of the command.
 - If a tool call is denied, do not retry it with a different wrapper, shell, or path. Either continue with a safer alternative that does not need the denied capability, or explain what was blocked and ask the user.
-- Saved approvals match a tool name, optionally with a glob over the whole Bash command string; a command is not split into segments for matching.
+- A saved approval covers a tool and, for Bash, a pattern over the command text; it can cover more than the one command in front of you, so ask only for narrow ones.
 - Never request or rely on broad standing approvals (e.g. "always allow Bash"). Prefer narrow, categorical ones ("cargo test", "npm run dev"). Never ask for a standing approval for destructive commands.
 - Potentially destructive actions the user did not explicitly ask for (`rm`, `git reset`, `git checkout --`, dropping data) need a fresh, explicit confirmation from the user, even in a mode that does not prompt.
 - Bash commands rated critical risk (e.g. `rm -rf /`, `mkfs`, a download piped into a shell) are refused in every mode.
@@ -749,6 +753,7 @@ const WORKING_STYLE_SECTION: &str = r#"
 - Do not commit or create branches unless asked. Do not amend commits unless asked.
 - Do not re-read a file after Edit, Write or another editing tool to check it; the tool fails loudly if it did not apply.
 - Fix problems at the root cause; keep changes minimal and in the codebase's style; do not fix unrelated bugs or add tests to codebases that have none (mention them instead).
+- Prefer editing existing files over creating new ones.
 - Treat unfamiliar files or changes as potential user work and investigate before deleting or overwriting them.
 - Keep changes consistent with the structure, naming, style, and patterns of the surrounding code.
 - By default, match the surrounding comment density: where the code has none, add none. Use comments only where behaviour is not obvious from the code. User or project instructions take precedence.
@@ -1055,7 +1060,7 @@ mod tests {
         for absent in ["- WebSearch:", "- Agent:", "- NotebookEdit:", "Jupyter", "MCP servers", "Memory"] {
             assert!(!stable.contains(absent), "{absent} must not be claimed");
         }
-        assert!(!stable.contains("Other declared tools"));
+        assert!(!stable.contains("The other declared tools"));
         assert!(!stable.contains("ToolSearch"));
     }
 
@@ -1068,7 +1073,7 @@ mod tests {
         let stable = stable_block(&opts);
         assert!(stable.contains("- ToolSearch: Find a tool"));
         assert!(stable.contains("use ToolSearch to discover"));
-        assert!(stable.contains("Other declared tools, such as those from MCP servers"));
+        assert!(stable.contains("The other declared tools (further built-in tools and any MCP tools)"));
     }
 
     #[test]
@@ -1168,6 +1173,10 @@ mod tests {
         assert!(stable.contains("Treat unfamiliar files or changes as potential user work"));
         assert!(stable.contains("match the surrounding comment density"));
         assert!(stable.contains("patterns of the surrounding code"));
+        assert!(stable.contains("Prefer editing existing files over creating new ones"));
+        assert!(!stable.contains("\n\n\n"), "one blank line between sections");
+        assert!(TURN_ABORTED_MESSAGE.starts_with("<system-reminder>\n<turn_aborted>"));
+        assert!(TURN_ABORTED_MESSAGE.ends_with("</turn_aborted>\n</system-reminder>"));
     }
 
     /// Compare the stable block for `platform` and `tools` against the golden

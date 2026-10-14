@@ -20,7 +20,12 @@ impl App {
         self.on_new_message();
     }
 
-    pub fn replace_messages(&mut self, messages: Vec<Message>) {
+    pub fn replace_messages(&mut self, mut messages: Vec<Message>) {
+        // Harness notes sent to the model are not part of the visible transcript.
+        messages.retain(|m| {
+            m.role != Role::User
+                || m.get_text() != Some(claurst_core::system_prompt::TURN_ABORTED_MESSAGE)
+        });
         self.messages = messages;
         self.sync_turn_metadata_to_messages();
         self.invalidate_transcript();

@@ -931,7 +931,7 @@ impl Tool for PtyBashTool {
                 },
                 "description": {
                     "type": "string",
-                    "description": "Clear, concise description of what this command does"
+                    "description": "Shown to the user as the approval question: a short question about what this command does, e.g. \"Install the project's npm dependencies?\""
                 },
                 "timeout": {
                     "type": "number",

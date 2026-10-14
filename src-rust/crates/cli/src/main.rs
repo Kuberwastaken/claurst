@@ -533,16 +533,6 @@ async fn main() -> anyhow::Result<()> {
             .api_base = Some(base.clone());
     }
 
-    // --dump-system-prompt fast path
-    if cli.dump_system_prompt {
-        let ctx = ContextBuilder::new(cwd.clone())
-            .disable_claude_mds(config.disable_claude_mds);
-        let sys = ctx.build_system_context().await;
-        let user = ctx.build_user_context().await;
-        println!("{}\n\n{}", sys, user);
-        return Ok(());
-    }
-
     // Build context
     let ctx_builder = ContextBuilder::new(cwd.clone())
         .disable_claude_mds(config.disable_claude_mds);
@@ -561,6 +551,35 @@ async fn main() -> anyhow::Result<()> {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
+
+    // --dump-system-prompt fast path: print the stable and dynamic blocks
+    // assembled the way the first turn of this session would send them.
+    if cli.dump_system_prompt {
+        let opts = claurst_core::system_prompt::SystemPromptOptions {
+            custom_system_prompt: (!system_prompt.is_empty()).then_some(system_prompt),
+            session_context: Some(system_ctx),
+            output_style: config.effective_output_style(),
+            custom_output_style_prompt: config.resolve_output_style_prompt(),
+            working_directory: Some(cwd.display().to_string()),
+            additional_dirs: config
+                .additional_dirs
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect(),
+            enabled_tools: Some(
+                claurst_tools::all_tools()
+                    .iter()
+                    .map(|tool| tool.name().to_string())
+                    .collect(),
+            ),
+            permission_mode: Some(config.permission_mode.clone()),
+            ..Default::default()
+        };
+        let prompt = claurst_core::system_prompt::build_system_prompt(&opts);
+        let (stable, dynamic) = claurst_core::system_prompt::split_at_dynamic_boundary(&prompt);
+        println!("{stable}\n\n{dynamic}");
+        return Ok(());
+    }
 
     // Initialize API client.
     // Try config/env first; fall back to saved OAuth tokens.
