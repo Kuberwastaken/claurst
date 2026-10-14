@@ -1048,6 +1048,9 @@ pub async fn run_query_loop(
                     // Accumulate reasoning/thinking content for providers like
                     // DeepSeek that require reasoning_content to be sent back.
                     let mut thinking_chunks: Vec<String> = Vec::new();
+                    // Opaque reasoning state (Codex `encrypted_content`)
+                    // that must be replayed on the next request.
+                    let mut redacted_thinking_blocks: Vec<ContentBlock> = Vec::new();
                     // tool_call_blocks: index → (id, name, accumulated_json, thought_signature)
                     // thought_signature carries Gemini's opaque per-call signature
                     // through stream assembly so it survives into the persisted
@@ -1105,6 +1108,12 @@ pub async fn run_query_loop(
                                                 content_block: ContentBlock::ToolUse { id, name, thought_signature, .. },
                                             } => {
                                                 tool_call_blocks.insert(*index, (id.clone(), name.clone(), String::new(), thought_signature.clone()));
+                                            }
+                                            claurst_api::StreamEvent::ContentBlockStart {
+                                                content_block: block @ ContentBlock::RedactedThinking { .. },
+                                                ..
+                                            } => {
+                                                redacted_thinking_blocks.push(block.clone());
                                             }
                                             claurst_api::StreamEvent::TextDelta { text, .. } => {
                                                 text_chunks.push(text.clone());
@@ -1215,6 +1224,7 @@ pub async fn run_query_loop(
                             signature: String::new(),
                         });
                     }
+                    content_blocks.append(&mut redacted_thinking_blocks);
 
                     let combined_text = text_chunks.join("");
                     if !combined_text.is_empty() {

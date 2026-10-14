@@ -309,6 +309,16 @@ impl CodexProvider {
                 first["role"] = json!("developer");
             }
         }
+        // The official client only replays reasoning items that carry
+        // `encrypted_content`; a summary-only item cannot be resumed by a
+        // store:false backend, so drop those.
+        input.retain(|item| {
+            item.get("type").and_then(Value::as_str) != Some("reasoning")
+                || item
+                    .get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|data| !data.is_empty())
+        });
 
         let tools: Vec<Value> = request
             .tools
@@ -525,6 +535,15 @@ impl CodexProvider {
                             });
                         }
                     }
+                    if let Some(data) = item
+                        .get("encrypted_content")
+                        .and_then(|v| v.as_str())
+                        .filter(|data| !data.is_empty())
+                    {
+                        content.push(ContentBlock::RedactedThinking {
+                            data: data.to_string(),
+                        });
+                    }
                 }
                 Some("function_call") => {
                     has_tool_call = true;
@@ -595,43 +614,22 @@ impl CodexProvider {
         })
     }
 
-}
-
-// ---------------------------------------------------------------------------
-// LlmProvider impl
-// ---------------------------------------------------------------------------
-
-#[async_trait]
-impl LlmProvider for CodexProvider {
-    fn id(&self) -> &ProviderId {
-        &self.id
-    }
-
-    fn name(&self) -> &str {
-        "OpenAI Codex"
-    }
-
-    async fn create_message(
-        &self,
-        request: ProviderRequest,
-    ) -> Result<ProviderResponse, ProviderError> {
-        self.send_responses_request(&request).await
-    }
-
-    async fn create_message_stream(
-        &self,
-        request: ProviderRequest,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
+    /// Decode a Codex Responses SSE byte stream into `StreamEvent`s.
+    /// `rate_limits` (parsed from the response headers) is emitted first.
+    fn sse_events<S, B, E>(
+        mut byte_stream: S,
+        provider_id: ProviderId,
+        rate_limits: Option<StreamEvent>,
+    ) -> impl Stream<Item = Result<StreamEvent, ProviderError>> + Send
+    where
+        S: Stream<Item = Result<B, E>> + Unpin + Send,
+        B: AsRef<[u8]> + Send,
+        E: std::fmt::Display + Send,
     {
-        let resp = self.send_responses_streaming_request(&request).await?;
-        let provider_id = self.id.clone();
-        let rate_limits = Self::parse_rate_limits(resp.headers());
-
-        let s = stream! {
+        stream! {
             if let Some(event) = rate_limits {
                 yield Ok(event);
             }
-            let mut byte_stream = resp.bytes_stream();
             let mut leftover = String::new();
             let mut current_event = String::new();
             let mut current_data: Vec<String> = Vec::new();
@@ -654,7 +652,7 @@ impl LlmProvider for CodexProvider {
                     }
                 };
 
-                let text = String::from_utf8_lossy(&chunk);
+                let text = String::from_utf8_lossy(chunk.as_ref());
                 let combined = if leftover.is_empty() {
                     text.to_string()
                 } else {
@@ -849,12 +847,72 @@ impl LlmProvider for CodexProvider {
                                     });
                                 }
                             }
+                            "response.reasoning_summary_part.added" => {
+                                // Separate consecutive summary parts like the
+                                // official client's transcript does.
+                                let summary_index = json_val
+                                    .get("summary_index")
+                                    .and_then(|value| value.as_u64())
+                                    .unwrap_or(0);
+                                if summary_index > 0 {
+                                    let output_index = json_val
+                                        .get("output_index")
+                                        .and_then(|value| value.as_u64())
+                                        .unwrap_or(0) as usize;
+                                    yield Ok(StreamEvent::ThinkingDelta {
+                                        index: output_index,
+                                        thinking: "\n\n".to_string(),
+                                    });
+                                }
+                            }
+                            "response.reasoning_summary_text.delta" => {
+                                let output_index = json_val
+                                    .get("output_index")
+                                    .and_then(|value| value.as_u64())
+                                    .unwrap_or(0) as usize;
+                                let delta = json_val
+                                    .get("delta")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or("");
+                                if !message_started {
+                                    yield Ok(StreamEvent::MessageStart {
+                                        id: message_id.clone(),
+                                        model: model_name.clone(),
+                                        usage: UsageInfo::default(),
+                                    });
+                                    message_started = true;
+                                }
+                                if !delta.is_empty() {
+                                    yield Ok(StreamEvent::ThinkingDelta {
+                                        index: output_index,
+                                        thinking: delta.to_string(),
+                                    });
+                                }
+                            }
                             "response.output_item.done" => {
                                 let output_index = json_val
                                     .get("output_index")
                                     .and_then(|value| value.as_u64())
                                     .unwrap_or(0) as usize;
                                 if open_blocks.remove(&output_index) {
+                                    yield Ok(StreamEvent::ContentBlockStop { index: output_index });
+                                }
+                                // Carry the reasoning item's encrypted state so
+                                // the next (stateless, store:false) request can
+                                // replay it and the model keeps its chain.
+                                if let Some(data) = json_val
+                                    .get("item")
+                                    .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("reasoning"))
+                                    .and_then(|item| item.get("encrypted_content"))
+                                    .and_then(|value| value.as_str())
+                                    .filter(|data| !data.is_empty())
+                                {
+                                    yield Ok(StreamEvent::ContentBlockStart {
+                                        index: output_index,
+                                        content_block: claurst_core::types::ContentBlock::RedactedThinking {
+                                            data: data.to_string(),
+                                        },
+                                    });
                                     yield Ok(StreamEvent::ContentBlockStop { index: output_index });
                                 }
                             }
@@ -956,9 +1014,43 @@ impl LlmProvider for CodexProvider {
                 message: "Codex stream ended before response.completed".to_string(),
                 partial_response: None,
             });
-        };
+        }
+    }
+}
 
-        Ok(Box::pin(s))
+// ---------------------------------------------------------------------------
+// LlmProvider impl
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl LlmProvider for CodexProvider {
+    fn id(&self) -> &ProviderId {
+        &self.id
+    }
+
+    fn name(&self) -> &str {
+        "OpenAI Codex"
+    }
+
+    async fn create_message(
+        &self,
+        request: ProviderRequest,
+    ) -> Result<ProviderResponse, ProviderError> {
+        self.send_responses_request(&request).await
+    }
+
+    async fn create_message_stream(
+        &self,
+        request: ProviderRequest,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
+    {
+        let resp = self.send_responses_streaming_request(&request).await?;
+        let rate_limits = Self::parse_rate_limits(resp.headers());
+        Ok(Box::pin(Self::sse_events(
+            resp.bytes_stream(),
+            self.id.clone(),
+            rate_limits,
+        )))
     }
 
     async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
@@ -1062,6 +1154,130 @@ mod tests {
         req.provider_options = json!({ "prompt_cache_key": "session-abc" });
         let body = CodexProvider::build_responses_body(&req);
         assert_eq!(body["prompt_cache_key"], "session-abc");
+    }
+
+    #[tokio::test]
+    async fn sse_fixture_yields_reasoning_summary_encrypted_state_and_tool_call() {
+        use claurst_core::types::ContentBlock;
+        let fixture = include_str!("fixtures/codex_reasoning_tool_call.sse");
+        // Odd-sized chunks exercise the partial-line carry-over.
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> = fixture
+            .as_bytes()
+            .chunks(37)
+            .map(|chunk| Ok(chunk.to_vec()))
+            .collect();
+        let rate_limits = Some(StreamEvent::RateLimits {
+            primary_used_percent: Some(10.0),
+            secondary_used_percent: None,
+        });
+        let events: Vec<StreamEvent> = CodexProvider::sse_events(
+            futures::stream::iter(chunks),
+            ProviderId::new(ProviderId::CODEX),
+            rate_limits,
+        )
+        .map(|event| event.expect("fixture stream has no errors"))
+        .collect()
+        .await;
+
+        assert!(matches!(events.first(), Some(StreamEvent::RateLimits { .. })));
+        assert!(matches!(events.last(), Some(StreamEvent::MessageStop)));
+
+        let thinking: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ThinkingDelta { thinking, .. } => Some(thinking.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking, "**Inspecting the repo**\n\nListing files first.");
+
+        let encrypted: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockStart {
+                    content_block: ContentBlock::RedactedThinking { data },
+                    ..
+                } => Some(data.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(encrypted, ["gAAAAABo-ENCRYPTED-REASONING-STATE=="]);
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockStart {
+                index: 1,
+                content_block: ContentBlock::ToolUse { id, name, .. },
+            } if id == "call_42" && name == "Bash"
+        )));
+        let args: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::InputJsonDelta { partial_json, .. } => Some(partial_json.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(args, r#"{"command":"ls"}"#);
+
+        let Some(StreamEvent::MessageDelta {
+            stop_reason: Some(StopReason::ToolUse),
+            usage: Some(usage),
+        }) = events.iter().rev().nth(1)
+        else {
+            panic!("expected a tool-use MessageDelta before MessageStop");
+        };
+        assert_eq!(usage.input_tokens, 1200);
+        assert_eq!(usage.cache_read_input_tokens, 1024);
+    }
+
+    #[test]
+    fn body_replays_encrypted_reasoning_and_drops_summary_only_items() {
+        use claurst_core::types::{ContentBlock, Message, ToolResultContent};
+        let mut req = request(None);
+        req.messages = vec![
+            Message::user("list files"),
+            Message::assistant_blocks(vec![
+                ContentBlock::Thinking {
+                    thinking: "Listing files first.".into(),
+                    signature: String::new(),
+                },
+                ContentBlock::RedactedThinking {
+                    data: "ENC-1".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call_42".into(),
+                    name: "Bash".into(),
+                    input: json!({ "command": "ls" }),
+                    thought_signature: None,
+                },
+            ]),
+            Message::user_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "call_42".into(),
+                content: ToolResultContent::Text("a.rs".into()),
+                is_error: None,
+            }]),
+            Message::assistant_blocks(vec![
+                ContentBlock::Thinking {
+                    thinking: "summary without state".into(),
+                    signature: String::new(),
+                },
+                ContentBlock::Text {
+                    text: "done".into(),
+                },
+            ]),
+        ];
+        let body = CodexProvider::build_responses_body(&req);
+        let input = body["input"].as_array().unwrap();
+        let types: Vec<&str> = input
+            .iter()
+            .map(|item| item["type"].as_str().or(item["role"].as_str()).unwrap_or(""))
+            .collect();
+        assert_eq!(
+            types,
+            ["user", "reasoning", "function_call", "function_call_output", "assistant"]
+        );
+        assert_eq!(input[1]["encrypted_content"], "ENC-1");
+        assert_eq!(input[1]["summary"][0]["text"], "Listing files first.");
     }
 
     #[test]

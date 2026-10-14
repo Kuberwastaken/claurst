@@ -361,7 +361,8 @@ impl CopilotProvider {
                                     }));
                                 }
                             };
-                        for block in blocks {
+                        let mut blocks = blocks.iter().peekable();
+                        while let Some(block) = blocks.next() {
                             match block {
                                 ContentBlock::Text { text } => message_parts.push(json!({
                                     "type": "output_text",
@@ -384,13 +385,23 @@ impl CopilotProvider {
                                 }
                                 ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
                                     flush_assistant_content(&mut input, &mut message_parts);
-                                    input.push(json!({
+                                    let mut item = json!({
                                         "type": "reasoning",
                                         "summary": [{
                                             "type": "summary_text",
                                             "text": thinking,
                                         }],
-                                    }));
+                                    });
+                                    // A summary followed by its encrypted state
+                                    // (Codex stores them as Thinking +
+                                    // RedactedThinking) is one reasoning item.
+                                    if let Some(ContentBlock::RedactedThinking { data }) = blocks.peek() {
+                                        if !data.is_empty() {
+                                            item["encrypted_content"] = json!(data);
+                                            blocks.next();
+                                        }
+                                    }
+                                    input.push(item);
                                 }
                                 ContentBlock::RedactedThinking { data } if !data.is_empty() => {
                                     flush_assistant_content(&mut input, &mut message_parts);
