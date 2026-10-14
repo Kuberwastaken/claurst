@@ -161,13 +161,45 @@ Edits within the same file are applied in order. If any individual edit fails (s
 
 **Permission level:** Write
 
-Apply a unified diff patch to one or more files. Accepts standard `diff -u` / `git diff` format patches.
+Apply a patch to one or more files. Two formats are accepted, detected from the first line:
+
+- **Envelope** (the format OpenAI's Codex models are trained on), starting with `*** Begin Patch`.
+- **Unified diff**, as produced by `git diff` or `diff -u`.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `patch` | string | yes | Unified diff patch text |
+| `patch` | string | yes | Envelope patch or unified diff |
+| `dry_run` | boolean | no | Validate the patch and report what it would change without writing (default: false) |
 
-Useful when the model needs to express changes in diff format rather than as string replacements.
+**Envelope format.**
+
+```
+*** Begin Patch
+*** Add File: docs/new.md
++first line of the new file
+*** Update File: src/app.py
+*** Move to: src/main.py
+@@ def main():
+-    print("hi")
++    print("hello")
+*** Delete File: old.txt
+*** End Patch
+```
+
+- `*** Add File: <path>` creates (or overwrites) a file; every following line starts with `+`.
+- `*** Delete File: <path>` deletes a file.
+- `*** Update File: <path>` edits a file, optionally renaming it with `*** Move to: <path>` on the next line. Its changes are `@@` sections of ` ` context, `-` removed and `+` added lines. `@@ <line>` first finds that anchor line (a class or function header, for example) and looks for the section after it. Sections are searched in order from where the previous one ended. `*** End of File` after a section means its lines end the file. An update always leaves a trailing newline.
+- A section's lines are matched exactly first, then ignoring trailing whitespace, then ignoring leading and trailing whitespace, then with typographic dashes, quotes and spaces folded to ASCII. A non-exact match that fits more than one place is an error; add context lines or an `@@` anchor so it matches once.
+- Each line keeps its own line ending (CRLF, LF or CR); inserted lines use the file's first line ending. A UTF-8 BOM is kept.
+- On success the result lists the files as `A` (added), `M` (modified or moved) and `D` (deleted).
+
+**Unified diffs.** Each hunk's body is delimited by the line counts in its `@@ -l,s +l,s @@` header, as in `git apply`, so removed lines that start with `--`, added lines that start with `++`, and empty context lines whose leading space was stripped all stay in the hunk. A header whose counts do not match its lines is an error. `--- /dev/null` creates the file (it must not exist) and `+++ /dev/null` deletes it (its hunks must remove every line). Later hunks are located from their header line shifted by the earlier hunks' net change.
+
+**Writes and permissions.** Every change is computed before anything is written; if one fails, no file is touched. Each path the patch writes, including a move destination, gets the same permission check as `FileEditTool` on that path. All paths are locked for the whole call, in the same sorted order as the other file-editing tools, so concurrent edits cannot interleave or deadlock. Updates and deletes go through the file handle that was checked, so a symlink swapped in afterwards cannot redirect them.
+
+**Codex models.** With the `codex` provider, gpt-5 and later models get this tool as `apply_patch`, a freeform tool constrained by the official Lark grammar, as the official Codex client sends it. Their raw patch text arrives as the `patch` input. Other providers and models see the JSON tool above.
+
+**Shell heredocs.** A `BashTool` command that is only `apply_patch <<'EOF'` followed by an envelope patch and `EOF` (or `applypatch`, with `<<EOF` or `<<"EOF"`, optionally after `cd <dir> &&`) is applied by this tool from the shell's current directory instead of being run, with the same per-path permission checks. A command that does anything else runs normally.
 
 ---
 
