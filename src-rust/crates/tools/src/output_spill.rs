@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::time::{Duration, SystemTime};
@@ -87,13 +87,20 @@ impl OutputAccumulator {
                 .map_err(|e| debug!(path = %path.display(), error = %e, "spill file unavailable"))
                 .ok();
         }
-        let evicted: Vec<u8> = self.tail.drain(..excess).collect();
         if let Some(spill) = self.spill.as_mut() {
-            if let Err(e) = spill.write(&evicted) {
+            // The evicted bytes are the front of the ring, possibly split
+            // across its two slices.
+            let (front, back) = self.tail.as_slices();
+            let in_front = excess.min(front.len());
+            let written = spill
+                .write(&front[..in_front])
+                .and_then(|()| spill.write(&back[..excess - in_front]));
+            if let Err(e) = written {
                 debug!(path = %spill.path.display(), error = %e, "spill write failed");
                 self.spill = None;
             }
         }
+        self.tail.drain(..excess);
         self.omitted += excess as u64;
     }
 
@@ -123,7 +130,7 @@ impl OutputAccumulator {
 #[derive(Debug)]
 pub(crate) struct SpillFile {
     path: PathBuf,
-    file: File,
+    file: BufWriter<File>,
 }
 
 impl SpillFile {
@@ -152,7 +159,7 @@ impl SpillFile {
         }
         Ok(Self {
             path: path.to_path_buf(),
-            file: options.open(path)?,
+            file: BufWriter::new(options.open(path)?),
         })
     }
 

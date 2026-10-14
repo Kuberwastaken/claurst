@@ -19,10 +19,9 @@ use crate::output_spill::{
     Captured, OutputAccumulator, RAW_HEAD_BYTES, RAW_TAIL_BYTES, finish_spill, spill_bytes,
     with_full_output,
 };
-use std::path::Path;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -48,8 +47,9 @@ pub struct PtyBashTool;
 /// Environment every shell child gets (#442): pagers are disabled so
 /// `git log`, `git diff` or `man` cannot hang in `less`, git never prompts for
 /// credentials on the terminal, and scripts can tell they run under an agent.
-/// On the PTY path these are applied before the restored session env, so an
-/// explicit `export` from an earlier call still wins.
+/// On the PTY path these are forced after the restored session env: the PTY
+/// has no stdin writer, so an earlier `export PAGER=less` would only hang the
+/// next `git log` until timeout (codex forces them the same way).
 const CHILD_ENV: [(&str, &str); 6] = [
     ("PAGER", "cat"),
     ("GIT_PAGER", "cat"),
@@ -145,7 +145,7 @@ cd '{cwd}'
 set +e
 {user_cmd}
 __CC_EXIT_CODE=$?
-echo '{sentinel}'
+printf '\n%s\n' '{sentinel}'
 pwd
 env | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' || true
 exit $__CC_EXIT_CODE
@@ -156,15 +156,20 @@ exit $__CC_EXIT_CODE
     )
 }
 
-/// Set [`CHILD_ENV`] on a PTY child, plus [`DEFAULT_TERM`] when it inherited no
-/// `TERM` (#442).
+/// Build the PTY child's environment (#442): [`DEFAULT_TERM`] when no `TERM`
+/// is inherited, then the restored session env (which may set `TERM`), then
+/// [`CHILD_ENV`], which always wins.
 #[cfg(unix)]
-fn apply_child_env_defaults(cmd: &mut portable_pty::CommandBuilder) {
-    for (key, value) in CHILD_ENV {
-        cmd.env(key, value);
-    }
+fn apply_child_env(
+    cmd: &mut portable_pty::CommandBuilder,
+    restored: &HashMap<String, String>,
+) {
     if cmd.get_env("TERM").is_none() {
         cmd.env("TERM", DEFAULT_TERM);
+    }
+    apply_restored_env(cmd, restored);
+    for (key, value) in CHILD_ENV {
+        cmd.env(key, value);
     }
 }
 
@@ -262,8 +267,7 @@ async fn run_in_background(
                                 }
                             },
                         };
-                        full.push(line.as_bytes());
-                        full.push(b"\n");
+                        full.push(format!("{line}\n").as_bytes());
                         global_registry().append_output(&task_id_clone, &line);
                     }
                     let spilled = match full.finish() {
@@ -476,9 +480,8 @@ async fn run_in_pty(
     let mut cmd = CommandBuilder::new("bash");
     cmd.args(["-c", script]);
     cmd.cwd(working_dir);
-    apply_child_env_defaults(&mut cmd);
     // Restored shell vars go through the child's ENVIRONMENT, never its argv (#211).
-    apply_restored_env(&mut cmd, env_vars);
+    apply_child_env(&mut cmd, env_vars);
 
     let child = match pair.slave.spawn_command(cmd) {
         Ok(c) => c,
@@ -642,20 +645,37 @@ fn drive_pty_child(
 
 /// Split raw PTY output at the wrapper's shell-state sentinel: returns the
 /// user's output and the state lines that follow the sentinel (`pwd`, then the
-/// `env` dump). The sentinel must sit on a line of its own; the last such line
-/// wins. Works on raw bytes so it also applies to a retained tail (#442).
+/// `env` dump). Works on raw bytes so it also applies to a retained tail (#442).
+///
+/// The sentinel line counts when nothing but escape sequences and whitespace
+/// precede it since the last `\n` or `\r` (a spinner's `\r\x1b[K` or a
+/// reset-on-exit `\x1b[0m` must not hide it) and a line ending or the end of
+/// the stream follows; the last such line wins. The wrapper prints a newline
+/// before the sentinel so output without a trailing newline cannot glue onto
+/// it; one trailing line ending is dropped from the user's output to undo that.
 #[cfg(unix)]
 fn split_state_block(raw: &[u8]) -> (&[u8], Vec<String>) {
     let needle = SHELL_STATE_SENTINEL.as_bytes();
     let mut end = raw.len();
     while let Some(pos) = raw[..end].windows(needle.len()).rposition(|w| w == needle) {
+        let line_start = raw[..pos]
+            .iter()
+            .rposition(|&b| b == b'\n' || b == b'\r')
+            .map_or(0, |i| i + 1);
         let rest = &raw[pos + needle.len()..];
-        let own_line = (pos == 0 || raw[pos - 1] == b'\n')
+        let own_line = strip_ansi(&String::from_utf8_lossy(&raw[line_start..pos]))
+            .trim()
+            .is_empty()
             && (rest.is_empty() || rest.starts_with(b"\n") || rest.starts_with(b"\r\n"));
         if own_line {
             let state = strip_ansi(&String::from_utf8_lossy(rest));
+            let user = &raw[..line_start];
+            let user = user
+                .strip_suffix(b"\r\n")
+                .or_else(|| user.strip_suffix(b"\n"))
+                .unwrap_or(user);
             // `rest` opens with the sentinel line's own line ending; skip it.
-            return (&raw[..pos], state.lines().skip(1).map(str::to_string).collect());
+            return (user, state.lines().skip(1).map(str::to_string).collect());
         }
         end = pos + needle.len() - 1;
     }
@@ -888,8 +908,8 @@ impl Tool for PtyBashTool {
 
     fn description(&self) -> &str {
         "Executes a given bash command in a real terminal (PTY) and returns its output. \
-         The working directory and exported variables persist between commands. Colors are \
-         stripped and pagers are disabled, so git and man never wait for input. Large output \
+         The working directory and exported variables persist between commands. Pagers are \
+         disabled, so git and man never wait for input. Large output \
          is cut to its first and last lines and the full output is saved to a file named in a \
          trailing `Full output: <path>` line; read that file with offset/limit instead of \
          piping through `| head` or `| tail`. Do not chain unrelated commands with separators \
@@ -1169,6 +1189,52 @@ mod tests {
         assert_eq!(state, vec!["/tmp".to_string(), "FOO=bar".to_string()]);
     }
 
+    /// #442 review: escape sequences or a carriage return before the sentinel
+    /// (spinner cleanup, colour reset on exit) must not hide the state block.
+    #[test]
+    fn render_finds_sentinel_after_escape_sequences() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill = dir.path().join("o.txt");
+        for raw in [
+            format!("busy\r\x1b[K{SHELL_STATE_SENTINEL}\r\n/tmp\r\n"),
+            format!("done\x1b[0m\r\n\x1b[?25h {SHELL_STATE_SENTINEL}\r\n/tmp\r\n"),
+        ] {
+            let (output, state) = render_pty_output(Captured::Complete(raw.into_bytes()), &spill);
+            assert_eq!(state, vec!["/tmp".to_string()]);
+            assert!(!output.contains(SHELL_STATE_SENTINEL), "{output:?}");
+        }
+    }
+
+    /// The newline the wrapper prints before the sentinel keeps output without
+    /// a trailing newline apart from it, and is not shown to the model.
+    #[tokio::test]
+    async fn output_without_trailing_newline_keeps_shell_state() {
+        let state = parking_lot::Mutex::new(ShellState::new());
+        let spill_dir = tempfile::tempdir().unwrap();
+        let result = run_pty_foreground(
+            "cd / && printf foo",
+            &state,
+            &std::env::temp_dir(),
+            Duration::from_secs(30),
+            30_000,
+            spill_dir.path(),
+        )
+        .await;
+        assert_eq!(result.content, "foo");
+        assert_eq!(state.lock().cwd, Some(PathBuf::from("/")));
+
+        let result = run_pty_foreground(
+            "printf 'a\\n\\n'",
+            &state,
+            &std::env::temp_dir(),
+            Duration::from_secs(30),
+            30_000,
+            spill_dir.path(),
+        )
+        .await;
+        assert_eq!(result.content, "a\n");
+    }
+
     /// A sentinel embedded in a line of user output is not the state block.
     #[test]
     fn render_ignores_sentinel_inside_a_line() {
@@ -1198,21 +1264,64 @@ mod tests {
         assert_eq!(state, vec!["/tmp".to_string()]);
     }
 
-    /// #442: TERM is filled in only when the child would otherwise have none.
+    /// #442: TERM is filled in only when the child would otherwise have none,
+    /// and the restored session env may override it; the pager / prompt vars
+    /// are forced even over a restored `export PAGER=less`.
     #[test]
-    fn child_env_defaults_keep_an_inherited_term() {
+    fn child_env_forces_pagers_and_defaults_term() {
         use portable_pty::CommandBuilder;
 
         let mut cmd = CommandBuilder::new("bash");
         cmd.env_remove("TERM");
-        apply_child_env_defaults(&mut cmd);
+        apply_child_env(&mut cmd, &HashMap::new());
         assert_eq!(cmd.get_env("TERM"), Some(OsStr::new(DEFAULT_TERM)));
         assert_eq!(cmd.get_env("GIT_PAGER"), Some(OsStr::new("cat")));
 
         let mut cmd = CommandBuilder::new("bash");
         cmd.env("TERM", "xterm-256color");
-        apply_child_env_defaults(&mut cmd);
+        apply_child_env(&mut cmd, &HashMap::new());
         assert_eq!(cmd.get_env("TERM"), Some(OsStr::new("xterm-256color")));
+
+        let restored: HashMap<String, String> = [
+            ("TERM", "vt100"),
+            ("PAGER", "less"),
+            ("GIT_PAGER", "less"),
+            ("GIT_TERMINAL_PROMPT", "1"),
+            ("SECRET", "kept"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let mut cmd = CommandBuilder::new("bash");
+        apply_child_env(&mut cmd, &restored);
+        assert_eq!(cmd.get_env("TERM"), Some(OsStr::new("vt100")));
+        assert_eq!(cmd.get_env("PAGER"), Some(OsStr::new("cat")));
+        assert_eq!(cmd.get_env("GIT_PAGER"), Some(OsStr::new("cat")));
+        assert_eq!(cmd.get_env("GIT_TERMINAL_PROMPT"), Some(OsStr::new("0")));
+        assert_eq!(cmd.get_env("SECRET"), Some(OsStr::new("kept")));
+    }
+
+    /// #442 review: a model `export PAGER=less` does not re-enable paging on
+    /// the next call.
+    #[tokio::test]
+    async fn exported_pager_does_not_survive_into_next_call() {
+        let state = parking_lot::Mutex::new(ShellState::new());
+        let spill_dir = tempfile::tempdir().unwrap();
+        for command in ["export PAGER=less GIT_PAGER=less", "echo \"$PAGER $GIT_PAGER\""] {
+            let result = run_pty_foreground(
+                command,
+                &state,
+                &std::env::temp_dir(),
+                Duration::from_secs(30),
+                30_000,
+                spill_dir.path(),
+            )
+            .await;
+            assert!(!result.is_error, "{}", result.content);
+            if command.starts_with("echo") {
+                assert_eq!(result.content, "cat cat");
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
