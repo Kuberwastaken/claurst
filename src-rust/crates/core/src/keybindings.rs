@@ -121,6 +121,7 @@ fn normalize_key(k: &str) -> String {
         "pageup" | "pgup" => "pageup".to_string(),
         "pagedown" | "pgdn" | "pgdown" => "pagedown".to_string(),
         "home" => "home".to_string(),
+        "ins" | "insert" => "insert".to_string(),
         "end" => "end".to_string(),
         "tab" => "tab".to_string(),
         k => k.to_string(),
@@ -705,6 +706,39 @@ mod tests {
     fn test_parse_keystroke_empty_returns_none() {
         assert!(parse_keystroke("ctrl+").is_none());
         assert!(parse_keystroke("").is_none());
+    }
+
+    #[test]
+    fn test_parse_keystroke_insert_aliases() {
+        // #495: `insert` (used by Shift+Insert) had no key-name mapping, so
+        // the shell-level binding table could never reference it.
+        let ks = parse_keystroke("shift+insert").unwrap();
+        assert_eq!(ks.key, "insert");
+        assert!(ks.shift);
+        let alias = parse_keystroke("ins").unwrap();
+        assert_eq!(alias.key, "insert");
+    }
+
+    #[test]
+    fn test_resolver_reaches_shift_insert_binding() {
+        // A Shift+Insert binding must resolve now that the key name is wired
+        // (previously no lookup ever produced the "insert" key name).
+        let user = UserKeybindings::from_json_str(
+            r#"{
+  "bindings": [
+    {
+      "context": "Chat",
+      "bindings": {
+        "shift+insert": "openHelp"
+      }
+    }
+  ]
+}"#,
+        );
+        let mut resolver = KeybindingResolver::new(&user);
+        let ks = parse_keystroke("shift+insert").unwrap();
+        let result = resolver.process(ks, &KeyContext::Chat);
+        assert!(matches!(result, KeybindingResult::Action(ref a) if a == "openHelp"));
     }
 
     #[test]

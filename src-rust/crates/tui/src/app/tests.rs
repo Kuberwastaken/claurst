@@ -864,6 +864,22 @@ use super::types::{ContextMenuItem, ContextMenuState};
     }
 
     #[test]
+    fn test_key_event_to_keystroke_maps_insert_key_name() {
+        // Shift+Insert must reach the binding table as the "insert" key name
+        // with the SHIFT flag preserved (issue #495); before the fix the two
+        // keys returned no keystroke at all.
+        let ks = key_event_to_keystroke(&press_key(KeyCode::Insert, KeyModifiers::SHIFT))
+            .expect("keystroke");
+        assert_eq!(ks.key, "insert");
+        assert!(ks.shift);
+        assert!(!ks.ctrl);
+
+        let ks = key_event_to_keystroke(&press_key(KeyCode::Insert, KeyModifiers::NONE))
+            .expect("keystroke");
+        assert_eq!(ks.key, "insert");
+    }
+
+    #[test]
     fn test_normalize_layout_shortcut_key_rewrites_pure_ctrl() {
         // Pure Ctrl + Cyrillic → Latin letter at the same physical position.
         let out = normalize_layout_shortcut_key(press_key(

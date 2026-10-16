@@ -77,13 +77,13 @@ These bindings are active when focus is in the chat input field.
 
 `Shift+Tab` (`reverseIndent`) cycles the permission mode (Default, Accept edits, Bypass permissions, back to Default; Plan goes to Default); it does not remove indentation. Most terminals send `Ctrl+I` as `Tab`, so `historyNext` on `Ctrl+I` only fires when the terminal reports it separately (kitty keyboard protocol).
 
-The defaults also bind `Ctrl+Left` / `Ctrl+Right` (`moveWordBackward` / `moveWordForward`), `Ctrl+F` (`findInMessage`), `Ctrl+Shift+F` (`globalSearch`), `Ctrl+]` (`findNext`), `Ctrl+[` (`findPrev`) and `Ctrl+G` (`goToLine`), but these actions are not implemented, so the keys do nothing. `F3` / `Shift+F3` are listed too, but function keys never reach the binding table. Use `Alt+B` / `Alt+F` to move by word and `Ctrl+P` for project search. The `openSearch` action (no default key) also opens project search and can be bound; the default `globalSearch` name does nothing.
+The defaults also bind `Ctrl+Left` / `Ctrl+Right` (`moveWordBackward` / `moveWordForward`), `Ctrl+F` (`findInMessage`), `Ctrl+]` (`findNext`), `Ctrl+[` (`findPrev`) and `Ctrl+G` (`goToLine`), but those actions are not implemented, so the keys do nothing. `F3` / `Shift+F3` are listed too, but function keys never reach the binding table. Use `Alt+B` / `Alt+F` to move by word and `Ctrl+P` for project search. `Ctrl+Shift+F` works: its default action is listed as `globalSearch`, an alias of the `openSearch` action — both names open the project search, so either can be bound in `keybindings.json`.
 
 > `Ctrl+A` previously opened the model picker; it now moves the cursor to the line start (matching Emacs/readline). The model picker is now `Ctrl+Shift+A`. Old `keybindings.json` files are auto-migrated.
 
 ### Fixed Keys
 
-These keys are hard-coded in the prompt and have no action names, so they cannot be remapped. A `keybindings.json` binding on the same key (other than `F1` and `Shift+Insert`) takes precedence over them.
+These keys are hard-coded in the prompt and have no action names, so they cannot be remapped. A `keybindings.json` binding on the same key (other than `F1`, which never reaches the binding table) takes precedence over them.
 
 | Key | Effect |
 |-----|--------|
@@ -96,7 +96,7 @@ These keys are hard-coded in the prompt and have no action names, so they cannot
 | `Alt+Delete` / `Ctrl+Delete` | Delete the word after the cursor |
 | `Alt+Up` / `Alt+Down` | Scroll the transcript 20 lines (`Alt+Up` edits the last queued message instead when one is pending) |
 | `Ctrl+V` / `Cmd+V` | Paste: an image from the clipboard if there is one, otherwise text |
-| `Shift+Insert` | Paste text |
+| `Shift+Insert` | Paste text (the `insert` key name reaches the binding table, so it can also be rebound) |
 | `Alt+V` | Start / stop voice recording (when `/voice` is on) |
 
 ### Confirmation Context

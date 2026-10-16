@@ -112,6 +112,7 @@ pub(super) fn key_event_to_keystroke(key: &KeyEvent) -> Option<ParsedKeystroke> 
         KeyCode::Enter     => "enter".to_string(),
         KeyCode::Esc       => "escape".to_string(),
         KeyCode::Home      => "home".to_string(),
+        KeyCode::Insert    => "insert".to_string(),
         KeyCode::Left      => "left".to_string(),
         KeyCode::PageDown  => "pagedown".to_string(),
         KeyCode::PageUp    => "pageup".to_string(),
