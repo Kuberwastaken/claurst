@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use agent_client_protocol_schema as acp;
 use claurst_api::streaming::{AnthropicStreamEvent, ContentDelta};
-use claurst_core::permissions::ManagedInteractivePermissionHandler;
 use claurst_core::types::{ContentBlock, ImageSource, Message};
 use claurst_query::{QueryEvent, QueryOutcome};
 use claurst_tools::ToolContext;
@@ -62,7 +61,7 @@ pub async fn handle(
     // The session's PermissionManager decides first; only its Ask decisions
     // reach the client through the pending-permission queue.
     let permission_handler: Arc<dyn claurst_core::PermissionHandler> = Arc::new(
-        ManagedInteractivePermissionHandler::new(session.permission_manager.clone()),
+        crate::permission::AcpPermissionHandler::new(session.permission_manager.clone()),
     );
     let tool_ctx = ToolContext {
         working_dir: session.cwd.clone(),
