@@ -100,7 +100,7 @@ pub use providers::OpenAiProvider;
 pub use model_registry::{
     CostBreakdown, CostTier, CostTierCondition, ExperimentalMode, InterleavedReasoning, Modality,
     ModelEntry, ModelRegistry, ModelStatus, ProviderEntry, ProviderOverride,
-    effective_model_for_config,
+    apply_session_cost_pricing, catalog_pricing, effective_model_for_config,
 };
 pub use effort_support::{
     anthropic_reasoning, model_is_reasoning, supported_efforts, variant_ladder, AnthropicReasoning,

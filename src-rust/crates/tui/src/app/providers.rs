@@ -211,7 +211,7 @@ impl App {
                 let imported_mcp = result.imported_fields.iter().any(|f| f == "mcpServers");
                 self.config = new_config.clone();
                 self.model_name = self.config.effective_model().to_string();
-                self.cost_tracker.set_model(&self.model_name);
+                self.sync_cost_pricing();
                 self.refresh_context_window_size();
                 self.context_used_tokens = 0;
                 self.has_credentials = self.config.resolve_api_key().is_some();
@@ -384,23 +384,38 @@ impl App {
         self.config.model = None;
 
         let model = self.display_default_model_for_provider(&provider_id);
-        self.cost_tracker.set_model(&model);
         self.model_name = model;
+        self.sync_cost_pricing();
         self.refresh_context_window_size();
         self.context_used_tokens = 0;
     }
 
     /// Update the active model name (also updates config + cost tracker).
     pub fn set_model(&mut self, model: String) {
-        self.cost_tracker.set_model(&model);
         self.model_name = model.clone();
         self.config.model = Some(model.clone());
         if let Some(provider) = Self::infer_provider_from_model(&model) {
             self.config.provider = Some(provider);
         }
+        self.sync_cost_pricing();
         self.refresh_context_window_size();
         // Reset used tokens when switching models (context is fresh).
         self.context_used_tokens = 0;
+    }
+
+    /// Re-apply session cost pricing to the shared tracker (issue #499):
+    /// zero cost for subscription providers (ChatGPT Codex, Claude Pro/Max
+    /// OAuth), catalog pricing for known models, and no invented default
+    /// rate for unknown ones. Keeps the TUI footer agreeing with the
+    /// headless `result` event and `/cost`.
+    pub fn sync_cost_pricing(&self) {
+        claurst_api::apply_session_cost_pricing(
+            &self.cost_tracker,
+            Some(&self.model_registry),
+            self.config.selected_provider_id(),
+            &self.model_name,
+            self.anthropic_bearer_auth,
+        );
     }
 
     pub fn apply_provider_refresh(
@@ -433,7 +448,8 @@ impl App {
         self.has_credentials = has_credentials;
         self.fast_mode = false;
         self.model_name = self.config.effective_model().to_string();
-        self.cost_tracker.set_model(&self.model_name);
+        self.anthropic_bearer_auth = false;
+        self.sync_cost_pricing();
         self.status_message = Some(status_message);
         self.clear_prompt();
     }
