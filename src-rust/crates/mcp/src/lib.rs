@@ -646,33 +646,6 @@ pub mod transport {
         LEGACY_PROTOCOL_VERSION,
     ];
 
-    /// A transport can send requests and receive responses.
-    #[async_trait]
-    pub trait McpTransport: Send + Sync {
-        async fn send(&self, message: &JsonRpcRequest) -> anyhow::Result<()>;
-        async fn recv(&self) -> anyhow::Result<Option<JsonRpcResponse>>;
-        async fn close(&self) -> anyhow::Result<()>;
-        /// Non-blocking poll: return the next raw JSON message if one is
-        /// immediately available, or `Ok(None)` if the queue is empty.
-        /// Used by the notification dispatch loop to drain server-initiated
-        /// notifications without blocking an async task.
-        async fn try_receive_raw(&self) -> anyhow::Result<Option<serde_json::Value>>;
-        /// Subscribe to raw JSON notifications from the transport.
-        /// Returns an async stream of notification messages.
-        ///
-        /// For transports that natively support push notifications (e.g., WebSocket),
-        /// this returns a stream that yields messages directly from the transport.
-        /// For transports without native push support (e.g., stdio), this returns
-        /// a stream that polls periodically.
-        fn subscribe_to_notifications(
-            &self,
-        ) -> BoxStream<'static, anyhow::Result<serde_json::Value>>;
-
-        fn protocol_version(&self) -> &'static str {
-            LEGACY_PROTOCOL_VERSION
-        }
-    }
-
     pub(crate) fn bearer_header_value(token: &str) -> anyhow::Result<HeaderValue> {
         HeaderValue::from_str(&format!("Bearer {}", token))
             .map_err(|e| anyhow::anyhow!("invalid bearer token header: {}", e))
