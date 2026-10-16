@@ -6074,11 +6074,15 @@ pub mod tasks {
                 let split = OUTPUT_WINDOW_LINES.min(self.output.len());
                 let head = self.output[..split].join("\n");
                 let tail = self.output[split..].join("\n");
-                join_head_tail(
-                    head_window(&head, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES),
-                    tail_window(&tail, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES),
-                    &format!("{} lines", self.omitted_output_lines),
-                )
+                let head_cut = head_window(&head, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES);
+                let tail_cut = tail_window(&tail, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES);
+                // The windows' byte caps can drop lines of their own, on top
+                // of the compaction count the registry tracks; the marker
+                // counts both (#465).
+                let omitted = self.omitted_output_lines
+                    + dropped_lines(&head, head_cut)
+                    + dropped_lines(&tail, tail_cut);
+                join_head_tail(head_cut, tail_cut, &format!("{omitted} lines"))
             };
             if let Some(path) = &self.output_file {
                 text.push_str(&format!("\n\nFull output: {}", path.display()));
@@ -6090,6 +6094,14 @@ pub mod tasks {
         pub fn is_running(&self) -> bool {
             matches!(self.status, TaskStatus::Running)
         }
+    }
+
+    /// Lines present in `text` but not in `window`, i.e. the lines a
+    /// head/tail window's byte cap dropped (#465). A cut landing mid-line
+    /// leaves a partial line behind, so this is a lower bound.
+    fn dropped_lines(text: &str, window: &str) -> u64 {
+        let lines = |s: &str| (!s.is_empty()) as u64 + s.matches('\n').count() as u64;
+        lines(text).saturating_sub(lines(window))
     }
 
     /// Thread-safe registry of background tasks.
@@ -6245,6 +6257,36 @@ pub mod tasks {
             registry.append_output(&id, "a");
             registry.append_output(&id, "b");
             assert_eq!(registry.get(&id).unwrap().render_output(), "a\nb");
+        }
+
+        /// #465: window cuts that land mid-line leave partial lines behind;
+        /// the accounting counts the lines a window dropped exactly.
+        #[test]
+        fn dropped_lines_counts_window_line_cuts() {
+            assert_eq!(dropped_lines("", ""), 0);
+            assert_eq!(dropped_lines("a\nb\nc\nd", "a\nb"), 2);
+            // A window that cuts mid-line still counts that partial line (the
+            // cut byte cap is what removed the rest of it).
+            assert_eq!(dropped_lines("a\nb\nc\nd", "a\nb\nc"), 1);
+            assert_eq!(dropped_lines("only", ""), 1);
+        }
+
+        /// #465: when the windows' byte caps drop lines of their own, the
+        /// marker names those on top of the registry's compaction count.
+        #[test]
+        fn render_output_accounts_for_window_line_cuts() {
+            let mut task = BackgroundTask::new("wide");
+            task.omitted_output_lines = 3;
+            // 100 lines of 60,000 bytes put the head window well past its
+            // byte cap with no complete line kept besides the first.
+            task.output = vec!["x".repeat(60_000); 100];
+            let rendered = task.render_output();
+            // 3 omitted in the registry + 99 lines dropped by the byte cap.
+            assert!(
+                rendered.contains("(102 lines omitted)"),
+                "marker missing from a render of {} bytes",
+                rendered.len()
+            );
         }
     }
 }

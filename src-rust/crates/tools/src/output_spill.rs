@@ -192,10 +192,11 @@ pub(crate) fn spill_bytes(path: &Path, bytes: &[u8]) -> Option<PathBuf> {
     }
 }
 
-/// Append the `Full output: <path>` trailer when the output was spilled.
-pub(crate) fn with_full_output(mut text: String, spill: Option<PathBuf>) -> String {
+/// Append the `Full output: <path>` trailer when the output was spilled. The
+/// PTY timeout path passes a `Partial output:` label instead (#465).
+pub(crate) fn with_output_trailer(mut text: String, spill: Option<PathBuf>, label: &str) -> String {
     if let Some(path) = spill {
-        text.push_str(&format!("\n\nFull output: {}", path.display()));
+        text.push_str(&format!("\n\n{label}: {}", path.display()));
     }
     text
 }
@@ -288,10 +289,14 @@ mod tests {
     #[test]
     fn trailer_names_the_spill_path() {
         let path = PathBuf::from("/x/tool-output/a.txt");
-        assert_eq!(with_full_output("out".into(), None), "out");
+        assert_eq!(with_output_trailer("out".into(), None, "Full output"), "out");
         assert_eq!(
-            with_full_output("out".into(), Some(path.clone())),
+            with_output_trailer("out".into(), Some(path.clone()), "Full output"),
             format!("out\n\nFull output: {}", path.display())
+        );
+        assert_eq!(
+            with_output_trailer("out".into(), Some(path), "Partial output"),
+            format!("out\n\nPartial output: {}", path.display())
         );
     }
 
