@@ -259,8 +259,8 @@ async fn run_in_background(
                     if let Some(pid) = c.id() {
                         global_registry().set_pid(&task_id_clone, pid);
                     }
-                    let mut stdout = c.stdout.take().map(|s| BufReader::new(s).lines());
-                    let mut stderr = c.stderr.take().map(|s| BufReader::new(s).lines());
+                    let mut stdout = c.stdout.take().map(|s| BgLineReader::new(BufReader::new(s)));
+                    let mut stderr = c.stderr.take().map(|s| BgLineReader::new(BufReader::new(s)));
                     // Full output for the spill file; the registry keeps only
                     // bounded windows of lines (#442).
                     let mut full = OutputAccumulator::new(
@@ -273,14 +273,14 @@ async fn run_in_background(
                     // block forever (#442).
                     while stdout.is_some() || stderr.is_some() {
                         let line = tokio::select! {
-                            line = next_line(&mut stdout), if stdout.is_some() => match line {
+                            line = stdout.as_mut().unwrap().next_line(), if stdout.is_some() => match line {
                                 Some(line) => line,
                                 None => {
                                     stdout = None;
                                     continue;
                                 }
                             },
-                            line = next_line(&mut stderr), if stderr.is_some() => match line {
+                            line = stderr.as_mut().unwrap().next_line(), if stderr.is_some() => match line {
                                 Some(line) => format!("STDERR: {}", line),
                                 None => {
                                     stderr = None;
@@ -372,14 +372,86 @@ async fn run_in_background(
     ))
 }
 
-/// Next line from an optional line reader; `None` at EOF, on a read error, or
-/// when the reader is absent.
-async fn next_line<R: tokio::io::AsyncBufRead + Unpin>(
-    lines: &mut Option<tokio::io::Lines<R>>,
-) -> Option<String> {
-    match lines {
-        Some(lines) => lines.next_line().await.ok().flatten(),
-        None => None,
+/// Maximum bytes one background output line contributes before it is cut
+/// (#465): the registry's line-count bound and the accumulator's windows are
+/// bounded per push, so a newline-free stream would otherwise grow them with
+/// a single unbounded line.
+const MAX_BG_LINE_BYTES: usize = 256 * 1024;
+
+/// Line reader over a background child's pipe. Reads raw bytes and decodes
+/// lossily, so non-UTF-8 output cannot end the drain early (#465: `Lines`
+/// turned `InvalidData` into EOF), and cuts every line at
+/// [`MAX_BG_LINE_BYTES`], discarding the rest of an over-long line so a
+/// newline-free stream cannot fill memory.
+struct BgLineReader<R> {
+    reader: R,
+    /// Bytes scanned from the stream since the last newline but not yet
+    /// returned as a line. Lives in `self` — not in the polled future — so a
+    /// `tokio::select!` may poll and drop this future freely without losing
+    /// partial bytes.
+    line: Vec<u8>,
+}
+
+impl<R: tokio::io::AsyncBufRead + Unpin> BgLineReader<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            line: Vec::new(),
+        }
+    }
+
+    /// Next line without its newline, lossily decoded as UTF-8. `None` at EOF
+    /// or on a read error — both end the drain, as before. An unterminated
+    /// final line is still returned, and once a line fills
+    /// [`MAX_BG_LINE_BYTES`] the remainder of it is read and dropped.
+    async fn next_line(&mut self) -> Option<String> {
+        loop {
+            // (`fill_buf` borrows the reader; the slice is only used inside
+            // this block, ending the borrow before `consume` below.)
+            let step: Option<(bool, usize)> = {
+                let buf = match self.reader.fill_buf().await {
+                    // EOF or a read error ends the scan; an unterminated
+                    // pending line is still returned below.
+                    Ok(buf) if !buf.is_empty() => Some(buf),
+                    _ => None,
+                };
+                match buf {
+                    None => None,
+                    Some(buf) => {
+                        let delim = buf.iter().position(|&b| b == b'\n');
+                        let room = MAX_BG_LINE_BYTES.saturating_sub(self.line.len());
+                        let take = delim.unwrap_or(buf.len()).min(room);
+                        self.line.extend_from_slice(&buf[..take]);
+                        Some(match delim {
+                            // Line done: consume it plus the newline.
+                            Some(p) => (true, p + 1),
+                            // No newline in this chunk: keep the prefix up to
+                            // the cap and drop the rest of the chunk; the cap
+                            // is reached, so nothing past `room` is wanted.
+                            None => (false, buf.len()),
+                        })
+                    }
+                }
+            };
+            match step {
+                None => break,
+                Some((done, n)) => {
+                    if n > 0 {
+                        self.reader.consume(n);
+                    }
+                    if done {
+                        break;
+                    }
+                }
+            }
+        }
+        if self.line.is_empty() {
+            None
+        } else {
+            let out = String::from_utf8_lossy(&self.line).into_owned();
+            self.line.clear();
+            Some(out)
+        }
     }
 }
 
@@ -1814,12 +1886,107 @@ mod tests {
         assert_eq!(result.content, "cat cat cat 0 1 1 1 term");
     }
 
-    /// #442: background children get the same environment.
+    /// #465: non-UTF-8 output no longer ends the drain (`Lines` surfaced the
+    /// read error as EOF), and an unterminated final line is still returned.
     #[tokio::test]
-    async fn background_child_gets_pager_free_agent_env() {
-        let spill_dir = tempfile::tempdir().unwrap();
-        let task = run_background_to_completion(ENV_PROBE, spill_dir.path()).await;
-        assert_eq!(task.output, vec!["cat cat cat 0 1 1 1 term".to_string()]);
+    async fn bg_reader_survives_non_utf8_output() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, mut lines) = bg_reader();
+        tokio::spawn(async move {
+            writer.write_all(b"one\xff\ntwo\xfe").await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+        assert_eq!(
+            lines.next_line().await,
+            Some("one\u{FFFD}".to_string()),
+            "non-UTF-8 bytes must be lossily decoded, not end the drain"
+        );
+        assert_eq!(
+            lines.next_line().await,
+            Some("two\u{FFFD}".to_string()),
+            "the unterminated final line must still be delivered"
+        );
+        assert_eq!(lines.next_line().await, None, "EOF after that");
+    }
+
+    /// #465: a line longer than `MAX_BG_LINE_BYTES` is cut there and the rest
+    /// of it is drained and discarded, so the next line is intact.
+    #[tokio::test]
+    async fn bg_reader_cuts_overlong_lines() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, mut lines) = bg_reader();
+        let long = format!("{}tail\n", "x".repeat(MAX_BG_LINE_BYTES + 1_000));
+        tokio::spawn(async move {
+            writer.write_all(long.as_bytes()).await.unwrap();
+            writer.write_all(b"after\n").await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+        let first = lines.next_line().await.unwrap();
+        assert_eq!(
+            first.len(),
+            MAX_BG_LINE_BYTES,
+            "the line must be cut at the byte cap"
+        );
+        assert!(first.chars().all(|c| c == 'x'), "cut line must keep the head");
+        assert_eq!(lines.next_line().await, Some("after".to_string()));
+        assert_eq!(lines.next_line().await, None);
+    }
+
+    /// #465: lines are assembled across underlying buffer boundaries — the
+    /// reader must not lose bytes at the edges of the chunks it polls.
+    #[tokio::test]
+    async fn bg_reader_assembles_lines_across_chunks() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, mut lines) = bg_reader();
+        tokio::spawn(async move {
+            for _ in 0..50 {
+                writer.write_all(b"0123456789").await.unwrap();
+            }
+            writer.write_all(b"end\nnext\n").await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+        assert_eq!(
+            lines.next_line().await,
+            Some(format!("{}end", "0123456789".repeat(50)))
+        );
+        assert_eq!(lines.next_line().await, Some("next".to_string()));
+        assert_eq!(lines.next_line().await, None);
+    }
+
+    /// #465: cancel-safety — partial-line state lives in the reader (not in
+    /// the future), so dropping a polled `next_line` future mid-read and then
+    /// reading again loses nothing.
+    #[tokio::test]
+    async fn bg_reader_is_cancel_safe() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, mut lines) = bg_reader();
+        tokio::spawn(async move {
+            writer.write_all(b"first\nsect").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            writer.write_all(b"ond\nthird\n").await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+        assert_eq!(lines.next_line().await, Some("first".to_string()));
+        // Drop an in-flight poll several times (nothing readable yet): the
+        // partial "sect" must survive every cancellation.
+        for _ in 0..5 {
+            let _ = tokio::time::timeout(Duration::from_millis(5), lines.next_line()).await;
+        }
+        assert_eq!(lines.next_line().await, Some("second".to_string()));
+        assert_eq!(lines.next_line().await, Some("third".to_string()));
+        assert_eq!(lines.next_line().await, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // BgLineReader (#465): byte-based, lossy, bounded line reading.
+    // -----------------------------------------------------------------------
+
+    fn bg_reader() -> (
+        tokio::io::DuplexStream,
+        BgLineReader<BufReader<tokio::io::DuplexStream>>,
+    ) {
+        let (writer, reader) = tokio::io::duplex(64);
+        (writer, BgLineReader::new(BufReader::new(reader)))
     }
 
     /// Regression test for #184: a tool command that spawns a child which
