@@ -222,6 +222,12 @@ pub const MCP_TOOL_PREFIX: &str = "mcp__";
 /// names at 64 characters; Anthropic allows 128.
 pub const MAX_MCP_TOOL_NAME_LEN: usize = 64;
 
+/// Bound on a single `tools/call` execution (issue #471). A hung tool call
+/// would otherwise wedge the running turn — and stop every later request —
+/// instead of returning an error to the model, so each call gets one minute
+/// by default. Startup is bounded separately by [`McpTimeouts`].
+pub const DEFAULT_TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// One MCP tool as exposed to the model.
 #[derive(Debug, Clone)]
 pub struct McpToolEntry {
@@ -317,6 +323,61 @@ fn build_tool_entries(
         }
     }
     entries
+}
+
+/// Cap on one server's `initialize` instructions (issue #471): instructions
+/// are untrusted text a server hands us for the system prompt, so they are
+/// bounded (~8 KiB per server) before they are stored.
+const MAX_SERVER_INSTRUCTION_BYTES: usize = 8 * 1024;
+
+/// Truncate a server's instructions to [`MAX_SERVER_INSTRUCTION_BYTES`] on a
+/// character boundary, logging the truncation. Shorter text passes through.
+fn clamp_server_instructions(server: &str, text: &str) -> String {
+    if text.len() <= MAX_SERVER_INSTRUCTION_BYTES {
+        return text.to_string();
+    }
+    let mut end = MAX_SERVER_INSTRUCTION_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    warn!(
+        server = %server,
+        original_bytes = text.len(),
+        kept_bytes = end,
+        "MCP server instructions exceeded the size cap and were truncated"
+    );
+    let mut clamped = text[..end].trim_end().to_string();
+    clamped.push_str("\n…[truncated]");
+    clamped
+}
+
+/// Saved permission rules written for the exposed tool names before the
+/// `mcp__<server>__<tool>` rename (issue #459): the old `{server}_{tool}`
+/// form never matches a current exposed name, so a saved approval silently
+/// stopped matching (issue #471). Returns the offending rule names — the
+/// bare tool part of each spec, deduplicated and sorted — for the given
+/// configured servers.
+pub fn legacy_permission_rule_names(
+    servers: &[McpServerConfig],
+    rule_specs: &[String],
+) -> Vec<String> {
+    let mut found = std::collections::BTreeSet::new();
+    for spec in rule_specs {
+        let name = match spec.split_once('(') {
+            Some((head, _)) => head.trim(),
+            None => spec.as_str(),
+        };
+        if name.is_empty() || name == "*" || name.starts_with(MCP_TOOL_PREFIX) {
+            continue;
+        }
+        for server in servers {
+            let legacy_prefix = format!("{}_", sanitize_tool_name_part(&server.name));
+            if name.starts_with(&legacy_prefix) {
+                found.insert(name.to_string());
+            }
+        }
+    }
+    found.into_iter().collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -585,33 +646,6 @@ pub mod transport {
         LEGACY_PROTOCOL_VERSION,
     ];
 
-    /// A transport can send requests and receive responses.
-    #[async_trait]
-    pub trait McpTransport: Send + Sync {
-        async fn send(&self, message: &JsonRpcRequest) -> anyhow::Result<()>;
-        async fn recv(&self) -> anyhow::Result<Option<JsonRpcResponse>>;
-        async fn close(&self) -> anyhow::Result<()>;
-        /// Non-blocking poll: return the next raw JSON message if one is
-        /// immediately available, or `Ok(None)` if the queue is empty.
-        /// Used by the notification dispatch loop to drain server-initiated
-        /// notifications without blocking an async task.
-        async fn try_receive_raw(&self) -> anyhow::Result<Option<serde_json::Value>>;
-        /// Subscribe to raw JSON notifications from the transport.
-        /// Returns an async stream of notification messages.
-        ///
-        /// For transports that natively support push notifications (e.g., WebSocket),
-        /// this returns a stream that yields messages directly from the transport.
-        /// For transports without native push support (e.g., stdio), this returns
-        /// a stream that polls periodically.
-        fn subscribe_to_notifications(
-            &self,
-        ) -> BoxStream<'static, anyhow::Result<serde_json::Value>>;
-
-        fn protocol_version(&self) -> &'static str {
-            LEGACY_PROTOCOL_VERSION
-        }
-    }
-
     pub(crate) fn bearer_header_value(token: &str) -> anyhow::Result<HeaderValue> {
         HeaderValue::from_str(&format!("Bearer {}", token))
             .map_err(|e| anyhow::anyhow!("invalid bearer token header: {}", e))
@@ -785,12 +819,14 @@ pub mod client {
                 tools: snapshot.tools,
                 resources: snapshot.resources,
                 prompts: snapshot.prompts,
-                instructions: snapshot.instructions,
+                instructions: snapshot
+                    .instructions
+                    .map(|text| clamp_server_instructions(&snapshot.server_name, &text)),
                 backend: None,
             }
         }
 
-        fn from_backend(backend: Arc<dyn backend::McpClientBackend>) -> Self {
+        pub(crate) fn from_backend(backend: Arc<dyn backend::McpClientBackend>) -> Self {
             let snapshot = backend.snapshot();
             let mut client = Self::from_snapshot(snapshot);
             client.backend = Some(backend);
@@ -1058,6 +1094,10 @@ pub struct McpManager {
     changes: tokio::sync::watch::Sender<u64>,
     /// Active resource subscriptions: (server_name, uri) → change event sender.
     pub resource_subscriptions: DashMap<(String, String), tokio::sync::mpsc::Sender<ResourceChangedEvent>>,
+    /// How often a remote server that failed at startup is retried at
+    /// runtime. Atomic so tests can shrink it without rebuilding the
+    /// manager's `Arc` mid-task.
+    remote_retry_interval_ms: std::sync::atomic::AtomicU64,
 }
 
 /// Mutable connection state. The lock is never held across an `.await`.
@@ -1107,6 +1147,9 @@ pub struct McpServerCatalog {
 const MAX_REMOTE_CONNECT_ATTEMPTS: u32 = 3;
 /// Delay before the second remote attempt; doubled for each later attempt.
 const REMOTE_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+/// How often a remote server that failed at startup is retried at runtime
+/// (issue #471), until it connects or Claurst exits.
+const REMOTE_RUNTIME_RETRY_INTERVAL_MS: u64 = 60_000;
 
 impl McpManager {
     pub fn new() -> Self {
@@ -1115,7 +1158,14 @@ impl McpManager {
             state: parking_lot::RwLock::new(ManagerState::default()),
             changes: tokio::sync::watch::Sender::new(0),
             resource_subscriptions: DashMap::new(),
+            remote_retry_interval_ms: std::sync::atomic::AtomicU64::new(REMOTE_RUNTIME_RETRY_INTERVAL_MS),
         }
+    }
+
+    /// Runtime retry interval for failed remote servers.
+    fn remote_retry_interval(&self) -> Duration {
+        let ms = self.remote_retry_interval_ms.load(std::sync::atomic::Ordering::SeqCst);
+        Duration::from_millis(ms.max(1))
     }
 
     /// Register `configs` and connect to every server concurrently in the
@@ -1176,6 +1226,12 @@ impl McpManager {
     /// Connect one server: env expansion, connect/catalog timeouts and, for
     /// remote transports, a bounded retry with backoff. Holds only a weak
     /// reference so dropping the manager is never delayed by a slow server.
+    ///
+    /// A remote server that failed its startup attempts keeps being retried
+    /// every [`McpManager::remote_retry_interval`] while Claurst runs, so a
+    /// server that comes back up reconnects without user action (issue
+    /// #471). Stdio servers stop after the first failure: a child process
+    /// that cannot start will not start later either.
     async fn connect_server(manager: Weak<Self>, config: McpServerConfig) {
         let name = config.name.clone();
         let expanded = expand_server_config(&config);
@@ -1192,78 +1248,132 @@ impl McpManager {
         let remote = matches!(expanded.server_type.as_str(), "sse" | "http");
         debug!(server = %name, transport = %expanded.server_type, "Connecting to MCP server");
 
-        let mut attempt = 1;
-        let result = loop {
-            let auth_token = match config.url.as_deref() {
-                Some(server_url) if remote => {
-                    oauth::get_valid_mcp_access_token(&name, server_url)
-                        .await
-                        .ok()
-                        .flatten()
+        loop {
+            let mut attempt = 1;
+            let result = loop {
+                let auth_token = match config.url.as_deref() {
+                    Some(server_url) if remote => {
+                        oauth::get_valid_mcp_access_token(&name, server_url)
+                            .await
+                            .ok()
+                            .flatten()
+                    }
+                    _ => None,
+                };
+                let error = match client::McpClient::connect(&expanded, auth_token, timeouts).await {
+                    Ok(client) => break Ok(client),
+                    Err(error) => error,
+                };
+                // A timed-out attempt already spent the whole connect budget.
+                let retry = remote
+                    && attempt < MAX_REMOTE_CONNECT_ATTEMPTS
+                    && error.downcast_ref::<McpTimeoutError>().is_none();
+                if !retry {
+                    break Err(error);
                 }
-                _ => None,
-            };
-            let error = match client::McpClient::connect(&expanded, auth_token, timeouts).await {
-                Ok(client) => break Ok(client),
-                Err(error) => error,
-            };
-            // A timed-out attempt already spent the whole connect budget.
-            let retry = remote
-                && attempt < MAX_REMOTE_CONNECT_ATTEMPTS
-                && error.downcast_ref::<McpTimeoutError>().is_none();
-            if !retry {
-                break Err(error);
-            }
-            let delay = REMOTE_RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
-            warn!(
-                server = %name,
-                attempt,
-                retry_in_ms = delay.as_millis() as u64,
-                error = %error,
-                "MCP connect attempt failed; retrying"
-            );
-            let Some(strong) = manager.upgrade() else { return };
-            strong.set_status(
-                &name,
-                McpServerStatus::Failed {
-                    error: error.to_string(),
-                    retry_at: Instant::now() + delay,
-                },
-            );
-            drop(strong);
-            tokio::time::sleep(delay).await;
-            let Some(strong) = manager.upgrade() else { return };
-            strong.set_status(&name, McpServerStatus::Connecting);
-            attempt += 1;
-        };
-
-        let Some(manager) = manager.upgrade() else { return };
-        match result {
-            Ok(client) => {
-                info!(
+                let delay = REMOTE_RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
+                warn!(
                     server = %name,
-                    transport = %expanded.server_type,
-                    tools = client.tools.len(),
-                    resources = client.resources.len(),
-                    "MCP server connected"
+                    attempt,
+                    retry_in_ms = delay.as_millis() as u64,
+                    error = %error,
+                    "MCP connect attempt failed; retrying"
                 );
-                manager.install_client(client);
-            }
-            Err(e) => {
-                error!(
-                    server = %name,
-                    transport = %expanded.server_type,
-                    error = %e,
-                    "Failed to connect to MCP server"
-                );
-                manager.set_status(
+                let Some(strong) = manager.upgrade() else { return };
+                strong.set_status(
                     &name,
-                    McpServerStatus::Disconnected {
-                        last_error: Some(e.to_string()),
+                    McpServerStatus::Failed {
+                        error: error.to_string(),
+                        retry_at: Instant::now() + delay,
                     },
                 );
+                drop(strong);
+                tokio::time::sleep(delay).await;
+                let Some(strong) = manager.upgrade() else { return };
+                strong.set_status(&name, McpServerStatus::Connecting);
+                attempt += 1;
+            };
+
+            let Some(manager) = manager.upgrade() else { return };
+            match result {
+                Ok(client) => {
+                    info!(
+                        server = %name,
+                        transport = %expanded.server_type,
+                        tools = client.tools.len(),
+                        resources = client.resources.len(),
+                        "MCP server connected"
+                    );
+                    manager.install_client(client);
+                    return;
+                }
+                Err(e) => {
+                    error!(
+                        server = %name,
+                        transport = %expanded.server_type,
+                        error = %e,
+                        "Failed to connect to MCP server"
+                    );
+                    manager.set_status(
+                        &name,
+                        McpServerStatus::Disconnected {
+                            last_error: Some(e.to_string()),
+                        },
+                    );
+                }
+            }
+            if !remote {
+                return;
+            }
+
+            let interval = manager.remote_retry_interval();
+            tokio::time::sleep(interval).await;
+            match manager.server_status(&name) {
+                McpServerStatus::Disconnected { .. } => {
+                    info!(
+                        server = %name,
+                        interval_secs = interval.as_secs(),
+                        "Retrying failed remote MCP server"
+                    );
+                    manager.set_status(&name, McpServerStatus::Connecting);
+                }
+                // Another connect attempt took over the server (or it
+                // already connected): it owns the retry from here on.
+                _ => return,
             }
         }
+    }
+
+    /// Start a runtime reconnect of `name` in the background (issue #471).
+    ///
+    /// Drops any existing client for the server and re-runs the startup
+    /// connect path (bounded attempts for remote transports, one for stdio;
+    /// failed remote servers then resume periodic retries). Sets the status
+    /// to [`McpServerStatus::Connecting`] before returning.
+    pub fn reconnect(self: &Arc<Self>, name: &str) -> anyhow::Result<()> {
+        let config = match self.server_configs.get(name) {
+            Some(config) => config.clone(),
+            None => {
+                return Err(anyhow::anyhow!("Unknown MCP server '{}'", name));
+            }
+        };
+        if matches!(self.server_status(name), McpServerStatus::Connecting) {
+            return Err(anyhow::anyhow!(
+                "MCP server '{}' is already connecting",
+                name
+            ));
+        }
+        // Drop the old client so the route table matches the reported
+        // status while the reconnect runs.
+        {
+            let mut state = self.state.write();
+            if state.clients.remove(name).is_some() {
+                state.rebuild_tools();
+            }
+        }
+        self.set_status(name, McpServerStatus::Connecting);
+        tokio::spawn(Self::connect_server(Arc::downgrade(self), config));
+        Ok(())
     }
 
     /// Record a connected client and start listening for its notifications.
@@ -1486,11 +1596,25 @@ impl McpManager {
     }
 
     /// Execute a tool call by its exposed name, routed through the
-    /// exposed-name map to the owning server.
+    /// exposed-name map to the owning server, bounded by
+    /// [`DEFAULT_TOOL_CALL_TIMEOUT`].
     pub async fn call_tool(
         &self,
         exposed_name: &str,
         arguments: Option<Value>,
+    ) -> anyhow::Result<CallToolResult> {
+        self.call_tool_with_timeout(exposed_name, arguments, DEFAULT_TOOL_CALL_TIMEOUT)
+            .await
+    }
+
+    /// [`McpManager::call_tool`] with an explicit bound (so tests do not have
+    /// to wait out the default). The timed-out call is dropped: MCP tool
+    /// calls are not cancel-safe work the model can resume later.
+    async fn call_tool_with_timeout(
+        &self,
+        exposed_name: &str,
+        arguments: Option<Value>,
+        timeout: Duration,
     ) -> anyhow::Result<CallToolResult> {
         let (client, tool_name) = {
             let state = self.state.read();
@@ -1509,7 +1633,14 @@ impl McpManager {
             })?;
             (client, entry.tool_name.clone())
         };
-        client.call_tool(&tool_name, arguments).await
+        match tokio::time::timeout(timeout, client.call_tool(&tool_name, arguments)).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "MCP tool '{}' timed out after {}s",
+                exposed_name,
+                timeout.as_secs_f32()
+            )),
+        }
     }
 
     /// Number of connected servers.
@@ -1540,7 +1671,14 @@ impl McpManager {
                     .tools
                     .iter()
                     .any(|entry| &entry.server_name == name && is_active(&entry.definition.name));
-                has_active_tool.then(|| format!("## {}\n{}", name, instructions))
+                // XML-fence the instructions so they read as server-supplied
+                // content, not as prompts of their own.
+                has_active_tool.then(|| {
+                    format!(
+                        "## {}\n<server-instructions>\n{}\n</server-instructions>",
+                        name, instructions
+                    )
+                })
             })
             .collect();
         if sections.is_empty() {
@@ -1669,6 +1807,17 @@ impl McpManager {
         };
 
         if !matches!(config.server_type.as_str(), "http" | "sse") {
+            return McpAuthState::NotRequired;
+        }
+
+        // A configured Authorization header authenticates every request of
+        // this server (issue #471): no OAuth token is needed, so /mcp must
+        // not report auth as required.
+        if config
+            .headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("authorization"))
+        {
             return McpAuthState::NotRequired;
         }
 
@@ -1801,6 +1950,12 @@ const ATTACHABLE_IMAGE_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif"
 /// per-image limit).
 const MAX_ATTACHED_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
+/// Largest total decoded image payload attached from one tool result. The
+/// Anthropic API rejects requests above 32 MB, and every image a tool result
+/// returns stays in the history on all later requests, so the sum of a
+/// result's images — not just each image on its own — must fit.
+const MAX_IMAGE_BYTES_PER_RESULT: usize = 32 * 1024 * 1024;
+
 /// An MCP tool result converted for the model.
 #[derive(Debug, Clone, Default)]
 pub struct McpToolOutput {
@@ -1831,8 +1986,10 @@ fn format_size(bytes: usize) -> String {
     }
 }
 
-/// Describe an image and, when it can be attached, push it to `images`.
-fn image_part(data: &str, mime_type: &str, images: &mut Vec<ContentBlock>) -> String {
+/// Describe an image and, when it fits in the remaining per-result budget,
+/// push it to `images`. `budget` holds how many more bytes may still be
+/// attached in this result; attached images consume it.
+fn image_part(data: &str, mime_type: &str, images: &mut Vec<ContentBlock>, budget: &mut usize) -> String {
     let size = base64_decoded_len(data);
     let size_label = format_size(size);
     if !ATTACHABLE_IMAGE_TYPES.contains(&mime_type) {
@@ -1844,6 +2001,14 @@ fn image_part(data: &str, mime_type: &str, images: &mut Vec<ContentBlock>) -> St
             mime_type,
             size_label,
             format_size(MAX_ATTACHED_IMAGE_BYTES)
+        );
+    }
+    if size > *budget {
+        return format!(
+            "[Image: {}, {}; not attached: image total exceeds {} per result]",
+            mime_type,
+            size_label,
+            format_size(MAX_IMAGE_BYTES_PER_RESULT)
         );
     }
     // An image block the provider rejects stays in the history and fails
@@ -1877,6 +2042,7 @@ fn image_part(data: &str, mime_type: &str, images: &mut Vec<ContentBlock>) -> St
             url: None,
         },
     });
+    *budget -= size;
     format!("[Image: {}, {}]", mime_type, size_label)
 }
 
@@ -1896,6 +2062,7 @@ fn image_part(data: &str, mime_type: &str, images: &mut Vec<ContentBlock>) -> St
 pub fn mcp_result_to_output(result: &CallToolResult) -> McpToolOutput {
     let mut images = Vec::new();
     let mut parts: Vec<String> = Vec::new();
+    let mut image_budget = MAX_IMAGE_BYTES_PER_RESULT;
     if let Some(structured) = &result.structured_content {
         parts.push(structured.to_string());
     }
@@ -1907,7 +2074,7 @@ pub fn mcp_result_to_output(result: &CallToolResult) -> McpToolOutput {
                 }
             }
             McpContent::Image { data, mime_type } => {
-                parts.push(image_part(data, mime_type, &mut images));
+                parts.push(image_part(data, mime_type, &mut images, &mut image_budget));
             }
             McpContent::Resource { resource } => {
                 parts.push(format!("[Resource: {}]", resource.uri));
@@ -1919,7 +2086,7 @@ pub fn mcp_result_to_output(result: &CallToolResult) -> McpToolOutput {
                         .as_deref()
                         .unwrap_or("application/octet-stream");
                     if mime.starts_with("image/") {
-                        parts.push(image_part(blob, mime, &mut images));
+                        parts.push(image_part(blob, mime, &mut images, &mut image_budget));
                     } else {
                         parts.push(format!(
                             "[Binary resource: {}, {}]",
@@ -2060,6 +2227,14 @@ mod tests {
         }
     }
 
+    /// A base64 PNG payload whose decoded size is `decoded_size` bytes.
+    fn png_base64(decoded_size: usize) -> String {
+        use base64::Engine as _;
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.resize(decoded_size, 0);
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
     #[test]
     fn test_result_output_text() {
         let out = mcp_result_to_output(&result(vec![McpContent::Text {
@@ -2104,6 +2279,27 @@ mod tests {
         }]));
         assert!(big.images.is_empty());
         assert!(big.text.contains("6.0 MB; not attached: larger than 5.0 MB"), "{}", big.text);
+    }
+
+    #[test]
+    fn test_result_output_caps_total_image_bytes_per_result() {
+        // Each image is under the per-image cap, but nine of them total more
+        // than the 32 MB a single result may carry.
+        use base64::Engine as _;
+        let png = png_base64(4 * 1024 * 1024);
+        let contents: Vec<McpContent> = (0..9)
+            .map(|_| McpContent::Image {
+                data: png.clone(),
+                mime_type: "image/png".to_string(),
+            })
+            .collect();
+        let out = mcp_result_to_output(&result(contents));
+        assert_eq!(out.images.len(), 8, "{}", out.text);
+        assert!(
+            out.text.contains("not attached: image total exceeds 32.0 MB per result"),
+            "{}",
+            out.text
+        );
     }
 
     #[test]
@@ -2205,6 +2401,34 @@ mod tests {
         assert_eq!(out.text, "line one\nline two");
     }
 
+    // ---- permission-rule naming --------------------------------------------
+
+    #[test]
+    fn test_legacy_permission_rule_names() {
+        let servers = vec![stdio_fail_config("github"), stdio_fail_config("a.b")];
+        let specs: Vec<String> = vec![
+            "github_create_issue".to_string(),      // legacy form
+            "github_create_issue".to_string(),      // duplicate → deduplicated
+            "a_b_reader".to_string(),               // sanitized a.b
+            "mcp__github__create_issue".to_string(), // current form → ignored
+            "mcp__github".to_string(),              // server-wide → ignored
+            "github_suffix".to_string(),            // starts with github → legacy form
+            "githubstart".to_string(),              // no '_' after the server name
+            "Read".to_string(),
+            "Bash(git status *)".to_string(),
+            "*".to_string(),
+        ];
+        let found = legacy_permission_rule_names(&servers, &specs);
+        assert_eq!(
+            found,
+            vec![
+                "a_b_reader".to_string(),
+                "github_create_issue".to_string(),
+                "github_suffix".to_string(),
+            ]
+        );
+    }
+
     // ---- McpManager --------------------------------------------------------
 
     #[test]
@@ -2223,6 +2447,115 @@ mod tests {
     fn test_manager_failed_servers_empty() {
         let mgr = McpManager::new();
         assert!(mgr.failed_servers().is_empty());
+    }
+
+    /// A stdio config whose child process cannot start, so connects fail
+    /// fast and terminally.
+    fn stdio_fail_config(name: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            command: Some("/nonexistent/claurst-mcp-reconnect-fixture".to_string()),
+            args: vec![],
+            env: HashMap::new(),
+            url: None,
+            server_type: "stdio".to_string(),
+            headers: Default::default(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
+            origin: Default::default(),
+        }
+    }
+
+    /// A streamable-HTTP config pointing at a closed local port.
+    fn http_fail_config(name: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            command: None,
+            args: vec![],
+            env: HashMap::new(),
+            url: Some("http://127.0.0.1:1/mcp".to_string()),
+            server_type: "http".to_string(),
+            headers: Default::default(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
+            origin: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_unknown_server_is_an_error() {
+        let mgr = McpManager::new();
+        let err = mgr.reconnect("nope").expect_err("unknown server");
+        assert!(err.to_string().contains("Unknown MCP server"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_starts_background_connect_for_failed_server() {
+        let mgr = McpManager::start(&[stdio_fail_config("srv")]);
+        mgr.wait_until_settled().await;
+        assert!(
+            matches!(
+                mgr.server_status("srv"),
+                McpServerStatus::Disconnected { last_error: Some(_) }
+            ),
+            "{:?}",
+            mgr.server_status("srv")
+        );
+
+        // Reconnect the named server at runtime: the status hands over to
+        // Connecting and a second reconnect is refused while it runs.
+        mgr.reconnect("srv").expect("reconnect a failed server");
+        assert!(
+            matches!(mgr.server_status("srv"), McpServerStatus::Connecting),
+            "{:?}",
+            mgr.server_status("srv")
+        );
+        let err = mgr.reconnect("srv").expect_err("already connecting");
+        assert!(err.to_string().contains("already connecting"), "{}", err);
+
+        // Stdio servers stop after one attempt, so it fails again.
+        mgr.wait_until_settled().await;
+        assert!(
+            matches!(
+                mgr.server_status("srv"),
+                McpServerStatus::Disconnected { last_error: Some(_) }
+            ),
+            "{:?}",
+            mgr.server_status("srv")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failed_remote_server_is_retried_periodically() {
+        let mgr = McpManager::start(&[http_fail_config("remote")]);
+        mgr.wait_until_settled().await;
+        assert!(matches!(
+            mgr.server_status("remote"),
+            McpServerStatus::Disconnected { .. }
+        ));
+
+        // Shrink the runtime retry interval, then watch the connection
+        // cycle Connecting → Disconnected in the background instead of
+        // stopping at the terminal startup failure.
+        use std::sync::atomic::Ordering;
+        mgr.remote_retry_interval_ms.store(50, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let mut observed_connecting = 0usize;
+        let mut was_connecting = false;
+        while observed_connecting < 2 && started.elapsed() < Duration::from_secs(30) {
+            if matches!(mgr.server_status("remote"), McpServerStatus::Connecting) {
+                observed_connecting += usize::from(!was_connecting);
+                was_connecting = true;
+            } else {
+                was_connecting = false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            observed_connecting >= 2,
+            "failed remote server should be retried periodically, status: {:?}",
+            mgr.server_status("remote")
+        );
     }
 
     #[tokio::test]
@@ -2339,6 +2672,105 @@ mod tests {
         assert_eq!(first, again);
     }
 
+    /// A backend whose `call_tool` hangs past any given deadline, so a
+    /// manager call can be made to time out.
+    struct SlowBackend {
+        delay: Duration,
+        snapshot: backend::McpClientSnapshot,
+    }
+
+    #[async_trait]
+    impl backend::McpClientBackend for SlowBackend {
+        fn kind(&self) -> backend::McpBackendKind {
+            backend::McpBackendKind::Rmcp
+        }
+
+        fn snapshot(&self) -> backend::McpClientSnapshot {
+            self.snapshot.clone()
+        }
+
+        async fn list_tools(&self) -> anyhow::Result<Vec<McpTool>> {
+            Ok(self.snapshot.tools.clone())
+        }
+
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Option<Value>,
+        ) -> anyhow::Result<CallToolResult> {
+            tokio::time::sleep(self.delay).await;
+            Ok(result(vec![]))
+        }
+
+        async fn list_resources(&self) -> anyhow::Result<Vec<McpResource>> {
+            Ok(vec![])
+        }
+
+        async fn read_resource(&self, _uri: &str) -> anyhow::Result<ResourceContents> {
+            Err(anyhow::anyhow!("no resources in the test backend"))
+        }
+
+        async fn list_prompts(&self) -> anyhow::Result<Vec<McpPrompt>> {
+            Ok(vec![])
+        }
+
+        async fn get_prompt(
+            &self,
+            _name: &str,
+            _arguments: Option<std::collections::HashMap<String, String>>,
+        ) -> anyhow::Result<GetPromptResult> {
+            Err(anyhow::anyhow!("no prompts in the test backend"))
+        }
+
+        async fn subscribe_resource(&self, _uri: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn unsubscribe_resource(&self, _uri: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn subscribe_to_notifications(&self) -> BoxStream<'static, anyhow::Result<Value>> {
+            Box::pin(futures::stream::iter(Vec::<anyhow::Result<Value>>::new()))
+        }
+    }
+
+    fn client_with_backend(delay: Duration) -> client::McpClient {
+        let mut snapshot = backend::McpClientSnapshot::empty("slow");
+        snapshot.tools = vec![McpTool {
+            name: "work".to_string(),
+            description: None,
+            input_schema: serde_json::json!({ "type": "object" }),
+        }];
+        client::McpClient::from_backend(Arc::new(SlowBackend { delay, snapshot }))
+    }
+
+    #[tokio::test]
+    async fn test_call_tool_times_out_per_call() {
+        let mgr = Arc::new(McpManager::new());
+        mgr.install_client(client_with_backend(Duration::from_secs(5)));
+        assert_eq!(mgr.all_tool_definitions().len(), 1);
+
+        // The call outlives its bound and is dropped, returning an error
+        // instead of wedging the turn.
+        let err = mgr
+            .call_tool_with_timeout("mcp__slow__work", None, Duration::from_millis(1))
+            .await
+            .expect_err("hung tool call");
+        assert!(err.to_string().contains("timed out"), "{}", err);
+
+        // A fast call finishes within the same bound.
+        let mgr_fast = Arc::new(McpManager::new());
+        mgr_fast.install_client(client_with_backend(Duration::from_millis(5)));
+        assert!(
+            mgr_fast
+                .call_tool_with_timeout("mcp__slow__work", None, Duration::from_secs(2))
+                .await
+                .is_ok(),
+            "a fast call succeeds within the bound"
+        );
+    }
+
     #[tokio::test]
     async fn test_manager_routes_by_exposed_name() {
         let mgr = Arc::new(McpManager::new());
@@ -2380,11 +2812,37 @@ mod tests {
             .instructions_prompt_section(|name| name != "mcp__quiet__noop")
             .expect("docs has an active tool and instructions");
         assert!(section.starts_with("# MCP Server Instructions"));
-        assert!(section.contains("## docs\nAlways cite the page URL."), "{}", section);
+        assert!(
+            section.contains("## docs\n<server-instructions>\nAlways cite the page URL.\n</server-instructions>"),
+            "{}",
+            section
+        );
         assert!(!section.contains("quiet"), "{}", section);
         assert!(!section.contains("## blank"), "{}", section);
 
         assert!(mgr.instructions_prompt_section(|_| false).is_none());
+    }
+
+    #[test]
+    fn test_server_instructions_are_capped() {
+        // Below the cap the text passes through unchanged.
+        assert_eq!(clamp_server_instructions("srv", "short"), "short");
+
+        // Above the cap it is truncated on a character boundary with a marker.
+        let long = "x".repeat(12 * 1024);
+        let clamped = clamp_server_instructions("srv", &long);
+        assert!(clamped.len() <= MAX_SERVER_INSTRUCTION_BYTES + "\n…[truncated]".len());
+        assert!(clamped.starts_with("xxxx"));
+        assert!(clamped.ends_with("…[truncated]"), "{}", clamped);
+
+        // Multi-byte text truncates between characters, not mid-character.
+        let multibyte = "é".repeat(20_000);
+        let clamped = clamp_server_instructions("srv", &multibyte);
+        assert!(
+            clamped.ends_with("…[truncated]"),
+            "truncation respects char boundaries: {}",
+            clamped
+        );
     }
 
     #[tokio::test]
@@ -2406,6 +2864,36 @@ mod tests {
         assert_eq!(mgr.server_names(), vec!["srv".to_string()]);
         // Nothing is pending, so waiting returns immediately.
         mgr.wait_until_settled().await;
+    }
+
+    #[tokio::test]
+    async fn test_auth_state_respects_configured_authorization_header() {
+        // Redirect the on-disk token store into a tempdir so the Required
+        // case is deterministic (no real token on this machine). See
+        // test_auth_state_uses_token_expiry_datetime for why env is used.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var_os("CLAURST_MCP_TOKENS_DIR");
+        std::env::set_var("CLAURST_MCP_TOKENS_DIR", tmp.path());
+
+        // A server that authenticates through a configured header does not
+        // need OAuth, so /mcp must not send the user to browser auth.
+        let mgr = McpManager::new();
+        let mut config = http_fail_config("remote");
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer tok".to_string());
+        config.headers = headers;
+        mgr.server_configs.insert("remote".to_string(), config);
+        assert!(matches!(mgr.auth_state("remote"), McpAuthState::NotRequired));
+
+        // Without the header the state stays Required (no stored token).
+        mgr.server_configs
+            .insert("plain".to_string(), http_fail_config("plain"));
+        assert!(matches!(mgr.auth_state("plain"), McpAuthState::Required { .. }));
+
+        match prev {
+            Some(v) => std::env::set_var("CLAURST_MCP_TOKENS_DIR", v),
+            None => std::env::remove_var("CLAURST_MCP_TOKENS_DIR"),
+        }
     }
 
     #[test]

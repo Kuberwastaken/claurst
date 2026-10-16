@@ -33,7 +33,7 @@ pub use command_queue::{CommandPriority, CommandQueue, QueuedCommand, drain_comm
 pub use continuation::{
     ContinuationDecision, ContinuationMode, ContinuationPolicy, StopPolicy, TurnEndContext,
 };
-pub use cron_scheduler::start_cron_scheduler;
+pub use cron_scheduler::{start_cron_scheduler, ToolListProvider};
 pub use goal_loop::{
     GoalContinuation, StopReason, check_and_continue_goal, decide_goal_continuation,
     mark_goal_complete,
