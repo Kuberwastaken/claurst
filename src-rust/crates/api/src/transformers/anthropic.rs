@@ -227,6 +227,7 @@ impl MessageTransformer for AnthropicTransformer {
             stop_reason,
             usage,
             model,
+            rate_limits: None,
         })
     }
 }

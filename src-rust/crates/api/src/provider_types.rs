@@ -94,6 +94,27 @@ pub struct ProviderRequest {
 // ProviderResponse
 // ---------------------------------------------------------------------------
 
+/// Subscription usage windows reported alongside a response (Codex
+/// `x-codex-{primary,secondary}-used-percent` headers, percent 0-100).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitUsage {
+    /// Primary window usage percent (the short, e.g. 5-hour window).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_used_percent: Option<f32>,
+    /// Secondary window usage percent (the weekly window).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secondary_used_percent: Option<f32>,
+}
+
+impl From<RateLimitUsage> for StreamEvent {
+    fn from(usage: RateLimitUsage) -> Self {
+        StreamEvent::RateLimits {
+            primary_used_percent: usage.primary_used_percent,
+            secondary_used_percent: usage.secondary_used_percent,
+        }
+    }
+}
+
 /// A normalised response returned by any provider adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderResponse {
@@ -111,6 +132,12 @@ pub struct ProviderResponse {
 
     /// The model that produced this response (as reported by the provider).
     pub model: String,
+
+    /// Subscription usage windows the provider reported with this response,
+    /// when it reports them (Codex sets this on non-streaming responses via
+    /// its `x-codex-*` headers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limits: Option<RateLimitUsage>,
 }
 
 // ---------------------------------------------------------------------------
