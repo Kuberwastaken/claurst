@@ -2151,7 +2151,11 @@ impl App {
                 self.history_search = Some(hs);
                 false
             }
-            "openSearch" => {
+            // `globalSearch` is the legacy/default action name and
+            // `openSearch` is the live one; both open project search
+            // (issue #495). Keep them aliased so old keybindings.json
+            // files and the default ctrl+shift+f binding keep working.
+            "openSearch" | "globalSearch" => {
                 self.global_search.open();
                 self.refresh_global_search();
                 false

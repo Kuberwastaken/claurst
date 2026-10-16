@@ -1376,3 +1376,29 @@ use super::types::{ContextMenuItem, ContextMenuState};
         // Selecting the tool_result would orphan the tool_use: cut before it.
         assert_eq!(rewind_cut_index(&history, 2), 1);
     }
+
+    // ---- globalSearch / openSearch aliases open project search (#495) ------
+
+    #[test]
+    fn ctrl_shift_f_default_binding_opens_project_search() {
+        // The default ctrl+shift+f binding maps to the legacy "globalSearch"
+        // action name, which used to be dead code.
+        let mut app = make_app();
+        let handled = app.handle_key_event(press_key(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert!(!handled);
+        assert!(app.global_search.visible);
+    }
+
+    #[test]
+    fn global_search_action_aliases_are_equivalent() {
+        // "openSearch" is the live handler; "globalSearch" is the legacy
+        // default action name. Both must open project search.
+        for action in ["openSearch", "globalSearch"] {
+            let mut app = make_app();
+            app.handle_keybinding_action(action);
+            assert!(app.global_search.visible, "{action} must open project search");
+        }
+    }

@@ -815,6 +815,25 @@ mod tests {
     }
 
     #[test]
+    fn test_default_ctrl_shift_f_maps_to_global_search_alias() {
+        // #495: ctrl+shift+f defaults to "globalSearch", which the TUI treats
+        // as an alias of "openSearch". Keep this contract test so the alias
+        // is not dropped in favour of the dead name (or vice versa).
+        let bindings = default_bindings();
+        let action = bindings
+            .iter()
+            .find(|b| {
+                b.chord.len() == 1
+                    && b.chord[0].ctrl
+                    && b.chord[0].shift
+                    && b.chord[0].key == "f"
+                    && b.context == KeyContext::Chat
+            })
+            .and_then(|b| b.action.as_deref());
+        assert_eq!(action, Some("globalSearch"));
+    }
+
+    #[test]
     fn test_resolver_simple_action() {
         let user = UserKeybindings::default();
         let mut resolver = KeybindingResolver::new(&user);
