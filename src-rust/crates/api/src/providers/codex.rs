@@ -703,92 +703,170 @@ impl CodexProvider {
         &self,
         request: &ProviderRequest,
     ) -> Result<ProviderResponse, ProviderError> {
-        let token = self.access_token().await?;
+        let mut token = self.access_token().await?;
         let account_id = self.account_id();
 
         let body = Self::build_responses_body(request);
 
-        let builder = self
-            .http_client
-            .post(CODEX_API_ENDPOINT)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json");
-        let builder = Self::codex_headers(builder, &token, account_id.as_deref(), &body);
+        let mut retried_auth = false;
+        loop {
+            let builder = self
+                .http_client
+                .post(CODEX_API_ENDPOINT)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json");
+            let builder = Self::codex_headers(builder, &token, account_id.as_deref(), &body);
 
-        let resp = builder
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("HTTP request failed: {}", e),
-                status: None,
-                body: None,
-            })?;
+            let resp = builder
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| ProviderError::Other {
+                    provider: self.id.clone(),
+                    message: format!("HTTP request failed: {}", e),
+                    status: None,
+                    body: None,
+                })?;
 
-        let status = resp.status().as_u16();
-        let text = resp.text().await.map_err(|e| ProviderError::Other {
-            provider: self.id.clone(),
-            message: format!("Failed to read response body: {}", e),
-            status: Some(status),
-            body: None,
-        })?;
+            let status = resp.status().as_u16();
+            // A 401 means the bearer token was rejected even though the
+            // 5-minute proactive refresh window said it was fine (server-side
+            // revocation, expired JWT, adoption race). Refresh once and retry,
+            // like the official client does before surfacing the error.
+            if status == 401 && !retried_auth {
+                retried_auth = true;
+                if let Ok(refreshed) = self.refresh_after_auth_failure(&token).await {
+                    debug!("Codex request hit a 401 — token refreshed, retrying once");
+                    token = refreshed;
+                    continue;
+                }
+            }
 
-        if !(200..300).contains(&(status as usize)) {
-            return Err(parse_error_response(status, &text, &self.id));
-        }
-
-        let json_val: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Other {
-            provider: self.id.clone(),
-            message: format!("Failed to parse response JSON: {}", e),
-            status: Some(status),
-            body: Some(text.clone()),
-        })?;
-
-        Self::parse_responses_response(&self.id, &json_val)
-    }
-
-    async fn send_responses_streaming_request(
-        &self,
-        request: &ProviderRequest,
-    ) -> Result<reqwest::Response, ProviderError> {
-        let token = self.access_token().await?;
-        let account_id = self.account_id();
-
-        let mut body = Self::build_responses_body(request);
-        body["stream"] = json!(true);
-
-        let builder = self
-            .http_client
-            .post(CODEX_API_ENDPOINT)
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream");
-        let builder = Self::codex_headers(builder, &token, account_id.as_deref(), &body);
-
-        let resp = builder
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("HTTP request failed: {}", e),
-                status: None,
-                body: None,
-            })?;
-
-        let status = resp.status().as_u16();
-        if !(200..300).contains(&(status as usize)) {
-            let retry_after = crate::retry::retry_after(resp.headers());
             let text = resp.text().await.map_err(|e| ProviderError::Other {
                 provider: self.id.clone(),
                 message: format!("Failed to read response body: {}", e),
                 status: Some(status),
                 body: None,
             })?;
-            return Err(parse_error_response(status, &text, &self.id).with_retry_after(retry_after));
+
+            if !(200..300).contains(&(status as usize)) {
+                return Err(parse_error_response(status, &text, &self.id));
+            }
+
+            let json_val: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Other {
+                provider: self.id.clone(),
+                message: format!("Failed to parse response JSON: {}", e),
+                status: Some(status),
+                body: Some(text.clone()),
+            })?;
+
+            return Self::parse_responses_response(&self.id, &json_val);
+        }
+    }
+
+    async fn send_responses_streaming_request(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let mut token = self.access_token().await?;
+        let account_id = self.account_id();
+
+        let mut body = Self::build_responses_body(request);
+        body["stream"] = json!(true);
+
+        let mut retried_auth = false;
+        loop {
+            let builder = self
+                .http_client
+                .post(CODEX_API_ENDPOINT)
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream");
+            let builder = Self::codex_headers(builder, &token, account_id.as_deref(), &body);
+
+            let resp = builder
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| ProviderError::Other {
+                    provider: self.id.clone(),
+                    message: format!("HTTP request failed: {}", e),
+                    status: None,
+                    body: None,
+                })?;
+
+            let status = resp.status().as_u16();
+            if !(200..300).contains(&(status as usize)) {
+                // Same refresh-once-and-retry contract as the non-streaming
+                // request (only a pre-stream rejection can be replayed; a
+                // mid-stream failure is terminal).
+                if status == 401 && !retried_auth {
+                    retried_auth = true;
+                    if let Ok(refreshed) = self.refresh_after_auth_failure(&token).await {
+                        debug!("Codex stream hit a 401 — token refreshed, retrying once");
+                        token = refreshed;
+                        continue;
+                    }
+                }
+                let retry_after = crate::retry::retry_after(resp.headers());
+                let text = resp.text().await.map_err(|e| ProviderError::Other {
+                    provider: self.id.clone(),
+                    message: format!("Failed to read response body: {}", e),
+                    status: Some(status),
+                    body: None,
+                })?;
+                return Err(
+                    parse_error_response(status, &text, &self.id).with_retry_after(retry_after)
+                );
+            }
+
+            return Ok(resp);
+        }
+    }
+
+    /// Recover from a 401 by obtaining a usable token (official client's
+    /// `reload-or-refresh` before surfacing the error):
+    ///
+    ///   1. adopt fresher tokens saved to disk by another provider instance —
+    ///      the single-use refresh token may already have been spent there;
+    ///   2. else force a refresh, bypassing the 5-minute proactive window that
+    ///      produced the stale-bearer 401.
+    ///
+    /// Returns `Err` (propagating the refresh failure's own taxonomy) when no
+    /// usable token can be produced; the caller then surfaces the original
+    /// 401.
+    async fn refresh_after_auth_failure(&self, stale_token: &str) -> Result<String, ProviderError> {
+        // Refresh tokens are single-use: serialize against other instances.
+        let _refresh_guard = REFRESH_LOCK.lock().await;
+        if let Some(stored) = get_codex_tokens() {
+            if stored.access_token != stale_token
+                && !stored.access_token.is_empty()
+                && !Self::is_expired(&stored, unix_now())
+            {
+                let fresh = stored.access_token.clone();
+                let mut guard = self.tokens.lock().unwrap_or_else(PoisonError::into_inner);
+                *guard = stored;
+                if guard.account_id.is_none() {
+                    guard.account_id = jwt_identity(&guard.access_token).account_id;
+                }
+                return Ok(fresh);
+            }
         }
 
-        Ok(resp)
+        let refresh = self
+            .tokens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .refresh_token
+            .clone();
+        let Some(refresh) = refresh else {
+            return Err(ProviderError::AuthFailed {
+                provider: self.id.clone(),
+                message: "Codex access token was rejected and no refresh token is available — \
+                          run /connect to sign in again"
+                    .to_string(),
+            });
+        };
+        self.refresh_token(&refresh).await
     }
 
     // -----------------------------------------------------------------------
