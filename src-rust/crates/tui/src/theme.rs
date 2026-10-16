@@ -1,5 +1,4 @@
-// theme.rs — Theme palettes for the TUI, ported from jcode's
-// custom theme palettes feature.
+// theme.rs — Theme palettes for the TUI.
 //
 // A theme is a set of named color roles. Three kinds exist:
 //
@@ -12,15 +11,17 @@
 //    unchanged and only the theme name is recorded in settings.
 //
 // The active palette is applied as a buffer post-pass over the rendered
-// frame (see `apply_theme_pass`): every cell color that matches a *native*
-// palette color is replaced with the corresponding themed color. Widgets
-// keep rendering their historical colors; themes remap them wholesale.
+// frame (see `apply_theme_pass`). Widgets keep rendering their historical
+// colors; the pass translates them through channel-separated remap tables
+// built once per theme (fg table, bg table), so foreground and background
+// uses of the same source color can land on different themed roles.
 
 use ratatui::style::Color;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::RwLock;
 
 // ---------------------------------------------------------------------------
 // Roles
@@ -108,43 +109,141 @@ pub const BUILTIN_THEMES: &[&str] = &[
 ];
 
 // ---------------------------------------------------------------------------
-// Active theme snapshot (lock-free reads, like jcode)
+// Active theme snapshot (cheap per-frame read of an Arc)
 // ---------------------------------------------------------------------------
 
-static ACTIVE_THEME: OnceLock<AtomicPtr<ThemeSnapshot>> = OnceLock::new();
+/// Global theme cell. Initialized with the native palette; replaced under
+/// the write lock by `set_theme`. Readers clone the `Arc` once per frame.
+static ACTIVE_THEME: OnceLock<RwLock<Arc<ThemeSnapshot>>> = OnceLock::new();
+
+fn active_theme_cell() -> &'static RwLock<Arc<ThemeSnapshot>> {
+    ACTIVE_THEME.get_or_init(|| {
+        RwLock::new(Arc::new(ThemeSnapshot::from_theme(
+            // The boot snapshot is the native palette; startup wiring replaces
+            // it with the configured theme (which may itself be "default").
+            &native_palette(),
+        )))
+    })
+}
+
+/// The active snapshot. Locks only to clone the Arc; the snapshot itself
+/// is immutable, so no lock is held while the buffer pass walks the cells.
+fn active_theme_snapshot() -> Arc<ThemeSnapshot> {
+    active_theme_cell().read().clone()
+}
 
 #[derive(Debug, Clone)]
 struct ThemeSnapshot {
-    name: String,
-    /// Role -> themed color, indexed by `ThemeColor as usize`.
-    colors: [Color; THEME_COLOR_COUNT],
-    /// Reverse map: native color -> themed color, for the buffer pass.
-    native_to_themed: HashMap<Color, Color>,
+    /// Foreground remap: native color -> themed color. Built from the role
+    /// table plus the wide anchors in `add_anchors`.
+    fg_remap: HashMap<Color, Color>,
+    /// Background remap: native color -> themed color. Separate from the fg
+    /// table so the same source color can land on different themed roles in
+    /// each channel (e.g. fg White -> Text, bg Black -> Background).
+    bg_remap: HashMap<Color, Color>,
 }
 
 impl ThemeSnapshot {
     fn from_theme(theme: &Theme) -> Self {
         let name = theme.name().to_string();
         let mut colors = [Color::Reset; THEME_COLOR_COUNT];
-        // Map every native role color to the themed equivalent. Widgets render
-        // native colors; the buffer pass swaps them for themed ones.
-        let mut native_to_themed = HashMap::new();
+        let mut fg_remap = HashMap::new();
+        let mut bg_remap = HashMap::new();
+        let native = native_palette();
         for (i, key) in ROLES.iter().enumerate() {
-            let native = native_palette().color(*key);
+            let native_color = native.color(*key);
             let themed = theme.color(*key);
             colors[i] = themed;
-            if themed != native {
-                // First role wins on native-color collisions (e.g. Info and
-                // Action are both Cyan natively).
-                native_to_themed.entry(native).or_insert(themed);
+            if themed == native_color {
+                continue;
+            }
+            // Background-family roles only feed the bg table: their native
+            // values (Black and the dark panel greys) are also painted as fg
+            // by badge and chip widgets, which must keep their native identity
+            // (black text stays black on a colored chip under any theme).
+            if !matches!(
+                key,
+                ThemeColor::Background | ThemeColor::PanelBg | ThemeColor::OverlayBg
+            ) {
+                fg_remap.insert(native_color, themed);
+            }
+            if matches!(
+                key,
+                ThemeColor::Background
+                    | ThemeColor::PanelBg
+                    | ThemeColor::OverlayBg
+                    | ThemeColor::Border
+            ) {
+                bg_remap.insert(native_color, themed);
             }
         }
-        Self {
-            name,
-            colors,
-            native_to_themed,
+        if name != "default" {
+            add_anchors(&mut fg_remap, &mut bg_remap, &colors);
         }
+        Self { fg_remap, bg_remap }
     }
+}
+
+/// Colors widgets paint that do not match any native role value but still
+/// carry role meaning. The review's color-site census found:
+/// - `Color::White` fg at 139 sites is the workhorse text color; `Color::Reset`
+///   fg is implicit terminal text. Under `light`, mapping neither to Text left
+///   most of the UI white-on-near-white.
+/// - `CLAURST_*` constants (overlays.rs) are close-but-not-equal to the
+///   native role values, so exact matching missed them.
+/// - `Color::Red` / `Green` / `Yellow` are painted directly by status widgets
+///   (bridge states, chips, banners) instead of the native Error / Success /
+///   Warning values.
+///
+/// Background side: `Color::Black` is the app background and `Color::Reset`
+/// means "no explicit background", both filled with the theme background so
+/// light/colorful palettes are readable. fg `Color::Black` is intentionally
+/// unmapped, and the semantic chip backgrounds (`bg` Green/Yellow/Red) keep
+/// their native colors: badges paint black text on those chips
+/// (elicitation dialog, status pills) and a themed background value can be
+/// too dark for black text (light's success green), which would break them.
+fn add_anchors(
+    fg_remap: &mut HashMap<Color, Color>,
+    bg_remap: &mut HashMap<Color, Color>,
+    colors: &[Color; THEME_COLOR_COUNT],
+) {
+    let text = colors[ThemeColor::Text as usize];
+    let bg = colors[ThemeColor::Background as usize];
+    let accent = colors[ThemeColor::Accent as usize];
+    let secondary = colors[ThemeColor::SecondaryAccent as usize];
+    let error = colors[ThemeColor::Error as usize];
+    let success = colors[ThemeColor::Success as usize];
+    let warning = colors[ThemeColor::Warning as usize];
+    let disabled = colors[ThemeColor::Disabled as usize];
+    let border = colors[ThemeColor::Border as usize];
+    let panel = colors[ThemeColor::PanelBg as usize];
+    let overlay = colors[ThemeColor::OverlayBg as usize];
+
+    fg_remap.insert(Color::White, text);
+    fg_remap.insert(Color::Reset, text);
+    fg_remap.insert(Color::DarkGray, disabled);
+    fg_remap.insert(Color::Gray, disabled);
+    fg_remap.insert(Color::Red, error);
+    fg_remap.insert(Color::Green, success);
+    fg_remap.insert(Color::Yellow, warning);
+    // The loop above already maps the native role colors, but Info and
+    // Action are both `Color::Cyan` natively; the accent is the deliberate
+    // winner for the generic cyan highlight sites.
+    fg_remap.insert(Color::Cyan, accent);
+    fg_remap.insert(Color::Blue, accent);
+    fg_remap.insert(Color::Magenta, secondary);
+    // CLAURST_* constants from overlays.rs: close to but not equal to the
+    // native role values, so the role loop's exact matches miss them.
+    fg_remap.insert(Color::Rgb(235, 235, 240), text); // CLAURST_TEXT
+    fg_remap.insert(Color::Rgb(110, 110, 118), disabled); // CLAURST_MUTED
+    fg_remap.insert(Color::Rgb(233, 30, 99), accent); // CLAURST_ACCENT
+
+    bg_remap.insert(Color::Black, bg);
+    bg_remap.insert(Color::Reset, bg);
+    bg_remap.insert(Color::Rgb(72, 72, 80), border); // CLAURST_PANEL_BORDER
+    bg_remap.insert(Color::Rgb(20, 20, 28), panel); // CLAURST_PANEL_BG
+    bg_remap.insert(Color::Rgb(10, 10, 14), overlay); // CLAURST_OVERLAY_BG
+    bg_remap.insert(Color::DarkGray, panel);
 }
 
 const ROLES: [ThemeColor; THEME_COLOR_COUNT] = [
@@ -163,43 +262,6 @@ const ROLES: [ThemeColor; THEME_COLOR_COUNT] = [
     ThemeColor::OverlayBg,
 ];
 
-fn active_theme_slot() -> &'static AtomicPtr<ThemeSnapshot> {
-    ACTIVE_THEME.get_or_init(|| AtomicPtr::new(std::ptr::null_mut()))
-}
-
-fn active_theme_snapshot() -> &'static ThemeSnapshot {
-    let slot = active_theme_slot();
-    let current = slot.load(Ordering::Acquire);
-    if !current.is_null() {
-        // SAFETY: snapshots are intentionally leaked after publication so
-        // render readers can dereference them without a lock.
-        return unsafe { &*current };
-    }
-
-    let snapshot = Box::into_raw(Box::new(ThemeSnapshot::from_theme(
-        // The boot snapshot is the native palette; startup wiring replaces it
-        // with the configured theme (which may itself be "default").
-        &native_palette(),
-    )));
-    match slot.compare_exchange(
-        std::ptr::null_mut(),
-        snapshot,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    ) {
-        Ok(_) => unsafe { &*snapshot },
-        Err(existing) => unsafe {
-            // Another thread won initialization; drop our unpublished snapshot.
-            drop(Box::from_raw(snapshot));
-            &*existing
-        },
-    }
-}
-
-/// Name of the currently active theme.
-pub fn active_theme_name() -> String {
-    active_theme_snapshot().name.clone()
-}
 /// Set the active theme. Unknown or invalid names return an error and leave
 /// the current theme unchanged.
 pub fn set_theme(name: &str, themes_dir: Option<&Path>) -> anyhow::Result<()> {
@@ -209,11 +271,8 @@ pub fn set_theme(name: &str, themes_dir: Option<&Path>) -> anyhow::Result<()> {
 }
 
 fn publish_snapshot(theme: Theme) {
-    let snapshot = Box::into_raw(Box::new(ThemeSnapshot::from_theme(&theme)));
-    // Keep the old snapshot alive (leak it): lock-free render readers may
-    // still hold references while a theme change races. Theme changes are
-    // rare and each snapshot is tiny.
-    let _old = active_theme_slot().swap(snapshot, Ordering::AcqRel);
+    let snapshot = Arc::new(ThemeSnapshot::from_theme(&theme));
+    *active_theme_cell().write() = snapshot;
 }
 
 // ---------------------------------------------------------------------------
@@ -355,7 +414,7 @@ fn named_color(name: &str) -> Option<Color> {
 }
 
 /// Parse a color value: "reset"/"default", a ratatui named color, or "#rrggbb".
-pub fn parse_color(raw: &str) -> Option<Color> {
+fn parse_color(raw: &str) -> Option<Color> {
     let raw = raw.trim();
     if raw.eq_ignore_ascii_case("reset") || raw.eq_ignore_ascii_case("default") {
         return Some(Color::Reset);
@@ -437,7 +496,7 @@ fn builtin_palette(name: &str) -> Option<Theme> {
                 (ThemeColor::Warning, Color::Rgb(230, 124, 13)),
                 (ThemeColor::Info, Color::Rgb(13, 71, 161)),
                 (ThemeColor::Action, Color::Blue),
-                (ThemeColor::Disabled, Color::Rgb(189, 189, 189)),
+                (ThemeColor::Disabled, Color::Rgb(117, 117, 117)),
                 (ThemeColor::Text, Color::Rgb(33, 33, 33)),
                 (ThemeColor::Border, Color::Rgb(189, 189, 189)),
                 (ThemeColor::PanelBg, Color::Rgb(240, 240, 245)),
@@ -545,28 +604,24 @@ fn builtin_palette(name: &str) -> Option<Theme> {
 
 /// Apply the active theme to a rendered frame, in place.
 ///
-/// Every cell whose fg/bg matches a *native* palette color is remapped to the
-/// themed equivalent. When the theme defines a background, cells still using
-/// the terminal default (`Color::Reset`) background get it filled in, so light
-/// and colorful themes are readable even though widgets never paint one.
-///
-/// The "default" theme is a no-op: native colors pass through unchanged.
+/// Each cell's fg and bg is translated through the snapshot's remap tables,
+/// channel by channel. Themes whose tables are empty (the "default"
+/// pass-through) cost one `is_empty` check.
 pub fn apply_theme_pass(buf: &mut ratatui::buffer::Buffer) {
     let snapshot = active_theme_snapshot();
-    if snapshot.name == "default" {
+    apply_snapshot_to_buffer(&snapshot, buf);
+}
+
+fn apply_snapshot_to_buffer(snapshot: &ThemeSnapshot, buf: &mut ratatui::buffer::Buffer) {
+    if snapshot.fg_remap.is_empty() && snapshot.bg_remap.is_empty() {
         return;
     }
-    let bg = snapshot.colors[ThemeColor::Background as usize];
-    let native_bg = native_palette().color(ThemeColor::Background);
     for cell in buf.content.iter_mut() {
-        if let Some(chosen) = snapshot.native_to_themed.get(&cell.fg) {
+        if let Some(chosen) = snapshot.fg_remap.get(&cell.fg) {
             cell.fg = *chosen;
         }
-        if let Some(chosen) = snapshot.native_to_themed.get(&cell.bg) {
+        if let Some(chosen) = snapshot.bg_remap.get(&cell.bg) {
             cell.bg = *chosen;
-        }
-        if bg != Color::Reset && (cell.bg == native_bg || cell.bg == Color::Reset) {
-            cell.bg = bg;
         }
     }
 }
@@ -717,40 +772,127 @@ mod tests {
     }
 
     #[test]
-    fn set_theme_remaps_native_colors_in_buffer() {
-        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 4, 1));
-        buf.content[0].set_fg(Color::Rgb(233, 30, 99)); // native accent
-        buf.content[1].set_fg(Color::Rgb(76, 175, 80)); // native success
-        buf.content[2].set_bg(Color::Rgb(20, 20, 28)); // native panel bg
-        buf.content[3].set_fg(Color::Reset);
+    fn nord_snapshot_remaps_native_colors_per_channel() {
+        let snapshot = ThemeSnapshot::from_theme(&load_theme("nord", None).unwrap());
 
-        // "default" theme: pass-through, nothing changes.
-        set_theme("default", None).unwrap();
-        apply_theme_pass(&mut buf);
-        assert_eq!(buf.content[0].fg, Color::Rgb(233, 30, 99));
+        // Foreground: native role colors plus the wide anchors.
+        assert_eq!(
+            snapshot.fg_remap.get(&Color::Rgb(233, 30, 99)),
+            Some(&Color::Rgb(136, 192, 208)) // native accent -> nord accent
+        );
+        assert_eq!(
+            snapshot.fg_remap.get(&Color::Rgb(76, 175, 80)),
+            Some(&Color::Rgb(163, 190, 140)) // native success
+        );
+        assert_eq!(
+            snapshot.fg_remap.get(&Color::White),
+            Some(&Color::Rgb(216, 222, 233)) // workhorse text -> nord Text
+        );
+        assert_eq!(
+            snapshot.fg_remap.get(&Color::Reset),
+            Some(&Color::Rgb(216, 222, 233))
+        );
+        assert_eq!(
+            snapshot.fg_remap.get(&Color::Red),
+            Some(&Color::Rgb(191, 97, 106)) // named Red -> nord Error
+        );
+        assert_eq!(
+            snapshot.fg_remap.get(&Color::Cyan),
+            Some(&Color::Rgb(136, 192, 208)) // accent wins the Info/Action tie
+        );
 
-        set_theme("nord", None).unwrap();
-        apply_theme_pass(&mut buf);
-        // Native accent remapped to the nord accent.
-        assert_eq!(buf.content[0].fg, Color::Rgb(136, 192, 208));
-        assert_eq!(buf.content[1].fg, Color::Rgb(163, 190, 140));
-        assert_eq!(buf.content[2].bg, Color::Rgb(59, 66, 82));
-        // Reset background filled with the nord background.
-        assert_eq!(buf.content[3].bg, Color::Rgb(46, 52, 64));
+        // Background: channel-separated from the fg table.
+        assert_eq!(
+            snapshot.bg_remap.get(&Color::Black),
+            Some(&Color::Rgb(46, 52, 64)) // app background
+        );
+        assert_eq!(
+            snapshot.bg_remap.get(&Color::Reset),
+            Some(&Color::Rgb(46, 52, 64))
+        );
+        assert_eq!(
+            snapshot.bg_remap.get(&Color::Rgb(20, 20, 28)),
+            Some(&Color::Rgb(59, 66, 82)) // native PanelBg -> nord PanelBg
+        );
 
-        // Restore default so other tests see the native palette.
-        set_theme("default", None).unwrap();
+        // Badge combos keep their native identity.
+        assert!(!snapshot.fg_remap.contains_key(&Color::Black));
+        assert!(!snapshot.bg_remap.contains_key(&Color::Green));
+
+        // End to end through the buffer pass.
+        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 3, 1));
+        buf.content[0].set_fg(Color::White);
+        buf.content[1].set_bg(Color::Reset);
+        buf.content[2].set_fg(Color::Black);
+        buf.content[2].set_bg(Color::Green);
+        apply_snapshot_to_buffer(&snapshot, &mut buf);
+        assert_eq!(buf.content[0].fg, Color::Rgb(216, 222, 233));
+        assert_eq!(buf.content[1].bg, Color::Rgb(46, 52, 64));
+        assert_eq!(buf.content[2].fg, Color::Black);
+        assert_eq!(buf.content[2].bg, Color::Green);
     }
 
     #[test]
-    fn set_theme_invalid_name_errors_and_keeps_theme() {
-        // Invalid names fail before anything is published. The load-level
-        // behaviour is asserted directly because the active-theme global is
-        // shared with the other theme tests, which run in parallel.
-        set_theme("nord", None).unwrap();
-        assert!(load_theme("does-not-exist", None).is_err());
-        // Publishing an invalid theme cannot happen: set_theme loads first.
+    fn light_snapshot_keeps_text_readable_on_light_background() {
+        let snapshot = ThemeSnapshot::from_theme(&load_theme("light", None).unwrap());
+
+        // The review's core complaint: white text on the light background.
+        // Both text anchors must flip to the dark themed Text color.
+        assert_eq!(
+            snapshot.fg_remap.get(&Color::White),
+            Some(&Color::Rgb(33, 33, 33))
+        );
+        assert_eq!(
+            snapshot.fg_remap.get(&Color::Reset),
+            Some(&Color::Rgb(33, 33, 33))
+        );
+        assert_eq!(
+            snapshot.fg_remap.get(&Color::Rgb(236, 236, 241)), // native Text value
+            Some(&Color::Rgb(33, 33, 33))
+        );
+        assert_eq!(
+            snapshot.fg_remap.get(&Color::Rgb(235, 235, 240)), // CLAURST_TEXT
+            Some(&Color::Rgb(33, 33, 33))
+        );
+        assert_eq!(
+            snapshot.fg_remap.get(&Color::DarkGray),
+            Some(&Color::Rgb(117, 117, 117)) // dim labels stay visible
+        );
+        // Backgrounds fill with the light background.
+        assert_eq!(
+            snapshot.bg_remap.get(&Color::Black),
+            Some(&Color::Rgb(250, 250, 250))
+        );
+        assert_eq!(
+            snapshot.bg_remap.get(&Color::Reset),
+            Some(&Color::Rgb(250, 250, 250))
+        );
+        // Semantic chip backgrounds keep their native colors so black badge
+        // text stays readable (light's success green is too dark for it).
+        assert!(!snapshot.bg_remap.contains_key(&Color::Green));
+        assert!(!snapshot.bg_remap.contains_key(&Color::Yellow));
+        assert!(!snapshot.bg_remap.contains_key(&Color::Red));
+    }
+
+    #[test]
+    fn default_snapshot_is_identity() {
+        let snapshot = ThemeSnapshot::from_theme(&load_theme("default", None).unwrap());
+        assert!(snapshot.fg_remap.is_empty());
+        assert!(snapshot.bg_remap.is_empty());
+
+        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 2, 1));
+        buf.content[0].set_fg(Color::White);
+        buf.content[1].set_bg(Color::Black);
+        apply_snapshot_to_buffer(&snapshot, &mut buf);
+        assert_eq!(buf.content[0].fg, Color::White);
+        assert_eq!(buf.content[1].bg, Color::Black);
+    }
+
+    #[test]
+    fn set_theme_invalid_name_errors() {
+        // set_theme loads before publishing, so a failed load leaves the
+        // active theme untouched without any restore step.
         assert!(set_theme("does-not-exist", None).is_err());
-        set_theme("default", None).unwrap();
+        assert!(load_theme("does-not-exist", None).is_err());
     }
 }

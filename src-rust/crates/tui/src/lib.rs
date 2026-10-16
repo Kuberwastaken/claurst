@@ -588,8 +588,8 @@ pub fn update_terminal_title(topic: Option<&str>) {
 
 /// The per-user themes directory: `<config_dir>/themes`, where custom TOML
 /// palettes (`<name>.toml`) live.
-pub fn themes_dir() -> Option<std::path::PathBuf> {
-    Some(claurst_core::config::Settings::config_dir().join("themes"))
+pub fn themes_dir() -> std::path::PathBuf {
+    claurst_core::config::Settings::config_dir().join("themes")
 }
 
 // ---------------------------------------------------------------------------

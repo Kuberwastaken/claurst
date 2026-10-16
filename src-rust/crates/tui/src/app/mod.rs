@@ -880,15 +880,8 @@ impl App {
     /// the render pass applies it. Unknown theme names fall back to the
     /// native ("default") palette.
     fn init_theme(&self) {
-        let name = match &self.config.theme {
-            Theme::Default => "default",
-            Theme::Dark => "dark",
-            Theme::Light => "light",
-            Theme::Deuteranopia => "deuteranopia",
-            Theme::Custom(name) => name.as_str(),
-        };
-        let themes_dir = Settings::config_dir().join("themes");
-        if let Err(error) = crate::theme::set_theme(name, Some(&themes_dir)) {
+        let name = self.config.theme.name();
+        if let Err(error) = crate::theme::set_theme(name, Some(&crate::themes_dir())) {
             tracing::warn!("failed to load theme '{}': {}", name, error);
         }
     }
@@ -1025,15 +1018,8 @@ impl App {
     /// Returns `false` and sets a status message when the theme fails to
     /// load, so the caller can keep the error instead of a success message.
     pub fn apply_theme_name(&mut self, theme: &Theme) -> bool {
-        let name = match theme {
-            Theme::Default => "default",
-            Theme::Dark => "dark",
-            Theme::Light => "light",
-            Theme::Deuteranopia => "deuteranopia",
-            Theme::Custom(name) => name.as_str(),
-        };
-        let themes_dir = Settings::config_dir().join("themes");
-        if let Err(error) = crate::theme::set_theme(name, Some(&themes_dir)) {
+        let name = theme.name();
+        if let Err(error) = crate::theme::set_theme(name, Some(&crate::themes_dir())) {
             self.status_message =
                 Some(format!("Theme '{}' failed to load: {}", name, error));
             return false;
@@ -1048,8 +1034,7 @@ impl App {
     /// rendered with the new palette. Persistence errors are surfaced as a
     /// status message but do not roll back the in-memory theme.
     pub fn apply_theme(&mut self, theme_name: &str) {
-        let themes_dir = Settings::config_dir().join("themes");
-        if let Err(error) = crate::theme::set_theme(theme_name, Some(&themes_dir)) {
+        if let Err(error) = crate::theme::set_theme(theme_name, Some(&crate::themes_dir())) {
             self.status_message = Some(format!("Theme '{}' failed to load: {}", theme_name, error));
             return;
         }

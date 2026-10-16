@@ -1503,6 +1503,21 @@ pub mod config {
         }
     }
 
+    impl Theme {
+        /// Canonical theme name: the string `/theme <name>` accepts, the
+        /// picker highlights, and settings round-trip. `Custom` passes the
+        /// user's name through unchanged.
+        pub fn name(&self) -> &str {
+            match self {
+                Theme::Default => "default",
+                Theme::Dark => "dark",
+                Theme::Light => "light",
+                Theme::Deuteranopia => "deuteranopia",
+                Theme::Custom(name) => name.as_str(),
+            }
+        }
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
     #[serde(rename_all = "lowercase")]
     pub enum OutputFormat {

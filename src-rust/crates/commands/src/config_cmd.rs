@@ -95,14 +95,8 @@ impl SlashCommand for ConfigCommand {
                     return CommandResult::Error("Theme name cannot be empty".to_string());
                 };
                 // Validate the theme loads before persisting, same as /theme.
-                let name = match &theme {
-                    Theme::Default => "default".to_string(),
-                    Theme::Dark => "dark".to_string(),
-                    Theme::Light => "light".to_string(),
-                    Theme::Deuteranopia => "deuteranopia".to_string(),
-                    Theme::Custom(name) => name.clone(),
-                };
-                let themes_dir = Settings::config_dir().join("themes");
+                let name = theme.name().to_string();
+                let themes_dir = claurst_tui::themes_dir();
                 if let Err(err) = claurst_tui::theme::load_theme(&name, Some(&themes_dir)) {
                     let available = claurst_tui::theme::available_theme_names(Some(&themes_dir)).join(", ");
                     return CommandResult::Error(format!(
@@ -119,7 +113,7 @@ impl SlashCommand for ConfigCommand {
                 }
                 CommandResult::ConfigChangeMessage(
                     new_config,
-                    format!("Theme set to {}.", value.trim().to_lowercase()),
+                    format!("Theme set to {}.", value.trim()),
                 )
             }
             "output-style" | "output_style" => {

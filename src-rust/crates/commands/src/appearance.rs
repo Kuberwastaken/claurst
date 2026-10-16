@@ -76,9 +76,9 @@ impl SlashCommand for ThemeCommand {
     fn description(&self) -> &str { "Show or change the current theme" }
     fn help(&self) -> &str {
         "Usage: /theme [name]\n\n\
-         Without arguments, shows the active theme. With an argument, updates the
+         Without arguments, shows the active theme. With an argument, updates the\
          theme for this and future sessions.\n\n\
-         Built-in themes: default, dark, light, deuteranopia, solarized, nord, dracula,
+         Built-in themes: default, dark, light, deuteranopia, solarized, nord, dracula,\
          monokai. Custom themes live in ~/.claurst/themes/<name>.toml."
     }
 
@@ -97,14 +97,8 @@ impl SlashCommand for ThemeCommand {
 
         // Validate the theme actually loads before persisting it, so a
         // typo does not get written to settings and break startup.
-        let name = match &theme {
-            Theme::Default => "default".to_string(),
-            Theme::Dark => "dark".to_string(),
-            Theme::Light => "light".to_string(),
-            Theme::Deuteranopia => "deuteranopia".to_string(),
-            Theme::Custom(name) => name.clone(),
-        };
-        let themes_dir = Settings::config_dir().join("themes");
+        let name = theme.name().to_string();
+        let themes_dir = claurst_tui::themes_dir();
         if let Err(err) = claurst_tui::theme::load_theme(&name, Some(&themes_dir)) {
             let available = claurst_tui::theme::available_theme_names(Some(&themes_dir)).join(", ");
             return CommandResult::Error(format!(
@@ -120,10 +114,7 @@ impl SlashCommand for ThemeCommand {
             return CommandResult::Error(format!("Failed to save theme: {}", err));
         }
 
-        CommandResult::ConfigChangeMessage(
-            new_config,
-            format!("Theme set to {}.", args.to_lowercase()),
-        )
+        CommandResult::ConfigChangeMessage(new_config, format!("Theme set to {}.", args))
     }
 }
 
