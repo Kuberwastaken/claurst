@@ -162,6 +162,10 @@ pub struct App {
     /// Maximum token budget (from env var or model context window) — P2 feature flag
     pub token_budget: Option<u32>,
     pub cost_usd: f64,
+    /// Anthropic session authenticated via Bearer (claude.ai OAuth, i.e. a
+    /// Claude Pro/Max subscription) rather than an API key. Feeds the cost
+    /// tracker's subscription detection (issue #499).
+    pub anthropic_bearer_auth: bool,
     pub model_name: String,
     /// Whether the app has valid API credentials configured.
     /// False = show the in-TUI provider setup dialog on startup.
@@ -651,6 +655,7 @@ impl App {
             token_count: 0,
             token_budget: Self::load_token_budget(),
             cost_usd: 0.0,
+            anthropic_bearer_auth: false,
             model_name,
             has_credentials: true, // overridden by caller when no key is configured
             effort_level: EffortLevel::Medium,
