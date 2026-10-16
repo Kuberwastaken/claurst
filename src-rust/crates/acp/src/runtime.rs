@@ -47,9 +47,20 @@ impl AgentRuntime {
             }
         };
         let mut config = settings.effective_config();
-        // Plan mode requires interactive UI — fall back to Default so the
-        // ACP permission bridge can route decisions to the client.
-        if config.permission_mode == claurst_core::PermissionMode::Plan {
+        // yoloMode from global settings maps to BypassPermissions with the
+        // same root/sudo guard the CLI applies (cli/src/main.rs) — it is
+        // global-only, so project settings cannot enable it.
+        if config.yolo_mode {
+            #[cfg(unix)]
+            if nix::unistd::Uid::effective().is_root() {
+                anyhow::bail!(
+                    "yoloMode cannot be used with root/sudo privileges for security reasons"
+                );
+            }
+            config.permission_mode = claurst_core::PermissionMode::BypassPermissions;
+        } else if config.permission_mode == claurst_core::PermissionMode::Plan {
+            // Plan mode requires interactive UI — fall back to Default so the
+            // ACP permission bridge can route decisions to the client.
             config.permission_mode = claurst_core::PermissionMode::Default;
         }
         config.project_dir = Some(working_dir.clone());

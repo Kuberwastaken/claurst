@@ -727,6 +727,28 @@ async fn prompt_images_reach_a_provider_that_accepts_them() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn global_yolo_mode_bypasses_permissions_in_acp_like_the_cli() {
+    let _home = isolated_home().await;
+    let mut settings = claurst_core::config::Settings::default();
+    settings.config.yolo_mode = true;
+    std::fs::write(
+        claurst_core::config::Settings::global_settings_path(),
+        serde_json::to_string(&settings).expect("serialize global settings"),
+    )
+    .expect("write global settings");
+
+    let runtime = AgentRuntime::build(scratch_dir("yolo"))
+        .await
+        .expect("runtime builds");
+    assert_eq!(
+        runtime.config.permission_mode,
+        claurst_core::PermissionMode::BypassPermissions,
+        "yoloMode must bypass permissions in ACP exactly like the CLI"
+    );
+    assert!(runtime.config.yolo_mode);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn runtime_uses_settings_and_agents_md_of_the_session_cwd() {
     let _home = isolated_home().await;
     let cwd = scratch_dir("project");

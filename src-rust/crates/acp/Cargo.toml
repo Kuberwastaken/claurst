@@ -26,3 +26,6 @@ parking_lot = { workspace = true }
 futures = { workspace = true }
 dirs = { workspace = true }
 agent-client-protocol-schema = { version = "0.13", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
