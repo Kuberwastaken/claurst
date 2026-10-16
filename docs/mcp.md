@@ -61,7 +61,7 @@ Each entry in the `config.mcp_servers` array is an `McpServerConfig` object. A t
 | `env` | object | No | Extra environment variables set for the child process |
 | `url` | string | HTTP only | Full URL of the SSE endpoint |
 | `type` | string | No | Transport type: `"stdio"` (default), `"http"` (streamable HTTP) or `"sse"` (legacy SSE) |
-| `headers` | object | No | HTTP/SSE only: extra headers sent with every request, e.g. `{"X-Api-Key": "${MY_KEY}"}`. Values support variable expansion. An `Authorization` header replaces the stored OAuth token |
+| `headers` | object | No | HTTP/SSE only: extra headers sent with every request, e.g. `{"X-Api-Key": "${MY_KEY}"}`. Values support variable expansion. An `Authorization` header replaces the stored OAuth token, so no OAuth flow is needed and `/mcp auth` reports the server as not requiring auth |
 | `connect_timeout_ms` | integer | No | Bound on starting the transport and the `initialize` handshake. Default `10000` |
 | `catalog_timeout_ms` | integer | No | Bound on each `tools/list`, `resources/list` and `prompts/list` request. Default `30000` |
 
@@ -143,13 +143,14 @@ Use `/mcp` inside an interactive session to inspect MCP servers at runtime.
 /mcp tools [server]               — list exposed tool names (mcp__<server>__<tool>)
 /mcp auth <server>                — start OAuth for an HTTP/SSE server; stdio servers get env-var instructions
 /mcp connect <server>             — reconnect a failed server in the background
+/mcp restart <server>             — drop the current connection and reconnect it
 /mcp logs <server>                — show the server's status and last connection error
 /mcp resources [server]           — list resources from connected servers
 /mcp prompts [server]             — list prompt templates from connected servers
 /mcp get-prompt <server> <prompt> [key=value ...]  — expand a prompt template
 ```
 
-There is no `/mcp disconnect`. A failed server is not dead for good: `/mcp connect <server>` reconnects it in the background, and remote (`http`/`sse`) servers that failed at startup are retried every 60 seconds until they connect or Claurst exits (see [Startup, Timeouts and Retries](#startup-timeouts-and-retries)).
+There is no `/mcp disconnect`. A failed server is not dead for good: `/mcp connect <server>` reconnects it in the background, and remote (`http`/`sse`) servers that failed at startup are retried every 60 seconds until they connect or Claurst exits (see [Startup, Timeouts and Retries](#startup-timeouts-and-retries)). `/mcp restart <server>` drops the current connection and reopens the server — use it to pick up a relaunched stdio process or refreshed configuration without restarting Claurst.
 
 ---
 
@@ -223,6 +224,8 @@ Each server's startup is bounded:
 
 Remote (`http`/`sse`) servers get up to three connect attempts, 0.5 s and 1 s apart, unless an attempt timed out. Stdio servers get one attempt. A remote server that fails all of them is retried every 60 seconds while Claurst runs, so a server that comes back up (or gets its auth fixed) reconnects without user action; `/mcp connect <server>` starts a reconnect on demand for any transport. A server also reconnects itself automatically after the MCP runtime is rebuilt (for example after approving a project server or completing `/mcp auth`).
 
+Tool calls are bounded too: a `tools/call` that does not answer within 60 seconds returns a timeout error to the model, so a hung server cannot wedge the running turn.
+
 Server statuses:
 
 | Status | Meaning |
@@ -230,7 +233,7 @@ Server statuses:
 | `Connected` | Active connection; reports tool count |
 | `Connecting` | Connection attempt in progress |
 | `Failed` | A remote attempt failed; another attempt is scheduled |
-| `Disconnected` | Startup failed for good (the error is shown), or not connected |
+| `Disconnected` | Not connected (startup failed — the error is shown; remote servers are retried every 60 s) |
 
 ---
 

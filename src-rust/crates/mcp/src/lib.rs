@@ -1837,6 +1837,17 @@ impl McpManager {
             return McpAuthState::NotRequired;
         }
 
+        // A configured Authorization header authenticates every request of
+        // this server (issue #471): no OAuth token is needed, so /mcp must
+        // not report auth as required.
+        if config
+            .headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("authorization"))
+        {
+            return McpAuthState::NotRequired;
+        }
+
         if let Some(token) = oauth::get_mcp_token(server_name) {
             if !token.is_expired(60) {
                 return McpAuthState::Authenticated {
@@ -2880,6 +2891,36 @@ mod tests {
         assert_eq!(mgr.server_names(), vec!["srv".to_string()]);
         // Nothing is pending, so waiting returns immediately.
         mgr.wait_until_settled().await;
+    }
+
+    #[tokio::test]
+    async fn test_auth_state_respects_configured_authorization_header() {
+        // Redirect the on-disk token store into a tempdir so the Required
+        // case is deterministic (no real token on this machine). See
+        // test_auth_state_uses_token_expiry_datetime for why env is used.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var_os("CLAURST_MCP_TOKENS_DIR");
+        std::env::set_var("CLAURST_MCP_TOKENS_DIR", tmp.path());
+
+        // A server that authenticates through a configured header does not
+        // need OAuth, so /mcp must not send the user to browser auth.
+        let mgr = McpManager::new();
+        let mut config = http_fail_config("remote");
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer tok".to_string());
+        config.headers = headers;
+        mgr.server_configs.insert("remote".to_string(), config);
+        assert!(matches!(mgr.auth_state("remote"), McpAuthState::NotRequired));
+
+        // Without the header the state stays Required (no stored token).
+        mgr.server_configs
+            .insert("plain".to_string(), http_fail_config("plain"));
+        assert!(matches!(mgr.auth_state("plain"), McpAuthState::Required { .. }));
+
+        match prev {
+            Some(v) => std::env::set_var("CLAURST_MCP_TOKENS_DIR", v),
+            None => std::env::remove_var("CLAURST_MCP_TOKENS_DIR"),
+        }
     }
 
     #[test]

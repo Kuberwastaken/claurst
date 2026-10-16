@@ -14,7 +14,7 @@ impl SlashCommand for McpCommand {
     fn name(&self) -> &str { "mcp" }
     fn description(&self) -> &str { "Show MCP server status and manage connections" }
     fn help(&self) -> &str {
-        "Usage: /mcp [list|status|auth <server>|connect <server>|logs <server>|resources|prompts|get-prompt ...]\n\n\
+        "Usage: /mcp [list|status|auth <server>|connect <server>|restart <server>|logs <server>|resources|prompts|get-prompt ...]\n\n\
          Manages Model Context Protocol (MCP) servers.\n\
          MCP servers extend Claurst with external tools, resources, and prompt templates.\n\n\
          Subcommands:\n\
@@ -22,7 +22,8 @@ impl SlashCommand for McpCommand {
            /mcp list                   — same as above\n\
            /mcp status                 — detailed connection status for all servers\n\
            /mcp auth <server>          — show OAuth auth instructions for a server\n\
-           /mcp connect <server>       — reconnect a disconnected server\n\
+           /mcp connect <server>       — connect a failed server again\n\
+           /mcp restart <server>       — drop the connection and reconnect it\n\
            /mcp logs <server>          — show recent errors/logs for a server\n\
            /mcp resources [server]     — list resources from connected servers\n\
            /mcp prompts [server]       — list prompt templates from connected servers\n\
@@ -64,17 +65,17 @@ impl SlashCommand for McpCommand {
             return McpCommand::handle_tools(server_filter, ctx);
         }
 
-        // /mcp connect <server-name>
-        if first_word == "connect" {
-            let server_name = sub["connect".len()..].trim();
+        // /mcp connect <server-name> — connect a failed server again;
+        // /mcp restart <server-name> — drop its connection and reconnect.
+        if matches!(first_word, "connect" | "restart") {
+            let server_name = sub[first_word.len()..].trim();
             if server_name.is_empty() {
-                return CommandResult::Error(
-                    "Usage: /mcp connect <server-name>\n\
-                     Example: /mcp connect my-server"
-                        .to_string(),
-                );
+                return CommandResult::Error(format!(
+                    "Usage: /mcp {first_word} <server-name>\n\
+                     Example: /mcp {first_word} my-server"
+                ));
             }
-            return McpCommand::handle_connect(server_name, ctx).await;
+            return McpCommand::handle_connect(server_name, ctx, first_word == "restart").await;
         }
 
         // /mcp logs <server-name>
@@ -177,7 +178,7 @@ impl SlashCommand for McpCommand {
             ));
         }
         output.push_str(
-            "\nSubcommands: status | auth <server> | connect <server> | logs <server>\n\
+            "\nSubcommands: status | auth <server> | connect <server> | restart <server> | logs <server>\n\
              Also: resources | prompts | get-prompt <server> <prompt> [key=val ...]"
         );
         CommandResult::Message(output)
@@ -359,8 +360,15 @@ impl McpCommand {
         CommandResult::Message(out)
     }
 
-    /// Handle `/mcp connect <server>` — attempt to reconnect a server.
-    async fn handle_connect(server_name: &str, ctx: &CommandContext) -> CommandResult {
+    /// Handle `/mcp connect <server>` and `/mcp restart <server>` (issue
+    /// #471): connect a failed server again, or, with `restart`, drop an
+    /// existing connection and reopen it. Both start a background reconnect
+    /// via [`claurst_mcp::McpManager::reconnect`].
+    async fn handle_connect(
+        server_name: &str,
+        ctx: &CommandContext,
+        restart: bool,
+    ) -> CommandResult {
         // Validate that the server is configured.
         if !ctx.config.mcp_servers.iter().any(|s| s.name == server_name) {
             let names: Vec<&str> = ctx.config.mcp_servers.iter().map(|s| s.name.as_str()).collect();
@@ -388,7 +396,7 @@ impl McpCommand {
                 let current = manager.server_status(server_name);
                 use claurst_mcp::McpServerStatus;
                 match current {
-                    McpServerStatus::Connected { tool_count } => {
+                    McpServerStatus::Connected { tool_count } if !restart => {
                         CommandResult::Message(format!(
                             "MCP server '{}' is already connected ({} tool{} available).",
                             server_name,
@@ -403,18 +411,18 @@ impl McpCommand {
                             server_name
                         ))
                     }
-                    McpServerStatus::Disconnected { .. } | McpServerStatus::Failed { .. } => {
-                        // Start a runtime reconnect in the background (#471).
-                        // Failed remote servers are also retried periodically
-                        // without any user action.
+                    // Disconnected/Failed connect it again; restart also
+                    // reopens a connected server.
+                    _ => {
+                        let action = if restart { "restarting" } else { "reconnecting" };
                         match manager.reconnect(server_name) {
                             Ok(()) => CommandResult::Message(format!(
-                                "MCP server '{}' is reconnecting in the background.\n\
+                                "MCP server '{}' is {action} in the background.\n\
                                  \n\
                                  Remote servers are retried periodically until they connect.\n\
-                                 If authentication failed, run /mcp auth {} first,\n\
+                                 If authentication failed, run /mcp auth {server_name} first,\n\
                                  then reconnect. Check the attempt: /mcp status",
-                                server_name, server_name
+                                server_name
                             )),
                             Err(e) => CommandResult::Error(format!(
                                 "Could not reconnect '{}': {}",
