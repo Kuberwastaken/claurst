@@ -402,6 +402,31 @@ async fn prompt_after_cancel_runs_normally() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_before_the_prompt_task_starts_cancels_the_turn() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("cancel-race");
+    // `Step::Hang` never answers: if the cancel were dropped because it
+    // arrived before the prompt task reached its turn reservation, this
+    // prompt could never finish and `Client::prompt` would time out.
+    let provider = ScriptedProvider::new(vec![Step::Hang]);
+    let client = Client::start(scripted_runtime(&cwd, provider.clone()));
+    let session_id = client.new_session(&cwd).await;
+
+    let prompt = {
+        let client = client.clone();
+        let session_id = session_id.clone();
+        tokio::spawn(async move { client.prompt(&session_id, "hang").await })
+    };
+    // Deliberately NOT waiting for the provider here: the cancel must reach
+    // the session even when it lands before the prompt handler has begun.
+    client
+        .notify("session/cancel", acp::CancelNotification::new(session_id.clone()))
+        .await;
+    let response = prompt.await.expect("prompt task");
+    assert_eq!(stop_reason(&response), acp::StopReason::Cancelled);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_prompt_on_one_session_is_rejected() {
     let _home = isolated_home().await;
     let cwd = scratch_dir("busy");

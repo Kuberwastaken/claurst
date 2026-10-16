@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use crate::connection::Connection;
-use crate::sessions::SessionState;
+use crate::sessions::{ActiveTurn, SessionState};
 
 /// Handle one `session/prompt` JSON-RPC call.
 ///
@@ -25,10 +25,15 @@ use crate::sessions::SessionState;
 /// thinking delta, and tool invocation back as `session/update`
 /// notifications. Returns the final `PromptResponse` with the appropriate
 /// `StopReason`, or a JSON-RPC error when the turn fails.
+///
+/// `turn` comes from the caller — `dispatch` reserves it synchronously so a
+/// `session/cancel` released before this task started still cancels the turn
+/// (issue #467) — and dropping it marks the session idle again.
 pub async fn handle(
     connection: Arc<Connection>,
     session: Arc<SessionState>,
     params: acp::PromptRequest,
+    turn: ActiveTurn,
 ) -> Result<acp::PromptResponse, acp::Error> {
     let runtime = &session.runtime;
     // Convert prompt content blocks → a single user message in Claurst's
@@ -37,15 +42,14 @@ pub async fn handle(
         return Err(acp::Error::invalid_params()
             .data(Some(serde_json::json!({ "reason": "prompt has no text or image content" }))));
     };
-
-    // One prompt at a time per session, each with its own cancel token.
-    let Some(turn) = session.begin_turn() else {
-        return Err(acp::Error::new(
-            i32::from(acp::ErrorCode::InvalidRequest),
-            format!("Session {} already has a prompt running", session.session_id),
-        ));
-    };
     let cancel = turn.token.clone();
+
+    // A cancel that arrived before this task started has already fired the
+    // turn's token: skip the provider entirely and answer Cancelled, as the
+    // schema's `session/cancel` behaviour requires (issue #467).
+    if cancel.is_cancelled() {
+        return Ok(acp::PromptResponse::new(acp::StopReason::Cancelled));
+    }
 
     // Append the user turn to the session transcript.
     let mut messages: Vec<Message> = {
