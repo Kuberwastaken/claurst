@@ -1051,6 +1051,13 @@ impl CodexProvider {
             let mut open_blocks: std::collections::HashSet<usize> = std::collections::HashSet::new();
             // Freeform tool input streamed so far, by output index.
             let mut custom_inputs: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+            // Reasoning items whose summary deltas were streamed into an open
+            // block, by output index. Each output_index is one reasoning item,
+            // so its Thinking block must be started and stopped as a unit and
+            // the item's encrypted state attached to that same index when the
+            // item completes — keeping the (summary, encrypted_content) pair
+            // and the ordering relative to function calls.
+            let mut reasoning_items: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
@@ -1298,6 +1305,15 @@ impl CodexProvider {
                                         .get("output_index")
                                         .and_then(|value| value.as_u64())
                                         .unwrap_or(0) as usize;
+                                    if reasoning_items.insert(output_index) {
+                                        yield Ok(StreamEvent::ContentBlockStart {
+                                            index: output_index,
+                                            content_block: claurst_core::types::ContentBlock::Thinking {
+                                                thinking: String::new(),
+                                                signature: String::new(),
+                                            },
+                                        });
+                                    }
                                     yield Ok(StreamEvent::ThinkingDelta {
                                         index: output_index,
                                         thinking: "\n\n".to_string(),
@@ -1320,6 +1336,17 @@ impl CodexProvider {
                                         usage: UsageInfo::default(),
                                     });
                                     message_started = true;
+                                }
+                                // Each reasoning item's summary streams into
+                                // its own block: open it on the first delta.
+                                if reasoning_items.insert(output_index) {
+                                    yield Ok(StreamEvent::ContentBlockStart {
+                                        index: output_index,
+                                        content_block: claurst_core::types::ContentBlock::Thinking {
+                                            thinking: String::new(),
+                                            signature: String::new(),
+                                        },
+                                    });
                                 }
                                 if !delta.is_empty() {
                                     yield Ok(StreamEvent::ThinkingDelta {
@@ -1345,6 +1372,14 @@ impl CodexProvider {
                                     }
                                 }
                                 if open_blocks.remove(&output_index) {
+                                    yield Ok(StreamEvent::ContentBlockStop { index: output_index });
+                                }
+                                // A reasoning item's summary block closes first,
+                                // keeping the (summary, encrypted_content) pair
+                                // adjacent on the same output index.
+                                if json_val.pointer("/item/type").and_then(Value::as_str) == Some("reasoning")
+                                    && reasoning_items.remove(&output_index)
+                                {
                                     yield Ok(StreamEvent::ContentBlockStop { index: output_index });
                                 }
                                 // Carry the reasoning item's encrypted state so
@@ -1384,6 +1419,17 @@ impl CodexProvider {
                                         // No reassignment: this branch is the
                                         // stream-completion handler — execution
                                         // never re-enters the guard below.
+                                    }
+
+                                    // Reasoning blocks whose item never saw
+                                    // `output_item.done` (defensive: a
+                                    // truncated done event) still need a
+                                    // closing stop event.
+                                    let mut reasoning_left: Vec<usize> =
+                                        reasoning_items.drain().collect();
+                                    reasoning_left.sort_unstable();
+                                    for index in reasoning_left {
+                                        yield Ok(StreamEvent::ContentBlockStop { index });
                                     }
 
                                     let mut remaining: Vec<usize> = open_blocks.drain().collect();
@@ -1598,6 +1644,93 @@ impl LlmProvider for CodexProvider {
 mod tests {
     use super::*;
     use base64::Engine as _;
+
+    fn sse_line(event: &str, payload: &Value) -> String {
+        format!("event: {event}\ndata: {payload}\n\n")
+    }
+
+    /// Two reasoning items interleaved with a function call must stream as
+    /// well-formed per-item blocks — (summary, encrypted_content) pair per
+    /// `output_index`, in wire order relative to the function call — instead
+    /// of one joined Thinking blob followed by detached redacted blocks.
+    #[tokio::test]
+    async fn sse_reasoning_items_stay_paired_per_output_index() {
+        use claurst_core::types::ContentBlock;
+
+        let events = [
+            sse_line("response.created", &json!({"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}})),
+            sse_line("response.reasoning_summary_text.delta", &json!({"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"first item"})),
+            sse_line("response.output_item.added", &json!({"type":"response.output_item.added","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Bash"}})),
+            sse_line("response.function_call_arguments.delta", &json!({"type":"response.function_call_arguments.delta","output_index":1,"delta":r#"{"command":"ls"}"#})),
+            sse_line("response.output_item.done", &json!({"type":"response.output_item.done","output_index":0,"item":{"id":"rs_0","type":"reasoning","encrypted_content":"ENC-1"}})),
+            sse_line("response.output_item.done", &json!({"type":"response.output_item.done","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Bash","arguments":r#"{"command":"ls"}"#}})),
+            sse_line("response.reasoning_summary_text.delta", &json!({"type":"response.reasoning_summary_text.delta","output_index":2,"delta":"second item"})),
+            sse_line("response.output_item.done", &json!({"type":"response.output_item.done","output_index":2,"item":{"id":"rs_2","type":"reasoning","encrypted_content":"ENC-2"}})),
+            sse_line("response.completed", &json!({"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.5","usage":{"input_tokens":10,"output_tokens":5}}})),
+        ]
+        .join("");
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> = vec![Ok(events.into_bytes())];
+        let events: Vec<StreamEvent> = CodexProvider::sse_events(
+            futures::stream::iter(chunks),
+            ProviderId::new(ProviderId::CODEX),
+            None,
+        )
+        .map(|event| event.expect("stream has no errors"))
+        .collect()
+        .await;
+
+        // The per-item pairing: for each reasoning item, Thinking start →
+        // ThinkingDelta → Thinking stop → encrypted RedactedThinking, all at
+        // the item's output index.
+        let position = |probe: &dyn Fn(&StreamEvent) -> bool| -> Option<usize> {
+            events.iter().position(probe)
+        };
+        for (index, delta_text, encrypted) in [
+            (0usize, "first item", "ENC-1"),
+            (2usize, "second item", "ENC-2"),
+        ] {
+            let probe = |event: &StreamEvent| matches!(event,
+                StreamEvent::ContentBlockStart { index: i, content_block: ContentBlock::Thinking { .. } } if *i == index);
+            let start = position(&probe).unwrap_or_else(|| panic!("item {index}: Thinking block must start"));
+            let delta = events[start..]
+                .iter()
+                .position(|event| matches!(event, StreamEvent::ThinkingDelta { index: i, thinking } if *i == index && thinking == delta_text))
+                .map(|p| start + p)
+                .expect("item deltas after the block start");
+            let stop = events[delta..]
+                .iter()
+                .position(|event| matches!(event, StreamEvent::ContentBlockStop { index: i } if *i == index))
+                .map(|p| delta + p)
+                .expect("item summary block must stop before the encrypted state");
+            let redacted_start = events[stop..]
+                .iter()
+                .position(|event| matches!(event,
+                    StreamEvent::ContentBlockStart { index: i, content_block: ContentBlock::RedactedThinking { data } }
+                    if *i == index && data == encrypted))
+                .map(|p| stop + p)
+                .expect("item's encrypted state must pair with its summary");
+            assert!(matches!(
+                &events[redacted_start + 1],
+                StreamEvent::ContentBlockStop { index: i } if *i == index,
+            ));
+        }
+
+        // Wire order relative to the function call: item 0's encrypted state
+        // precedes the tool call; item 2's summary block opens after it.
+        let tool_start = events
+            .iter()
+            .position(|event| matches!(event,
+                StreamEvent::ContentBlockStart { index: 1, content_block: ContentBlock::ToolUse { .. } }))
+            .expect("function call block must start");
+        let enc1 = events.iter().position(|event| matches!(event,
+            StreamEvent::ContentBlockStart { content_block: ContentBlock::RedactedThinking { data }, .. } if data == "ENC-1"))
+            .expect("item 0 encrypted state present");
+        assert!(enc1 < tool_start, "item 0's pair must complete before the tool call");
+        let thinking2 = events.iter().position(|event| matches!(event,
+            StreamEvent::ContentBlockStart { index: 2, content_block: ContentBlock::Thinking { .. } }))
+            .expect("item 2 Thinking start present");
+        assert!(thinking2 > tool_start, "item 2 must stream after the tool call");
+    }
 
     fn jwt(payload: Value) -> String {
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string());
