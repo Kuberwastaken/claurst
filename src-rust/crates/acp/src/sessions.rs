@@ -57,7 +57,11 @@ impl SessionState {
 
     /// Start a prompt turn with a fresh cancellation token. Returns `None`
     /// when another prompt is already running on this session.
-    pub fn begin_turn(&self) -> Option<ActiveTurn<'_>> {
+    ///
+    /// Takes `&Arc<Self>` so the returned `ActiveTurn` owns the session: the
+    /// reservation is taken in `dispatch` (issue #467) and must outlive the
+    /// borrowed dispatcher state.
+    pub fn begin_turn(self: &Arc<Self>) -> Option<ActiveTurn> {
         let mut slot = self.active_turn.lock();
         if slot.is_some() {
             return None;
@@ -65,7 +69,7 @@ impl SessionState {
         let token = CancellationToken::new();
         *slot = Some(token.clone());
         Some(ActiveTurn {
-            slot: &self.active_turn,
+            session: Arc::clone(self),
             token,
         })
     }
@@ -82,15 +86,16 @@ impl SessionState {
     }
 }
 
-/// A running prompt turn. Dropping it marks the session idle again.
-pub struct ActiveTurn<'a> {
-    slot: &'a parking_lot::Mutex<Option<CancellationToken>>,
+/// A running prompt turn owning its session. Dropping it clears the
+/// session's active-turn slot, marking it idle again.
+pub struct ActiveTurn {
+    session: Arc<SessionState>,
     pub token: CancellationToken,
 }
 
-impl Drop for ActiveTurn<'_> {
+impl Drop for ActiveTurn {
     fn drop(&mut self) {
-        *self.slot.lock() = None;
+        *self.session.active_turn.lock() = None;
     }
 }
 
@@ -115,6 +120,27 @@ impl SessionRegistry {
 
     pub fn remove(&self, id: &acp::SessionId) -> Option<Arc<SessionState>> {
         self.inner.remove(id).map(|(_, v)| v)
+    }
+
+    /// Canonical working directories of all registered sessions.
+    pub fn live_cwds(&self) -> std::collections::HashSet<PathBuf> {
+        self.inner.iter().map(|entry| entry.value().cwd.clone()).collect()
+    }
+
+    /// GC: drop sessions whose working directory no longer has a cached
+    /// runtime. Live sessions never lose theirs — the runtime cache only
+    /// evicts directories with no session — so this only fires for strays
+    /// from a session creation racing an eviction.
+    pub fn gc(&self, live: &std::collections::HashSet<PathBuf>) -> usize {
+        let before = self.inner.len();
+        self.inner.retain(|id, state| {
+            let keep = live.contains(&state.cwd);
+            if !keep {
+                tracing::warn!(session_id = %id, cwd = %state.cwd.display(), "ACP: GC dropping session with no runtime");
+            }
+            keep
+        });
+        before - self.inner.len()
     }
 }
 
@@ -194,5 +220,29 @@ mod tests {
         let registry = SessionRegistry::new();
         let id = acp::SessionId::new("missing");
         assert!(registry.remove(&id).is_none());
+    }
+
+    #[test]
+    fn registry_gc_drops_sessions_whose_directory_has_no_runtime() {
+        let registry = SessionRegistry::new();
+        registry.insert(session("kept", "/tmp/kept"));
+        registry.insert(session("dropped", "/tmp/dropped"));
+        let mut live = std::collections::HashSet::new();
+        live.insert(PathBuf::from("/tmp/kept"));
+
+        assert_eq!(registry.gc(&live), 1);
+        assert!(registry.get(&acp::SessionId::new("kept")).is_some());
+        assert!(registry.get(&acp::SessionId::new("dropped")).is_none());
+    }
+
+    #[test]
+    fn registry_gc_keeps_sessions_whose_directory_still_has_a_runtime() {
+        let registry = SessionRegistry::new();
+        registry.insert(session("kept", "/tmp/kept"));
+        let mut live = std::collections::HashSet::new();
+        live.insert(PathBuf::from("/tmp/kept"));
+
+        assert_eq!(registry.gc(&live), 0);
+        assert!(registry.get(&acp::SessionId::new("kept")).is_some());
     }
 }
