@@ -156,18 +156,27 @@ impl App {
     /// Opt-in only: the default is OFF. Persists to settings.json.
     pub fn handle_poke_command(&mut self, args: &str) {
         let mut settings = claurst_core::Settings::load_sync().unwrap_or_default();
+        // Persist first, flip the live flag only when the save succeeded;
+        // otherwise the setting would revert on the next launch while the
+        // status message claims it changed.
+        let mut persist =
+            |settings: &claurst_core::Settings, flag: bool, enabled_msg: &str| -> String {
+                match settings.save_sync() {
+                    Ok(()) => {
+                        self.config.auto_poke_enabled = flag;
+                        enabled_msg.to_string()
+                    }
+                    Err(e) => format!("Auto-poke unchanged: could not save settings ({e})."),
+                }
+            };
         match args.trim() {
             "on" | "enable" => {
                 settings.config.auto_poke_enabled = true;
-                let _ = settings.save_sync();
-                self.config.auto_poke_enabled = true;
-                self.status_message = Some("Auto-poke enabled.".to_string());
+                self.status_message = Some(persist(&settings, true, "Auto-poke enabled."));
             }
             "off" | "disable" => {
                 settings.config.auto_poke_enabled = false;
-                let _ = settings.save_sync();
-                self.config.auto_poke_enabled = false;
-                self.status_message = Some("Auto-poke disabled.".to_string());
+                self.status_message = Some(persist(&settings, false, "Auto-poke disabled."));
             }
             "status" => {
                 let budget_left = claurst_tools::todo_write::MAX_AUTO_POKES
@@ -185,11 +194,11 @@ impl App {
             }
             "" => {
                 settings.config.auto_poke_enabled = !settings.config.auto_poke_enabled;
-                let _ = settings.save_sync();
-                self.config.auto_poke_enabled = settings.config.auto_poke_enabled;
-                self.status_message = Some(format!(
-                    "Auto-poke {}.",
-                    if settings.config.auto_poke_enabled { "enabled" } else { "disabled" }
+                let now_on = settings.config.auto_poke_enabled;
+                self.status_message = Some(persist(
+                    &settings,
+                    now_on,
+                    if now_on { "Auto-poke enabled." } else { "Auto-poke disabled." },
                 ));
             }
             _ => {

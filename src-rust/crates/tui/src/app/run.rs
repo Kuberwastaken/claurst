@@ -384,6 +384,28 @@ impl App {
     // Auto-poke
     // -------------------------------------------------------------------
 
+    /// Reset the per-session auto-poke state. Called when the session
+    /// changes (`/new`, `/resume`, and resuming a `/fork`): the budget and
+    /// no-progress trackers are documented as per-session, so a fresh session
+    /// must start with a clean slate instead of inheriting the counters of
+    /// the session that was swapped out.
+    pub fn reset_auto_poke_state(&mut self) {
+        self.auto_poke_count = 0;
+        self.no_progress_turns = 0;
+        self.last_todo_hash = String::new();
+    }
+
+    /// Whether a `/goal` continuation loop is currently active for this
+    /// session. Auto-poke must stay silent while a goal loop drives its own
+    /// continuations: its TurnComplete events would otherwise queue pokes
+    /// on top of the loop's turns.
+    pub(super) fn goal_active(&self) -> bool {
+        claurst_core::goals_enabled()
+            && claurst_core::GoalStore::open_default()
+                .map(|store| store.get_active_goal(&self.session_id).is_some())
+                .unwrap_or(false)
+    }
+
     /// Check whether auto-poke should fire after a model turn ended with
     /// `stop_reason`. When the model stopped cleanly with incomplete todos,
     /// queue a synthetic continuation message via the existing
@@ -409,6 +431,31 @@ impl App {
         // aborted (Esc) or cancelled turn must never re-poke, and neither
         // should truncation or provider-side refusals.
         if stop_reason != "end_turn" {
+            return;
+        }
+
+        // Bridge/remote sessions share handle_query_event, but their turns
+        // come from a remote session URL, not a local query loop; a queued
+        // continuation would never be submitted for them.
+        if self.remote_session_url.is_some() {
+            return;
+        }
+
+        // Never poke while a goal continuation loop is running: TurnComplete
+        // also fires on every in-loop goal continuation, so a poke here would
+        // stack onto the loop's own continuations in queued_messages and
+        // replay after /goal pause or a budget stop.
+        if self.goal_active() {
+            return;
+        }
+
+        // One poke at a time: if a previous poke is still queued (not yet
+        // submitted), do not stack another on top of it.
+        if self
+            .queued_messages
+            .iter()
+            .any(|m| claurst_tools::todo_write::is_auto_poke_message(m))
+        {
             return;
         }
 

@@ -347,7 +347,6 @@ project settings file cannot enable it. Same root/sudo guard as
 ---
 
 ### /poke
-**Aliases:** `autopoke`
 
 Toggle auto-poke. When enabled, Claurst sends a continuation prompt
 automatically when the model stops a turn with incomplete todos. Opt-in:

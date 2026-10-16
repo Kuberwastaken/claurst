@@ -572,17 +572,79 @@ use super::types::{ContextMenuItem, ContextMenuState};
         // First poke records the hash.
         app.check_auto_poke("end_turn");
         assert_eq!(app.auto_poke_count, 1);
-        // Simulate two more no-progress turns (todo state unchanged).
-        // The first call records the hash; calls 2 and 3 increment the
-        // no-progress counter to 1 and 2 and still poke.
-        app.check_auto_poke("end_turn");
-        app.check_auto_poke("end_turn");
+        // Simulate two more no-progress turns (todo state unchanged). The
+        // main loop submits each queued poke before the next turn completes,
+        // so drain the queue between checks like it would. The first call
+        // records the hash; calls 2 and 3 increment the no-progress counter
+        // to 1 and 2 and still poke.
+        for _ in 0..2 {
+            app.queued_messages.pop_front();
+            app.check_auto_poke("end_turn");
+        }
         assert_eq!(app.auto_poke_count, 3);
         assert_eq!(app.no_progress_turns, claurst_tools::todo_write::NO_PROGRESS_THRESHOLD - 1);
         // Fourth check reaches the threshold and stops without queueing.
+        app.queued_messages.pop_front();
         app.check_auto_poke("end_turn");
         assert_eq!(app.auto_poke_count, 3);
         assert!(app.status_message.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_reset_auto_poke_state_clears_counters() {
+        let _lock = SESSION_HOME_LOCK.lock().await;
+        let (mut app, _home) = make_poke_app(&[todo("1", "pending")]);
+        // Burn through part of the budget so there is non-zero state to
+        // clear. The main loop submits each queued poke before the next turn
+        // completes, so drain the queue between checks like it would.
+        app.check_auto_poke("end_turn");
+        app.queued_messages.pop_front();
+        app.check_auto_poke("end_turn");
+        assert_eq!(app.auto_poke_count, 2);
+        assert!(!app.last_todo_hash.is_empty());
+        app.reset_auto_poke_state();
+        assert_eq!(app.auto_poke_count, 0);
+        assert_eq!(app.no_progress_turns, 0);
+        assert!(app.last_todo_hash.is_empty());
+        // After a reset the budget is available again.
+        app.queued_messages.clear();
+        app.check_auto_poke("end_turn");
+        assert_eq!(app.auto_poke_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_check_auto_poke_no_duplicate_while_queued() {
+        let _lock = SESSION_HOME_LOCK.lock().await;
+        let (mut app, _home) = make_poke_app(&[todo("1", "pending")]);
+        // A poke already sits in the queue (not yet submitted): a second
+        // TurnComplete must not stack another one on top.
+        app.queued_messages
+            .push_back(claurst_tools::todo_write::build_auto_poke_message(1));
+        app.check_auto_poke("end_turn");
+        assert_eq!(app.queued_messages.len(), 1);
+        assert_eq!(app.auto_poke_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_check_auto_poke_silent_while_goal_active() {
+        let _lock = SESSION_HOME_LOCK.lock().await;
+        let (app, _home) = make_poke_app(&[todo("1", "pending")]);
+        // No active goal in the store -> the goal guard must not block a poke.
+        assert!(!app.goal_active());
+        let mut app = app;
+        app.check_auto_poke("end_turn");
+        assert_eq!(app.queued_messages.len(), 1);
+        // With an active goal recorded for this session the poke is skipped.
+        let store = claurst_core::GoalStore::open_default()
+            .expect("goal store must open under the tempdir CLAURST_HOME");
+        store
+            .set_goal(&app.session_id, "finish everything", None)
+            .unwrap();
+        assert!(app.goal_active());
+        app.queued_messages.clear();
+        app.check_auto_poke("end_turn");
+        assert!(app.queued_messages.is_empty());
+        assert_eq!(app.auto_poke_count, 1); // unchanged by the blocked poke
     }
 
     #[test]

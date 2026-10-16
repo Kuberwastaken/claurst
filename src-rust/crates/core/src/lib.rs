@@ -2383,7 +2383,7 @@ pub mod config {
                 // settings file must not be able to flip this on.
                 yolo_mode: base.config.yolo_mode,
                 cursor_blink_enabled: over.config.cursor_blink_enabled || base.config.cursor_blink_enabled,
-                auto_poke_enabled: over.config.auto_poke_enabled || base.config.auto_poke_enabled,
+                auto_poke_enabled: base.config.auto_poke_enabled,
                 file_autocomplete_limit: if over.config.file_autocomplete_limit != 0 { over.config.file_autocomplete_limit } else { base.config.file_autocomplete_limit },
                 file_autocomplete_show_hidden_files: over.config.file_autocomplete_show_hidden_files || base.config.file_autocomplete_show_hidden_files,
                 file_injection_enabled: over.config.file_injection_enabled || base.config.file_injection_enabled,
@@ -2910,13 +2910,8 @@ pub mod config {
             // Opt-in: absent key deserializes to false, not true.
             let settings = Settings::default();
             assert!(!settings.config.auto_poke_enabled);
-            let json = r#"{ "config": { "autoPokeEnabled": true } }"#;
-            let parsed: Result<Settings, _> = serde_json::from_str(json);
-            // A partial config block is valid only if required fields are
-            // present; check the roundtrip instead.
-            if let Ok(s) = parsed {
-                assert!(s.config.auto_poke_enabled);
-            }
+            // Roundtrip through camelCase `autoPokeEnabled` (mirrors
+            // yolo_mode_json_roundtrip above).
             let mut on = Settings::default();
             on.config.auto_poke_enabled = true;
             let serialized = serde_json::to_string(&on).unwrap();
@@ -2926,19 +2921,28 @@ pub mod config {
         }
 
         #[test]
-        fn auto_poke_merges_with_or() {
-            // Either global or project can enable; default false everywhere.
-            let base = Settings::default();
-            let mut over = Settings::default();
-            over.config.auto_poke_enabled = true;
+        fn auto_poke_global_on_wins() {
+            // Global settings can enable; default false everywhere.
+            let mut base = Settings::default();
+            base.config.auto_poke_enabled = true;
+            let over = Settings::default();
             let merged = Settings::merge(base, over);
             assert!(merged.config.auto_poke_enabled);
+        }
 
-            let mut base2 = Settings::default();
-            base2.config.auto_poke_enabled = true;
-            let over2 = Settings::default();
-            let merged2 = Settings::merge(base2, over2);
-            assert!(merged2.config.auto_poke_enabled);
+        #[test]
+        fn auto_poke_is_global_only() {
+            // A project settings file must not be able to enable auto-poke:
+            // it auto-submits turns, which combined with bypassPermissions
+            // would form a self-driving loop the user never opted into.
+            let base = Settings::default();
+            let mut project = Settings::default();
+            project.config.auto_poke_enabled = true;
+            let merged = Settings::merge(base, project);
+            assert!(
+                !merged.config.auto_poke_enabled,
+                "project settings must not be able to enable autoPokeEnabled"
+            );
         }
 
         #[test]
