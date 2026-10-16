@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn poisoned_manager_lock_denies_rather_than_allowing() {
-        let manager = Arc::new(Mutex::new(claurst_core::PermissionManager::new(
+        let manager = Arc::new(Mutex::new(claurst_core::permissions::PermissionManager::new(
             claurst_core::PermissionMode::Default,
             &claurst_core::config::Settings::default(),
         )));
@@ -309,7 +309,8 @@ mod tests {
     }
 
     #[test]
-    fn read_only_requests_are_always_classified_as_read() {        // Even a tool whose name would otherwise map to Execute/Delete/etc.
+    fn read_only_requests_are_always_classified_as_read() {
+        // Even a tool whose name would otherwise map to Execute/Delete/etc.
         // should report Read once the caller marks it read-only.
         assert_eq!(infer_tool_kind(&request("Bash", true)), acp::ToolKind::Read);
         assert_eq!(infer_tool_kind(&request("Rm", true)), acp::ToolKind::Read);
