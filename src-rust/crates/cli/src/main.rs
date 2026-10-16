@@ -382,6 +382,7 @@ async fn main() -> anyhow::Result<()> {
                     mcp_manager: None,
                     mcp_auth_runner: None,
                     permission_manager: None,
+                    disabled_mcp_servers: settings.disabled_mcp_servers.clone(),
                 };
                 // Collect remaining args after the command name
                 let rest: Vec<&str> = raw_args[2..].iter().map(|s| s.as_str()).collect();
@@ -2409,6 +2410,7 @@ async fn run_interactive(
         mcp_manager: tool_ctx.mcp_manager.clone(),
         mcp_auth_runner: None,
         permission_manager: tool_ctx.permission_manager.clone(),
+        disabled_mcp_servers: settings.disabled_mcp_servers.clone(),
     };
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
@@ -3051,21 +3053,33 @@ async fn run_interactive(
                                     // `/mcp enable|disable` persisted the toggle in
                                     // global settings; reload them so the reconnect
                                     // gate below sees the new disabled set, then
-                                    // rebuild the manager + tool list.
-                                    if let Ok(reloaded) =
-                                        claurst_core::config::Settings::load_hierarchical(
-                                            &tool_ctx.working_dir,
-                                        )
-                                        .await
+                                    // rebuild the manager + tool list. If the reload
+                                    // fails, keep the runtime as-is: rebuilding
+                                    // against stale settings could relaunch a
+                                    // server the user just disabled.
+                                    match claurst_core::config::Settings::load_hierarchical(
+                                        &tool_ctx.working_dir,
+                                    )
+                                    .await
                                     {
-                                        settings = reloaded;
+                                        Ok(reloaded) => {
+                                            settings = reloaded;
+                                            app.pending_mcp_reconnect = true;
+                                            app.status_message = Some(format!(
+                                                "MCP server '{}' {}. Rebuilding connections...",
+                                                server_name,
+                                                if enabled { "enabled" } else { "disabled" }
+                                            ));
+                                        }
+                                        Err(err) => {
+                                            app.status_message = Some(format!(
+                                                "MCP server '{}' {}, but reloading settings failed: {}. Restart to apply the change.",
+                                                server_name,
+                                                if enabled { "enabled" } else { "disabled" },
+                                                err
+                                            ));
+                                        }
                                     }
-                                    app.pending_mcp_reconnect = true;
-                                    app.status_message = Some(format!(
-                                        "MCP server '{}' {}. Rebuilding connections...",
-                                        server_name,
-                                        if enabled { "enabled" } else { "disabled" }
-                                    ));
                                 }
                                 Some(CommandResult::Message(msg)) => {
                                     // Suppress text output when TUI already opened an
@@ -4782,6 +4796,12 @@ async fn run_interactive(
                 &settings.disabled_mcp_servers,
             );
             let new_mcp_manager = start_mcp_manager(&decision.allowed);
+            // Shut the old manager down before installing the new one so its
+            // transports (stdio children, HTTP sessions) are closed and no
+            // server runs twice (issue #418 review).
+            if let Some(old_manager) = tool_ctx.mcp_manager.clone() {
+                old_manager.shutdown().await;
+            }
             // Log the roster change for post-mortem: which servers the rebuild
             // keeps, which are dropped (disabled by the user, untrusted, or
             // failed to connect — per-server connect errors are logged inside
@@ -4812,7 +4832,9 @@ async fn run_interactive(
             }
             tool_ctx.mcp_manager = new_mcp_manager.clone();
             app.mcp_manager = new_mcp_manager.clone();
+            cmd_ctx.mcp_manager = new_mcp_manager.clone();
             app.disabled_mcp_servers = settings.disabled_mcp_servers.clone();
+            cmd_ctx.disabled_mcp_servers = settings.disabled_mcp_servers.clone();
             // Read the generation before building: a connect task that bumps
             // it in between then still triggers a rebuild in the idle block.
             mcp_seen_generation = new_mcp_manager.as_ref().map(|manager| manager.generation());

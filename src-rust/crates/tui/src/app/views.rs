@@ -227,10 +227,18 @@ impl App {
                 } else {
                     "Configured server".to_string()
                 };
+                // Without a manager there is no live status to report, but a
+                // user-disabled server is still known and must not show as
+                // merely disconnected.
+                let status = if self.disabled_mcp_servers.contains(&server.name) {
+                    McpViewStatus::Disabled
+                } else {
+                    McpViewStatus::Disconnected
+                };
                 McpServerView {
                     name: server.name.clone(),
                     transport,
-                    status: McpViewStatus::Disconnected,
+                    status,
                     tool_count: 0,
                     resource_count: 0,
                     prompt_count: 0,

@@ -1144,6 +1144,7 @@ mod tests {
             mcp_manager: None,
             mcp_auth_runner: None,
             permission_manager: None,
+            disabled_mcp_servers: std::collections::HashSet::new(),
         }
     }
 

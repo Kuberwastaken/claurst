@@ -36,6 +36,10 @@ pub struct CommandContext {
     /// rule in effect. `None` outside an interactive session.
     pub permission_manager:
         Option<Arc<std::sync::Mutex<claurst_core::permissions::PermissionManager>>>,
+    /// Server names disabled via `/mcp disable`, as last seen on disk. The
+    /// runtime refreshes it after every toggle so `/mcp status` and friends
+    /// never re-read the settings file (which only covers global servers).
+    pub disabled_mcp_servers: std::collections::HashSet<String>,
 }
 
 /// Result of running a slash command.
@@ -1633,6 +1637,7 @@ mod tests {
             mcp_manager: None,
             mcp_auth_runner: None,
             permission_manager: None,
+            disabled_mcp_servers: std::collections::HashSet::new(),
         }
     }
 
