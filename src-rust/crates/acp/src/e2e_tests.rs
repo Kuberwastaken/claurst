@@ -222,6 +222,9 @@ pub(crate) struct Client {
     pub hold_permissions: AtomicBool,
     /// Every `session/update` notification the agent sent.
     pub updates: Arc<parking_lot::Mutex<Vec<Value>>>,
+    /// The agent behind the pipe, exposed so tests can inspect the runtime
+    /// cache and registry directly.
+    pub server: Arc<AgentServer>,
 }
 
 impl Client {
@@ -239,9 +242,10 @@ impl Client {
             .insert(runtime.working_dir.clone(), Arc::new(runtime));
         let (tx, mut rx) = mpsc::unbounded_channel();
         tokio::spawn(connection::run_reader(connection, server_read, tx));
+        let dispatch_server = server.clone();
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
-                server.dispatch(msg);
+                dispatch_server.dispatch(msg);
             }
         });
 
@@ -253,6 +257,7 @@ impl Client {
             permission_answers: Arc::new(parking_lot::Mutex::new(VecDeque::new())),
             hold_permissions: AtomicBool::new(false),
             updates: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            server: server.clone(),
         });
         tokio::spawn(Self::read_loop(client.clone(), client_read));
         client
@@ -398,6 +403,50 @@ async fn prompt_after_cancel_runs_normally() {
         stop_reason(&second),
         acp::StopReason::EndTurn,
         "a cancel must not poison later prompts"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_directory_via_different_spellings_shares_one_runtime() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("canonical");
+    let client = Client::start(scripted_runtime(&cwd, ScriptedProvider::new(vec![Step::Text("ok")])));
+    let first = client.new_session(&cwd).await;
+    let second = client.new_session(&cwd.join(".")).await;
+    assert_ne!(first, second, "each session/new must return a fresh session id");
+
+    let runtimes = client.server.runtimes.lock().await;
+    let keys: Vec<&std::path::PathBuf> = runtimes.keys().collect();
+    assert_eq!(keys, vec![&cwd], "one runtime per directory, not per spelling: {keys:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn runtimes_without_sessions_are_evicted() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("evict");
+    let unused = scratch_dir("evict-unused");
+    let client = Client::start(scripted_runtime(&cwd, ScriptedProvider::new(vec![Step::Text("ok")])));
+    let _session_id = client.new_session(&cwd).await;
+
+    // Build a second directory's runtime without ever creating a session in
+    // it: its cache entry is garbage and must go on the next pass.
+    client
+        .server
+        .runtime_for(&unused)
+        .await
+        .expect("build runtime for the unused directory");
+    assert!(
+        client.server.runtimes.lock().await.contains_key(&unused),
+        "the runtime exists after an explicit build"
+    );
+
+    client.new_session(&cwd).await; // triggers an eviction pass
+    let runtimes = client.server.runtimes.lock().await;
+    let keys: Vec<&std::path::PathBuf> = runtimes.keys().collect();
+    assert_eq!(
+        keys,
+        vec![&cwd],
+        "the unused directory's runtime is evicted, the one with a session stays: {keys:?}"
     );
 }
 

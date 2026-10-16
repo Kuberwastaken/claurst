@@ -44,21 +44,73 @@ impl AgentServer {
 
     /// The runtime for `cwd`, building it (settings, context, MCP servers
     /// for that directory) the first time a session opens there.
-    async fn runtime_for(&self, cwd: &std::path::Path) -> Result<Arc<AgentRuntime>, acp::Error> {
-        let mut runtimes = self.runtimes.lock().await;
-        if let Some(runtime) = runtimes.get(cwd) {
-            return Ok(runtime.clone());
+    ///
+    /// Keyed by the canonical cwd so the same directory reached under
+    /// different spellings (`/a/b`, `/a/b/`) shares one runtime.
+    pub(crate) async fn runtime_for(&self, cwd: &std::path::Path) -> Result<Arc<AgentRuntime>, acp::Error> {
+        // Canonicalize before using the path as the cache key; fall back to
+        // the given path when the directory does not exist yet.
+        let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        self.evict_unused_runtimes(&cwd).await;
+        if let Some(runtime) = {
+            let runtimes = self.runtimes.lock().await;
+            runtimes.get(&cwd).cloned()
+        } {
+            return Ok(runtime);
         }
-        let cwd = cwd.to_path_buf();
-        let runtime = AgentRuntime::build(cwd.clone()).await.map_err(|e| {
+        // Build OUTSIDE the cache lock: MCP connects can take seconds, and
+        // holding the lock across `build().await` serialised `session/new`
+        // for every directory behind the first one's connects.
+        let runtime = Arc::new(AgentRuntime::build(cwd.clone()).await.map_err(|e| {
             acp::Error::new(
                 i32::from(acp::ErrorCode::InternalError),
                 format!("Failed to start the agent for {}: {e}", cwd.display()),
             )
-        })?;
-        let runtime = Arc::new(runtime);
-        runtimes.insert(cwd, runtime.clone());
-        Ok(runtime)
+        })?);
+        let mut runtimes = self.runtimes.lock().await;
+        // Another session/new may have raced us building the same directory;
+        // one runtime wins and the loser's MCP connections close when its Arc
+        // is dropped at the end of this call.
+        match runtimes.get(&cwd) {
+            Some(existing) => Ok(existing.clone()),
+            None => {
+                runtimes.insert(cwd, runtime.clone());
+                Ok(runtime)
+            }
+        }
+    }
+
+    /// Evict the runtimes of directories that no session references (closing
+    /// a workspace must not pin its MCP child processes for the life of the
+    /// agent) and GC the session registry for sessions whose directory lost
+    /// its runtime. `keep_cwd` — the directory a `session/new` is currently
+    /// resolving, with no session yet — is never evicted whether it is cached
+    /// or being built. Living sessions always keep their runtime cached, so
+    /// the registry GC only drops strays from the race between a session's
+    /// creation and an eviction pass.
+    async fn evict_unused_runtimes(&self, keep_cwd: &std::path::Path) {
+        let mut evicted: Vec<Arc<AgentRuntime>> = Vec::new();
+        let remaining: std::collections::HashSet<PathBuf> = {
+            let mut runtimes = self.runtimes.lock().await;
+            let keep = self.sessions.live_cwds();
+            let stale: Vec<PathBuf> = runtimes
+                .keys()
+                .filter(|dir| dir.as_path() != keep_cwd && !keep.contains(dir.as_path()))
+                .cloned()
+                .collect();
+            for dir in stale {
+                if let Some((_, stale_runtime)) = runtimes.remove(&dir) {
+                    info!(cwd = %dir.display(), "ACP: evicting runtime for unused directory");
+                    evicted.push(stale_runtime);
+                }
+            }
+            runtimes.keys().cloned().collect()
+        };
+        // Release the evicted runtimes (and thus their McpManagers) outside
+        // the cache lock, so their teardown cannot block another directory's
+        // session/new.
+        drop(evicted);
+        self.sessions.gc(&remaining);
     }
 
     /// Dispatch a single inbound message. Spawns the actual handler on a
