@@ -583,6 +583,38 @@ use super::types::{ContextMenuItem, ContextMenuState};
         assert!(!app.prompt_input.vim_enabled);
     }
 
+    // ---- Ctrl+V reaches the vim state machine as block-visual (issue #495) --
+
+    #[test]
+    fn ctrl_v_in_vim_normal_enters_visual_block() {
+        let mut app = make_app();
+        app.prompt_input.vim_enabled = true;
+        app.prompt_input.vim_mode = crate::prompt_input::VimMode::Normal;
+        let handled = app.handle_key_event(press_key(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        assert!(!handled);
+        assert_eq!(
+            app.prompt_input.vim_mode,
+            crate::prompt_input::VimMode::VisualBlock,
+            "Ctrl+V must report the \x16 block-visual key to the vim handler"
+        );
+        assert_eq!(
+            app.prompt_input.visual_anchor,
+            Some(app.prompt_input.cursor),
+            "block-visual anchors the selection at the cursor"
+        );
+    }
+
+    #[test]
+    fn plain_v_in_vim_normal_still_enters_charwise_visual() {
+        // The Ctrl+V special case must not disturb the printable-key path.
+        let mut app = make_app();
+        app.prompt_input.vim_enabled = true;
+        app.prompt_input.vim_mode = crate::prompt_input::VimMode::Normal;
+        let handled = app.handle_key_event(press_key(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(!handled);
+        assert_eq!(app.prompt_input.vim_mode, crate::prompt_input::VimMode::Visual);
+    }
+
     #[test]
     fn test_model_slash_command_opens_picker() {
         let mut app = make_app();

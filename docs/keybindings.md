@@ -263,7 +263,7 @@ The action names behind the fixed keys still exist and can be bound to other cho
 
 ## Vim Mode
 
-The prompt editor contains a vim emulation with insert, normal, visual (`v`, `V`), command-line (`:`) and search (`/`) modes.
+The prompt editor contains a vim emulation with insert, normal, visual (`v`, `V`, `Ctrl+V`), command-line (`:`) and search (`/`) modes.
 
 ### Enabling Vim Mode
 

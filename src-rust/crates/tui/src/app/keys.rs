@@ -1524,7 +1524,21 @@ impl App {
             KeyCode::Char(c) => {
                 let c = self.shift_normalize(c, key.modifiers);
                 if self.prompt_input.vim_enabled && self.prompt_input.vim_mode != VimMode::Insert {
-                    self.prompt_input.vim_command(&c.to_string());
+                    // Ctrl+V is vim's block-visual key: feed the vim state
+                    // machine the \x16 control code instead of the plain 'v'
+                    // character so it reaches the `key == "\x16"` branch in
+                    // `vim_command` (issue #495). In insert mode the clipboard
+                    // paste handler earlier in this function consumed it
+                    // instead.
+                    let vim_key = if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && c == 'v'
+                        && self.prompt_input.vim_mode == VimMode::Normal
+                    {
+                        "\x16".to_string()
+                    } else {
+                        c.to_string()
+                    };
+                    self.prompt_input.vim_command(&vim_key);
                 } else {
                     self.prompt_input.insert_char(c);
                 }
