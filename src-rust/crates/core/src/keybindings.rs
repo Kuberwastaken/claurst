@@ -411,8 +411,12 @@ impl UserKeybindings {
         // Warn about and filter out non-rebindable keys
         let original_len = kb.bindings.len();
         kb.bindings.retain(|binding| {
-            let normalized = binding.chord.to_lowercase();
-            if NON_REBINDABLE.iter().any(|protected| normalized == *protected) {
+            // Compare canonical chords, not raw strings: aliases such as
+            // "control+c" or "CTRL+C" must still hit the protected-key guard.
+            let is_protected = parse_chord(&binding.chord)
+                .map(|chord| format_chord_string(&chord))
+                .is_some_and(|canonical| NON_REBINDABLE.contains(&canonical.as_str()));
+            if is_protected {
                 warn!("Cannot rebind protected key '{}' in keybindings.json", binding.chord);
                 return false;
             }
@@ -845,6 +849,37 @@ mod tests {
         assert_eq!(user.bindings[0].action.as_deref(), Some("chat:externalEditor"));
         assert_eq!(user.bindings[1].chord, "space");
         assert_eq!(user.bindings[1].action, None);
+    }
+
+    #[test]
+    fn test_non_rebindable_filter_normalizes_chord_spellings() {
+        // #495: the guard compared raw strings, so `control+c`/`CTRL+D` slipped
+        // through and silently rebound keys that are meant to stay protected.
+        let user = UserKeybindings::from_json_str(
+            r#"{
+  "bindings": [
+    {
+      "context": "Chat",
+      "bindings": {
+        "control+c": "chat:submit",
+        "CTRL+D": "chat:exit",
+        "ctrl+g": "chat:externalEditor"
+      }
+    }
+  ]
+}"#,
+        );
+
+        let chords: Vec<&str> = user.bindings.iter().map(|b| b.chord.as_str()).collect();
+        assert!(
+            !chords.contains(&"control+c"),
+            "control+c must be filtered as a protected Ctrl+C alias"
+        );
+        assert!(
+            !chords.contains(&"CTRL+D"),
+            "CTRL+D must be filtered as a protected Ctrl+D alias"
+        );
+        assert!(chords.contains(&"ctrl+g"), "ctrl+g is not protected and must be kept");
     }
 
     #[test]
