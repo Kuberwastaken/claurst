@@ -221,6 +221,11 @@ pub fn parse_codex_catalog(json_val: &Value) -> Vec<CodexCatalogModel> {
 /// fallback stands in.
 static LIVE_CATALOG: RwLock<Option<Box<[CodexCatalogModel]>>> = RwLock::new(None);
 
+/// Process-wide one-shot for the lazy catalog hydration: a failed attempt is
+/// cached too, so requests never stall behind a repeatedly failing endpoint
+/// and no request path retries it.
+static CATALOG_HYDRATION: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
 /// Publish a parsed catalog to the process-wide registry.
 fn set_live_catalog(models: Vec<CodexCatalogModel>) {
     let mut guard = LIVE_CATALOG.write().unwrap_or_else(PoisonError::into_inner);
@@ -604,6 +609,25 @@ impl CodexProvider {
         Ok(models)
     }
 
+    /// Hydrate the shared catalog once per process, before the request body is
+    /// built, so the `include: reasoning.encrypted_content` gate and any later
+    /// model switch consult real capabilities instead of a model-id heuristic.
+    /// Best-effort: failures leave the static fallback in place.
+    async fn ensure_catalog(&self, token: &str, account_id: Option<&str>) {
+        let _ = CATALOG_HYDRATION
+            .get_or_try_init(|| async {
+                if let Ok(models) =
+                    fetch_catalog_raw(&self.id, &self.http_client, token, account_id).await
+                {
+                    set_live_catalog(models);
+                }
+                // Failure is cached too: one attempt per process, never a
+                // retry storm against the catalog endpoint.
+                Ok::<(), ProviderError>(())
+            })
+            .await;
+    }
+
     /// Build the Responses-API request body for Codex.
     fn build_responses_body(request: &ProviderRequest) -> Value {
         // Re-use the same message translation that the Copilot provider uses.
@@ -674,6 +698,25 @@ impl CodexProvider {
         // at the server default. Mirrors opencode's gpt-5 reasoning defaults.
         CopilotProvider::apply_responses_provider_options_pub(&mut body, &request.provider_options);
 
+        // The query layer's `include` option rides a gpt-5*/o* model-id
+        // heuristic, which fires for every gpt-5 slug — including ones the
+        // live catalog knows have no reasoning levels. A model that produces
+        // no encrypted reasoning state must not request it (the endpoint
+        // rejects the include). Catalog-unknown models keep the heuristic
+        // fallback since nothing else discriminates.
+        if codex_catalog_lookup(&request.model)
+            .is_some_and(|entry| entry.supported_reasoning_levels.is_empty())
+        {
+            if let Some(object) = body.as_object_mut() {
+                if let Some(Value::Array(items)) = object.get_mut("include") {
+                    items.retain(|item| item.as_str() != Some("reasoning.encrypted_content"));
+                    if items.is_empty() {
+                        object.remove("include");
+                    }
+                }
+            }
+        }
+
         body
     }
 
@@ -705,6 +748,10 @@ impl CodexProvider {
     ) -> Result<ProviderResponse, ProviderError> {
         let mut token = self.access_token().await?;
         let account_id = self.account_id();
+
+        // Best-effort one-shot: real capabilities (item 5's include gate) need
+        // the live catalog before the body is built.
+        self.ensure_catalog(&token, account_id.as_deref()).await;
 
         let body = Self::build_responses_body(request);
 
@@ -770,6 +817,9 @@ impl CodexProvider {
     ) -> Result<reqwest::Response, ProviderError> {
         let mut token = self.access_token().await?;
         let account_id = self.account_id();
+
+        // Same one-shot as the non-streaming path, before body building.
+        self.ensure_catalog(&token, account_id.as_deref()).await;
 
         let mut body = Self::build_responses_body(request);
         body["stream"] = json!(true);
@@ -1944,14 +1994,103 @@ mod tests {
         assert_eq!(efforts, ["minimal", "low", "medium", "high", "xhigh"]);
     }
 
+    /// Serializes tests that swap the process-wide `LIVE_CATALOG` registry:
+    /// the registry is shared state and the suite may run multi-threaded.
+    static CATALOG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Snapshot/restore helper for `CATALOG_TEST_LOCK` holders: swaps the
+    /// process-wide catalog for `models`, restoring the previous contents
+    /// when the returned guard is dropped.
+    fn with_live_catalog(models: Vec<CodexCatalogModel>) -> impl Drop {
+        struct Restore(Option<Vec<CodexCatalogModel>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let restore = self.0.take();
+                set_live_catalog(restore.unwrap_or_default());
+            }
+        }
+        let saved = LIVE_CATALOG
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_deref()
+            .map(|catalog| catalog.to_vec());
+        set_live_catalog(models);
+        Restore(saved)
+    }
+
     #[test]
     fn catalog_lookup_accepts_prefixed_ids_and_misses_unknown_models() {
-        set_live_catalog(parse_codex_catalog(
+        let _guard = CATALOG_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _catalog = with_live_catalog(parse_codex_catalog(
             &serde_json::from_str(include_str!("fixtures/codex_catalog.json")).unwrap(),
         ));
         assert!(codex_catalog_lookup("gpt-5.5").is_some());
         assert!(codex_catalog_lookup("codex/gpt-5.5").is_some());
         assert!(codex_catalog_lookup("gpt-6-lens").is_none());
+    }
+
+    /// The `include: reasoning.encrypted_content` option the query layer adds
+    /// on a gpt-5* id-heuristic must not reach the wire for models the live
+    /// catalog lists with no reasoning levels; models the catalog does not
+    /// list keep the heuristic fallback.
+    #[test]
+    fn include_gate_reads_catalog_reasoning_levels() {
+        let _guard = CATALOG_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+
+        let options = |model: &str| -> ProviderRequest {
+            let mut req = request(None);
+            req.model = model.to_string();
+            req.provider_options = json!({
+                "reasoningEffort": "medium",
+                "reasoningSummary": "auto",
+                "include": ["reasoning.encrypted_content"],
+            });
+            req
+        };
+
+        let _catalog = with_live_catalog(vec![
+            CodexCatalogModel {
+                slug: "gpt-5-no-effort".to_string(),
+                visibility: Some("list".to_string()),
+                supported_in_api: true,
+                ..CodexCatalogModel::default()
+            }, // The reasoning-bearing listed entry keeps its include gate.
+            CodexCatalogModel {
+                slug: "gpt-5-with-effort".to_string(),
+                visibility: Some("list".to_string()),
+                supported_in_api: true,
+                supported_reasoning_levels: vec![CodexReasoningLevel {
+                    effort: "high".to_string(),
+                }],
+                ..CodexCatalogModel::default()
+            },
+        ]);
+
+        let body = CodexProvider::build_responses_body(&options("gpt-5-no-effort"));
+        assert_eq!(body["model"], "gpt-5-no-effort");
+        assert!(body.get("include").is_none(), "non-reasoning model must not request encrypted reasoning: {body}");
+        // Reasoning options themselves are untouched.
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert_eq!(body["reasoning"]["effort"], "medium");
+
+        let body = CodexProvider::build_responses_body(&options("gpt-5-with-effort"));
+        assert_eq!(
+            body["include"],
+            json!(["reasoning.encrypted_content"]),
+            "reasoning-capable catalog entries keep the include"
+        );
+
+        // Not in the catalog: heuristic fallback keeps the include.
+        let body = CodexProvider::build_responses_body(&options("gpt-99-unknown"));
+        assert_eq!(
+            body["include"],
+            json!(["reasoning.encrypted_content"]),
+            "catalog-unknown models fall back to the id heuristic"
+        );
+
+        // A `provider/`-prefixed id resolves through the catalog too.
+        let body = CodexProvider::build_responses_body(&options("openai/gpt-5-no-effort"));
+        assert!(body.get("include").is_none());
     }
 
     fn tool(name: &str) -> claurst_core::types::ToolDefinition {
