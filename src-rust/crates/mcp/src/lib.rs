@@ -1801,6 +1801,12 @@ const ATTACHABLE_IMAGE_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif"
 /// per-image limit).
 const MAX_ATTACHED_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
+/// Largest total decoded image payload attached from one tool result. The
+/// Anthropic API rejects requests above 32 MB, and every image a tool result
+/// returns stays in the history on all later requests, so the sum of a
+/// result's images — not just each image on its own — must fit.
+const MAX_IMAGE_BYTES_PER_RESULT: usize = 32 * 1024 * 1024;
+
 /// An MCP tool result converted for the model.
 #[derive(Debug, Clone, Default)]
 pub struct McpToolOutput {
@@ -1831,8 +1837,10 @@ fn format_size(bytes: usize) -> String {
     }
 }
 
-/// Describe an image and, when it can be attached, push it to `images`.
-fn image_part(data: &str, mime_type: &str, images: &mut Vec<ContentBlock>) -> String {
+/// Describe an image and, when it fits in the remaining per-result budget,
+/// push it to `images`. `budget` holds how many more bytes may still be
+/// attached in this result; attached images consume it.
+fn image_part(data: &str, mime_type: &str, images: &mut Vec<ContentBlock>, budget: &mut usize) -> String {
     let size = base64_decoded_len(data);
     let size_label = format_size(size);
     if !ATTACHABLE_IMAGE_TYPES.contains(&mime_type) {
@@ -1844,6 +1852,14 @@ fn image_part(data: &str, mime_type: &str, images: &mut Vec<ContentBlock>) -> St
             mime_type,
             size_label,
             format_size(MAX_ATTACHED_IMAGE_BYTES)
+        );
+    }
+    if size > *budget {
+        return format!(
+            "[Image: {}, {}; not attached: image total exceeds {} per result]",
+            mime_type,
+            size_label,
+            format_size(MAX_IMAGE_BYTES_PER_RESULT)
         );
     }
     // An image block the provider rejects stays in the history and fails
@@ -1877,6 +1893,7 @@ fn image_part(data: &str, mime_type: &str, images: &mut Vec<ContentBlock>) -> St
             url: None,
         },
     });
+    *budget -= size;
     format!("[Image: {}, {}]", mime_type, size_label)
 }
 
@@ -1896,6 +1913,7 @@ fn image_part(data: &str, mime_type: &str, images: &mut Vec<ContentBlock>) -> St
 pub fn mcp_result_to_output(result: &CallToolResult) -> McpToolOutput {
     let mut images = Vec::new();
     let mut parts: Vec<String> = Vec::new();
+    let mut image_budget = MAX_IMAGE_BYTES_PER_RESULT;
     if let Some(structured) = &result.structured_content {
         parts.push(structured.to_string());
     }
@@ -1907,7 +1925,7 @@ pub fn mcp_result_to_output(result: &CallToolResult) -> McpToolOutput {
                 }
             }
             McpContent::Image { data, mime_type } => {
-                parts.push(image_part(data, mime_type, &mut images));
+                parts.push(image_part(data, mime_type, &mut images, &mut image_budget));
             }
             McpContent::Resource { resource } => {
                 parts.push(format!("[Resource: {}]", resource.uri));
@@ -1919,7 +1937,7 @@ pub fn mcp_result_to_output(result: &CallToolResult) -> McpToolOutput {
                         .as_deref()
                         .unwrap_or("application/octet-stream");
                     if mime.starts_with("image/") {
-                        parts.push(image_part(blob, mime, &mut images));
+                        parts.push(image_part(blob, mime, &mut images, &mut image_budget));
                     } else {
                         parts.push(format!(
                             "[Binary resource: {}, {}]",
@@ -2060,6 +2078,14 @@ mod tests {
         }
     }
 
+    /// A base64 PNG payload whose decoded size is `decoded_size` bytes.
+    fn png_base64(decoded_size: usize) -> String {
+        use base64::Engine as _;
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.resize(decoded_size, 0);
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
     #[test]
     fn test_result_output_text() {
         let out = mcp_result_to_output(&result(vec![McpContent::Text {
@@ -2104,6 +2130,27 @@ mod tests {
         }]));
         assert!(big.images.is_empty());
         assert!(big.text.contains("6.0 MB; not attached: larger than 5.0 MB"), "{}", big.text);
+    }
+
+    #[test]
+    fn test_result_output_caps_total_image_bytes_per_result() {
+        // Each image is under the per-image cap, but nine of them total more
+        // than the 32 MB a single result may carry.
+        use base64::Engine as _;
+        let png = png_base64(4 * 1024 * 1024);
+        let contents: Vec<McpContent> = (0..9)
+            .map(|_| McpContent::Image {
+                data: png.clone(),
+                mime_type: "image/png".to_string(),
+            })
+            .collect();
+        let out = mcp_result_to_output(&result(contents));
+        assert_eq!(out.images.len(), 8, "{}", out.text);
+        assert!(
+            out.text.contains("not attached: image total exceeds 32.0 MB per result"),
+            "{}",
+            out.text
+        );
     }
 
     #[test]
