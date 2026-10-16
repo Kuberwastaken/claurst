@@ -556,6 +556,15 @@ use super::types::{ContextMenuItem, ContextMenuState};
     }
 
     #[test]
+    fn test_keybindings_slash_command_left_to_cli_layer() {
+        // The commands crate owns /keybindings (template creation + open);
+        // the TUI intercept used to open the file too, popping it twice for
+        // one command (issue #495). It must fall through instead.
+        let mut app = make_app();
+        assert!(!app.intercept_slash_command("keybindings"));
+    }
+
+    #[test]
     fn test_clear_slash_command_clears_messages() {
         let mut app = make_app();
         app.add_message(Role::User, "hello".to_string());
