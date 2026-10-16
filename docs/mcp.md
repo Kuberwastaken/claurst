@@ -142,14 +142,14 @@ Use `/mcp` inside an interactive session to inspect MCP servers at runtime.
 /mcp status                       — detailed status table for all servers
 /mcp tools [server]               — list exposed tool names (mcp__<server>__<tool>)
 /mcp auth <server>                — start OAuth for an HTTP/SSE server; stdio servers get env-var instructions
-/mcp connect <server>             — report the server's status and how to recover; it does not reconnect
+/mcp connect <server>             — reconnect a failed server in the background
 /mcp logs <server>                — show the server's status and last connection error
 /mcp resources [server]           — list resources from connected servers
 /mcp prompts [server]             — list prompt templates from connected servers
 /mcp get-prompt <server> <prompt> [key=value ...]  — expand a prompt template
 ```
 
-There is no `/mcp disconnect` or `/mcp restart`. A failed server stays failed until the MCP runtime is rebuilt or Claurst restarts (see [Startup, Timeouts and Retries](#startup-timeouts-and-retries)).
+There is no `/mcp disconnect`. A failed server is not dead for good: `/mcp connect <server>` reconnects it in the background, and remote (`http`/`sse`) servers that failed at startup are retried every 60 seconds until they connect or Claurst exits (see [Startup, Timeouts and Retries](#startup-timeouts-and-retries)).
 
 ---
 
@@ -221,7 +221,7 @@ Each server's startup is bounded:
 - **Connect timeout** (`connect_timeout_ms`, default 10 s): spawning the process or opening the HTTP/SSE stream plus the `initialize` handshake. A hung stdio server is killed when it expires.
 - **Catalog timeout** (`catalog_timeout_ms`, default 30 s): each `tools/list`, `resources/list` and `prompts/list` request. A failing `tools/list` fails the server; a failing `resources/list` or `prompts/list` is logged and the server stays usable.
 
-Remote (`http`/`sse`) servers get up to three connect attempts, 0.5 s and 1 s apart, unless an attempt timed out. Stdio servers get one attempt. After that the server stays failed until the MCP runtime is rebuilt (for example after approving a project server or completing `/mcp auth`) or Claurst restarts.
+Remote (`http`/`sse`) servers get up to three connect attempts, 0.5 s and 1 s apart, unless an attempt timed out. Stdio servers get one attempt. A remote server that fails all of them is retried every 60 seconds while Claurst runs, so a server that comes back up (or gets its auth fixed) reconnects without user action; `/mcp connect <server>` starts a reconnect on demand for any transport. A server also reconnects itself automatically after the MCP runtime is rebuilt (for example after approving a project server or completing `/mcp auth`).
 
 Server statuses:
 

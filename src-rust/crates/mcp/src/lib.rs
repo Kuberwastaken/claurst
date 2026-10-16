@@ -1086,6 +1086,10 @@ pub struct McpManager {
     changes: tokio::sync::watch::Sender<u64>,
     /// Active resource subscriptions: (server_name, uri) → change event sender.
     pub resource_subscriptions: DashMap<(String, String), tokio::sync::mpsc::Sender<ResourceChangedEvent>>,
+    /// How often a remote server that failed at startup is retried at
+    /// runtime. Atomic so tests can shrink it without rebuilding the
+    /// manager's `Arc` mid-task.
+    remote_retry_interval_ms: std::sync::atomic::AtomicU64,
 }
 
 /// Mutable connection state. The lock is never held across an `.await`.
@@ -1135,6 +1139,9 @@ pub struct McpServerCatalog {
 const MAX_REMOTE_CONNECT_ATTEMPTS: u32 = 3;
 /// Delay before the second remote attempt; doubled for each later attempt.
 const REMOTE_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+/// How often a remote server that failed at startup is retried at runtime
+/// (issue #471), until it connects or Claurst exits.
+const REMOTE_RUNTIME_RETRY_INTERVAL_MS: u64 = 60_000;
 
 impl McpManager {
     pub fn new() -> Self {
@@ -1143,7 +1150,14 @@ impl McpManager {
             state: parking_lot::RwLock::new(ManagerState::default()),
             changes: tokio::sync::watch::Sender::new(0),
             resource_subscriptions: DashMap::new(),
+            remote_retry_interval_ms: std::sync::atomic::AtomicU64::new(REMOTE_RUNTIME_RETRY_INTERVAL_MS),
         }
+    }
+
+    /// Runtime retry interval for failed remote servers.
+    fn remote_retry_interval(&self) -> Duration {
+        let ms = self.remote_retry_interval_ms.load(std::sync::atomic::Ordering::SeqCst);
+        Duration::from_millis(ms.max(1))
     }
 
     /// Register `configs` and connect to every server concurrently in the
@@ -1204,6 +1218,12 @@ impl McpManager {
     /// Connect one server: env expansion, connect/catalog timeouts and, for
     /// remote transports, a bounded retry with backoff. Holds only a weak
     /// reference so dropping the manager is never delayed by a slow server.
+    ///
+    /// A remote server that failed its startup attempts keeps being retried
+    /// every [`McpManager::remote_retry_interval`] while Claurst runs, so a
+    /// server that comes back up reconnects without user action (issue
+    /// #471). Stdio servers stop after the first failure: a child process
+    /// that cannot start will not start later either.
     async fn connect_server(manager: Weak<Self>, config: McpServerConfig) {
         let name = config.name.clone();
         let expanded = expand_server_config(&config);
@@ -1220,78 +1240,132 @@ impl McpManager {
         let remote = matches!(expanded.server_type.as_str(), "sse" | "http");
         debug!(server = %name, transport = %expanded.server_type, "Connecting to MCP server");
 
-        let mut attempt = 1;
-        let result = loop {
-            let auth_token = match config.url.as_deref() {
-                Some(server_url) if remote => {
-                    oauth::get_valid_mcp_access_token(&name, server_url)
-                        .await
-                        .ok()
-                        .flatten()
+        loop {
+            let mut attempt = 1;
+            let result = loop {
+                let auth_token = match config.url.as_deref() {
+                    Some(server_url) if remote => {
+                        oauth::get_valid_mcp_access_token(&name, server_url)
+                            .await
+                            .ok()
+                            .flatten()
+                    }
+                    _ => None,
+                };
+                let error = match client::McpClient::connect(&expanded, auth_token, timeouts).await {
+                    Ok(client) => break Ok(client),
+                    Err(error) => error,
+                };
+                // A timed-out attempt already spent the whole connect budget.
+                let retry = remote
+                    && attempt < MAX_REMOTE_CONNECT_ATTEMPTS
+                    && error.downcast_ref::<McpTimeoutError>().is_none();
+                if !retry {
+                    break Err(error);
                 }
-                _ => None,
-            };
-            let error = match client::McpClient::connect(&expanded, auth_token, timeouts).await {
-                Ok(client) => break Ok(client),
-                Err(error) => error,
-            };
-            // A timed-out attempt already spent the whole connect budget.
-            let retry = remote
-                && attempt < MAX_REMOTE_CONNECT_ATTEMPTS
-                && error.downcast_ref::<McpTimeoutError>().is_none();
-            if !retry {
-                break Err(error);
-            }
-            let delay = REMOTE_RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
-            warn!(
-                server = %name,
-                attempt,
-                retry_in_ms = delay.as_millis() as u64,
-                error = %error,
-                "MCP connect attempt failed; retrying"
-            );
-            let Some(strong) = manager.upgrade() else { return };
-            strong.set_status(
-                &name,
-                McpServerStatus::Failed {
-                    error: error.to_string(),
-                    retry_at: Instant::now() + delay,
-                },
-            );
-            drop(strong);
-            tokio::time::sleep(delay).await;
-            let Some(strong) = manager.upgrade() else { return };
-            strong.set_status(&name, McpServerStatus::Connecting);
-            attempt += 1;
-        };
-
-        let Some(manager) = manager.upgrade() else { return };
-        match result {
-            Ok(client) => {
-                info!(
+                let delay = REMOTE_RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
+                warn!(
                     server = %name,
-                    transport = %expanded.server_type,
-                    tools = client.tools.len(),
-                    resources = client.resources.len(),
-                    "MCP server connected"
+                    attempt,
+                    retry_in_ms = delay.as_millis() as u64,
+                    error = %error,
+                    "MCP connect attempt failed; retrying"
                 );
-                manager.install_client(client);
-            }
-            Err(e) => {
-                error!(
-                    server = %name,
-                    transport = %expanded.server_type,
-                    error = %e,
-                    "Failed to connect to MCP server"
-                );
-                manager.set_status(
+                let Some(strong) = manager.upgrade() else { return };
+                strong.set_status(
                     &name,
-                    McpServerStatus::Disconnected {
-                        last_error: Some(e.to_string()),
+                    McpServerStatus::Failed {
+                        error: error.to_string(),
+                        retry_at: Instant::now() + delay,
                     },
                 );
+                drop(strong);
+                tokio::time::sleep(delay).await;
+                let Some(strong) = manager.upgrade() else { return };
+                strong.set_status(&name, McpServerStatus::Connecting);
+                attempt += 1;
+            };
+
+            let Some(manager) = manager.upgrade() else { return };
+            match result {
+                Ok(client) => {
+                    info!(
+                        server = %name,
+                        transport = %expanded.server_type,
+                        tools = client.tools.len(),
+                        resources = client.resources.len(),
+                        "MCP server connected"
+                    );
+                    manager.install_client(client);
+                    return;
+                }
+                Err(e) => {
+                    error!(
+                        server = %name,
+                        transport = %expanded.server_type,
+                        error = %e,
+                        "Failed to connect to MCP server"
+                    );
+                    manager.set_status(
+                        &name,
+                        McpServerStatus::Disconnected {
+                            last_error: Some(e.to_string()),
+                        },
+                    );
+                }
+            }
+            if !remote {
+                return;
+            }
+
+            let interval = manager.remote_retry_interval();
+            tokio::time::sleep(interval).await;
+            match manager.server_status(&name) {
+                McpServerStatus::Disconnected { .. } => {
+                    info!(
+                        server = %name,
+                        interval_secs = interval.as_secs(),
+                        "Retrying failed remote MCP server"
+                    );
+                    manager.set_status(&name, McpServerStatus::Connecting);
+                }
+                // Another connect attempt took over the server (or it
+                // already connected): it owns the retry from here on.
+                _ => return,
             }
         }
+    }
+
+    /// Start a runtime reconnect of `name` in the background (issue #471).
+    ///
+    /// Drops any existing client for the server and re-runs the startup
+    /// connect path (bounded attempts for remote transports, one for stdio;
+    /// failed remote servers then resume periodic retries). Sets the status
+    /// to [`McpServerStatus::Connecting`] before returning.
+    pub fn reconnect(self: &Arc<Self>, name: &str) -> anyhow::Result<()> {
+        let config = match self.server_configs.get(name) {
+            Some(config) => config.clone(),
+            None => {
+                return Err(anyhow::anyhow!("Unknown MCP server '{}'", name));
+            }
+        };
+        if matches!(self.server_status(name), McpServerStatus::Connecting) {
+            return Err(anyhow::anyhow!(
+                "MCP server '{}' is already connecting",
+                name
+            ));
+        }
+        // Drop the old client so the route table matches the reported
+        // status while the reconnect runs.
+        {
+            let mut state = self.state.write();
+            if state.clients.remove(name).is_some() {
+                state.rebuild_tools();
+            }
+        }
+        self.set_status(name, McpServerStatus::Connecting);
+        tokio::spawn(Self::connect_server(Arc::downgrade(self), config));
+        Ok(())
     }
 
     /// Record a connected client and start listening for its notifications.
@@ -2305,6 +2379,115 @@ mod tests {
     fn test_manager_failed_servers_empty() {
         let mgr = McpManager::new();
         assert!(mgr.failed_servers().is_empty());
+    }
+
+    /// A stdio config whose child process cannot start, so connects fail
+    /// fast and terminally.
+    fn stdio_fail_config(name: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            command: Some("/nonexistent/claurst-mcp-reconnect-fixture".to_string()),
+            args: vec![],
+            env: HashMap::new(),
+            url: None,
+            server_type: "stdio".to_string(),
+            headers: Default::default(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
+            origin: Default::default(),
+        }
+    }
+
+    /// A streamable-HTTP config pointing at a closed local port.
+    fn http_fail_config(name: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            command: None,
+            args: vec![],
+            env: HashMap::new(),
+            url: Some("http://127.0.0.1:1/mcp".to_string()),
+            server_type: "http".to_string(),
+            headers: Default::default(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
+            origin: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_unknown_server_is_an_error() {
+        let mgr = McpManager::new();
+        let err = mgr.reconnect("nope").expect_err("unknown server");
+        assert!(err.to_string().contains("Unknown MCP server"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn test_reconnect_starts_background_connect_for_failed_server() {
+        let mgr = McpManager::start(&[stdio_fail_config("srv")]);
+        mgr.wait_until_settled().await;
+        assert!(
+            matches!(
+                mgr.server_status("srv"),
+                McpServerStatus::Disconnected { last_error: Some(_) }
+            ),
+            "{:?}",
+            mgr.server_status("srv")
+        );
+
+        // Reconnect the named server at runtime: the status hands over to
+        // Connecting and a second reconnect is refused while it runs.
+        mgr.reconnect("srv").expect("reconnect a failed server");
+        assert!(
+            matches!(mgr.server_status("srv"), McpServerStatus::Connecting),
+            "{:?}",
+            mgr.server_status("srv")
+        );
+        let err = mgr.reconnect("srv").expect_err("already connecting");
+        assert!(err.to_string().contains("already connecting"), "{}", err);
+
+        // Stdio servers stop after one attempt, so it fails again.
+        mgr.wait_until_settled().await;
+        assert!(
+            matches!(
+                mgr.server_status("srv"),
+                McpServerStatus::Disconnected { last_error: Some(_) }
+            ),
+            "{:?}",
+            mgr.server_status("srv")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failed_remote_server_is_retried_periodically() {
+        let mgr = McpManager::start(&[http_fail_config("remote")]);
+        mgr.wait_until_settled().await;
+        assert!(matches!(
+            mgr.server_status("remote"),
+            McpServerStatus::Disconnected { .. }
+        ));
+
+        // Shrink the runtime retry interval, then watch the connection
+        // cycle Connecting → Disconnected in the background instead of
+        // stopping at the terminal startup failure.
+        use std::sync::atomic::Ordering;
+        mgr.remote_retry_interval_ms.store(50, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let mut observed_connecting = 0usize;
+        let mut was_connecting = false;
+        while observed_connecting < 2 && started.elapsed() < Duration::from_secs(30) {
+            if matches!(mgr.server_status("remote"), McpServerStatus::Connecting) {
+                observed_connecting += usize::from(!was_connecting);
+                was_connecting = true;
+            } else {
+                was_connecting = false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            observed_connecting >= 2,
+            "failed remote server should be retried periodically, status: {:?}",
+            mgr.server_status("remote")
+        );
     }
 
     #[tokio::test]

@@ -404,21 +404,23 @@ impl McpCommand {
                         ))
                     }
                     McpServerStatus::Disconnected { .. } | McpServerStatus::Failed { .. } => {
-                        // The McpManager doesn't expose a reconnect method — it's built at
-                        // startup.  Inform the user and suggest a restart.
-                        CommandResult::Message(format!(
-                            "MCP server '{}' is currently disconnected.\n\
-                             Status: {}\n\
-                             \n\
-                             Remote servers get up to 3 startup attempts, stdio servers one.\n\
-                             To recover:\n\
-                             1. Check authentication: /mcp auth {}\n\
-                             2. Verify the command/URL in ~/.claurst/settings.json\n\
-                             3. Restart Claurst to force a full reconnect",
-                            server_name,
-                            manager.server_status(server_name).display(),
-                            server_name
-                        ))
+                        // Start a runtime reconnect in the background (#471).
+                        // Failed remote servers are also retried periodically
+                        // without any user action.
+                        match manager.reconnect(server_name) {
+                            Ok(()) => CommandResult::Message(format!(
+                                "MCP server '{}' is reconnecting in the background.\n\
+                                 \n\
+                                 Remote servers are retried periodically until they connect.\n\
+                                 If authentication failed, run /mcp auth {} first,\n\
+                                 then reconnect. Check the attempt: /mcp status",
+                                server_name, server_name
+                            )),
+                            Err(e) => CommandResult::Error(format!(
+                                "Could not reconnect '{}': {}",
+                                server_name, e
+                            )),
+                        }
                     }
                 }
             }
