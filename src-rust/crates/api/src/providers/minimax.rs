@@ -303,6 +303,7 @@ impl LlmProvider for MinimaxProvider {
             stop_reason,
             usage,
             model,
+            rate_limits: None,
         })
     }
 

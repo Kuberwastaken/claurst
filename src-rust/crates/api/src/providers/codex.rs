@@ -38,8 +38,8 @@ use crate::error_handling::parse_error_response;
 use crate::provider::{LlmProvider, ModelInfo};
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
-    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
-    StreamEvent, SystemPromptStyle,
+    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, RateLimitUsage,
+    StopReason, StreamEvent, SystemPromptStyle,
 };
 
 // Re-use Copilot's message translation helpers via the public Copilot type.
@@ -576,7 +576,7 @@ impl CodexProvider {
 
     /// Parse the `x-codex-{primary,secondary}-used-percent` headers (official
     /// `codex-api/src/rate_limits.rs`). `None` when neither is present.
-    fn parse_rate_limits(headers: &reqwest::header::HeaderMap) -> Option<StreamEvent> {
+    fn parse_rate_limits(headers: &reqwest::header::HeaderMap) -> Option<RateLimitUsage> {
         let used = |name: &str| {
             headers
                 .get(name)
@@ -589,7 +589,7 @@ impl CodexProvider {
         if primary_used_percent.is_none() && secondary_used_percent.is_none() {
             return None;
         }
-        Some(StreamEvent::RateLimits {
+        Some(RateLimitUsage {
             primary_used_percent,
             secondary_used_percent,
         })
@@ -789,6 +789,10 @@ impl CodexProvider {
                 }
             }
 
+            // The non-streaming path must parse the x-codex-* usage headers
+            // too — the streaming path gets them via `sse_events`.
+            let rate_limits = Self::parse_rate_limits(resp.headers());
+
             let text = resp.text().await.map_err(|e| ProviderError::Other {
                 provider: self.id.clone(),
                 message: format!("Failed to read response body: {}", e),
@@ -807,7 +811,9 @@ impl CodexProvider {
                 body: Some(text.clone()),
             })?;
 
-            return Self::parse_responses_response(&self.id, &json_val);
+            let mut response = Self::parse_responses_response(&self.id, &json_val)?;
+            response.rate_limits = rate_limits;
+            return Ok(response);
         }
     }
 
@@ -1072,6 +1078,7 @@ impl CodexProvider {
             stop_reason,
             usage,
             model,
+            rate_limits: None,
         })
     }
 
@@ -1591,7 +1598,7 @@ impl LlmProvider for CodexProvider {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
     {
         let resp = self.send_responses_streaming_request(&request).await?;
-        let rate_limits = Self::parse_rate_limits(resp.headers());
+        let rate_limits = Self::parse_rate_limits(resp.headers()).map(StreamEvent::from);
         Ok(Box::pin(Self::sse_events(
             resp.bytes_stream(),
             self.id.clone(),
@@ -2233,16 +2240,18 @@ mod tests {
         headers.insert("x-codex-primary-used-percent", HeaderValue::from_static("12.5"));
         headers.insert("x-codex-primary-window-minutes", HeaderValue::from_static("300"));
         headers.insert("x-codex-secondary-used-percent", HeaderValue::from_static("71"));
-        match CodexProvider::parse_rate_limits(&headers) {
-            Some(StreamEvent::RateLimits {
+        let usage = CodexProvider::parse_rate_limits(&headers).expect("both headers present");
+        assert_eq!(usage.primary_used_percent, Some(12.5));
+        assert_eq!(usage.secondary_used_percent, Some(71.0));
+        // The usage converts to the stream event the streaming path emits.
+        assert!(matches!(
+            StreamEvent::from(usage.clone()),
+            StreamEvent::RateLimits {
                 primary_used_percent,
                 secondary_used_percent,
-            }) => {
-                assert_eq!(primary_used_percent, Some(12.5));
-                assert_eq!(secondary_used_percent, Some(71.0));
             }
-            other => panic!("unexpected {other:?}"),
-        }
+            if primary_used_percent == Some(12.5) && secondary_used_percent == Some(71.0)
+        ));
 
         let mut partial = HeaderMap::new();
         partial.insert("x-codex-secondary-used-percent", HeaderValue::from_static("garbage"));

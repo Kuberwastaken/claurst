@@ -610,6 +610,7 @@ impl CopilotProvider {
             stop_reason,
             usage,
             model,
+            rate_limits: None,
         })
     }
 

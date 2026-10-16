@@ -574,6 +574,7 @@ impl GoogleProvider {
             stop_reason,
             usage,
             model: model.to_string(),
+            rate_limits: None,
         })
     }
 
