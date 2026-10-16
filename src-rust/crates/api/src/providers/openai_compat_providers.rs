@@ -21,7 +21,7 @@ pub fn provider_for_id(provider_id: &str) -> Option<OpenAiCompatProvider> {
         "xai" => Some(xai()),
         "deepinfra" => Some(deepinfra()),
         "cerebras" => Some(cerebras()),
-        "together-ai" => Some(together_ai()),
+        "together-ai" | "togetherai" => Some(together_ai()),
         "perplexity" => Some(perplexity()),
         "venice" => Some(venice()),
         "qwen" | "alibaba" => Some(qwen()),
@@ -630,5 +630,16 @@ mod tests {
         let qwen = provider_for_id("qwen").expect("qwen should resolve");
         assert_eq!(alibaba.id(), qwen.id());
         assert_eq!(alibaba.name(), qwen.name());
+    }
+
+    #[test]
+    fn togetherai_alias_resolves_to_canonical_id() {
+        // "togetherai" is the spelling the route, auth store and CLI accept;
+        // it must build the same backend as the canonical "together-ai".
+        let alias = provider_for_id("togetherai").expect("togetherai should resolve");
+        let canonical = provider_for_id("together-ai").expect("together-ai should resolve");
+        assert_eq!(alias.id(), canonical.id());
+        assert_eq!(&**alias.id(), ProviderId::TOGETHER_AI);
+        assert_eq!(alias.name(), canonical.name());
     }
 }
