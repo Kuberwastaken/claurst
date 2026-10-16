@@ -1717,9 +1717,9 @@ mod tests {
         let events = [
             sse_line("response.created", &json!({"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}})),
             sse_line("response.reasoning_summary_text.delta", &json!({"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"first item"})),
+            sse_line("response.output_item.done", &json!({"type":"response.output_item.done","output_index":0,"item":{"id":"rs_0","type":"reasoning","encrypted_content":"ENC-1"}})),
             sse_line("response.output_item.added", &json!({"type":"response.output_item.added","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Bash"}})),
             sse_line("response.function_call_arguments.delta", &json!({"type":"response.function_call_arguments.delta","output_index":1,"delta":r#"{"command":"ls"}"#})),
-            sse_line("response.output_item.done", &json!({"type":"response.output_item.done","output_index":0,"item":{"id":"rs_0","type":"reasoning","encrypted_content":"ENC-1"}})),
             sse_line("response.output_item.done", &json!({"type":"response.output_item.done","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Bash","arguments":r#"{"command":"ls"}"#}})),
             sse_line("response.reasoning_summary_text.delta", &json!({"type":"response.reasoning_summary_text.delta","output_index":2,"delta":"second item"})),
             sse_line("response.output_item.done", &json!({"type":"response.output_item.done","output_index":2,"item":{"id":"rs_2","type":"reasoning","encrypted_content":"ENC-2"}})),
