@@ -15,6 +15,7 @@ use crate::{PermissionLevel, Tool, ToolContext, ToolResult};
 use async_trait::async_trait;
 use serde_json::Value;
 
+#[derive(Clone)]
 pub struct SyntheticOutputTool {
     schema: Value,
 }
@@ -32,6 +33,17 @@ impl SyntheticOutputTool {
                 other
             )),
             None => Err("the schema must be a JSON object with \"type\": \"object\"".to_string()),
+        }
+    }
+
+    /// Check `input` against the schema: `Ok(())` when it matches, otherwise
+    /// the violations, one message each.
+    pub fn validate(&self, input: &Value) -> Result<(), Vec<String>> {
+        let problems = self.violations(input);
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems)
         }
     }
 
@@ -106,14 +118,13 @@ impl Tool for SyntheticOutputTool {
     }
 
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
-        let problems = self.violations(&input);
-        if !problems.is_empty() {
-            return ToolResult::error(format!(
+        match self.validate(&input) {
+            Ok(()) => ToolResult::success("Structured output provided successfully"),
+            Err(problems) => ToolResult::error(format!(
                 "StructuredOutput input does not match the schema: {}.",
                 problems.join("; ")
-            ));
+            )),
         }
-        ToolResult::success("Structured output provided successfully")
     }
 }
 

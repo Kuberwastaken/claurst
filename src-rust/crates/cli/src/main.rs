@@ -976,7 +976,7 @@ async fn main() -> anyhow::Result<()> {
     };
     // StructuredOutput is offered only with --json-schema. The list was built
     // above and has no other owner yet.
-    let tools = match structured_output_tool {
+    let tools = match structured_output_tool.clone() {
         Some(tool) => {
             let mut list = Arc::try_unwrap(tools)
                 .map_err(|_| anyhow::anyhow!("the tool list is already shared"))?;
@@ -1006,6 +1006,7 @@ async fn main() -> anyhow::Result<()> {
             tool_ctx,
             query_config,
             cost_tracker,
+            structured_output_tool,
         )
         .await;
         cron_cancel.cancel();
@@ -1638,6 +1639,7 @@ async fn run_headless(
     tool_ctx: ToolContext,
     mut query_config: claurst_query::QueryConfig,
     cost_tracker: Arc<CostTracker>,
+    json_schema: Option<claurst_tools::SyntheticOutputTool>,
 ) -> anyhow::Result<i32> {
     use tokio_util::sync::CancellationToken;
 
@@ -1770,6 +1772,7 @@ async fn run_headless(
     let mut sink = headless::HeadlessSink::new(
         cli.output_format,
         session.id.clone(),
+        json_schema,
         std::io::stdout(),
         std::io::stderr(),
     );
