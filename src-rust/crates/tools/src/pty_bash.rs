@@ -49,14 +49,18 @@ pub struct PtyBashTool;
 /// Environment every shell child gets (#442): pagers are disabled so
 /// `git log`, `git diff` or `man` cannot hang in `less`, git never prompts for
 /// credentials on the terminal, and scripts can tell they run under an agent.
+/// `NO_COLOR` keeps children from emitting ANSI colors (#465): the raw windows
+/// and spill files are read by the model, so escape bytes only eat into its
+/// caps and the PTY path would strip most of them again anyway.
 /// On the PTY path these are forced after the restored session env: the PTY
 /// has no stdin writer, so an earlier `export PAGER=less` would only hang the
 /// next `git log` until timeout (codex forces them the same way).
-const CHILD_ENV: [(&str, &str); 6] = [
+const CHILD_ENV: [(&str, &str); 7] = [
     ("PAGER", "cat"),
     ("GIT_PAGER", "cat"),
     ("GH_PAGER", "cat"),
     ("GIT_TERMINAL_PROMPT", "0"),
+    ("NO_COLOR", "1"),
     ("CLAURST", "1"),
     ("AGENT", "1"),
 ];
@@ -1789,7 +1793,7 @@ mod tests {
         assert!(task.output.iter().any(|l| l == "done"));
     }
 
-    const ENV_PROBE: &str = "echo \"$PAGER $GIT_PAGER $GH_PAGER $GIT_TERMINAL_PROMPT $CLAURST $AGENT ${TERM:+term}\"";
+    const ENV_PROBE: &str = "echo \"$PAGER $GIT_PAGER $GH_PAGER $GIT_TERMINAL_PROMPT $CLAURST $AGENT $NO_COLOR ${TERM:+term}\"";
 
     /// #442: the PTY child runs with pagers off, no git prompts, the agent
     /// markers, and a TERM.
@@ -1807,7 +1811,7 @@ mod tests {
         )
         .await;
         assert!(!result.is_error, "{}", result.content);
-        assert_eq!(result.content, "cat cat cat 0 1 1 term");
+        assert_eq!(result.content, "cat cat cat 0 1 1 1 term");
     }
 
     /// #442: background children get the same environment.
@@ -1815,7 +1819,7 @@ mod tests {
     async fn background_child_gets_pager_free_agent_env() {
         let spill_dir = tempfile::tempdir().unwrap();
         let task = run_background_to_completion(ENV_PROBE, spill_dir.path()).await;
-        assert_eq!(task.output, vec!["cat cat cat 0 1 1 term".to_string()]);
+        assert_eq!(task.output, vec!["cat cat cat 0 1 1 1 term".to_string()]);
     }
 
     /// Regression test for #184: a tool command that spawns a child which
