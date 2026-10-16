@@ -175,10 +175,19 @@ pub(crate) struct HeadlessSink<W: Write, E: Write> {
     pending_structured: HashMap<String, serde_json::Value>,
     /// Input of the last StructuredOutput call the tool accepted.
     structured_output: Option<serde_json::Value>,
+    /// The `--json-schema` validator: used to check a JSON fallback parse of
+    /// the final assistant text when the model never called StructuredOutput.
+    json_schema: Option<claurst_tools::SyntheticOutputTool>,
 }
 
 impl<W: Write, E: Write> HeadlessSink<W, E> {
-    pub(crate) fn new(format: CliOutputFormat, session_id: String, out: W, err: E) -> Self {
+    pub(crate) fn new(
+        format: CliOutputFormat,
+        session_id: String,
+        json_schema: Option<claurst_tools::SyntheticOutputTool>,
+        out: W,
+        err: E,
+    ) -> Self {
         Self {
             format,
             session_id,
@@ -191,6 +200,7 @@ impl<W: Write, E: Write> HeadlessSink<W, E> {
             compactions: Vec::new(),
             pending_structured: HashMap::new(),
             structured_output: None,
+            json_schema,
         }
     }
 
@@ -326,7 +336,26 @@ impl<W: Write, E: Write> HeadlessSink<W, E> {
         cost_tracker: &claurst_core::cost::CostTracker,
         duration: std::time::Duration,
     ) -> RunResult {
-        let (subtype, stop_reason, error) = classify(outcome, self.max_turns);
+        let (mut subtype, mut stop_reason, mut error) = classify(outcome, self.max_turns);
+        let mut structured_output = self.structured_output.clone();
+        // A schema was requested but the model ended its turn without a
+        // successful StructuredOutput call: accept a final message that is
+        // itself JSON matching the schema, otherwise fail the run.
+        if structured_output.is_none() && subtype == ResultSubtype::Success {
+            if let Some(tool) = &self.json_schema {
+                match structured_output_from_text(&self.last_assistant_text, tool) {
+                    Ok(value) => structured_output = Some(value),
+                    Err(reason) => {
+                        subtype = ResultSubtype::ErrorDuringExecution;
+                        stop_reason = "error";
+                        error = Some(format!(
+                            "the model produced no valid structured output: {}",
+                            reason
+                        ));
+                    }
+                }
+            }
+        }
         RunResult {
             subtype,
             is_error: subtype != ResultSubtype::Success,
@@ -343,7 +372,7 @@ impl<W: Write, E: Write> HeadlessSink<W, E> {
                 cache_creation_input_tokens: cost_tracker.cache_creation_tokens(),
                 cache_read_input_tokens: cost_tracker.cache_read_tokens(),
             },
-            structured_output: self.structured_output.clone(),
+            structured_output,
         }
     }
 
@@ -406,6 +435,25 @@ fn classify(outcome: &QueryOutcome, max_turns: Option<u32>) -> (ResultSubtype, &
         QueryOutcome::Cancelled => (ResultSubtype::Cancelled, "cancelled", None),
         QueryOutcome::Error(e) => (ResultSubtype::ErrorDuringExecution, "error", Some(e.to_string())),
     }
+}
+
+/// Parse the final assistant text as JSON and validate it against `tool`'s
+/// schema, for runs where the model answered with plain text instead of
+/// calling StructuredOutput. Returns the parsed value or the reason it was
+/// rejected, used verbatim in the run's error.
+fn structured_output_from_text(
+    text: &str,
+    tool: &claurst_tools::SyntheticOutputTool,
+) -> Result<serde_json::Value, String> {
+    let value: serde_json::Value = serde_json::from_str(text.trim())
+        .map_err(|e| format!("the final message is not valid JSON ({})", e))?;
+    tool.validate(&value).map_err(|problems| {
+        format!(
+            "the final message does not match the schema ({})",
+            problems.join("; ")
+        )
+    })?;
+    Ok(value)
 }
 
 /// Build the StructuredOutput tool from `--json-schema`: inline JSON when the
@@ -790,6 +838,7 @@ mod tests {
         tools: Vec<Box<dyn Tool>>,
         ctx: ToolContext,
         history: Vec<Message>,
+        json_schema: Option<claurst_tools::SyntheticOutputTool>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Run {
         let client = Arc::new(
@@ -803,7 +852,8 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let (outcome, messages, result) = {
-            let mut sink = HeadlessSink::new(format, ctx.session_id.clone(), &mut out, &mut err);
+            let mut sink =
+                HeadlessSink::new(format, ctx.session_id.clone(), json_schema, &mut out, &mut err);
             let tool_names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
             sink.init(InitInfo {
                 model: &config.model,
@@ -839,6 +889,7 @@ mod tests {
             tools,
             context(std::path::PathBuf::from("/workspace"), allow_all()),
             vec![Message::user("start")],
+            None,
             tokio_util::sync::CancellationToken::new(),
         )
         .await
@@ -978,6 +1029,7 @@ mod tests {
             vec![Box::new(PingTool)],
             context(std::path::PathBuf::from("/workspace"), allow_all()),
             vec![Message::user("start")],
+            None,
             tokio_util::sync::CancellationToken::new(),
         )
         .await;
@@ -1000,6 +1052,7 @@ mod tests {
             Vec::new(),
             context(std::path::PathBuf::from("/workspace"), allow_all()),
             vec![Message::user("start")],
+            None,
             cancel,
         )
         .await;
@@ -1030,7 +1083,8 @@ mod tests {
     fn text_mode_reports_a_limit_on_stderr() {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let mut sink = HeadlessSink::new(CliOutputFormat::Text, "s".to_string(), &mut out, &mut err);
+        let mut sink =
+            HeadlessSink::new(CliOutputFormat::Text, "s".to_string(), None, &mut out, &mut err);
         let outcome = QueryOutcome::BudgetExceeded { cost_usd: 1.5, limit_usd: 1.0 };
         let result = sink.result(&outcome, &claurst_core::cost::CostTracker::new(), std::time::Duration::ZERO);
         sink.finish(&result).unwrap();
@@ -1075,6 +1129,7 @@ mod tests {
             Vec::new(),
             ctx,
             history,
+            None,
             tokio_util::sync::CancellationToken::new(),
         )
         .await;
@@ -1141,6 +1196,7 @@ mod tests {
             vec![Box::new(claurst_tools::FileWriteTool)],
             context(workspace.clone(), Arc::new(handler)),
             vec![Message::user("start")],
+            None,
             tokio_util::sync::CancellationToken::new(),
         )
         .await;
@@ -1183,6 +1239,57 @@ mod tests {
     async fn without_json_schema_the_result_has_no_structured_output() {
         let run = run(CliOutputFormat::Json, Vec::new(), Vec::new()).await;
         assert!(lines(&run.stdout)[0].get("structured_output").is_none());
+    }
+
+    #[tokio::test]
+    async fn json_schema_falls_back_to_parsing_final_json_text() {
+        let schema = r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}"#;
+        let tool = structured_output_tool(schema).unwrap();
+        // The model answers with raw JSON text and never calls StructuredOutput.
+        let run = run_with(
+            CliOutputFormat::StreamJson,
+            scripted_config(vec![Step::Stream(text_turn(r#"{"answer":"42"}"#))]),
+            vec![Box::new(tool.clone())],
+            context(std::path::PathBuf::from("/workspace"), allow_all()),
+            vec![Message::user("start")],
+            Some(tool),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        let events = lines(&run.stdout);
+        let result = events.last().unwrap();
+        assert_eq!(result["subtype"], "success");
+        assert_eq!(result["structured_output"], serde_json::json!({"answer": "42"}));
+    }
+
+    #[tokio::test]
+    async fn json_schema_with_invalid_final_text_exits_nonzero() {
+        let schema = r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}"#;
+        let tool = structured_output_tool(schema).unwrap();
+        // Valid JSON, but "answer" has the wrong type and no tool call was made.
+        let run = run_with(
+            CliOutputFormat::Json,
+            scripted_config(vec![Step::Stream(text_turn(r#"{"answer":42}"#))]),
+            vec![Box::new(tool.clone())],
+            context(std::path::PathBuf::from("/workspace"), allow_all()),
+            vec![Message::user("start")],
+            Some(tool),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(run.result.subtype.exit_code(), 1);
+        assert!(
+            run.result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("no valid structured output")),
+            "{:?}",
+            run.result.error
+        );
+        let result = &lines(&run.stdout)[0];
+        assert_eq!(result["is_error"], true);
+        assert_eq!(result["stop_reason"], "error");
+        assert!(result.get("structured_output").is_none());
     }
 
     #[test]
