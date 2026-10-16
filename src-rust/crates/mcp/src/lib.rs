@@ -222,6 +222,12 @@ pub const MCP_TOOL_PREFIX: &str = "mcp__";
 /// names at 64 characters; Anthropic allows 128.
 pub const MAX_MCP_TOOL_NAME_LEN: usize = 64;
 
+/// Bound on a single `tools/call` execution (issue #471). A hung tool call
+/// would otherwise wedge the running turn — and stop every later request —
+/// instead of returning an error to the model, so each call gets one minute
+/// by default. Startup is bounded separately by [`McpTimeouts`].
+pub const DEFAULT_TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// One MCP tool as exposed to the model.
 #[derive(Debug, Clone)]
 pub struct McpToolEntry {
@@ -818,7 +824,7 @@ pub mod client {
             }
         }
 
-        fn from_backend(backend: Arc<dyn backend::McpClientBackend>) -> Self {
+        pub(crate) fn from_backend(backend: Arc<dyn backend::McpClientBackend>) -> Self {
             let snapshot = backend.snapshot();
             let mut client = Self::from_snapshot(snapshot);
             client.backend = Some(backend);
@@ -1588,11 +1594,25 @@ impl McpManager {
     }
 
     /// Execute a tool call by its exposed name, routed through the
-    /// exposed-name map to the owning server.
+    /// exposed-name map to the owning server, bounded by
+    /// [`DEFAULT_TOOL_CALL_TIMEOUT`].
     pub async fn call_tool(
         &self,
         exposed_name: &str,
         arguments: Option<Value>,
+    ) -> anyhow::Result<CallToolResult> {
+        self.call_tool_with_timeout(exposed_name, arguments, DEFAULT_TOOL_CALL_TIMEOUT)
+            .await
+    }
+
+    /// [`McpManager::call_tool`] with an explicit bound (so tests do not have
+    /// to wait out the default). The timed-out call is dropped: MCP tool
+    /// calls are not cancel-safe work the model can resume later.
+    async fn call_tool_with_timeout(
+        &self,
+        exposed_name: &str,
+        arguments: Option<Value>,
+        timeout: Duration,
     ) -> anyhow::Result<CallToolResult> {
         let (client, tool_name) = {
             let state = self.state.read();
@@ -1611,7 +1631,14 @@ impl McpManager {
             })?;
             (client, entry.tool_name.clone())
         };
-        client.call_tool(&tool_name, arguments).await
+        match tokio::time::timeout(timeout, client.call_tool(&tool_name, arguments)).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "MCP tool '{}' timed out after {}s",
+                exposed_name,
+                timeout.as_secs_f32()
+            )),
+        }
     }
 
     /// Number of connected servers.
@@ -2602,6 +2629,105 @@ mod tests {
         // Same raw identity → same name on a rebuild.
         let again = exposed_tool_name("server", &long_tool, false, &mut std::collections::HashSet::new());
         assert_eq!(first, again);
+    }
+
+    /// A backend whose `call_tool` hangs past any given deadline, so a
+    /// manager call can be made to time out.
+    struct SlowBackend {
+        delay: Duration,
+        snapshot: backend::McpClientSnapshot,
+    }
+
+    #[async_trait]
+    impl backend::McpClientBackend for SlowBackend {
+        fn kind(&self) -> backend::McpBackendKind {
+            backend::McpBackendKind::Rmcp
+        }
+
+        fn snapshot(&self) -> backend::McpClientSnapshot {
+            self.snapshot.clone()
+        }
+
+        async fn list_tools(&self) -> anyhow::Result<Vec<McpTool>> {
+            Ok(self.snapshot.tools.clone())
+        }
+
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Option<Value>,
+        ) -> anyhow::Result<CallToolResult> {
+            tokio::time::sleep(self.delay).await;
+            Ok(result(vec![]))
+        }
+
+        async fn list_resources(&self) -> anyhow::Result<Vec<McpResource>> {
+            Ok(vec![])
+        }
+
+        async fn read_resource(&self, _uri: &str) -> anyhow::Result<ResourceContents> {
+            Err(anyhow::anyhow!("no resources in the test backend"))
+        }
+
+        async fn list_prompts(&self) -> anyhow::Result<Vec<McpPrompt>> {
+            Ok(vec![])
+        }
+
+        async fn get_prompt(
+            &self,
+            _name: &str,
+            _arguments: Option<std::collections::HashMap<String, String>>,
+        ) -> anyhow::Result<GetPromptResult> {
+            Err(anyhow::anyhow!("no prompts in the test backend"))
+        }
+
+        async fn subscribe_resource(&self, _uri: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn unsubscribe_resource(&self, _uri: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn subscribe_to_notifications(&self) -> BoxStream<'static, anyhow::Result<Value>> {
+            Box::pin(futures::stream::iter(Vec::<anyhow::Result<Value>>::new()))
+        }
+    }
+
+    fn client_with_backend(delay: Duration) -> client::McpClient {
+        let mut snapshot = backend::McpClientSnapshot::empty("slow");
+        snapshot.tools = vec![McpTool {
+            name: "work".to_string(),
+            description: None,
+            input_schema: serde_json::json!({ "type": "object" }),
+        }];
+        client::McpClient::from_backend(Arc::new(SlowBackend { delay, snapshot }))
+    }
+
+    #[tokio::test]
+    async fn test_call_tool_times_out_per_call() {
+        let mgr = Arc::new(McpManager::new());
+        mgr.install_client(client_with_backend(Duration::from_secs(5)));
+        assert_eq!(mgr.all_tool_definitions().len(), 1);
+
+        // The call outlives its bound and is dropped, returning an error
+        // instead of wedging the turn.
+        let err = mgr
+            .call_tool_with_timeout("mcp__slow__work", None, Duration::from_millis(1))
+            .await
+            .expect_err("hung tool call");
+        assert!(err.to_string().contains("timed out"), "{}", err);
+
+        // A fast call finishes within the same bound.
+        let mgr_fast = Arc::new(McpManager::new());
+        mgr_fast.install_client(client_with_backend(Duration::from_millis(5)));
+        assert!(
+            mgr_fast
+                .call_tool_with_timeout("mcp__slow__work", None, Duration::from_secs(2))
+                .await
+                .is_ok(),
+            "a fast call succeeds within the bound"
+        );
     }
 
     #[tokio::test]
