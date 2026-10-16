@@ -19,7 +19,7 @@ use claurst_core::tasks::{BackgroundTask, global_registry};
 use claurst_core::truncate::bound_head_tail;
 use crate::output_spill::{
     Captured, OutputAccumulator, RAW_HEAD_BYTES, RAW_TAIL_BYTES, finish_spill, spill_bytes,
-    with_full_output,
+    with_output_trailer,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -218,92 +218,130 @@ async fn run_in_background(
     let term = std::env::var_os("TERM").unwrap_or_else(|| DEFAULT_TERM.into());
 
     tokio::spawn(async move {
-        let result = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
-            // kill_on_drop: when the timeout drops this future the child must die
-            // with it, otherwise a timed-out background command leaks (#220).
-            let child = if cfg!(windows) {
-                Command::new("cmd")
-                    .arg("/C")
-                    .arg(&command_clone)
-                    .current_dir(&cwd)
-                    .envs(CHILD_ENV)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .stdin(Stdio::null())
-                    .kill_on_drop(true)
-                    .spawn()
-            } else {
-                // Sandboxed: `sandbox-exec <profile args> -- bash -c <command>`.
-                let mut bash = match &sandbox {
-                    Some(profile) => {
-                        let mut cmd = Command::new(SEATBELT_EXECUTABLE);
-                        cmd.args(profile.args()).arg("bash");
-                        cmd
-                    }
-                    None => Command::new("bash"),
-                };
-                bash.arg("-c")
-                    .arg(&command_clone)
-                    .current_dir(&cwd)
-                    .envs(CHILD_ENV)
-                    .env("TERM", &term)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .stdin(Stdio::null())
-                    .kill_on_drop(true)
-                    .spawn()
+        // kill_on_drop: should this task ever be dropped mid-future (stop via
+        // the monitor tool), the child must die with it, not leak (#220). The
+        // in-command timeout below kills it explicitly (#465).
+        let child = if cfg!(windows) {
+            Command::new("cmd")
+                .arg("/C")
+                .arg(&command_clone)
+                .current_dir(&cwd)
+                .envs(CHILD_ENV)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .stdin(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+        } else {
+            // Sandboxed: `sandbox-exec <profile args> -- bash -c <command>`.
+            let mut bash = match &sandbox {
+                Some(profile) => {
+                    let mut cmd = Command::new(SEATBELT_EXECUTABLE);
+                    cmd.args(profile.args()).arg("bash");
+                    cmd
+                }
+                None => Command::new("bash"),
             };
+            bash.arg("-c")
+                .arg(&command_clone)
+                .current_dir(&cwd)
+                .envs(CHILD_ENV)
+                .env("TERM", &term)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .stdin(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+        };
 
-            match child {
-                Ok(mut c) => {
-                    if let Some(pid) = c.id() {
-                        global_registry().set_pid(&task_id_clone, pid);
-                    }
-                    let mut stdout = c.stdout.take().map(|s| BgLineReader::new(BufReader::new(s)));
-                    let mut stderr = c.stderr.take().map(|s| BgLineReader::new(BufReader::new(s)));
-                    // Full output for the spill file; the registry keeps only
-                    // bounded windows of lines (#442).
-                    let mut full = OutputAccumulator::new(
-                        RAW_HEAD_BYTES,
-                        RAW_TAIL_BYTES,
-                        Some(spill_path.clone()),
-                    );
-                    // Drain both pipes concurrently until both close. Reading
-                    // stdout to EOF first let a child that filled the stderr pipe
-                    // block forever (#442).
-                    while stdout.is_some() || stderr.is_some() {
-                        let line = tokio::select! {
-                            line = stdout.as_mut().unwrap().next_line(), if stdout.is_some() => match line {
-                                Some(line) => line,
-                                None => {
-                                    stdout = None;
-                                    continue;
-                                }
-                            },
-                            line = stderr.as_mut().unwrap().next_line(), if stderr.is_some() => match line {
-                                Some(line) => format!("STDERR: {}", line),
-                                None => {
-                                    stderr = None;
-                                    continue;
-                                }
-                            },
-                        };
-                        full.push(format!("{line}\n").as_bytes());
-                        global_registry().append_output(&task_id_clone, &line);
-                    }
-                    let spilled = match full.finish() {
-                        Captured::Truncated { tail, spill, .. } => finish_spill(spill, &tail),
-                        Captured::Complete(bytes) => {
-                            match bound_head_tail(&String::from_utf8_lossy(&bytes)) {
-                                Some(_) => spill_bytes(&spill_path, &bytes),
-                                None => None,
-                            }
+        match child {
+            Ok(mut c) => {
+                if let Some(pid) = c.id() {
+                    global_registry().set_pid(&task_id_clone, pid);
+                }
+                let mut stdout = c.stdout.take().map(|s| BgLineReader::new(BufReader::new(s)));
+                let mut stderr = c.stderr.take().map(|s| BgLineReader::new(BufReader::new(s)));
+                // Full output for the spill file; the registry keeps only
+                // bounded windows of lines (#442).
+                let mut full = OutputAccumulator::new(
+                    RAW_HEAD_BYTES,
+                    RAW_TAIL_BYTES,
+                    Some(spill_path.clone()),
+                );
+                // Drain both pipes concurrently until both close. Reading
+                // stdout to EOF first let a child that filled the stderr pipe
+                // block forever (#442).
+                //
+                // The timeout no longer aborts the drain mid-stream: it kills
+                // the child, and the drain then finishes and spills whatever
+                // the command printed before the deadline onto the task instead
+                // of orphaning that data until the 7-day sweep (#465).
+                let timed_out = {
+                    let mut drain = async {
+                        while stdout.is_some() || stderr.is_some() {
+                            let line = tokio::select! {
+                                line = stdout.as_mut().unwrap().next_line(), if stdout.is_some() => match line {
+                                    Some(line) => line,
+                                    None => {
+                                        stdout = None;
+                                        continue;
+                                    }
+                                },
+                                line = stderr.as_mut().unwrap().next_line(), if stderr.is_some() => match line {
+                                    Some(line) => format!("STDERR: {}", line),
+                                    None => {
+                                        stderr = None;
+                                        continue;
+                                    }
+                                },
+                            };
+                            full.push(format!("{line}\n").as_bytes());
+                            global_registry().append_output(&task_id_clone, &line);
                         }
                     };
-                    if let Some(path) = spilled {
-                        global_registry().set_output_file(&task_id_clone, path);
+                    let drifted = tokio::time::timeout(Duration::from_millis(timeout_ms), &mut drain)
+                        .await
+                        .is_err();
+                    if drifted {
+                        // Kill the child so the pipes close and the drain
+                        // finishes; a child that leaks its fds elsewhere only
+                        // costs the grace window below.
+                        let _ = c.kill().await;
+                        if tokio::time::timeout(BG_DRAIN_GRACE, &mut drain)
+                            .await
+                            .is_err()
+                        {
+                            debug!(
+                                task = %task_id_clone,
+                                "background drain still open after its child was killed"
+                            );
+                        }
                     }
-                    match c.wait().await {
+                    drifted
+                };
+                let spilled = match full.finish() {
+                    Captured::Truncated { tail, spill, .. } => finish_spill(spill, &tail),
+                    Captured::Complete(bytes) => {
+                        match bound_head_tail(&String::from_utf8_lossy(&bytes)) {
+                            Some(_) => spill_bytes(&spill_path, &bytes),
+                            None => None,
+                        }
+                    }
+                };
+                if let Some(path) = spilled {
+                    global_registry().set_output_file(&task_id_clone, path);
+                }
+                let status = c.wait().await;
+                if timed_out {
+                    global_registry().update_status(
+                        &task_id_clone,
+                        claurst_core::tasks::TaskStatus::Failed(format!(
+                            "timed out after {}ms",
+                            timeout_ms
+                        )),
+                    );
+                } else {
+                    match status {
                         Ok(status) if status.success() => {
                             global_registry().complete(&task_id_clone);
                         }
@@ -325,24 +363,13 @@ async fn run_in_background(
                         }
                     }
                 }
-                Err(e) => {
-                    global_registry().update_status(
-                        &task_id_clone,
-                        claurst_core::tasks::TaskStatus::Failed(e.to_string()),
-                    );
-                }
             }
-        })
-        .await;
-
-        if result.is_err() {
-            global_registry().update_status(
-                &task_id_clone,
-                claurst_core::tasks::TaskStatus::Failed(format!(
-                    "timed out after {}ms",
-                    timeout_ms
-                )),
-            );
+            Err(e) => {
+                global_registry().update_status(
+                    &task_id_clone,
+                    claurst_core::tasks::TaskStatus::Failed(e.to_string()),
+                );
+            }
         }
 
         // Completion wake-up (#444). A task cancelled through the monitor
@@ -520,7 +547,9 @@ enum PtyOutcome {
     /// The command finished; carries (bounded raw PTY output, exit code).
     Completed(Captured, i32),
     /// The command exceeded its timeout. The child has been KILLED (#220).
-    TimedOut,
+    /// `partial` is the output captured up to the kill, rendered with the
+    /// windows' bounds and spilled as `Partial output: <path>` (#465).
+    TimedOut(Option<String>),
     /// The PTY could not be set up / the command could not be spawned.
     Failed(String),
 }
@@ -633,9 +662,10 @@ async fn run_in_pty(
     // reap the child there so we can return its exit code. drive_pty_child stops
     // reading as soon as the DIRECT child exits rather than waiting for pty EOF,
     // which a detached grandchild would hold open forever (#184).
+    let spill_for_thread = spill_path;
     let read_handle = tokio::task::spawn_blocking(move || {
         let master_fd = master.as_raw_fd();
-        let result = drive_pty_child(child, reader, master_fd, spill_path);
+        let result = drive_pty_child(child, reader, master_fd, spill_for_thread);
         // Keep the master fd alive until reading + reaping is complete.
         drop(master);
         result
@@ -645,7 +675,7 @@ async fn run_in_pty(
     // the guard fires and kills the child instead of leaking it (#220).
     let mut guard = PtyKillGuard::new(killer);
 
-    match tokio::time::timeout(timeout, read_handle).await {
+    match tokio::time::timeout(timeout, &mut read_handle).await {
         Ok(Ok((captured, exit_code))) => {
             guard.disarm();
             PtyOutcome::Completed(captured, exit_code)
@@ -658,7 +688,17 @@ async fn run_in_pty(
             // Timed out: explicitly KILL the child so it can't linger as an
             // orphan (#220). The read thread then observes the exit and finishes.
             guard.kill_now();
-            PtyOutcome::TimedOut
+            // Give the read thread a moment to notice the kill and hand back
+            // what it captured, so the result names the already-spilled partial
+            // output instead of orphaning the file until the 7-day sweep (#465).
+            let partial = match tokio::time::timeout(PTY_PARTIAL_GRACE, &mut read_handle).await {
+                Ok(Ok((captured, _))) => {
+                    let (text, _) = render_captured_pty(captured, &spill_path, "Partial output");
+                    (!text.trim().is_empty()).then_some(text)
+                }
+                _ => None,
+            };
+            PtyOutcome::TimedOut(partial)
         }
     }
 }
@@ -667,6 +707,16 @@ async fn run_in_pty(
 /// child has exited even while a detached grandchild still holds the pty open.
 #[cfg(unix)]
 const PTY_POLL_INTERVAL_MS: i32 = 20;
+
+/// How long the PTY read thread gets, once the timed-out child has been killed,
+/// to observe the exit and hand back the output it captured: rendered as the
+/// timeout error's partial output (#465).
+#[cfg(unix)]
+const PTY_PARTIAL_GRACE: Duration = Duration::from_secs(2);
+
+/// Same for the background drain (#465): how long it gets to observe the
+/// killed child's EOF and still spill the partial output onto the task.
+const BG_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Wait up to `timeout_ms` for `fd` to become readable. Returns `true` when the
 /// caller should attempt a read — data ready, EOF/hangup, or a poll error we'd
@@ -807,19 +857,34 @@ fn split_state_block(raw: &[u8]) -> (&[u8], Vec<String>) {
 }
 
 /// Turn captured PTY output into the text shown to the model plus the shell
-/// state lines. ANSI codes are stripped and the final newline dropped; output
-/// larger than the head + tail windows keeps only those windows, and the full
-/// output is spilled to `spill_path` with a `Full output:` trailer (#442). The
-/// shell-state block (it carries the environment) is never written to disk.
+/// state lines, with the spill trailer labelled `Full output:`.
 #[cfg(unix)]
 fn render_pty_output(captured: Captured, spill_path: &Path) -> (String, Vec<String>) {
+    render_captured_pty(captured, spill_path, "Full output")
+}
+
+/// Turn captured PTY output into the text shown to the model plus the shell
+/// state lines. ANSI codes are stripped and the final newline dropped; output
+/// larger than the head + tail windows keeps only those windows, and the full
+/// output is spilled to `spill_path` with a `<spill_label>:` trailer (#442). The
+/// shell-state block (it carries the environment) is never written to disk.
+#[cfg(unix)]
+fn render_captured_pty(
+    captured: Captured,
+    spill_path: &Path,
+    spill_label: &str,
+) -> (String, Vec<String>) {
     match captured {
         Captured::Complete(raw) => {
             let (user, state) = split_state_block(&raw);
             let text = strip_ansi(&String::from_utf8_lossy(user));
             let text = text.strip_suffix('\n').unwrap_or(&text);
             let output = match bound_head_tail(text) {
-                Some(bounded) => with_full_output(bounded, spill_bytes(spill_path, text.as_bytes())),
+                Some(bounded) => with_output_trailer(
+                    bounded,
+                    spill_bytes(spill_path, text.as_bytes()),
+                    spill_label,
+                ),
                 None => text.to_string(),
             };
             (output, state)
@@ -848,7 +913,7 @@ fn render_pty_output(captured: Captured, spill_path: &Path) -> (String, Vec<Stri
             let omitted =
                 omitted + (head_text.len() - head.len() + tail_text.len() - tail.len()) as u64;
             let output = join_head_tail(head, tail, &format!("about {omitted} bytes"));
-            (with_full_output(output, spilled), state)
+            (with_output_trailer(output, spilled, spill_label), state)
         }
     }
 }
@@ -988,7 +1053,11 @@ async fn run_windows_fallback(
             let output = match bound_head_tail(&output) {
                 Some(bounded) => {
                     let path = spill_dir.join(format!("{}.txt", uuid::Uuid::new_v4()));
-                    with_full_output(bounded, spill_bytes(&path, output.as_bytes()))
+                    with_output_trailer(
+                        bounded,
+                        spill_bytes(&path, output.as_bytes()),
+                        "Full output",
+                    )
                 }
                 None => output,
             };
@@ -1249,10 +1318,16 @@ async fn run_pty_once(
             })
         }
         PtyOutcome::Failed(e) => Err(ToolResult::error(format!("PTY execution failed: {}", e))),
-        PtyOutcome::TimedOut => Err(ToolResult::error(format!(
-            "Command timed out after {}ms",
-            timeout_ms
-        ))),
+        PtyOutcome::TimedOut(partial) => {
+            let mut message = format!("Command timed out after {}ms", timeout_ms);
+            if let Some(partial) = partial {
+                // Trim the trailing newline so the block sits under the
+                // timeout line.
+                message.push_str("\n\n");
+                message.push_str(partial.trim_end());
+            }
+            Err(ToolResult::error(message))
+        }
     }
 }
 
@@ -1722,6 +1797,134 @@ mod tests {
                 "timed-out child `{marker}` was not killed; still running (pids: {lingering:?})",
             );
         }
+    }
+
+    /// #465: a timed-out foreground command surfaces what it printed before
+    /// the timeout instead of swallowing it, and must not fold a half-finished
+    /// run's state block into the session's shell state.
+    #[tokio::test]
+    async fn timeout_surfaces_partial_output() {
+        let state = parking_lot::Mutex::new(ShellState::new());
+        let spill_dir = tempfile::tempdir().unwrap();
+        let result = run_pty_foreground(
+            "echo before-timeout && sleep 29991",
+            &state,
+            &std::env::temp_dir(),
+            Duration::from_millis(800),
+            800,
+            spill_dir.path(),
+        )
+        .await;
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("timed out"),
+            "expected the timeout message, got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("before-timeout"),
+            "partial output missing from: {}",
+            result.content
+        );
+        assert_eq!(
+            state.lock().cwd,
+            None,
+            "a timed-out run must not touch the shell state"
+        );
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Ok(out) = std::process::Command::new("pgrep")
+            .arg("-f")
+            .arg("sleep 29991")
+            .output()
+        {
+            let pids = String::from_utf8_lossy(&out.stdout);
+            let lingering: Vec<&str> = pids.split_whitespace().collect();
+            assert!(
+                lingering.is_empty(),
+                "timed-out command's sleep left running (pids: {lingering:?})"
+            );
+        }
+    }
+
+    /// #465: when the output that arrived before the timeout overflows the
+    /// windows, it is spilled and the timeout names the file with a
+    /// `Partial output:` line instead of orphaning it until the 7-day sweep.
+    #[tokio::test]
+    async fn timeout_names_the_partial_output_file() {
+        let state = parking_lot::Mutex::new(ShellState::new());
+        let spill_dir = tempfile::tempdir().unwrap();
+        // 1.2 MB of newline-free bytes overflows the RAW_HEAD/RAW_TAIL windows;
+        // the trailing sleep keeps the run alive until the timeout.
+        let result = run_pty_foreground(
+            "head -c 1200000 /dev/zero | tr '\\0' x; sleep 29991",
+            &state,
+            &std::env::temp_dir(),
+            Duration::from_millis(1500),
+            1500,
+            spill_dir.path(),
+        )
+        .await;
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("timed out"),
+            "expected the timeout message, got: {}",
+            result.content
+        );
+        let (_, path) = result.content.rsplit_once("Partial output: ").unwrap();
+        let path = PathBuf::from(path);
+        assert_eq!(path.parent(), Some(spill_dir.path()));
+        let spilled = std::fs::read(&path).unwrap();
+        assert!(spilled.len() >= 1_000_000, "spilled: {} bytes", spilled.len());
+        assert!(spilled.ends_with(b"x"), "spill must hold the raw tail");
+    }
+
+    /// #465: a timed-out background task reports its partial output: the drain
+    /// finishes after the child is killed and the file is attached to the task,
+    /// not orphaned until the 7-day sweep.
+    #[tokio::test]
+    async fn background_timeout_still_spills_partial_output() {
+        let spill_dir = tempfile::tempdir().unwrap();
+        let started = run_in_background(
+            "yes | head -c 1200000; sleep 29991".to_string(),
+            std::env::temp_dir(),
+            1500,
+            spill_dir.path(),
+            None,
+            None,
+        )
+        .await;
+        let task_id = started
+            .content
+            .lines()
+            .find_map(|l| l.strip_prefix("Task ID: "))
+            .unwrap()
+            .to_string();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let task = loop {
+            let task = global_registry().get(&task_id).unwrap();
+            if !task.is_running() {
+                break task;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed-out background task never reported back"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(
+            matches!(
+                task.status,
+                claurst_core::tasks::TaskStatus::Failed(ref reason) if reason.contains("timed out")
+            ),
+            "{:?}",
+            task.status
+        );
+        let path = task.output_file.clone().unwrap();
+        assert_eq!(path.parent(), Some(spill_dir.path()));
+        let spilled = std::fs::read(&path).unwrap();
+        assert!(spilled.len() >= 1_000_000, "spilled: {} bytes", spilled.len());
+        assert!(spilled.ends_with(b"y\n"), "lossy tail: {:?}", &spilled[..spilled.len().min(16)]);
     }
 
     /// #442: 10 MB of output used to hit the reader's 2 MB head-only cap, after
