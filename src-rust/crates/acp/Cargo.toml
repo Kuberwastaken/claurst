@@ -18,7 +18,6 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-async-trait = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 dashmap = { workspace = true }
@@ -29,3 +28,6 @@ agent-client-protocol-schema = { version = "0.13", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
