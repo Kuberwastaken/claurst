@@ -798,6 +798,47 @@ async fn global_yolo_mode_bypasses_permissions_in_acp_like_the_cli() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn runtime_prompt_wiring_matches_the_cli() {
+    let _home = isolated_home().await;
+
+    // Without a custom prompt: `system_prompt` stays None so the query loop
+    // emits the full default prompt layers — the previous wiring stuffed the
+    // git context into `system_prompt`, flipping every ACP session into
+    // custom-prompt mode.
+    let plain = AgentRuntime::build(scratch_dir("prompt-plain"))
+        .await
+        .expect("runtime builds");
+    assert_eq!(plain.query_config.system_prompt, None);
+    assert_eq!(plain.query_config.append_system_prompt, None);
+    assert!(
+        plain.query_config.session_context.is_some(),
+        "the git/IDE context must ride the dynamic block via session_context"
+    );
+
+    // Custom and append prompts combine into `system_prompt` exactly like the
+    // CLI's stable block, and the append field is left empty for the loop's
+    // own per-turn addenda.
+    let cwd = scratch_dir("prompt-custom");
+    std::fs::create_dir_all(cwd.join(".claurst")).expect("create .claurst");
+    let mut project = claurst_core::config::Settings::default();
+    project.config.custom_system_prompt = Some("ACP-CUSTOM-PROMPT".to_string());
+    project.config.append_system_prompt = Some("ACP-APPEND-PROMPT".to_string());
+    std::fs::write(
+        cwd.join(".claurst").join("settings.json"),
+        serde_json::to_string(&project).expect("serialize project settings"),
+    )
+    .expect("write project settings");
+
+    let custom = AgentRuntime::build(cwd.clone()).await.expect("runtime builds");
+    assert_eq!(
+        custom.query_config.system_prompt.as_deref(),
+        Some("ACP-CUSTOM-PROMPT\n\nACP-APPEND-PROMPT"),
+    );
+    assert_eq!(custom.query_config.append_system_prompt, None);
+    assert_eq!(custom.query_config.working_directory, Some(cwd.display().to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn runtime_uses_settings_and_agents_md_of_the_session_cwd() {
     let _home = isolated_home().await;
     let cwd = scratch_dir("project");
