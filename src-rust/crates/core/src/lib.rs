@@ -6356,6 +6356,10 @@ mod tests {
         tracker.add_usage(1000, 500, 200, 100);
         assert_eq!(tracker.input_tokens(), 1000);
         assert_eq!(tracker.output_tokens(), 500);
+        // Unpriced and unknown-model trackers report zero (issue #499).
+        assert_eq!(tracker.total_cost_usd(), 0.0);
+        // With explicit pricing, normal per-token accounting applies.
+        tracker.set_pricing(Some(cost::ModelPricing::SONNET));
         assert!(tracker.total_cost_usd() > 0.0);
     }
 

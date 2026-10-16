@@ -2349,24 +2349,17 @@ mod tests {
     }
 
     #[test]
-    fn catalog_pricing_is_none_for_priceless_entries() {
+    fn model_pricing_from_entry_skips_priceless_entries() {
         // Entries without usable per-token prices (free / subscription
         // models) must map to no pricing, never to an all-zero estimate.
         let reg = ModelRegistry::new();
-        for entry in reg.list_all() {
-            let pricing = catalog_pricing(Some(&reg), &entry.info.provider_id, &entry.info.id);
-            if entry.cost.input.is_none() && entry.cost.output.is_none() {
-                assert_eq!(pricing, None, "priceless entry {}", entry.info.id);
-            } else {
-                assert!(
-                    pricing.is_some(),
-                    "priced entry {} in={:?} out={:?} resolved={:?}",
-                    entry.info.id,
-                    entry.cost.input,
-                    entry.cost.output,
-                    pricing
-                );
-            }
-        }
+        let mut entry = reg
+            .resolve_entry("anthropic", "claude-sonnet-4-5")
+            .cloned()
+            .expect("bundled snapshot should resolve claude-sonnet");
+        assert!(model_pricing_from_entry(&entry).is_some());
+        // Wiping the prices must map to no pricing (not zero-rate pricing).
+        entry.cost = CostBreakdown::default();
+        assert_eq!(model_pricing_from_entry(&entry), None);
     }
 }
