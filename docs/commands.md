@@ -1312,12 +1312,15 @@ Copy the most recent assistant response to the system clipboard. Pass a number t
 
 ### Keyboard text selection
 
-When the prompt is empty (no text typed), press `v` to enter keyboard
-selection mode. A cursor bar appears at the bottom of the transcript.
+Press `ctrl+x` then `v` to enter keyboard selection mode (the chord keeps a
+bare `v` free for typing). A cursor bar appears at the bottom of the
+transcript. The selection is anchored to the transcript's content lines, so
+it survives scrolling and terminal resizes.
 Use the arrow keys to extend the selection up or down. `PageUp`/`PageDown`
 scroll by a page, `Home`/`End` jump to the top/bottom of the transcript.
-`Enter` or `Ctrl+C` copies the selected text to the clipboard and exits
-selection mode. `Esc` cancels without copying.
+`Enter` copies the selected text to the clipboard and exits selection mode.
+`Ctrl+C` does the same and never triggers the exit confirmation, even with an
+empty selection. `Esc` cancels without copying.
 
 All selection-mode keys are routed through the configurable keybinding
 system under `KeyContext::Transcript` (see `/keybindings`).

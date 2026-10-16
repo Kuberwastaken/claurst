@@ -79,6 +79,7 @@ impl App {
             || self.mcp_approval.visible
             || self.file_injection_dialog.visible
             || self.context_menu_state.is_some()
+            || self.kb_select_mode
     }
 
     pub(super) fn dismiss_error_notifications(&mut self) {

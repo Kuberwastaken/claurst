@@ -253,6 +253,11 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // full pasted body (clicking the placeholder does the same).
         ("alt+e", "expandPaste", KeyContext::Chat),
 
+        // Keyboard text selection: enter with a chord so a bare `v` keeps
+        // its normal typing meaning (a bare `v` on an empty prompt would
+        // otherwise swallow the first character of words like "verify").
+        ("ctrl+x v", "enterSelection", KeyContext::Chat),
+
         // Scrolling
         ("pageup", "scrollUp", KeyContext::Chat),
         ("pagedown", "scrollDown", KeyContext::Chat),
@@ -1087,6 +1092,32 @@ mod tests {
     }
 
     #[test]
+    fn test_ctrl_x_v_chord_enters_selection_in_chat() {
+        // ctrl+x v is a two-keystroke chord in the Chat context: the first
+        // key must report Pending and the second must resolve to
+        // enterSelection (bare `v` keeps its typing meaning).
+        let user = UserKeybindings::default();
+        let mut resolver = KeybindingResolver::new(&user);
+
+        let ctrl_x = parse_keystroke("ctrl+x").unwrap();
+        match resolver.process(ctrl_x, &KeyContext::Chat) {
+            KeybindingResult::Pending => {}
+            other => panic!("ctrl+x should be Pending, got {:?}", other),
+        }
+
+        let v = parse_keystroke("v").unwrap();
+        match resolver.process(v, &KeyContext::Chat) {
+            KeybindingResult::Action(action) => {
+                assert_eq!(
+                    action, "enterSelection",
+                    "ctrl+x v should resolve to enterSelection"
+                );
+            }
+            other => panic!("ctrl+x v should be Action(enterSelection), got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_transcript_context_does_not_resolve_chat_actions() {
         // The Transcript context should NOT carry Chat-context bindings
         // like historyPrev (up in Chat). This confirms the context
@@ -1097,11 +1128,8 @@ mod tests {
         let ks = parse_keystroke("up").unwrap();
         let result = resolver.process(ks, &KeyContext::Chat);
         // In Chat, up should be historyPrev, not selectionUp.
-        match result {
-            KeybindingResult::Action(action) => {
-                assert_ne!(action, "selectionUp", "up in Chat should not be selectionUp");
-            }
-            _ => {} // NoMatch/Unbound/Pending all fine — just not selectionUp
-        }
+        if let KeybindingResult::Action(action) = result {
+            assert_ne!(action, "selectionUp", "up in Chat should not be selectionUp");
+        } // NoMatch/Unbound/Pending all fine — just not selectionUp
     }
 }

@@ -430,6 +430,22 @@ fn flatten_line_text(line: &Line<'_>) -> String {
         .join("")
 }
 
+/// Map a transcript content line index to the screen row it currently occupies
+/// inside `pane`, given the current top-row `scroll`. Lines above or below the
+/// viewport clamp to the pane's top/bottom row (the highlight extends to the
+/// edge, like mouse drags) — the full range still copies from the line cache.
+fn project_line_to_pane_row(line: usize, pane: Rect, scroll: usize) -> u16 {
+    if pane.height == 0 {
+        return pane.y;
+    }
+    let offset = line.saturating_sub(scroll);
+    if offset >= pane.height as usize {
+        pane.y.saturating_add(pane.height).saturating_sub(1)
+    } else {
+        pane.y + offset as u16
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct MessageLinesCacheKey {
     width: u16,
@@ -957,9 +973,24 @@ fn cache_selectable_row_text(frame: &mut Frame, app: &App) {
 /// Post-render pass: invert colours on selected cells and extract the
 /// selection text into `app.selection_text`.
 fn apply_selection_highlight(frame: &mut Frame, app: &App) {
-    let (anchor, focus) = match (app.selection_anchor, app.selection_focus) {
-        (Some(a), Some(f)) => (a, f),
-        _ => return,
+    // Keyboard selection mode: the anchor/focus screen rows come from the
+    // renderer's projection of the content lines (kb_anchor_line / kb_cursor_line),
+    // not from mouse-driven selection_anchor/focus. The column spans the full
+    // pane width (line selection).
+    let (anchor, focus) = if app.kb_select_mode {
+        let area = app.last_selectable_area.get();
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        (
+            (area.x, app.kb_anchor_screen_row.get()),
+            (area.x, app.kb_cursor_screen_row.get()),
+        )
+    } else {
+        match (app.selection_anchor, app.selection_focus) {
+            (Some(a), Some(f)) => (a, f),
+            _ => return,
+        }
     };
 
     let selectable_area = app.last_selectable_area.get();
@@ -1264,11 +1295,42 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     let mut list = VirtualList::new();
     list.viewport_height = msg_area.height;
     list.sticky_bottom = app.auto_scroll;
-    list.set_items(lines);
-    list.scroll_offset = scroll as u16;
+
+    // Populate the content-line cache for keyboard selection mode. The
+    // cursor/anchor are content line indices; this cache is the source of
+    // truth for copy (so selections extending past the viewport copy in
+    // full). Must run before `lines` is moved into the list widget.
+    if app.kb_select_mode {
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|item| flatten_line_text(&item.line))
+            .collect();
+        *app.kb_line_text.borrow_mut() = texts;
+    }
 
     // Track scroll offset for selection validation
     app.last_render_scroll_offset.set(scroll as u16);
+
+    list.set_items(lines);
+    list.scroll_offset = scroll as u16;
+
+    // Project the keyboard selection's content lines to screen rows so
+    // apply_selection_highlight (the topmost post-pass in render_app) can
+    // highlight the visible part. Clamping to the pane edge mirrors how
+    // mouse drags clamp: the highlight visibly extends to the edge while
+    // copy reads the full content range from the line cache.
+    if app.kb_select_mode {
+        app.kb_anchor_screen_row.set(project_line_to_pane_row(
+            app.kb_anchor_line,
+            msg_area,
+            scroll,
+        ));
+        app.kb_cursor_screen_row.set(project_line_to_pane_row(
+            app.kb_cursor_line,
+            msg_area,
+            scroll,
+        ));
+    }
 
     list.render(msg_area, frame.buffer_mut());
 
