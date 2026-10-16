@@ -746,7 +746,6 @@ impl SlashCommand for CostCommand {
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         let tracker = &ctx.cost_tracker;
         let model = ctx.config.effective_model();
-        let pricing = claurst_core::cost::ModelPricing::for_model(model);
 
         let input = tracker.input_tokens();
         let output = tracker.output_tokens();
@@ -755,6 +754,29 @@ impl SlashCommand for CostCommand {
         let total = tracker.total_tokens();
         let cost = tracker.total_cost_usd();
 
+        // Flat-subscription providers (ChatGPT Plus/Pro for Codex, Claude
+        // Pro/Max OAuth) are not billed per token, so the tracker reports
+        // zero and no rates apply (issue #499).
+        if tracker.is_subscription() {
+            return CommandResult::Message(format!(
+                "Session Cost — {model}\n\
+                 ──────────────────────────────\n\
+                 Billed through a flat subscription (ChatGPT Plus/Pro or\n\
+                 Claude Pro/Max) — usage is not billed per token.\n\n\
+                 \n\
+                 Total tokens:   {total:>10}\n\n\
+                 Use /usage for quota info · /extra-usage for per-call breakdown",
+                model = model,
+                total = total,
+            ));
+        }
+
+        // Read pricing from the tracker itself (catalog-resolved at session
+        // start and on model switches) so these figures match the tracker's
+        // total instead of guessing a rate (issue #499).
+        let pricing_opt = tracker.pricing();
+        let pricing = pricing_opt.unwrap_or(claurst_core::cost::ModelPricing::FREE);
+
         // Per-category cost breakdown.
         let input_cost    = (input as f64 * pricing.input_per_mtk) / 1_000_000.0;
         let output_cost   = (output as f64 * pricing.output_per_mtk) / 1_000_000.0;
@@ -762,13 +784,17 @@ impl SlashCommand for CostCommand {
         let cr_cost       = (cache_read as f64 * pricing.cache_read_per_mtk) / 1_000_000.0;
 
         // Pricing info line.
-        let pricing_line = format!(
-            "  Rates ($/MTok): input ${:.2} | output ${:.2} | cache-write ${:.3} | cache-read ${:.3}",
-            pricing.input_per_mtk,
-            pricing.output_per_mtk,
-            pricing.cache_creation_per_mtk,
-            pricing.cache_read_per_mtk,
-        );
+        let pricing_line = match pricing_opt {
+            Some(p) => format!(
+                "  Rates ($/MTok): input ${:.2} | output ${:.2} | cache-write ${:.3} | cache-read ${:.3}",
+                p.input_per_mtk,
+                p.output_per_mtk,
+                p.cache_creation_per_mtk,
+                p.cache_read_per_mtk,
+            ),
+            // Unknown model: no invented default rate — cost reports $0.00.
+            None => "  No per-token rates known for this model — cost reports $0.00.".to_string(),
+        };
 
         // Cache savings note: how much input cost was avoided by using cache-read
         // instead of re-sending those tokens as normal input.
