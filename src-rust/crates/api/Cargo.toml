@@ -31,3 +31,6 @@ urlencoding = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 hmac = "0.12"
+
+[dev-dependencies]
+tempfile = { workspace = true }

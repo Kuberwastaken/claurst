@@ -67,7 +67,13 @@ pub(crate) fn resolve_provider_route(
             "vultr", "vultr-ai",
             "baseten", "friendli", "upstage", "stepfun",
         ];
-        if known_providers.contains(&p) {
+        if known_providers.contains(&p)
+            // Custom providers declared in settings (`customProviders`)
+            // are dispatched by id the same way as built-ins. The defs
+            // were copied onto Config at load time, so this is an in-memory
+            // lookup, not a settings read per request.
+            || tool_ctx.config.custom_providers.contains_key(p)
+        {
             (p.to_string(), m.to_string())
         } else {
             // Treat the whole string as the model ID, fall through
