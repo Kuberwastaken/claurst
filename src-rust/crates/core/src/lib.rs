@@ -1081,7 +1081,7 @@ pub mod config {
     /// Disabled by default (opt-in). When enabled, typing `! <command>`
     /// at the prompt runs the command in a spawned subprocess with a
     /// timeout and output cap, and displays the result in the transcript.
-    #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct BangCommandsConfig {
         /// Whether the feature is enabled. Default: false (opt-in).
         #[serde(default)]
@@ -1089,6 +1089,17 @@ pub mod config {
         /// Whether to display command + output in the chat transcript.
         #[serde(default = "default_true", rename = "showInTranscript")]
         pub show_in_transcript: bool,
+    }
+
+    impl Default for BangCommandsConfig {
+        // Keep this in sync with the serde missing-field defaults above:
+        // `enabled` defaults to false, `show_in_transcript` to true.
+        fn default() -> Self {
+            Self {
+                enabled: false,
+                show_in_transcript: true,
+            }
+        }
     }
 
     // ---- ModelOverride ---------------------------------------------------
@@ -1215,7 +1226,7 @@ pub mod config {
         #[serde(default, rename = "yoloMode")]
         pub yolo_mode: bool,
         /// Configuration for `!` bang commands.
-        #[serde(default)]
+        #[serde(default, rename = "bangCommands")]
         pub bang_commands: BangCommandsConfig,
         /// Formatter configurations (copied from Settings on load).
         #[serde(default)]
@@ -2921,6 +2932,50 @@ pub mod config {
             assert!(json.contains("\"yoloMode\":true"), "got: {json}");
             let back: Settings = serde_json::from_str(&json).unwrap();
             assert!(back.config.yolo_mode);
+        }
+
+        #[test]
+        fn bang_commands_json_roundtrip() {
+            // Serializes as camelCase `bangCommands` and deserializes back.
+            let mut settings = Settings::default();
+            settings.config.bang_commands = BangCommandsConfig {
+                enabled: true,
+                show_in_transcript: false,
+            };
+            let json = serde_json::to_string(&settings).unwrap();
+            assert!(
+                json.contains("\"bangCommands\":{"),
+                "expected camelCase bangCommands key, got: {json}"
+            );
+            let back: Settings = serde_json::from_str(&json).unwrap();
+            assert!(back.config.bang_commands.enabled);
+            assert!(!back.config.bang_commands.show_in_transcript);
+        }
+
+        #[test]
+        fn bang_commands_defaults_are_off() {
+            let settings = Settings::default();
+            assert!(!settings.config.bang_commands.enabled);
+            assert!(settings.config.bang_commands.show_in_transcript);
+        }
+
+        #[test]
+        fn project_settings_cannot_enable_bang_commands() {
+            // Bang commands bypass the permission system, so a project
+            // settings file must not be able to enable them.
+            let project_json = serde_json::to_string(&Settings::default())
+                .unwrap()
+                .replace("\"enabled\":false", "\"enabled\":true");
+            assert!(project_json.contains("\"enabled\":true"));
+            let project: Settings = serde_json::from_str(&project_json).unwrap();
+            assert!(project.config.bang_commands.enabled);
+
+            let global = Settings::default();
+            let merged = Settings::merge(global, project);
+            assert!(
+                !merged.config.bang_commands.enabled,
+                "project settings must not be able to enable bangCommands"
+            );
         }
 
         #[test]

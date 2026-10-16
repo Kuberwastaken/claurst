@@ -193,9 +193,9 @@ impl App {
 
     /// Execute a `!` bang command in a spawned subprocess with a timeout
     /// and output cap. The command runs through the system shell (sh on
-    /// Unix, cmd on Windows) — not hardcoded to bash — and the result
-    /// is displayed in the transcript. The spawned task sends the
-    /// (command, output) pair back over a channel so the TUI never blocks.
+    /// Unix, cmd on Windows) and the result is pushed into the transcript
+    /// as a system message when the spawned task completes. Only one bang
+    /// command may run at a time.
     pub fn execute_bang_command(&mut self, command: String) {
         // Block in plan mode.
         if self.config.permission_mode == claurst_core::PermissionMode::Plan {
@@ -207,42 +207,20 @@ impl App {
             return;
         }
 
+        if self.bang_command_pending.is_some() {
+            self.status_message = Some("A bang command is already running.".to_string());
+            return;
+        }
+
         let working_dir = self.project_root();
 
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         self.bang_command_pending = Some(rx);
 
         tokio::spawn(async move {
-            // Run the command in a blocking task with a timeout.
-            let cmd_str = command.clone();
-            let working_dir = working_dir.clone();
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(60),
-                tokio::task::spawn_blocking(move || {
-                    run_shell_command(&cmd_str, &working_dir)
-                }),
-            )
-            .await;
-
-            let output = match result {
-                Ok(Ok(Ok(output))) => output,
-                Ok(Ok(Err(e))) => format!("Error: {e}"),
-                Ok(Err(e)) => format!("Task panicked: {e}"),
-                Err(_) => "Command timed out after 60 seconds.".to_string(),
-            };
-
-            // Cap output to 100KB to prevent OOM in the TUI.
-            const MAX_OUTPUT: usize = 100_000;
-            let output = if output.len() > MAX_OUTPUT {
-                format!("{}\n... (output truncated at {} bytes)", &output[..MAX_OUTPUT], MAX_OUTPUT)
-            } else {
-                output
-            };
-
+            let output = run_shell_command(&command, &working_dir).await;
             let _ = tx.send((command, output)).await;
         });
-
-        // Result will be displayed when the spawned task completes.
     }
 
     pub fn intercept_slash_command(&mut self, cmd: &str) -> bool {
@@ -548,55 +526,217 @@ impl App {
 }
 
 
-/// Run a shell command with a 60-second timeout. Uses `sh` on Unix and
-/// `cmd` on Windows — never hardcoded to `bash`. Returns the combined
-/// stdout+stderr output.
-fn run_shell_command(command: &str, working_dir: &std::path::Path) -> Result<String, String> {
+const MAX_BANG_OUTPUT_BYTES: usize = 100 * 1024;
+
+/// Run a shell command with a 60-second timeout, returning combined
+/// stdout+stderr. Uses `sh -c` on Unix and `cmd /C` on Windows. On timeout
+/// the child process is killed. Output is capped at
+/// [`MAX_BANG_OUTPUT_BYTES`] and truncated at a UTF-8 character boundary.
+async fn run_shell_command(command: &str, working_dir: &std::path::Path) -> String {
     #[cfg(unix)]
-    {
-        let output = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .current_dir(working_dir)
-            .output()
-            .map_err(|e| format!("Failed to spawn: {e}"))?;
-        let mut combined = String::new();
-        if !output.stdout.is_empty() {
-            combined.push_str(&String::from_utf8_lossy(&output.stdout));
+    let (shell, shell_args): (&str, &[&str]) = ("sh", &["-c"]);
+    #[cfg(not(unix))]
+    let (shell, shell_args): (&str, &[&str]) = ("cmd", &["/C"]);
+
+    let spawn_result = tokio::process::Command::new(shell)
+        .args(shell_args)
+        .arg(command)
+        .current_dir(working_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn();
+
+    let mut child = match spawn_result {
+        Ok(child) => child,
+        Err(e) => return format!("Failed to spawn: {e}"),
+    };
+
+    // Read both pipes concurrently; each reader stops at the byte cap so
+    // a `while true; do echo x; done` cannot exhaust memory.
+    let stdout_reader = child.stdout.take();
+    let stderr_reader = child.stderr.take();
+    let stdout_task = stdout_reader.map(|r| tokio::spawn(async move { read_bounded(r).await }));
+    let stderr_task = stderr_reader.map(|r| tokio::spawn(async move { read_bounded(r).await }));
+
+    let timeout = std::time::Duration::from_secs(60);
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(status) => status,
+        Err(_) => {
+            // The timeout only dropped the wait future; the child is still
+            // running, so kill it explicitly.
+            let _ = child.kill().await;
+            return format!("Command timed out after {} seconds.", timeout.as_secs());
         }
-        if !output.stderr.is_empty() {
-            if !combined.is_empty() {
-                combined.push('\n');
-            }
-            combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    };
+
+    let stdout = match stdout_task {
+        Some(task) => task.await.unwrap_or_default(),
+        None => String::new(),
+    };
+    let stderr = match stderr_task {
+        Some(task) => task.await.unwrap_or_default(),
+        None => String::new(),
+    };
+
+    let mut combined = String::new();
+    if !stdout.is_empty() {
+        combined.push_str(&stdout);
+    }
+    if !stderr.is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
         }
-        if !output.status.success() {
-            combined = format!("Exit code: {}\n{}", output.status.code().unwrap_or(-1), combined);
-        }
-        Ok(combined)
+        combined.push_str(&stderr);
     }
 
-    #[cfg(not(unix))]
-    {
-        let output = std::process::Command::new("cmd")
-            .arg("/C")
-            .arg(command)
-            .current_dir(working_dir)
-            .output()
-            .map_err(|e| format!("Failed to spawn: {e}"))?;
-        let mut combined = String::new();
-        if !output.stdout.is_empty() {
-            combined.push_str(&String::from_utf8_lossy(&output.stdout));
+    // Awaited above, so the status is real (or the timeout branch returned).
+    match status {
+        Ok(status) if !status.success() => {
+            let code = status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".to_string());
+            format!("Exit code: {code}\n{combined}")
         }
-        if !output.stderr.is_empty() {
-            if !combined.is_empty() {
-                combined.push('\n');
+        Ok(_) => combined,
+        Err(e) => format!("Failed to wait for process: {e}"),
+    }
+}
+
+/// Read a child pipe to a string, stopping after [`MAX_BANG_OUTPUT_BYTES`]
+/// bytes. A multibyte UTF-8 sequence split by the cap becomes the
+/// replacement character via lossy conversion.
+async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> String {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        let n = reader.read(&mut chunk).await.unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() >= MAX_BANG_OUTPUT_BYTES {
+            buf.truncate(MAX_BANG_OUTPUT_BYTES);
+            break;
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+#[cfg(test)]
+mod bang_tests {
+    use super::*;
+    use crate::App;
+
+    fn test_app() -> App {
+        // Same construction path as make_app in tests.rs, kept local so this
+        // module stays independent of the shared fixture.
+        let config = claurst_core::Config::default();
+        let cost_tracker = claurst_core::cost::CostTracker::new();
+        App::new(config, cost_tracker)
+    }
+
+    #[tokio::test]
+    async fn bang_output_combines_stdout_and_stderr() {
+        let dir = std::env::temp_dir();
+        let out = run_shell_command("echo out; echo err 1>&2", &dir).await;
+        assert!(out.contains("out"));
+        assert!(out.contains("err"));
+    }
+
+    #[tokio::test]
+    async fn bang_output_reports_nonzero_exit_code() {
+        let dir = std::env::temp_dir();
+        let out = run_shell_command("exit 3", &dir).await;
+        assert!(out.starts_with("Exit code: 3"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn bang_spawn_failure_is_reported() {
+        // A directory as the working dir fails spawn on all platforms.
+        let dir = std::env::temp_dir().join("claurst-bang-no-such-dir");
+        let out = run_shell_command("echo hi", &dir).await;
+        assert!(
+            out.starts_with("Failed to spawn:"),
+            "spawn must fail for a missing working dir, got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_bounded_caps_output_bytes() {
+        // 300KB of input must come back capped at MAX_BANG_OUTPUT_BYTES.
+        let big = vec![b'x'; MAX_BANG_OUTPUT_BYTES * 3];
+        let cursor = std::io::Cursor::new(big);
+        let out = read_bounded(cursor).await;
+        assert_eq!(out.len(), MAX_BANG_OUTPUT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn read_bounded_splits_multibyte_char_without_panicking() {
+        // The cap lands mid-way through a multibyte UTF-8 sequence; the
+        // lossy conversion must yield a replacement char, not a panic.
+        let payload: Vec<u8> = vec![b'a'; MAX_BANG_OUTPUT_BYTES - 1]
+            .into_iter()
+            .chain([0xF0, 0x9F, 0x92]) // incomplete 4-byte sequence
+            .collect();
+        let out = read_bounded(std::io::Cursor::new(payload)).await;
+        assert!(out.ends_with('\u{FFFD}'));
+        assert!(out.len() >= MAX_BANG_OUTPUT_BYTES - 1);
+    }
+
+    #[tokio::test]
+    async fn second_bang_command_is_rejected_while_one_runs() {
+        let mut app = test_app();
+        app.config.bang_commands.enabled = true;
+        app.execute_bang_command("sleep 1".to_string());
+        assert!(app.bang_command_pending.is_some());
+
+        app.execute_bang_command("echo second".to_string());
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("A bang command is already running.")
+        );
+
+        // Drain both so the spawned task and channel shut down cleanly.
+        for _ in 0..200 {
+            app.poll_session_loads();
+            if app.bang_command_pending.is_none() {
+                break;
             }
-            combined.push_str(&String::from_utf8_lossy(&output.stderr));
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        if !output.status.success() {
-            combined = format!("Exit code: {}\n{}", output.status.code().unwrap_or(-1), combined);
+        assert!(app.bang_command_pending.is_none());
+    }
+
+    #[tokio::test]
+    async fn bang_command_result_lands_in_transcript() {
+        let mut app = test_app();
+        app.config.bang_commands.enabled = true;
+        app.execute_bang_command("echo bang-ok".to_string());
+
+        for _ in 0..200 {
+            app.poll_session_loads();
+            if app.system_annotations.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            } else {
+                break;
+            }
         }
-        Ok(combined)
+        assert_eq!(app.system_annotations.len(), 1);
+        assert!(app.system_annotations[0].text.contains("bang-ok"));
+    }
+
+    #[tokio::test]
+    async fn bang_command_blocked_in_plan_mode() {
+        let mut app = test_app();
+        app.config.bang_commands.enabled = true;
+        app.config.permission_mode = claurst_core::PermissionMode::Plan;
+        app.execute_bang_command("echo no".to_string());
+        assert!(app.bang_command_pending.is_none());
+        assert!(!app.notifications.is_empty());
     }
 }

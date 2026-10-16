@@ -2518,8 +2518,8 @@ async fn run_interactive(
             last_auto_scroll = app.auto_scroll;
         }
 
-        // Load/drain the session browser and welcome-screen session lists
-        // (this loop does not go through `App::run`; issue #382).
+        // Load/drain the session browser and welcome-screen session lists,
+        // plus bang-command and voice events (issue #382).
         app.poll_session_loads();
 
         // Draw the UI
