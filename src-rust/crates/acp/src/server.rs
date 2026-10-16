@@ -99,7 +99,7 @@ impl AgentServer {
                 .cloned()
                 .collect();
             for dir in stale {
-                if let Some((_, stale_runtime)) = runtimes.remove(&dir) {
+                if let Some(stale_runtime) = runtimes.remove(&dir) {
                     info!(cwd = %dir.display(), "ACP: evicting runtime for unused directory");
                     evicted.push(stale_runtime);
                 }
