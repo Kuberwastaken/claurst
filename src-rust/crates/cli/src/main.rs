@@ -766,6 +766,36 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // One-time warning for saved permission rules in the legacy
+    // `<server>_<tool>` form (issue #471): the exposed names were renamed to
+    // `mcp__<server>__<tool>` (#459), so a saved rule matching a configured
+    // server no longer matches anything. Sees all saved-rule sources:
+    // allowed_tools / disallowed_tools and the persisted permissionRules.
+    {
+        let mut legacy_specs: Vec<String> = config
+            .allowed_tools
+            .iter()
+            .chain(config.disallowed_tools.iter())
+            .cloned()
+            .collect();
+        legacy_specs.extend(
+            settings
+                .permission_rules
+                .iter()
+                .filter_map(|rule| rule.tool_name.clone()),
+        );
+        let legacy_rules =
+            claurst_mcp::legacy_permission_rule_names(&config.mcp_servers, &legacy_specs);
+        if !legacy_rules.is_empty() {
+            warn!(
+                rules = ?legacy_rules,
+                "Saved permission rules use the legacy <server>_<tool> MCP naming and never \
+                 match now; rename them to mcp__<server>__<tool> (or mcp__<server> to cover \
+                 every tool of a server) in allowed_tools / disallowed_tools or permissionRules"
+            );
+        }
+    }
+
     let pending_permissions = Arc::new(ParkingMutex::new(claurst_tools::PendingPermissionStore::default()));
 
     let is_non_interactive = cli.print || cli.prompt.is_some();

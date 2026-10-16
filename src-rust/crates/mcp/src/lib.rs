@@ -351,6 +351,35 @@ fn clamp_server_instructions(server: &str, text: &str) -> String {
     clamped
 }
 
+/// Saved permission rules written for the exposed tool names before the
+/// `mcp__<server>__<tool>` rename (issue #459): the old `{server}_{tool}`
+/// form never matches a current exposed name, so a saved approval silently
+/// stopped matching (issue #471). Returns the offending rule names — the
+/// bare tool part of each spec, deduplicated and sorted — for the given
+/// configured servers.
+pub fn legacy_permission_rule_names(
+    servers: &[McpServerConfig],
+    rule_specs: &[String],
+) -> Vec<String> {
+    let mut found = std::collections::BTreeSet::new();
+    for spec in rule_specs {
+        let name = match spec.split_once('(') {
+            Some((head, _)) => head.trim(),
+            None => spec.as_str(),
+        };
+        if name.is_empty() || name == "*" || name.starts_with(MCP_TOOL_PREFIX) {
+            continue;
+        }
+        for server in servers {
+            let legacy_prefix = format!("{}_", sanitize_tool_name_part(&server.name));
+            if name.starts_with(&legacy_prefix) {
+                found.insert(name.to_string());
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
 // ---------------------------------------------------------------------------
 // JSON-RPC 2.0 Types
 // ---------------------------------------------------------------------------
@@ -2386,6 +2415,34 @@ mod tests {
             },
         ]));
         assert_eq!(out.text, "line one\nline two");
+    }
+
+    // ---- permission-rule naming --------------------------------------------
+
+    #[test]
+    fn test_legacy_permission_rule_names() {
+        let servers = vec![stdio_fail_config("github"), stdio_fail_config("a.b")];
+        let specs: Vec<String> = vec![
+            "github_create_issue".to_string(),      // legacy form
+            "github_create_issue".to_string(),      // duplicate → deduplicated
+            "a_b_reader".to_string(),               // sanitized a.b
+            "mcp__github__create_issue".to_string(), // current form → ignored
+            "mcp__github".to_string(),              // server-wide → ignored
+            "github_suffix".to_string(),            // starts with github → legacy form
+            "githubstart".to_string(),              // no '_' after the server name
+            "Read".to_string(),
+            "Bash(git status *)".to_string(),
+            "*".to_string(),
+        ];
+        let found = legacy_permission_rule_names(&servers, &specs);
+        assert_eq!(
+            found,
+            vec![
+                "a_b_reader".to_string(),
+                "github_create_issue".to_string(),
+                "github_suffix".to_string(),
+            ]
+        );
     }
 
     // ---- McpManager --------------------------------------------------------

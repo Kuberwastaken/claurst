@@ -194,7 +194,7 @@ Each MCP tool is exposed as `mcp__<server>__<tool>`, for example `mcp__github__c
 
 Permission rules match the exposed name. A rule for `mcp__<server>` or `mcp__<server>__*` (with the sanitized server name) matches every tool of that server.
 
-The previous `<server>_<tool>` names are not accepted; permission rules written for them must be renamed.
+The previous `<server>_<tool>` names are not accepted; permission rules written for them must be renamed. Claurst warns once at startup when a saved rule matches the legacy form for a configured server, listing the rule names in the log.
 
 ### Tool list changes
 
