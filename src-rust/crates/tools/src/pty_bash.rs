@@ -30,15 +30,14 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tracing::debug;
 
-// Unix-only imports used by the shell-state helpers and PTY execution path.
+// Unix-only imports used by the shell-state helpers.
 #[cfg(unix)]
 use crate::ShellState;
-#[cfg(unix)]
-use claurst_core::truncate::{head_window, join_head_tail, tail_window, OUTPUT_WINDOW_BYTES, OUTPUT_WINDOW_LINES};
 #[cfg(unix)]
 use regex::Regex;
 #[cfg(unix)]
 use std::collections::HashMap;
+use claurst_core::truncate::{head_window, join_head_tail, tail_window, OUTPUT_WINDOW_BYTES, OUTPUT_WINDOW_LINES};
 
 /// Sentinel appended to the shell wrapper script (Unix only).
 #[cfg(unix)]
@@ -1006,60 +1005,85 @@ async fn run_windows_fallback(
     // the guard fires and kills cmd.exe and all of its children (#391).
     let mut guard = WindowsProcessTreeGuard::new(child.id());
 
-    let stdout_handle = child.stdout.take();
-    let stderr_handle = child.stderr.take();
-
-    let result = tokio::time::timeout(timeout_dur, async {
-        let mut stdout_lines = Vec::new();
-        let mut stderr_lines = Vec::new();
-
-        if let Some(stdout) = stdout_handle {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                stdout_lines.push(line);
+    // Drain both pipes concurrently with bounded per-line reads and an
+    // accumulator that spills the dropped middle (#465): reading each stream
+    // fully into memory first could be starved by the other pipe and grew
+    // without bound on a newline-free stream.
+    let spill_path = spill_dir.join(format!("{}.txt", uuid::Uuid::new_v4()));
+    let mut full = OutputAccumulator::new(RAW_HEAD_BYTES, RAW_TAIL_BYTES, Some(spill_path.clone()));
+    let result = {
+        let mut stdout = child.stdout.take().map(|s| BgLineReader::new(BufReader::new(s)));
+        let mut stderr = child.stderr.take().map(|s| BgLineReader::new(BufReader::new(s)));
+        let mut drain = async {
+            while stdout.is_some() || stderr.is_some() {
+                let line = tokio::select! {
+                    line = stdout.as_mut().unwrap().next_line(), if stdout.is_some() => match line {
+                        Some(line) => line,
+                        None => {
+                            stdout = None;
+                            continue;
+                        }
+                    },
+                    line = stderr.as_mut().unwrap().next_line(), if stderr.is_some() => match line {
+                        Some(line) => format!("STDERR: {}", line),
+                        None => {
+                            stderr = None;
+                            continue;
+                        }
+                    },
+                };
+                full.push(format!("{line}\n").as_bytes());
             }
-        }
-        if let Some(stderr) = stderr_handle {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                stderr_lines.push(line);
-            }
-        }
-        let status = child.wait().await;
-        (stdout_lines, stderr_lines, status)
-    })
-    .await;
+        };
+        tokio::time::timeout(timeout_dur, &mut drain).await
+    };
 
     match result {
-        Ok((stdout_lines, stderr_lines, status)) => {
+        Ok(()) => {
             guard.disarm();
+            let status = child.wait().await;
             let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-            let mut output = String::new();
-            if !stdout_lines.is_empty() {
-                output.push_str(&stdout_lines.join("\n"));
-            }
-            if !stderr_lines.is_empty() {
-                if !output.is_empty() {
-                    output.push('\n');
+            let output = match full.finish() {
+                Captured::Complete(bytes) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    match bound_head_tail(&text) {
+                        Some(bounded) => with_output_trailer(
+                            bounded,
+                            spill_bytes(&spill_path, &bytes),
+                            "Full output",
+                        ),
+                        None => text.into_owned(),
+                    }
                 }
-                output.push_str("STDERR:\n");
-                output.push_str(&stderr_lines.join("\n"));
-            }
-            if output.is_empty() {
-                output = "(no output)".to_string();
-            }
-            let output = match bound_head_tail(&output) {
-                Some(bounded) => {
-                    let path = spill_dir.join(format!("{}.txt", uuid::Uuid::new_v4()));
-                    with_output_trailer(
-                        bounded,
-                        spill_bytes(&path, output.as_bytes()),
-                        "Full output",
-                    )
+                Captured::Truncated {
+                    head,
+                    tail,
+                    omitted,
+                    spill,
+                } => {
+                    // The stream overflowed the windows: the spill file holds
+                    // the head plus the dropped middle; finish it with the tail.
+                    let spilled = finish_spill(spill, &tail);
+                    // The rolling tail starts mid-line: begin at the next full
+                    // line so no half line opens the output.
+                    let tail = match tail.iter().position(|&b| b == b'\n') {
+                        Some(i) => &tail[i + 1..],
+                        None => &tail[..],
+                    };
+                    let head_text = String::from_utf8_lossy(&head);
+                    let tail_text = String::from_utf8_lossy(tail);
+                    let head = head_window(&head_text, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES);
+                    let tail = tail_window(&tail_text, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES);
+                    let omitted = omitted
+                        + (head_text.len() - head.len() + tail_text.len() - tail.len()) as u64;
+                    let output = join_head_tail(head, tail, &format!("about {omitted} bytes"));
+                    with_output_trailer(output, spilled, "Full output")
                 }
-                None => output,
+            };
+            let output = if output.is_empty() {
+                "(no output)".to_string()
+            } else {
+                output
             };
             shell_result(output, exit_code)
         }
