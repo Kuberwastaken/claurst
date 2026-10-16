@@ -4288,6 +4288,7 @@ async fn run_interactive(
                                                                 ctx_for(&id, m.context_window),
                                                             ),
                                                         is_current: false,
+                                                        provider_id: String::new(),
                                                     }
                                                 })
                                             })
@@ -4304,6 +4305,7 @@ async fn run_interactive(
                                                             ctx_for(&id, m.context_window),
                                                         ),
                                                     id,
+                                                    provider_id: String::new(),
                                                     is_current: false,
                                                 }
                                             })
