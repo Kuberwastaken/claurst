@@ -202,7 +202,7 @@ When a server sends `notifications/tools/list_changed`, Claurst re-lists that se
 
 ### Server instructions
 
-Instructions a server returns from `initialize` are added to the system prompt under `# MCP Server Instructions`, one `## <server>` section per server, for servers with at least one tool in the current tool set. They are placed after the dynamic boundary (with the environment and memory sections), so connecting or refreshing a server does not invalidate the cached part of the prompt.
+Instructions a server returns from `initialize` are added to the system prompt under `# MCP Server Instructions`, one `## <server>` section per server, for servers with at least one tool in the current tool set. They are placed after the dynamic boundary (with the environment and memory sections), so connecting or refreshing a server does not invalidate the cached part of the prompt. Each section's text is XML-fenced as `<server-instructions>…</server-instructions>` so it reads as server-supplied content, and a server's instructions are truncated to 8 KiB with a `…[truncated]` marker, so a misbehaving server cannot flood the prompt.
 
 ### Tool results
 

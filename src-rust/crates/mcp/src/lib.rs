@@ -319,6 +319,32 @@ fn build_tool_entries(
     entries
 }
 
+/// Cap on one server's `initialize` instructions (issue #471): instructions
+/// are untrusted text a server hands us for the system prompt, so they are
+/// bounded (~8 KiB per server) before they are stored.
+const MAX_SERVER_INSTRUCTION_BYTES: usize = 8 * 1024;
+
+/// Truncate a server's instructions to [`MAX_SERVER_INSTRUCTION_BYTES`] on a
+/// character boundary, logging the truncation. Shorter text passes through.
+fn clamp_server_instructions(server: &str, text: &str) -> String {
+    if text.len() <= MAX_SERVER_INSTRUCTION_BYTES {
+        return text.to_string();
+    }
+    let mut end = MAX_SERVER_INSTRUCTION_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    warn!(
+        server = %server,
+        original_bytes = text.len(),
+        kept_bytes = end,
+        "MCP server instructions exceeded the size cap and were truncated"
+    );
+    let mut clamped = text[..end].trim_end().to_string();
+    clamped.push_str("\n…[truncated]");
+    clamped
+}
+
 // ---------------------------------------------------------------------------
 // JSON-RPC 2.0 Types
 // ---------------------------------------------------------------------------
@@ -785,7 +811,9 @@ pub mod client {
                 tools: snapshot.tools,
                 resources: snapshot.resources,
                 prompts: snapshot.prompts,
-                instructions: snapshot.instructions,
+                instructions: snapshot
+                    .instructions
+                    .map(|text| clamp_server_instructions(&snapshot.server_name, &text)),
                 backend: None,
             }
         }
@@ -1540,7 +1568,14 @@ impl McpManager {
                     .tools
                     .iter()
                     .any(|entry| &entry.server_name == name && is_active(&entry.definition.name));
-                has_active_tool.then(|| format!("## {}\n{}", name, instructions))
+                // XML-fence the instructions so they read as server-supplied
+                // content, not as prompts of their own.
+                has_active_tool.then(|| {
+                    format!(
+                        "## {}\n<server-instructions>\n{}\n</server-instructions>",
+                        name, instructions
+                    )
+                })
             })
             .collect();
         if sections.is_empty() {
@@ -2427,11 +2462,37 @@ mod tests {
             .instructions_prompt_section(|name| name != "mcp__quiet__noop")
             .expect("docs has an active tool and instructions");
         assert!(section.starts_with("# MCP Server Instructions"));
-        assert!(section.contains("## docs\nAlways cite the page URL."), "{}", section);
+        assert!(
+            section.contains("## docs\n<server-instructions>\nAlways cite the page URL.\n</server-instructions>"),
+            "{}",
+            section
+        );
         assert!(!section.contains("quiet"), "{}", section);
         assert!(!section.contains("## blank"), "{}", section);
 
         assert!(mgr.instructions_prompt_section(|_| false).is_none());
+    }
+
+    #[test]
+    fn test_server_instructions_are_capped() {
+        // Below the cap the text passes through unchanged.
+        assert_eq!(clamp_server_instructions("srv", "short"), "short");
+
+        // Above the cap it is truncated on a character boundary with a marker.
+        let long = "x".repeat(12 * 1024);
+        let clamped = clamp_server_instructions("srv", &long);
+        assert!(clamped.len() <= MAX_SERVER_INSTRUCTION_BYTES + "\n…[truncated]".len());
+        assert!(clamped.starts_with("xxxx"));
+        assert!(clamped.ends_with("…[truncated]"), "{}", clamped);
+
+        // Multi-byte text truncates between characters, not mid-character.
+        let multibyte = "é".repeat(20_000);
+        let clamped = clamp_server_instructions("srv", &multibyte);
+        assert!(
+            clamped.ends_with("…[truncated]"),
+            "truncation respects char boundaries: {}",
+            clamped
+        );
     }
 
     #[tokio::test]
