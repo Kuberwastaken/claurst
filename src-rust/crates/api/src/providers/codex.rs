@@ -11,11 +11,13 @@
 //   token endpoint with `grant_type=refresh_token` before making the request,
 //   matching the official client's 5-minute proactive refresh window.
 //
-// Model list: static — the Codex endpoint does not expose a /models route,
-//   so we use the `CODEX_MODELS` constant from `claurst-core`.
+// Model list: the live ChatGPT catalog (`GET  .../codex/models?client_version=X`,
+// pinned to `CODEX_CATALOG_CLIENT_VERSION`), filtered to the entries the
+// official picker lists, falling back to the `CODEX_MODELS` constant from
+// `claurst-core` when the fetch fails.
 
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_stream::stream;
@@ -129,6 +131,175 @@ fn custom_tool_name(name: &str) -> String {
 /// Refresh the access token this many seconds before it expires (the official
 /// client's `CHATGPT_ACCESS_TOKEN_REFRESH_WINDOW_MINUTES` = 5).
 const REFRESH_WINDOW_SECS: u64 = 5 * 60;
+
+/// Client version the live model-catalog query advertises.
+///
+/// The ChatGPT backend (`codex-api/src/endpoint/models.rs`) returns only the
+/// models whose `minimal_client_version` is at or below this value, so the
+/// pinned constant must be the highest codex release whose request shape
+/// claurst fully implements (`0.124.0`, the last one before
+/// `use_responses_lite` entries started being listed). Never send claurst's
+/// own version — `0.1.8` hides every entry — and never a current codex
+/// version, which lists lite models whose request body claurst does not
+/// build. Bump this when claurst implements the lite request shape.
+pub const CODEX_CATALOG_CLIENT_VERSION: &str = "0.124.0";
+
+// ---------------------------------------------------------------------------
+// Live model catalog (codex-rs models-manager)
+// ---------------------------------------------------------------------------
+
+/// One entry of the Codex `/models` catalog response.
+///
+/// Field set intentionally minimal: only what claurst's registry and gating
+/// need, with `serde` defaults so new server fields never break parsing
+/// (mirrors codex-rs `openai_models::Model`).
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+pub struct CodexCatalogModel {
+    /// Model slug, e.g. `gpt-5.5`.
+    #[serde(default)]
+    pub slug: String,
+    /// Display name, e.g. `GPT-5.5 (default)`; falls back to the slug.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Total context window in tokens.
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    /// Catalog ordering priority (higher = preferred default in the
+    /// official client's picker).
+    #[serde(default)]
+    pub priority: Option<u64>,
+    /// Whether the model is callable over the Responses API.
+    #[serde(default)]
+    pub supported_in_api: bool,
+    /// Picker visibility (`"list"` = shown in the official picker).
+    #[serde(default)]
+    pub visibility: Option<String>,
+    /// Whether the model only accepts the "lite" Responses request shape,
+    /// which claurst does not emit yet (see
+    /// [`CODEX_CATALOG_CLIENT_VERSION`]).
+    #[serde(default)]
+    pub use_responses_lite: bool,
+    /// Reasoning efforts the model accepts, ascending (official
+    /// `supported_reasoning_levels`); empty for non-reasoning models.
+    #[serde(default)]
+    pub supported_reasoning_levels: Vec<CodexReasoningLevel>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+pub struct CodexReasoningLevel {
+    #[serde(default)]
+    pub effort: String,
+}
+
+impl CodexCatalogModel {
+    /// Entries the official picker lists: callable, listed, and not
+    /// restricted to the lite request shape.
+    pub fn is_listed(&self) -> bool {
+        self.supported_in_api
+            && self.visibility.as_deref() == Some("list")
+            && !self.use_responses_lite
+    }
+}
+
+/// Parse a canned/live `/models` response, keeping only the entries the
+/// official picker would list ([`CodexCatalogModel::is_listed`]).
+pub fn parse_codex_catalog(json_val: &Value) -> Vec<CodexCatalogModel> {
+    let Some(models) = json_val.get("models").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    models
+        .iter()
+        .filter_map(|model| serde_json::from_value::<CodexCatalogModel>(model.clone()).ok())
+        .filter(CodexCatalogModel::is_listed)
+        .collect()
+}
+
+/// The last successfully fetched live catalog, shared process-wide so a
+/// mid-conversation model switch (or the `include` gating below) consults the
+/// same registry snapshot under `codex`. Hydrated by
+/// [`CodexProvider::fetch_catalog`]; until then the static `CODEX_MODELS`
+/// fallback stands in.
+static LIVE_CATALOG: RwLock<Option<Box<[CodexCatalogModel]>>> = RwLock::new(None);
+
+/// Publish a parsed catalog to the process-wide registry.
+fn set_live_catalog(models: Vec<CodexCatalogModel>) {
+    let mut guard = LIVE_CATALOG.write().unwrap_or_else(PoisonError::into_inner);
+    *guard = Some(models.into_boxed_slice());
+}
+
+/// Look `model` up in the live catalog (accepting a `provider/` prefix the
+/// way `uses_freeform_apply_patch` does). `None` while no live catalog has
+/// been fetched — callers fall back to the model-id heuristics.
+pub fn codex_catalog_lookup(model: &str) -> Option<CodexCatalogModel> {
+    let slug = model.rsplit('/').next().unwrap_or(model);
+    let guard = LIVE_CATALOG.read().unwrap_or_else(PoisonError::into_inner);
+    guard
+        .as_deref()
+        .and_then(|catalog| catalog.iter().find(|m| m.slug == slug))
+        .cloned()
+}
+
+/// Base URL for the catalog endpoint, derived from the Responses URL so the
+/// two can never drift (`https://chatgpt.com/backend-api/codex/models`).
+fn codex_models_url() -> String {
+    let base = CODEX_API_ENDPOINT
+        .trim_end_matches("responses")
+        .trim_end_matches('/');
+    format!("{base}/models?client_version={CODEX_CATALOG_CLIENT_VERSION}")
+}
+
+/// One fetch attempt of the live catalog. Failure is swallowed by the caller;
+/// the static builtin list remains the fallback.
+async fn fetch_catalog_raw(
+    provider_id: &ProviderId,
+    http_client: &reqwest::Client,
+    token: &str,
+    account_id: Option<&str>,
+) -> Result<Vec<CodexCatalogModel>, ProviderError> {
+    let builder = http_client.get(codex_models_url()).header("Accept", "application/json");
+    let builder = CodexProvider::codex_headers(builder, token, account_id, &json!({}));
+    let resp = builder.send().await.map_err(|e| ProviderError::Other {
+        provider: provider_id.clone(),
+        message: format!("Codex model catalog request failed: {}", e),
+        status: None,
+        body: None,
+    })?;
+
+    let status = resp.status().as_u16();
+    let text = resp.text().await.map_err(|e| ProviderError::Other {
+        provider: provider_id.clone(),
+        message: format!("Failed to read Codex model catalog response: {}", e),
+        status: Some(status),
+        body: None,
+    })?;
+
+    if !(200..300).contains(&(status as usize)) {
+        return Err(ProviderError::Other {
+            provider: provider_id.clone(),
+            message: format!("Codex model catalog request failed (HTTP {})", status),
+            status: Some(status),
+            body: Some(text),
+        });
+    }
+
+    let json_val: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Other {
+        provider: provider_id.clone(),
+        message: format!("Failed to parse Codex model catalog JSON: {}", e),
+        status: Some(status),
+        body: Some(text.clone()),
+    })?;
+
+    let models = parse_codex_catalog(&json_val);
+    if models.is_empty() {
+        return Err(ProviderError::Other {
+            provider: provider_id.clone(),
+            message: "Codex model catalog listed no usable models".to_string(),
+            status: Some(status),
+            body: Some(text),
+        });
+    }
+    Ok(models)
+}
 
 /// Process-wide refresh guard (the official client's `AuthManager.refresh_lock`).
 /// Refresh tokens are single-use and the query path builds a fresh
@@ -380,7 +551,6 @@ impl CodexProvider {
     /// `session-id` header: ChatGPT derives prompt-cache affinity from it, and
     /// the official client sets it to the same value as `prompt_cache_key`.
     fn codex_headers(
-        &self,
         builder: reqwest::RequestBuilder,
         token: &str,
         account_id: Option<&str>,
@@ -422,6 +592,16 @@ impl CodexProvider {
 
     fn account_id(&self) -> Option<String> {
         self.tokens.lock().unwrap_or_else(PoisonError::into_inner).account_id.clone()
+    }
+
+    /// Fetch the live model catalog with fresh credentials (used by
+    /// `discover_models`, which must not hit a stale one-shot guard).
+    async fn fetch_catalog(&self) -> Result<Vec<CodexCatalogModel>, ProviderError> {
+        let token = self.access_token().await?;
+        let account_id = self.account_id();
+        let models = fetch_catalog_raw(&self.id, &self.http_client, &token, account_id.as_deref()).await?;
+        set_live_catalog(models.clone());
+        Ok(models)
     }
 
     /// Build the Responses-API request body for Codex.
@@ -533,7 +713,7 @@ impl CodexProvider {
             .post(CODEX_API_ENDPOINT)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json");
-        let builder = self.codex_headers(builder, &token, account_id.as_deref(), &body);
+        let builder = Self::codex_headers(builder, &token, account_id.as_deref(), &body);
 
         let resp = builder
             .json(&body)
@@ -583,7 +763,7 @@ impl CodexProvider {
             .post(CODEX_API_ENDPOINT)
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream");
-        let builder = self.codex_headers(builder, &token, account_id.as_deref(), &body);
+        let builder = Self::codex_headers(builder, &token, account_id.as_deref(), &body);
 
         let resp = builder
             .json(&body)
@@ -1247,6 +1427,43 @@ impl LlmProvider for CodexProvider {
 
     async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         use claurst_core::codex_oauth::codex_limit_override;
+
+        // Live catalog first (issue #462 item 1): the ChatGPT backend filters
+        // by the pinned client version, and `context_window` /
+        // `supported_reasoning_levels` / `priority` come straight from the
+        // response. Fall back to the static builtin list when the fetch
+        // fails or yields nothing usable — the picker must never go empty.
+        let live = match self.fetch_catalog().await {
+            Ok(models) => Some(models),
+            Err(err) => {
+                debug!(error = %err, "Codex live model catalog unavailable — using the builtin list");
+                None
+            }
+        };
+
+        if let Some(models) = live {
+            return Ok(models
+                .iter()
+                .map(|entry| {
+                    let context_window = entry.context_window.map(|c| c as u32).unwrap_or(400_000);
+                    let max_output_tokens = codex_limit_override(&entry.slug)
+                        .map(|(_, _, out)| out)
+                        .unwrap_or(128_000);
+                    ModelInfo {
+                        id: ModelId::new(entry.slug.clone()),
+                        provider_id: self.id.clone(),
+                        name: entry
+                            .display_name
+                            .clone()
+                            .unwrap_or_else(|| entry.slug.clone()),
+                        context_window,
+                        max_output_tokens,
+                        ..Default::default()
+                    }
+                })
+                .collect());
+        }
+
         let models = CODEX_MODELS
             .iter()
             .map(|(id, name)| {
@@ -1464,12 +1681,66 @@ mod tests {
             .iter()
             .map(|item| item["type"].as_str().or(item["role"].as_str()).unwrap_or(""))
             .collect();
-        assert_eq!(
-            types,
-            ["user", "reasoning", "function_call", "function_call_output", "assistant"]
-        );
+        assert_eq!(types, ["user", "reasoning", "function_call", "function_call_output", "assistant"]);
         assert_eq!(input[1]["encrypted_content"], "ENC-1");
         assert_eq!(input[1]["summary"][0]["text"], "Listing files first.");
+    }
+
+    #[test]
+    fn codex_models_url_pins_the_catalog_client_version() {
+        let url = codex_models_url();
+        assert_eq!(
+            url,
+            format!(
+                "https://chatgpt.com/backend-api/codex/models?client_version={CODEX_CATALOG_CLIENT_VERSION}"
+            )
+        );
+        assert_eq!(CODEX_CATALOG_CLIENT_VERSION, "0.124.0");
+    }
+
+    /// The live catalog (`GET .../codex/models?client_version=X`, canned
+    /// response): entries the official picker lists (supported_in_api,
+    /// visibility == "list", not `use_responses_lite`) survive, and the
+    /// registry-relevant fields (context window, reasoning levels, priority)
+    /// come straight from the response.
+    #[test]
+    fn catalog_filter_and_field_mapping_match_the_canned_response() {
+        use claurst_core::codex_oauth::codex_limit_override;
+
+        let json_val: Value =
+            serde_json::from_str(include_str!("fixtures/codex_catalog.json")).unwrap();
+        let models = parse_codex_catalog(&json_val);
+
+        let slugs: Vec<&str> = models.iter().map(|m| m.slug.as_str()).collect();
+        assert_eq!(
+            slugs,
+            ["gpt-5.5", "gpt-5.3-codex-spark"],
+            "lite / non-listed / non-API models must be filtered out"
+        );
+
+        let gpt55 = &models[0];
+        assert_eq!(gpt55.display_name.as_deref(), Some("GPT-5.5 (default)"));
+        // Context window and the gpt-5.5 output override come from the
+        // catalog / limit table, not the (missing) models.dev row.
+        assert_eq!(gpt55.context_window, Some(400_000));
+        assert_eq!(
+            codex_limit_override("gpt-5.5").map(|(_, _, out)| out),
+            Some(128_000)
+        );
+        assert_eq!(gpt55.priority, Some(3));
+        let efforts: Vec<&str> =
+            gpt55.supported_reasoning_levels.iter().map(|l| l.effort.as_str()).collect();
+        assert_eq!(efforts, ["minimal", "low", "medium", "high", "xhigh"]);
+    }
+
+    #[test]
+    fn catalog_lookup_accepts_prefixed_ids_and_misses_unknown_models() {
+        set_live_catalog(parse_codex_catalog(
+            &serde_json::from_str(include_str!("fixtures/codex_catalog.json")).unwrap(),
+        ));
+        assert!(codex_catalog_lookup("gpt-5.5").is_some());
+        assert!(codex_catalog_lookup("codex/gpt-5.5").is_some());
+        assert!(codex_catalog_lookup("gpt-6-lens").is_none());
     }
 
     fn tool(name: &str) -> claurst_core::types::ToolDefinition {
