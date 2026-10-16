@@ -661,7 +661,7 @@ async fn run_in_pty(
     // reap the child there so we can return its exit code. drive_pty_child stops
     // reading as soon as the DIRECT child exits rather than waiting for pty EOF,
     // which a detached grandchild would hold open forever (#184).
-    let spill_for_thread = spill_path;
+    let spill_for_thread = spill_path.clone();
     let read_handle = tokio::task::spawn_blocking(move || {
         let master_fd = master.as_raw_fd();
         let result = drive_pty_child(child, reader, master_fd, spill_for_thread);
