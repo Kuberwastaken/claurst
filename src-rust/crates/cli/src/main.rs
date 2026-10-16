@@ -1001,10 +1001,20 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn the background cron scheduler (fires cron tasks at scheduled times).
     // Cancelled automatically when the process exits since we use a shared token.
+    // The scheduler resolves its tool list at fire time (issue #471) through
+    // `cron_manager_cell`, so tasks pick up MCP tools whose servers connect
+    // after startup.
     let cron_cancel = tokio_util::sync::CancellationToken::new();
+    let cron_manager_cell: Arc<parking_lot::RwLock<Option<Arc<claurst_mcp::McpManager>>>> =
+        Arc::new(parking_lot::RwLock::new(mcp_manager_arc.clone()));
+    let cron_tool_list: claurst_query::ToolListProvider = {
+        let manager_cell = Arc::clone(&cron_manager_cell);
+        let snapshot = query_config.clone();
+        Arc::new(move || tools_for_session(manager_cell.read().clone(), &snapshot))
+    };
     claurst_query::start_cron_scheduler(
         client.clone(),
-        tools.clone(),
+        cron_tool_list,
         tool_ctx.clone(),
         query_config.clone(),
         cron_cancel.clone(),
@@ -1055,6 +1065,7 @@ async fn main() -> anyhow::Result<()> {
             pending_project_mcp,
             mcp_project_root,
             skill_discovery,
+            cron_manager_cell,
         )
         .await
     };
@@ -2014,6 +2025,10 @@ async fn run_interactive(
     pending_project_mcp: Vec<claurst_core::config::McpServerConfig>,
     mcp_project_root: Option<PathBuf>,
     skill_discovery: Option<tokio::task::JoinHandle<claurst_core::SkillRegistry>>,
+    /// Shared slot for the cron scheduler's session tool list (issue #471):
+    /// updated when the MCP runtime is rebuilt so cron tasks resolve fresh
+    /// tool lists, including MCP tools from late-connecting servers.
+    cron_manager_cell: Arc<parking_lot::RwLock<Option<Arc<claurst_mcp::McpManager>>>>,
 ) -> anyhow::Result<()> {
     use claurst_commands::{execute_command, CommandContext, CommandResult};
     use claurst_bridge::{BridgeOutbound, TuiBridgeEvent};
@@ -4758,6 +4773,9 @@ async fn run_interactive(
             let new_mcp_manager = start_mcp_manager(&decision.allowed);
             tool_ctx.mcp_manager = new_mcp_manager.clone();
             app.mcp_manager = new_mcp_manager.clone();
+            // Keep the cron scheduler's tool resolver in sync with the
+            // rebuilt runtime (issue #471).
+            *cron_manager_cell.write() = Some(new_mcp_manager.clone());
             // Read the generation before building: a connect task that bumps
             // it in between then still triggers a rebuild in the idle block.
             mcp_seen_generation = new_mcp_manager.as_ref().map(|manager| manager.generation());
