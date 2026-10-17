@@ -377,6 +377,31 @@ Search file contents with a Rust `regex` pattern (not ripgrep). Directories are 
 
 ---
 
+### AgentGrepTool
+
+**Permission level:** ReadOnly
+
+Structure-aware code search in the spirit of jcode's agentgrep: a required `intent` label explains why the call is made, and four modes cover the common agent workflows. `grep` (the default) matches a literal query unless `regex=true`, returning matching regions with adaptive trimming of already-seen content. `find` ranks file paths whose relative path carries evidence of the query tokens, closest to the root first. `outline` lists the symbols of one file. `trace` filters files with a small DSL of `subject:`, `relation:`, and `support:` terms (unknown `prefix:term` fields error). Walks skip hidden entries, `node_modules`, `target`, and `__pycache__` unless `hidden=true`; the walk root itself is always in scope. Every opened file is permission-fenced against symlink swaps (#415).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `intent` | string | yes | Short label shown in the UI: why this call is being made |
+| `mode` | string | no | `grep`, `find`, `outline`, or `trace` (default `grep`) |
+| `query` | string | grep | Search query; literal unless `regex=true`. Ranking terms for `find` |
+| `file` | string | outline | Single file to inspect |
+| `terms` | string[] | trace | DSL terms, e.g. `["subject:auth_status", "relation:rendered"]` |
+| `regex` | boolean | no | Treat `query` as a regex in grep mode (default false) |
+| `path` | string | no | Directory or file to search; defaults to the workspace root |
+| `glob` | string | no | File glob filter (e.g. `*.rs`) |
+| `type` | string | no | File type filter (e.g. `rust`, `py`, `js`) |
+| `hidden` | boolean | no | Include hidden files and directories (default false) |
+| `no_ignore` | boolean | no | Ignore `.gitignore` patterns (default false) |
+| `max_files` | integer | no | Cap on files returned for find/trace-style modes (default 10) |
+| `max_regions` | integer | no | Cap on matching regions returned, with an overflow hint |
+| `paths_only` | boolean | no | Return only matching paths where supported |
+
+---
+
 ### ToolSearchTool
 
 **Permission level:** None

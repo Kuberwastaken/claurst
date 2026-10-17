@@ -36,6 +36,7 @@ pub(crate) mod test_support;
 pub mod file_read;
 pub mod file_write;
 pub mod glob_tool;
+pub mod agentgrep_tool;
 pub mod grep_tool;
 pub mod lsp_tool;
 pub mod mcp_resources;
@@ -77,6 +78,7 @@ pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use glob_tool::GlobTool;
+pub use agentgrep_tool::AgentGrepTool;
 pub use grep_tool::GrepTool;
 pub use lsp_tool::LspTool;
 pub use mcp_resources::{ListMcpResourcesTool, ReadMcpResourceTool};
@@ -1068,6 +1070,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(ApplyPatchTool),
         Box::new(GlobTool),
         Box::new(GrepTool),
+        Box::new(AgentGrepTool),
         Box::new(WebFetchTool),
         Box::new(WebSearchTool),
         Box::new(NotebookEditTool),
