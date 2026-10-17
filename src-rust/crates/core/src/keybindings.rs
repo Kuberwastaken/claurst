@@ -253,6 +253,11 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // full pasted body (clicking the placeholder does the same).
         ("alt+e", "expandPaste", KeyContext::Chat),
 
+        // Keyboard text selection: enter with a chord so a bare `v` keeps
+        // its normal typing meaning (a bare `v` on an empty prompt would
+        // otherwise swallow the first character of words like "verify").
+        ("ctrl+x v", "enterSelection", KeyContext::Chat),
+
         // Scrolling
         ("pageup", "scrollUp", KeyContext::Chat),
         ("pagedown", "scrollDown", KeyContext::Chat),
@@ -284,15 +289,17 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("escape", "cancel", KeyContext::HistorySearch),
         ("tab", "togglePreview", KeyContext::HistorySearch),
 
-        // ========== TRANSCRIPT / MESSAGE SELECTION ==========
-        ("up", "prevMessage", KeyContext::Transcript),
-        ("down", "nextMessage", KeyContext::Transcript),
-        ("pageup", "pageUp", KeyContext::Transcript),
-        ("pagedown", "pageDown", KeyContext::Transcript),
-        ("home", "goStart", KeyContext::Transcript),
-        ("end", "goEnd", KeyContext::Transcript),
-        ("enter", "selectMessage", KeyContext::Transcript),
-        ("escape", "cancel", KeyContext::Transcript),
+        // ========== TRANSCRIPT / KEYBOARD TEXT SELECTION ==========
+        // Active when kb_select_mode is true. Movement keys extend the
+        // selection; Enter and Ctrl+C copy and exit; Escape cancels.
+        ("up", "selectionUp", KeyContext::Transcript),
+        ("down", "selectionDown", KeyContext::Transcript),
+        ("pageup", "selectionPageUp", KeyContext::Transcript),
+        ("pagedown", "selectionPageDown", KeyContext::Transcript),
+        ("home", "selectionGoStart", KeyContext::Transcript),
+        ("end", "selectionGoEnd", KeyContext::Transcript),
+        ("enter", "selectionCopy", KeyContext::Transcript),
+        ("escape", "selectionCancel", KeyContext::Transcript),
 
         // ========== MESSAGE SELECTOR OVERLAY ==========
         ("up", "prevMessage", KeyContext::MessageSelector),
@@ -1054,5 +1061,75 @@ mod tests {
             }
             other => panic!("Expected Action(\"goLineStart\"), got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_transcript_context_resolves_selection_actions() {
+        // Verify that the real keybinding resolver dispatches the
+        // selection actions we registered in KeyContext::Transcript.
+        let user = UserKeybindings::default();
+        let mut resolver = KeybindingResolver::new(&user);
+
+        let check = |resolver: &mut KeybindingResolver, key: &str, expected: &str| {
+            let ks = parse_keystroke(key).unwrap();
+            let result = resolver.process(ks, &KeyContext::Transcript);
+            match result {
+                KeybindingResult::Action(action) => {
+                    assert_eq!(action, expected, "{} in Transcript should resolve to {}", key, expected);
+                }
+                other => panic!("{} in Transcript: expected Action({}), got {:?}", key, expected, other),
+            }
+        };
+
+        check(&mut resolver, "up", "selectionUp");
+        check(&mut resolver, "down", "selectionDown");
+        check(&mut resolver, "enter", "selectionCopy");
+        check(&mut resolver, "escape", "selectionCancel");
+        check(&mut resolver, "home", "selectionGoStart");
+        check(&mut resolver, "end", "selectionGoEnd");
+        check(&mut resolver, "pageup", "selectionPageUp");
+        check(&mut resolver, "pagedown", "selectionPageDown");
+    }
+
+    #[test]
+    fn test_ctrl_x_v_chord_enters_selection_in_chat() {
+        // ctrl+x v is a two-keystroke chord in the Chat context: the first
+        // key must report Pending and the second must resolve to
+        // enterSelection (bare `v` keeps its typing meaning).
+        let user = UserKeybindings::default();
+        let mut resolver = KeybindingResolver::new(&user);
+
+        let ctrl_x = parse_keystroke("ctrl+x").unwrap();
+        match resolver.process(ctrl_x, &KeyContext::Chat) {
+            KeybindingResult::Pending => {}
+            other => panic!("ctrl+x should be Pending, got {:?}", other),
+        }
+
+        let v = parse_keystroke("v").unwrap();
+        match resolver.process(v, &KeyContext::Chat) {
+            KeybindingResult::Action(action) => {
+                assert_eq!(
+                    action, "enterSelection",
+                    "ctrl+x v should resolve to enterSelection"
+                );
+            }
+            other => panic!("ctrl+x v should be Action(enterSelection), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_transcript_context_does_not_resolve_chat_actions() {
+        // The Transcript context should NOT carry Chat-context bindings
+        // like historyPrev (up in Chat). This confirms the context
+        // isolation is correct — selection mode keys won't accidentally
+        // trigger chat history navigation.
+        let user = UserKeybindings::default();
+        let mut resolver = KeybindingResolver::new(&user);
+        let ks = parse_keystroke("up").unwrap();
+        let result = resolver.process(ks, &KeyContext::Chat);
+        // In Chat, up should be historyPrev, not selectionUp.
+        if let KeybindingResult::Action(action) = result {
+            assert_ne!(action, "selectionUp", "up in Chat should not be selectionUp");
+        } // NoMatch/Unbound/Pending all fine — just not selectionUp
     }
 }

@@ -569,6 +569,28 @@ pub struct App {
     /// (issue #149 follow-up: prior word-boundary detection was a placeholder).
     pub last_row_text: RefCell<std::collections::HashMap<u16, String>>,
 
+    // ---- Keyboard text selection state ----------------------------------
+    /// Keyboard selection mode active (entered with `ctrl+x v`).
+    pub kb_select_mode: bool,
+    /// Cursor line for keyboard selection, as a content line index into the
+    /// transcript (0 = topmost rendered line), NOT a screen row. Content-
+    /// anchored so the selection survives scrolling and terminal resizes.
+    pub kb_cursor_line: usize,
+    /// Content line index where the selection was anchored on entry. Line-based
+    /// counterpart of the mouse `selection_anchor`.
+    pub kb_anchor_line: usize,
+    /// Flattened text of every rendered transcript line (index-aligned with
+    /// the content lines), cached at render time while keyboard selection mode
+    /// is active. Copy reads from it so a selection that extends beyond the
+    /// viewport still copies the full text.
+    pub kb_line_text: RefCell<Vec<String>>,
+    /// Screen-row projection of kb_anchor_line for the current frame, written
+    /// by the renderer (render_messages) and read by the selection-highlight
+    /// post-pass. The renderer owns this mapping; keys.rs never writes it.
+    pub kb_anchor_screen_row: Cell<u16>,
+    /// Screen-row projection of kb_cursor_line for the current frame.
+    pub kb_cursor_screen_row: Cell<u16>,
+
     // ---- Advanced mouse interaction state --------------------------------
     /// Timestamp of the last left mouse click (for double/triple-click detection).
     pub last_click_time: Option<std::time::Instant>,
@@ -860,6 +882,12 @@ impl App {
             selection_focus: None,
             selection_text: RefCell::new(String::new()),
             last_row_text: RefCell::new(std::collections::HashMap::new()),
+            kb_select_mode: false,
+            kb_cursor_line: 0,
+            kb_anchor_line: 0,
+            kb_line_text: RefCell::new(Vec::new()),
+            kb_anchor_screen_row: Cell::new(0),
+            kb_cursor_screen_row: Cell::new(0),
             last_click_time: None,
             last_click_position: None,
             click_count: 0,
