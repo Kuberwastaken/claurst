@@ -86,7 +86,9 @@ impl InterruptSignal {
     }
 
     /// Shared atomic view of the flag, for call sites that read it without
-    /// the async machinery.
+    /// the async machinery. Read-only by contract: callers must only `load`,
+    /// never `store`, since a store bypasses the epoch and Notify bookkeeping
+    /// and can silently erase a fired interrupt without waking waiters.
     pub fn as_atomic(&self) -> Arc<std::sync::atomic::AtomicBool> {
         Arc::clone(&self.flag)
     }
@@ -124,7 +126,7 @@ mod tests {
         assert!(signal.is_set());
         signal.reset();
         assert!(!signal.is_set());
-        let waited = tokio::time::timeout(Duration::from_millis(50), signal.notified()).await;
+        let waited = tokio::time::timeout(Duration::from_millis(200), signal.notified()).await;
         assert!(waited.is_err(), "reset signal must park notified() again");
     }
 
