@@ -879,7 +879,25 @@ impl App {
                         }
                         KeyCode::Up => self.session_browser.select_prev(),
                         KeyCode::Down => self.session_browser.select_next(),
+                        KeyCode::Char('/') => self.session_browser.start_search(),
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            self.session_browser.clear_filter();
+                        }
                         KeyCode::Char('r') => self.session_browser.start_rename(),
+                        _ => {}
+                    }
+                }
+                SessionBrowserMode::Search => {
+                    match key.code {
+                        // Apply the filter and return to browsing.
+                        KeyCode::Enter | KeyCode::Esc => self.session_browser.confirm_search(),
+                        KeyCode::Up => self.session_browser.select_prev(),
+                        KeyCode::Down => self.session_browser.select_next(),
+                        KeyCode::Backspace => self.session_browser.pop_filter_char(),
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            self.session_browser.clear_filter();
+                        }
+                        KeyCode::Char(c) => self.session_browser.push_filter_char(c),
                         _ => {}
                     }
                 }

@@ -57,6 +57,7 @@ pub(super) const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("review", "Review changes (git diff)"),
     ("rewind", "Rewind to an earlier turn"),
     ("session", "Browse and manage sessions"),
+    ("sessions", "Browse sessions, optionally pre-filtered: /sessions <query>"),
     ("settings", "Open settings"),
     ("share", "Upload the current session as a secret gist and get a shareable URL"),
     ("stats", "Open token and cost stats"),
@@ -188,6 +189,19 @@ impl App {
         if cmd == "mcp" && !args.trim().is_empty() {
             return false;
         }
+        // `/sessions <query>` opens the browser with the filter pre-applied;
+        // a bare `/sessions` behaves like `/session`.
+        if cmd == "sessions" {
+            let query = args.trim();
+            if query.is_empty() {
+                return self.intercept_slash_command("session");
+            }
+            self.close_secondary_views();
+            self.dismiss_error_notifications();
+            self.session_browser.open_with_query(vec![], query);
+            self.session_list_pending = true;
+            return true;
+        }
         self.intercept_slash_command(cmd)
     }
 
@@ -274,6 +288,14 @@ impl App {
                 true
             }
             "session" | "resume" => {
+                self.session_browser.open(vec![]);
+                self.session_list_pending = true;
+                true
+            }
+            // `/sessions <query>` pre-filters the browser (see
+            // `intercept_slash_command_with_args`); reached here only when the
+            // TUI-layer arg dispatch above didn't catch it.
+            "sessions" => {
                 self.session_browser.open(vec![]);
                 self.session_list_pending = true;
                 true
