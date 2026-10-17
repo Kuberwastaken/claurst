@@ -391,6 +391,13 @@ async fn call_tool(shared: &Arc<Shared>, name: String, raw_args: String) -> Stri
     let fut = shared.host.call_tool(name, args);
     // Abort the host call if the script is torn down (timeout or cancel)
     // while this call is still in flight.
+    //
+    // Cancellation is cooperative at the task level only: `abort()` drops the
+    // host-call future, but a tool that is already past an await point in
+    // blocking code (a spawned process, blocking file IO) is not interrupted
+    // and runs to completion in the background with its result discarded.
+    // Tools that honor the ToolContext cancel token stop early; the rest do
+    // not.
     struct AbortOnDrop(tokio::task::JoinHandle<Result<Value, String>>);
     impl Drop for AbortOnDrop {
         fn drop(&mut self) {
