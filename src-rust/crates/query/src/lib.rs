@@ -1159,6 +1159,7 @@ pub async fn run_query_loop(
                                 &model_id_str,
                                 effective_effort_level,
                                 effective_thinking_budget,
+                                &tool_ctx.config.custom_providers,
                             );
                             // ChatGPT routes its prompt cache on a stable
                             // per-session key (official client: session id).
@@ -2557,6 +2558,7 @@ mod tests {
             "gemini-3-flash-preview",
             Some(claurst_core::effort::EffortLevel::High),
             None,
+            &std::collections::HashMap::new(),
         );
         assert_eq!(
             options["thinkingConfig"]["thinkingLevel"],
@@ -2575,6 +2577,7 @@ mod tests {
             "gpt-5.4",
             Some(claurst_core::effort::EffortLevel::Medium),
             None,
+            &std::collections::HashMap::new(),
         );
         assert_eq!(options["reasoningEffort"], serde_json::json!("medium"));
         assert_eq!(options["textVerbosity"], serde_json::json!("low"));
@@ -2589,7 +2592,13 @@ mod tests {
             (claurst_core::effort::EffortLevel::Medium, "medium"),
             (claurst_core::effort::EffortLevel::High, "high"),
         ] {
-            let options = build_provider_options("openai-codex", "gpt-5.5", Some(level), None);
+            let options = build_provider_options(
+                "openai-codex",
+                "gpt-5.5",
+                Some(level),
+                None,
+                &std::collections::HashMap::new(),
+            );
             assert_eq!(options["reasoningEffort"], serde_json::json!(expected));
         }
         // ...but the top "Max" tier becomes "xhigh" (extra high) on Codex.
@@ -2598,6 +2607,7 @@ mod tests {
             "gpt-5.5",
             Some(claurst_core::effort::EffortLevel::Max),
             None,
+            &std::collections::HashMap::new(),
         );
         assert_eq!(options["reasoningEffort"], serde_json::json!("xhigh"));
         assert_eq!(options["reasoningSummary"], serde_json::json!("auto"));
@@ -2608,6 +2618,7 @@ mod tests {
             "gpt-5.4",
             Some(claurst_core::effort::EffortLevel::Max),
             None,
+            &std::collections::HashMap::new(),
         );
         assert_eq!(other["reasoningEffort"], serde_json::json!("high"));
     }
@@ -2619,6 +2630,7 @@ mod tests {
             "anthropic.claude-sonnet-4-6-v1",
             Some(claurst_core::effort::EffortLevel::High),
             Some(10_000),
+            &std::collections::HashMap::new(),
         );
         assert_eq!(
             options["reasoningConfig"]["budgetTokens"],
@@ -2630,8 +2642,8 @@ mod tests {
     fn test_alibaba_is_openaiish_provider() {
         // "alibaba" is an alias for "qwen" (Alibaba's DashScope backend);
         // both must be treated as OpenAI-compatible providers.
-        assert!(is_openaiish_provider("alibaba"));
-        assert!(is_openaiish_provider("qwen"));
+        assert!(is_openaiish_provider("alibaba", &std::collections::HashMap::new()));
+        assert!(is_openaiish_provider("qwen", &std::collections::HashMap::new()));
     }
 
     // ---- apply_compact_result / #213 data-loss guard ------------------------

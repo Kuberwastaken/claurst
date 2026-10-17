@@ -210,40 +210,47 @@ impl SettingsScreen {
     pub fn apply_and_save(&mut self, config: &mut Config) {
         for (field, value) in &self.pending_changes {
             match field.as_str() {
+                // SECURITY: `config` is project-merged but the snapshot is
+                // global-scoped; copying whole would leak project settings.
                 "max_tokens" => {
                     if let Ok(n) = value.parse::<u32>() {
                         config.max_tokens = Some(n);
+                        self.settings_snapshot.config.max_tokens = Some(n);
                     }
                 }
                 "output_style" => {
-                    config.output_style = if value.is_empty() {
+                    let style = if value.is_empty() {
                         None
                     } else {
                         Some(value.clone())
                     };
+                    config.output_style = style.clone();
+                    self.settings_snapshot.config.output_style = style;
                 }
                 "compact_threshold" => {
                     if let Ok(n) = value.parse::<f32>() {
                         config.compact_threshold = n;
+                        self.settings_snapshot.config.compact_threshold = n;
                         self.compact_threshold = value.clone();
                     }
                 }
                 "fileAutocompleteLimit" => {
                     if let Ok(n) = value.parse::<usize>() {
                         config.file_autocomplete_limit = n;
+                        self.settings_snapshot.config.file_autocomplete_limit = n;
                         self.file_autocomplete_limit = value.clone();
                     }
                 }
                 "fileInjectionMaxSize" => {
                     if let Ok(n) = value.parse::<usize>() {
                         config.file_injection_max_size = n;
+                        self.settings_snapshot.config.file_injection_max_size = n;
                         self.file_injection_max_size = value.clone();
                     }
                 }
                 _ => {}
             }
         }
-        self.settings_snapshot.config = config.clone();
         let _ = self.settings_snapshot.save_sync();
         self.pending_changes.clear();
     }

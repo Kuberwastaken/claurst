@@ -1219,10 +1219,11 @@ async fn run_models_command(args: &[String]) -> anyhow::Result<()> {
 
     // Layer user metadata overrides on top of the catalog (issue #309) so the
     // listing matches what the TUI picker and context logic use.
-    let overrides = claurst_core::config::Settings::load_sync()
-        .map(|s| s.effective_config().model_overrides)
+    let effective = claurst_core::config::Settings::load_sync()
+        .map(|s| s.effective_config())
         .unwrap_or_default();
-    registry.apply_model_overrides(&overrides);
+    registry.apply_model_overrides(&effective.model_overrides);
+    registry.apply_custom_providers(&effective.custom_providers);
 
     let mut entries: Vec<&claurst_api::ModelEntry> = match &provider_filter {
         Some(pid) => registry.list_by_provider(pid),
@@ -1365,6 +1366,10 @@ fn load_cached_model_registry(config: &Config) -> Arc<claurst_api::ModelRegistry
     // Layer user metadata overrides on top of the catalog (issue #309). Stored
     // in the registry, so any later cache reload re-asserts them automatically.
     reg.apply_model_overrides(&config.model_overrides);
+    // Register user-defined custom providers so their models appear in
+    // listings and resolve for routing. `config.custom_providers` was
+    // populated from settings at load time.
+    reg.apply_custom_providers(&config.custom_providers);
     Arc::new(reg)
 }
 
@@ -4283,6 +4288,7 @@ async fn run_interactive(
                                                                 ctx_for(&id, m.context_window),
                                                             ),
                                                         is_current: false,
+                                                        provider_id: String::new(),
                                                     }
                                                 })
                                             })
@@ -4299,6 +4305,7 @@ async fn run_interactive(
                                                             ctx_for(&id, m.context_window),
                                                         ),
                                                     id,
+                                                    provider_id: String::new(),
                                                     is_current: false,
                                                 }
                                             })
