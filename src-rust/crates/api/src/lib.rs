@@ -61,6 +61,10 @@ pub mod error_handling;
 // Unified retry policy: classification, back-off, Retry-After (#439).
 pub mod retry;
 
+// Interactive cross-provider failover prompt + route ranking.
+pub mod failover;
+pub mod fallback_pick;
+
 // Repair-then-reject parsing of streamed tool-call arguments (#439).
 pub mod tool_json;
 

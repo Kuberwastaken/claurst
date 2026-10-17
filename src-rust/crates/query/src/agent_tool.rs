@@ -391,6 +391,7 @@ impl Tool for AgentTool {
             is_subagent: true,
             // Filled by `run_query_loop` from the sub-agent's tool context.
             sandbox_state: None,
+            unavailable_providers: None,
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.

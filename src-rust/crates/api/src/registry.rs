@@ -692,6 +692,55 @@ impl Default for ProviderRegistry {
     }
 }
 
+/// Provider ids that can be offered as interactive failover targets.
+///
+/// `anthropic-oauth` is excluded on purpose: it dispatches through the raw
+/// Anthropic client with a Bearer flag managed by the TUI, not through the
+/// provider registry, so an automatic switch to it could not rebuild the
+/// auth path reliably.
+pub const FAILOVER_CANDIDATE_PROVIDERS: &[&str] = &[
+    "codex",
+    "github-copilot",
+    "free",
+    "openai",
+    "google",
+    "anthropic",
+    "minimax",
+    "cohere",
+];
+
+/// Providers that need no credential at all (local servers and the keyless
+/// upstreams). They are always viable failover targets.
+pub const KEYLESS_FAILOVER_PROVIDERS: &[&str] = &["ollama", "lmstudio", "llamacpp"];
+
+/// Collect the provider ids that have usable credentials right now, for
+/// the interactive failover ranking. Reads the auth store and environment
+/// once per call.
+///
+/// `with_env` injects extra `(provider_id, credential-present)` pairs; the
+/// query loop uses it to fold in the pre-built Anthropic client's auth
+/// state so a provider configured only through `ANTHROPIC_API_KEY` (never
+/// stored in the auth store) still shows up. Tests inject a fixture list.
+pub fn failover_candidate_providers(
+    with_env: impl Fn(&str) -> Option<String>,
+) -> Vec<&'static str> {
+    let auth_store = claurst_core::AuthStore::load();
+    let mut out: Vec<&'static str> = Vec::new();
+    for id in KEYLESS_FAILOVER_PROVIDERS {
+        out.push(id);
+    }
+    for id in FAILOVER_CANDIDATE_PROVIDERS {
+        if auth_store.api_key_for(id).is_some() {
+            out.push(id);
+            continue;
+        }
+        if with_env(id).is_some_and(|key| !key.is_empty()) {
+            out.push(id);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

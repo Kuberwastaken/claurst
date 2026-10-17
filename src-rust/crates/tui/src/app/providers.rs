@@ -403,6 +403,23 @@ impl App {
         self.context_used_tokens = 0;
     }
 
+    /// Switch the session to a failover route chosen from the failover
+    /// dialog. The route is either `"provider/model"` or a bare provider id;
+    /// a provider-only route falls back to that provider's default model.
+    pub(super) fn apply_failover_route(&mut self, route: &str) {
+        match route.split_once('/') {
+            Some((provider_id, model)) => {
+                self.config.provider = Some(provider_id.to_string());
+                self.model_name = model.to_string();
+                self.config.model = Some(model.to_string());
+            }
+            None => self.set_provider_default(route.to_string()),
+        }
+        self.sync_cost_pricing();
+        self.refresh_context_window_size();
+        self.context_used_tokens = 0;
+    }
+
     /// Re-apply session cost pricing to the shared tracker (issue #499):
     /// zero cost for subscription providers (ChatGPT Codex, Claude Pro/Max
     /// OAuth), catalog pricing for known models, and no invented default

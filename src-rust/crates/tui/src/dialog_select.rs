@@ -121,6 +121,14 @@ impl DialogSelectState {
             .and_then(|&idx| self.items.get(idx))
     }
 
+    /// The id of the n-th filtered item (0-based), if it exists.
+    pub fn filtered_id(&self, n: usize) -> Option<String> {
+        self.filtered_indices
+            .get(n)
+            .and_then(|&idx| self.items.get(idx))
+            .map(|item| item.id.clone())
+    }
+
     /// Type a character into the filter.
     pub fn filter_push(&mut self, c: char) {
         self.filter.push(c);

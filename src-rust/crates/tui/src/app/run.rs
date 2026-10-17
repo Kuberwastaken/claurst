@@ -317,6 +317,13 @@ impl App {
                 self.streaming_text.clear();
                 self.streaming_thinking.clear();
                 self.invalidate_transcript();
+                // Failover-class errors carry a structured prompt; open the
+                // chooser instead of the plain error modal.
+                if let Some(prompt) = claurst_api::failover::parse_failover_prompt_message(&msg) {
+                    if self.failover_dialog.open_for(&prompt).is_some() {
+                        return;
+                    }
+                }
                 let err_msg = format!("Error: {}", msg);
                 self.push_assistant_message(err_msg.clone());
                 self.push_notification(NotificationKind::Error, err_msg, None);

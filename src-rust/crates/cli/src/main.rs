@@ -3428,6 +3428,10 @@ async fn run_interactive(
                         if let Some(level) = current_effort {
                             qcfg.effort_level = Some(level);
                         }
+                        // Session-scoped providers the user marked unavailable
+                        // from the failover dialog are excluded from future
+                        // failover prompts.
+                        qcfg.unavailable_providers = Some(app.failover_dialog.unavailable.clone());
                         let tracker = cost_tracker.clone();
                         let tx = event_tx.clone();
                         let client_clone = client.clone();
