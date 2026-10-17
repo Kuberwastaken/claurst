@@ -29,6 +29,17 @@ pub(crate) fn allow_all_context(working_dir: PathBuf) -> ToolContext {
     context_with_handler(working_dir, Arc::new(AllowAllHandler))
 }
 
+/// Like [`allow_all_context`], with a caller-chosen session id so tests that
+/// mutate shell state (the tracked `cwd`) do not leak into each other.
+pub(crate) fn allow_all_context_with_session(
+    working_dir: PathBuf,
+    session_id: &str,
+) -> ToolContext {
+    let mut ctx = context_with_handler(working_dir, Arc::new(AllowAllHandler));
+    ctx.session_id = session_id.to_string();
+    ctx
+}
+
 /// Permission handler that runs the real `PermissionManager` (workspace fence
 /// included, `Ask` rejected by the non-interactive context as in headless
 /// mode) and, right after
@@ -158,7 +169,10 @@ mod accept_edits_tests {
         std::fs::write(dir.join("patch.txt"), "old\n").unwrap();
         std::fs::write(dir.join("nb.ipynb"), notebook()).unwrap();
         let path = |name: &str| dir.join(name).display().to_string();
-        let patch = format!("--- {p}\n+++ {p}\n@@ -1 +1 @@\n-old\n+new\n", p = path("patch.txt"));
+        let patch = format!(
+            "--- {p}\n+++ {p}\n@@ -1 +1 @@\n-old\n+new\n",
+            p = path("patch.txt")
+        );
         let results = [
             crate::file_write::FileWriteTool
                 .execute(json!({ "file_path": path("new.txt"), "content": "x" }), ctx)
@@ -199,12 +213,21 @@ mod accept_edits_tests {
         let accept = managed_context(root.clone(), PermissionMode::AcceptEdits);
         assert_eq!(run_write_tools(&accept, &root).await, vec![true; 5]);
         assert_eq!(std::fs::read_to_string(root.join("new.txt")).unwrap(), "x");
-        assert_eq!(std::fs::read_to_string(root.join("patch.txt")).unwrap(), "new\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("patch.txt")).unwrap(),
+            "new\n"
+        );
 
         // Outside the workspace AcceptEdits still asks, which headless refuses.
-        assert_eq!(run_write_tools(&accept, &outside_root).await, vec![false; 5]);
+        assert_eq!(
+            run_write_tools(&accept, &outside_root).await,
+            vec![false; 5]
+        );
         assert!(!outside_root.join("new.txt").exists());
-        assert_eq!(std::fs::read_to_string(outside_root.join("patch.txt")).unwrap(), "old\n");
+        assert_eq!(
+            std::fs::read_to_string(outside_root.join("patch.txt")).unwrap(),
+            "old\n"
+        );
 
         // Default mode asks (refused headless) even inside the workspace.
         let default = managed_context(root.clone(), PermissionMode::Default);

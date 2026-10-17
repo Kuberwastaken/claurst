@@ -723,3 +723,79 @@ fn issue_1753_inert_text_stays_safe() {
         assert!(level(command).runs_immediately(), "{command:?}");
     }
 }
+#[test]
+fn eval_quotes_do_not_hide_a_catastrophic_payload() {
+    // `eval` concatenates its arguments and runs the joined text as shell
+    // source, so a quoted payload must be re-tokenized, not treated as one
+    // opaque program name.
+    for command in [
+        "eval 'rm -rf ~'",
+        "eval \"rm -rf ~\"",
+        "eval rm -rf ~",
+        "sudo eval 'rm -rf ~'",
+        "bash -c \"eval 'rm -rf ~'\"",
+    ] {
+        assert_eq!(level(command), RiskLevel::Catastrophic, "{command:?}");
+    }
+
+    // An inert eval payload stays Safe.
+    for command in [
+        "eval 'echo hi'",
+        "eval 'cd /tmp && echo hi'",
+        "eval 'ls'",
+        "eval 'cargo build'",
+    ] {
+        assert!(level(command).runs_immediately(), "{command:?}");
+    }
+}
+
+#[test]
+fn shell_heredoc_body_is_assessed_as_shell_source() {
+    // A shell invoked through a heredoc runs its body as a script: the body
+    // is source, not data.
+    for command in [
+        "bash <<EOF\nrm -rf ~\nEOF",
+        "bash <<'EOF'\nrm -rf ~\nEOF",
+        "sh <<EOF\nrm -rf ~\nEOF",
+        "sudo bash <<EOF\nrm -rf ~\nEOF",
+        "bash -c \"echo x; bash <<EOF\nrm -rf ~\nEOF\"",
+        "bash -c \"echo x; bash <<'EOF'\nrm -rf ~\nEOF\"",
+    ] {
+        assert_eq!(level(command), RiskLevel::Catastrophic, "{command:?}");
+    }
+
+    // A non-shell declaring program keeps its heredoc as data.
+    for command in [
+        "cat <<EOF\nrm -rf ~\nEOF",
+        "cat <<'EOF'\nrm -rf ~\nEOF",
+        "git commit -m \"$(cat <<'EOF'\nrm -rf ~ is mentioned here\nEOF\n)\"",
+        "git commit -m \"$(cat <<'EOF'\nfix: thing\n\nrm -rf ~ is rm\nEOF\n)\"",
+    ] {
+        assert!(level(command).runs_immediately(), "{command:?}");
+    }
+}
+
+#[test]
+fn cd_tracking_resolves_relative_targets_across_segments() {
+    // `cd` only affects later segments, and only at the top level.
+    for command in [
+        "cd /; rm -rf .",
+        "cd /etc; rm -rf .",
+        "cd /etc; rm -rf ./config",
+        "cd ~; rm -rf .",
+    ] {
+        assert_eq!(level(command), RiskLevel::Catastrophic, "{command:?}");
+    }
+
+    // A subshell's `cd` does not survive it.
+    assert!(level("(cd /; echo hi)").runs_immediately());
+    assert!(level("(cd /; rm -rf .)").runs_immediately());
+
+    // In-project relative deletion stays routine.
+    assert!(level("rm -rf target").runs_immediately());
+
+    // An unresolvable `cd` destination makes relative targets unknowable.
+    for command in ["cd $var; rm -rf .", "cd -; rm -rf .", "cd `pwd`; rm -rf ."] {
+        assert_eq!(level(command), RiskLevel::Confirm, "{command:?}");
+    }
+}

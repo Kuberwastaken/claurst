@@ -53,27 +53,39 @@ impl Token {
     }
 }
 
+/// Shells, which take their program from a string argument or a heredoc body
+/// we cannot parse reliably. Shared with the assessor: a shell's payload is
+/// shell source, not data.
+pub(crate) const SHELL_PROGRAMS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
+
 /// Characters that separate one command from the next.
 const SEGMENT_SEPARATORS: &[&str] = &["&&", "||", ";", "|", "\n", "(", ")"];
 
-/// Split a command line into individual command segments, each tokenized.
+/// Like [`split_segments`], but each segment is tagged with its subshell depth.
 ///
-/// `rm -rf a && rm -rf b` yields two segments so both are assessed. Without
-/// this, chaining would be a trivial bypass.
-pub fn split_segments(command: &str) -> Vec<Vec<Token>> {
+/// `cd` inside `( ... )` does not change the caller's directory, so callers
+/// that track directory changes between segments need to know which segments
+/// run at the top level. Depth counts unmatched `(` operators.
+pub fn split_segments_at_depth(command: &str) -> Vec<(usize, Vec<Token>)> {
     let tokens = tokenize(command);
-    let mut segments = Vec::new();
+    let mut segments: Vec<(usize, Vec<Token>)> = Vec::new();
     let mut current = Vec::new();
+    let mut depth = 0usize;
 
     let mut next_receives_pipe = false;
     for token in tokens {
         if token.is_operator && SEGMENT_SEPARATORS.contains(&token.text.as_str()) {
             if !current.is_empty() {
-                segments.push(std::mem::take(&mut current));
+                segments.push((depth, std::mem::take(&mut current)));
             }
             // The command after `|` consumes the previous one's output as
             // operands, which this parser cannot see (ported from upstream jcode #604).
             next_receives_pipe = token.text == "|";
+            if token.text == "(" {
+                depth += 1;
+            } else if token.text == ")" {
+                depth = depth.saturating_sub(1);
+            }
             continue;
         }
         let mut token = token;
@@ -81,7 +93,7 @@ pub fn split_segments(command: &str) -> Vec<Vec<Token>> {
         current.push(token);
     }
     if !current.is_empty() {
-        segments.push(current);
+        segments.push((depth, current));
     }
     segments
 }
@@ -236,6 +248,66 @@ fn without_heredoc_bodies(command: &str) -> String {
     }
 
     output
+}
+
+/// Heredoc bodies whose declaration line invokes a shell (`bash <<EOF`,
+/// `sh <<'EOF'`, ...): the body is the shell's script, so it must be assessed
+/// as shell source instead of dropped by `without_heredoc_bodies`. Writing a
+/// script for later use through `cat > f <<EOF` stays data: nothing runs it
+/// here, and the declarations the tokenizer keeps (`cat`, `f`) carry no
+/// destructive verb.
+pub(crate) fn shell_heredoc_bodies(command: &str) -> Vec<String> {
+    let lines: Vec<&str> = command.split_inclusive('\n').collect();
+    let mut bodies = Vec::new();
+    let mut index = 0;
+
+    while index < lines.len() {
+        let line = lines[index].trim_end_matches('\n');
+        let delimiters = heredoc_delimiters(line);
+        index += 1;
+        if delimiters.is_empty() {
+            continue;
+        }
+        // A shell program on the declaration line means the body is that
+        // shell's script. A heredoc declared inside a `$(...)` body belongs to
+        // that body's program: `"$(bash <<EOF)"` runs the body as shell source,
+        // `"$(cat <<'EOF')"` only reads it as data.
+        let invokes_shell = line.split_whitespace().any(|word| {
+            let word = word.trim_end_matches([';', '&']);
+            let basename = word.rsplit('/').next().unwrap_or(word);
+            SHELL_PROGRAMS.contains(&basename)
+        }) || embedded_substitutions(line).iter().any(|script| {
+            script.split_whitespace().any(|word| {
+                let word = word.trim_end_matches([';', '&']);
+                let basename = word.rsplit('/').next().unwrap_or(word);
+                SHELL_PROGRAMS.contains(&basename)
+            })
+        });
+        // Consume every declared body even when it is data, so a body line
+        // is never mistaken for a declaration itself. Only a shell's body is
+        // kept for assessment; `cat > f <<EOF` writes a file, it runs nothing.
+        for (delimiter, strip_tabs, _quoted) in delimiters {
+            let mut body = String::new();
+            while index < lines.len() {
+                let raw = lines[index];
+                let candidate = raw.trim_end_matches(['\r', '\n']);
+                let candidate = if strip_tabs {
+                    candidate.trim_start_matches('\t')
+                } else {
+                    candidate
+                };
+                index += 1;
+                if candidate == delimiter {
+                    break;
+                }
+                body.push_str(raw);
+            }
+            if invokes_shell && !body.is_empty() {
+                bodies.push(body);
+            }
+        }
+    }
+    bodies
 }
 
 /// Command sources that the shell runs through `$(...)` or backtick

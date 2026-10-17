@@ -201,11 +201,13 @@ pub fn classify_target(
     if (raw.contains('*') || raw.contains('?'))
         && !expand_known_prefix(raw, ctx).contains(['$', '`'])
     {
-        // A bare `/*` or `~/*` is catastrophic in effect even though no single
-        // resolved path is protected.
+        // Any wildcard whose expansion boundary lives inside a protected
+        // directory destroys protected content: every file `rm /etc/*.conf`
+        // can match lives inside a directory whose contents are protected
+        // recursively. Escalate to the absolute tier rather than Confirm,
+        // which a bypass-mode handler would answer with Allow.
         if let Some(parent_of_glob) = expanded.parent()
             && is_catastrophic_target(parent_of_glob, ctx)
-            && expanded.file_name().is_some_and(|n| n == "*")
         {
             return Some(RiskFinding {
                 level: RiskLevel::Catastrophic,
@@ -243,6 +245,19 @@ pub fn classify_target(
     // Check the resolved path first: `$HOME` expands to a protected path and
     // must be denied outright, not merely queried. Only genuinely unresolvable
     // substitutions fall through to the Confirm tier below.
+    //
+    // A relative target under an unknown working directory resolves
+    // somewhere the classifier cannot see (`cd $dir; rm -rf .`). No protected
+    // comparison is meaningful before resolution, so escalate instead of
+    // guessing that it lands somewhere harmless.
+    if ctx.working_dir.is_none() && !expanded.is_absolute() {
+        return Some(RiskFinding {
+            level: RiskLevel::Confirm,
+            reason: "relative target resolves against an unknown working directory".to_string(),
+            target: Some(raw.to_string()),
+        });
+    }
+
     if is_catastrophic_target(expanded, ctx) {
         return Some(RiskFinding {
             level: RiskLevel::Catastrophic,

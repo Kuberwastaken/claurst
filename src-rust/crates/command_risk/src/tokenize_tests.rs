@@ -48,6 +48,15 @@ fn heredoc_declared_inside_command_substitution_is_found() {
     assert!(heredoc_delimiters("echo \"$(date) <<EOF\"").is_empty());
 }
 
+/// Depth-aware segment splitting is the tokenizer's contract with callers:
+/// only the depth tag separates it from the discarded flat list.
+fn split_segments(command: &str) -> Vec<Vec<Token>> {
+    split_segments_at_depth(command)
+        .into_iter()
+        .map(|(_, segment)| segment)
+        .collect()
+}
+
 fn texts(command: &str) -> Vec<String> {
     tokenize(command).into_iter().map(|t| t.text).collect()
 }
@@ -141,13 +150,23 @@ fn tokenizing_is_total_and_never_panics() {
 
 #[test]
 fn parentheses_split_subshell_and_command_substitution_bodies() {
-    let segments = split_segments("x=$(rm -rf ~); (echo ok)");
-    let texts: Vec<Vec<_>> = segments
+    let segments = split_segments_at_depth("x=$(rm -rf ~); (echo ok)");
+    let (depths, texts): (Vec<_>, Vec<Vec<_>>) = segments
         .into_iter()
-        .map(|segment| segment.into_iter().map(|token| token.text).collect())
-        .collect();
+        .map(|(depth, segment)| {
+            (
+                depth,
+                segment
+                    .into_iter()
+                    .map(|token| token.text)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .unzip();
     assert_eq!(
         texts,
         vec![vec!["x=$"], vec!["rm", "-rf", "~"], vec!["echo", "ok"]]
     );
+    // `cd` inside the subshell does not survive it.
+    assert_eq!(depths, vec![0, 1, 1]);
 }

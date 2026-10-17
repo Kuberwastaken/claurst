@@ -213,25 +213,88 @@ pub fn assess(command: &str, ctx: &RiskContext) -> RiskAssessment {
         });
     }
 
-    for segment in tokenize::split_segments(command) {
-        assess_segment(&segment, ctx, &mut findings);
+    assess_source(command, ctx, &mut findings);
+
+    if findings.is_empty() {
+        return RiskAssessment::safe();
     }
+    RiskAssessment::from_findings(findings)
+}
+
+/// Assess one shell source string: its segments, then the command sources
+/// nested inside it that word tokenization cannot see.
+fn assess_source(command: &str, ctx: &RiskContext, findings: &mut Vec<RiskFinding>) {
+    assess_segments(command, ctx, findings);
 
     // `"$(...)"`, backticks and unquoted heredoc bodies run commands the
-    // word tokenizer flattens into literals (upstream jcode #1753). Each body is strictly
-    // shorter than its parent, so the recursion terminates.
-    for source in tokenize::embedded_substitutions(command) {
+    // word tokenizer flattens into literals (upstream jcode #1753). A shell
+    // invoked through a heredoc (`bash <<EOF`) runs its body as a script the
+    // tokenizer drops as data (upstream jcode #922). Each returned source is
+    // strictly shorter than its parent, so the recursion terminates.
+    let embedded_sources = tokenize::embedded_substitutions(command)
+        .into_iter()
+        .chain(tokenize::shell_heredoc_bodies(command));
+    for source in embedded_sources {
         for finding in assess(&source, ctx).findings {
             if !findings.contains(&finding) {
                 findings.push(finding);
             }
         }
     }
+}
 
-    if findings.is_empty() {
-        return RiskAssessment::safe();
+/// Assess each segment of a command line, tracking the working directory
+/// across top-level segments.
+///
+/// `cd` inside a subshell does not survive it, and even at the top level it
+/// only affects later segments. Tracking it makes `cd /; rm -rf .` resolve
+/// `.` to `/` and get classified, instead of resolving against the stale
+/// project root where it looks like routine in-project cleanup.
+fn assess_segments(command: &str, ctx: &RiskContext, findings: &mut Vec<RiskFinding>) {
+    let mut cwd = ctx.working_dir.clone();
+    for (depth, segment) in tokenize::split_segments_at_depth(command) {
+        let segment_ctx = RiskContext {
+            working_dir: cwd.clone(),
+            ..ctx.clone()
+        };
+        assess_segment(&segment, &segment_ctx, findings);
+        if depth == 0 {
+            track_cd(&segment, &segment_ctx, &mut cwd);
+        }
     }
-    RiskAssessment::from_findings(findings)
+}
+
+/// Update the tracked working directory after a top-level segment.
+///
+/// Only destinations resolvable without the shell are followed. `cd -`,
+/// `cd $var` and friends leave the location unknown, and an unknown location
+/// can never make a later relative target look like in-project cleanup.
+fn track_cd(segment: &[Token], ctx: &RiskContext, cwd: &mut Option<std::path::PathBuf>) {
+    let mut tokens = segment;
+    while tokens.len() > 1
+        && tokens
+            .first()
+            .is_some_and(|token| SHELL_CONTROL_PREFIXES.contains(&token.text.as_str()))
+    {
+        tokens = &tokens[1..];
+    }
+    let Some(first) = tokens.first() else {
+        return;
+    };
+    if first.basename() != "cd" {
+        return;
+    }
+    let Some(arg) = tokens.get(1).map(|token| token.text.as_str()) else {
+        // Bare `cd` returns to $HOME (POSIX).
+        *cwd = ctx.home_dir.clone();
+        return;
+    };
+    if arg == "-" || arg.contains(['$', '`']) {
+        *cwd = None;
+        return;
+    }
+    let expanded = paths::expand(arg, ctx);
+    *cwd = expanded.is_absolute().then_some(expanded);
 }
 
 fn assess_segment(tokens: &[Token], ctx: &RiskContext, findings: &mut Vec<RiskFinding>) {
@@ -351,6 +414,21 @@ fn assess_segment(tokens: &[Token], ctx: &RiskContext, findings: &mut Vec<RiskFi
     };
     let program_name = program.basename();
 
+    // `eval` concatenates its arguments and runs the result as fresh shell
+    // source. A quoted payload survives tokenization as one opaque word
+    // (`eval 'rm -rf ~'`), so assessing the word as a program name would see
+    // a harmless unknown command. Re-tokenize the joined text instead.
+    if wrapped_by.as_deref() == Some("eval") {
+        let joined = tokens
+            .iter()
+            .filter(|token| !token.is_truncating_redirect_target)
+            .map(|token| token.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assess_source(&joined, ctx, findings);
+        return;
+    }
+
     if program_name == "find" {
         assess_find(tokens, ctx, findings);
         return;
@@ -360,9 +438,7 @@ fn assess_segment(tokens: &[Token], ctx: &RiskContext, findings: &mut Vec<RiskFi
     // the script text too, so `sh -c "rm -rf ~"` is not a free pass.
     if SHELL_COMMANDS.contains(&program_name.as_str()) {
         for token in tokens.iter().skip(1).filter(|t| !t.is_flag()) {
-            for segment in tokenize::split_segments(&token.text) {
-                assess_segment(&segment, ctx, findings);
-            }
+            assess_source(&token.text, ctx, findings);
         }
         return;
     }

@@ -11,18 +11,18 @@
 //             in portable_pty but adds complexity for minimal gain on Windows.
 
 use crate::output_spill::{
-    Captured, OutputAccumulator, RAW_HEAD_BYTES, RAW_TAIL_BYTES, finish_spill, spill_bytes,
-    with_full_output,
+    finish_spill, spill_bytes, with_full_output, Captured, OutputAccumulator, RAW_HEAD_BYTES,
+    RAW_TAIL_BYTES,
 };
 use crate::sandbox::SeatbeltProfile;
 use crate::{
-    CompletionNotifier, PermissionLevel, Tool, ToolContext, ToolResult, session_shell_state,
+    session_shell_state, CompletionNotifier, PermissionLevel, Tool, ToolContext, ToolResult,
 };
 use async_trait::async_trait;
-use claurst_command_risk::{assess, RiskContext, RiskLevel};
+use claurst_command_risk::{assess, gate, GateOutcome, Justification, RiskContext, RiskLevel};
 use claurst_core::bash_classifier::{classify_bash_command, BashRiskLevel};
 use claurst_core::sandbox::SEATBELT_EXECUTABLE;
-use claurst_core::tasks::{BackgroundTask, global_registry};
+use claurst_core::tasks::{global_registry, BackgroundTask};
 use claurst_core::truncate::bound_head_tail;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -82,52 +82,67 @@ struct BashInput {
     /// `None` follows the `completionWakeups.shell` setting (default off).
     #[serde(default)]
     notify: Option<bool>,
+    /// Why this command serves the user's request, in the model's own words.
+    /// Required on the retry of a refused destructive command: the risk gate
+    /// reflects once without it and approves nothing by repetition.
+    #[serde(default)]
+    justification: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
-// Blast-radius risk gate (stage 1 of the two-stage gate)
+// Blast-radius risk gate (the two-stage cascade)
 // ---------------------------------------------------------------------------
 
 /// Layered on top of `bash_classifier`: it classifies by blast radius (what the
 /// command destroys, and whether it can be undone) rather than by command name,
 /// so it catches `find -delete`, `shred`, `truncate`, `dd` and `>file` even
-/// though none of those are `rm`. Catastrophic targets ($HOME, $HOME/.ssh, /,
-/// /etc, ...) are denied outright and no approval unlocks them; every other
-/// non-Safe verdict escalates to a manual approval even in bypass modes, where
-/// `check_permission_for_path` would have allowed the call without asking.
+/// though none of those are `rm`.
+///
+/// Catastrophic targets ($HOME, $HOME/.ssh, /, /etc, ...) are denied outright
+/// and no approval unlocks them. A Confirm-tier verdict runs the stage-2
+/// reflection gate: without a substantive `justification` naming the user
+/// request the command serves, the call is refused with a prompt that a blind
+/// retry cannot satisfy. With one, it escalates to a manual approval even in
+/// bypass modes, where `check_permission_for_path` would have allowed the
+/// call without asking. Safe and Low verdicts stay on the normal approval
+/// path.
 ///
 /// Returns `Err` with a model-facing refusal when the command must not run,
 /// or `Ok(reason)` when it may proceed, with the reason the approval question
 /// should carry when the risk gate escalated.
-fn gate_by_blast_radius(command: &str, ctx: &ToolContext) -> Result<Option<String>, String> {
-    let risk_ctx = RiskContext::from_env(Some(ctx.working_dir.clone()));
+fn gate_by_blast_radius(
+    command: &str,
+    justification: Option<&str>,
+    ctx: &ToolContext,
+) -> Result<Option<String>, String> {
+    // The shell may have `cd`'d earlier in the session; relative targets
+    // resolve against that directory, not the session's starting one.
+    let live_cwd = session_shell_state(&ctx.session_id)
+        .lock()
+        .cwd
+        .clone()
+        .or_else(|| Some(ctx.working_dir.clone()));
+    let risk_ctx = RiskContext::from_env(live_cwd);
     let assessment = assess(command, &risk_ctx);
-    match assessment.level {
-        RiskLevel::Catastrophic => Err(format!(
+    let justification = Justification {
+        text: justification.map(str::to_string),
+    };
+    match gate(&assessment, &justification) {
+        GateOutcome::Allow if assessment.level <= RiskLevel::Low => Ok(None),
+        // Approved on the strength of the justification: the approval
+        // question repeats it so the user sees the model's account.
+        GateOutcome::Allow => Ok(Some(format!(
+            "The blast radius of this command could not be determined \
+             statically, so it needs explicit approval: {}. Justification: {}",
+            assessment.explanation().replace('\n', "; "),
+            justification.text.as_deref().unwrap_or_default()
+        ))),
+        GateOutcome::Reflect { prompt } => Err(prompt),
+        GateOutcome::Deny { reason } => Err(format!(
             "Command blocked: it targets a path that must never be destroyed \
              (home directory, credentials, or a system root), so no approval \
-             can allow it. If the user genuinely wants this, they must run it \
-             themselves outside Claurst.\n{}\nRefusing to execute: {}",
-            assessment.explanation(),
-            command
+             can allow it. {reason} Refusing to execute: {command}"
         )),
-        // Low is bounded and routine (a recursive delete inside the working
-        // directory); it stays on the normal approval path.
-        RiskLevel::Safe | RiskLevel::Low => Ok(None),
-        // Confirm: the blast radius could not be determined statically.
-        // Escalate to a manual approval with the findings attached, even when
-        // the permission mode or an allow rule would have answered alone.
-        RiskLevel::Confirm => Ok(Some(if assessment.findings.is_empty() {
-            "The blast radius of this command could not be determined statically, \
-             so it needs explicit approval"
-                .to_string()
-        } else {
-            format!(
-                "The blast radius of this command could not be determined \
-                 statically, so it needs explicit approval: {}",
-                assessment.explanation().replace('\n', "; ")
-            )
-        })),
     }
 }
 
@@ -1061,6 +1076,10 @@ impl Tool for PtyBashTool {
                 "notify": {
                     "type": "boolean",
                     "description": "With run_in_background: set to true to be sent the command's output automatically when it finishes, instead of checking with the monitor tool. Use it for builds and tests you are waiting on; leave it off for servers and watchers."
+                },
+                "justification": {
+                    "type": "string",
+                    "description": "Required when retrying a command the risk gate refused: name the specific user request this command serves and why the destructive target is necessary. First attempts do not need it."
                 }
             },
             "required": ["command"]
@@ -1082,13 +1101,16 @@ impl Tool for PtyBashTool {
         }
 
         // Permission check
-        // Stage 1 of the two-stage risk gate runs before the permission check:
-        // a catastrophic target is denied outright, and a Confirm-tier verdict
-        // forces a manual approval question even in modes that would not ask.
-        let escalation = match gate_by_blast_radius(&params.command, ctx) {
-            Ok(escalation) => escalation,
-            Err(refusal) => return ToolResult::error(refusal),
-        };
+        // The two-stage risk gate runs before the permission check: a
+        // catastrophic target is denied outright, and a Confirm-tier verdict
+        // needs a substantive justification or is refused with a reflection
+        // prompt, then still forces a manual approval question even in modes
+        // that would not ask.
+        let escalation =
+            match gate_by_blast_radius(&params.command, params.justification.as_deref(), ctx) {
+                Ok(escalation) => escalation,
+                Err(refusal) => return ToolResult::error(refusal),
+            };
 
         let reason = match escalation {
             Some(prefix) => format!(
@@ -2119,6 +2141,131 @@ mod tests {
         let failed = tool.execute(json!({ "command": "false" }), &ctx).await;
         assert!(failed.is_error);
         assert!(!failed.content.contains("[sandbox]"), "{}", failed.content);
+    }
+
+    /// The stage-2 reflection gate: a Confirm-tier command without a
+    /// justification is refused with the reflection prompt before any
+    /// permission handler is consulted.
+    #[tokio::test]
+    async fn confirm_without_justification_reflects_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = crate::test_support::allow_all_context_with_session(
+            temp.path().to_path_buf(),
+            "gate-reflect-test",
+        );
+        let tool = PtyBashTool;
+
+        let refused = tool
+            .execute(
+                json!({
+                    "command": "shred $UNKNOWN_VAR",
+                    "description": "wipe temp file"
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(refused.is_error, "must reflect, got: {}", refused.content);
+        assert!(
+            refused.content.contains("was not run"),
+            "expected the reflection prompt, got: {}",
+            refused.content
+        );
+    }
+
+    /// A substantive justification on the retry passes the reflection gate,
+    /// and the approval question it escalates to carries the justification
+    /// so the user sees the model's account.
+    #[test]
+    fn justified_confirm_escalates_with_the_reason() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = crate::test_support::allow_all_context_with_session(
+            temp.path().to_path_buf(),
+            "gate-justify-test",
+        );
+        let without = gate_by_blast_radius("shred $UNKNOWN_VAR", None, &ctx);
+        assert!(without.is_err(), "no justification must reflect");
+
+        let escalation = gate_by_blast_radius(
+            "shred $UNKNOWN_VAR",
+            Some("The user asked me to securely wipe the scratch file named in the request"),
+            &ctx,
+        )
+        .expect("substantive justification passes the gate")
+        .expect("escalated verdicts carry an approval reason");
+        assert!(
+            escalation.contains("Justification:"),
+            "approval question must carry the justification, got: {escalation}"
+        );
+        assert!(
+            escalation.contains("scratch file"),
+            "approval question must quote the justification, got: {escalation}"
+        );
+    }
+
+    /// The risk gate resolves relative targets against the shell's live cwd
+    /// from the session state, not the session's starting directory: after a
+    /// `cd` earlier in the session, `rm -rf .` is judged from where the shell
+    /// actually is. Judged directly on the gate, so the command is never
+    /// executed in the test.
+    #[test]
+    fn gate_uses_the_live_shell_cwd_for_relative_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = crate::test_support::allow_all_context_with_session(
+            temp.path().to_path_buf(),
+            "gate-livecwd-test",
+        );
+        let state = session_shell_state(&ctx.session_id);
+        state.lock().cwd = Some(std::path::PathBuf::from("/etc"));
+
+        let denied = gate_by_blast_radius("rm -rf .", None, &ctx);
+        assert!(
+            denied.is_err(),
+            "`rm -rf .` from /etc must be denied, got: {denied:?}"
+        );
+        let refusal = denied.err().unwrap_or_default();
+        assert!(
+            refusal.contains("Command blocked"),
+            "expected the catastrophic denial, got: {refusal}"
+        );
+
+        // Without a tracked `cd`, the same command resolves against the
+        // session's working directory and stays on the normal approval path.
+        crate::clear_session_shell_state(&ctx.session_id);
+        let routine = gate_by_blast_radius("rm -rf .", None, &ctx);
+        assert!(
+            routine
+                .as_ref()
+                .is_ok_and(|escalation| escalation.is_none()),
+            "`rm -rf .` inside the working directory must not escalate, got: {routine:?}"
+        );
+    }
+
+    /// A Catastrophic verdict is denied outright: no justification field, no
+    /// matter how plausible, unlocks `rm -rf ~`.
+    #[tokio::test]
+    async fn catastrophic_stays_denied_with_any_justification() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = crate::test_support::allow_all_context_with_session(
+            temp.path().to_path_buf(),
+            "gate-deny-test",
+        );
+        let tool = PtyBashTool;
+        let result = tool
+            .execute(
+                json!({
+                    "command": "rm -rf ~",
+                    "description": "clean up",
+                    "justification": "The user explicitly asked me to remove everything in the home directory"
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(result.is_error, "must deny, got: {}", result.content);
+        assert!(
+            result.content.contains("Command blocked"),
+            "expected the catastrophic denial, got: {}",
+            result.content
+        );
     }
 }
 
