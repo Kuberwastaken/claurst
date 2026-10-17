@@ -824,6 +824,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "claurst-command-risk"
+version = "0.2.0"
+
+[[package]]
 name = "claurst-commands"
 version = "0.2.0"
 dependencies = [
@@ -993,6 +997,7 @@ dependencies = [
  "bytes",
  "chrono",
  "claurst-api",
+ "claurst-command-risk",
  "claurst-core",
  "claurst-mcp",
  "dashmap",

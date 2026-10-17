@@ -13,6 +13,7 @@ members = [
     "crates/buddy",
     "crates/plugins",
     "crates/acp",
+    "crates/command_risk",
 ]
 
 [workspace.package]
@@ -111,6 +112,7 @@ schemars = { version = "0.8", features = ["derive"] }
 
 # Workspace crates
 claurst-core = { path = "crates/core" }
+claurst-command-risk = { path = "crates/command_risk" }
 claurst-acp = { path = "crates/acp" }
 claurst-api = { path = "crates/api" }
 claurst-tools = { path = "crates/tools" }
