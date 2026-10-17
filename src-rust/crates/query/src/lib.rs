@@ -23,6 +23,7 @@ pub mod compact;
 pub mod context_analyzer;
 pub mod coordinator;
 pub mod cron_scheduler;
+pub mod interrupt;
 pub mod sanitize;
 pub mod session_memory;
 
