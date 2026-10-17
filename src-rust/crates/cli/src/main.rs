@@ -382,6 +382,7 @@ async fn main() -> anyhow::Result<()> {
                     mcp_manager: None,
                     mcp_auth_runner: None,
                     permission_manager: None,
+                    disabled_mcp_servers: settings.disabled_mcp_servers.clone(),
                 };
                 // Collect remaining args after the command name
                 let rest: Vec<&str> = raw_args[2..].iter().map(|s| s.as_str()).collect();
@@ -736,6 +737,7 @@ async fn main() -> anyhow::Result<()> {
             settings.trust_project_mcp_servers,
             &std::collections::HashSet::new(),
             &store,
+            &settings.disabled_mcp_servers,
         )
     };
     let mut pending_project_mcp = mcp_decision.pending.clone();
@@ -877,6 +879,7 @@ async fn main() -> anyhow::Result<()> {
             &cwd,
             settings.trust_project_mcp_servers,
             &claurst_core::mcp_trust::McpTrustStore::load(),
+            &settings.disabled_mcp_servers,
         );
         if !plugin_pending.is_empty() {
             let names: Vec<&str> = plugin_pending.iter().map(|s| s.name.as_str()).collect();
@@ -1077,6 +1080,7 @@ fn pending_project_plugin_mcp(
     cwd: &std::path::Path,
     trust_all_project: bool,
     store: &claurst_core::mcp_trust::McpTrustStore,
+    disabled: &std::collections::HashSet<String>,
 ) -> Vec<claurst_core::config::McpServerConfig> {
     if !plugin_servers
         .iter()
@@ -1091,6 +1095,7 @@ fn pending_project_plugin_mcp(
         trust_all_project,
         &std::collections::HashSet::new(),
         store,
+        disabled,
     )
     .pending
 }
@@ -1998,7 +2003,7 @@ async fn session_skill_listings(
 
 async fn run_interactive(
     config: Config,
-    settings: claurst_core::config::Settings,
+    mut settings: claurst_core::config::Settings,
     settings_load_error: Option<String>,
     client: Arc<claurst_api::AnthropicClient>,
     tools: Arc<Vec<Box<dyn claurst_tools::Tool>>>,
@@ -2154,6 +2159,7 @@ async fn run_interactive(
     // OAuth session must report zero cost (issue #499).
     app.anthropic_bearer_auth = anthropic_bearer_auth;
     app.sync_cost_pricing();
+    app.disabled_mcp_servers = settings.disabled_mcp_servers.clone();
     // Startup skill discovery runs on the blocking pool so a cold
     // `skills.urls` clone never holds the terminal. When it finishes, the
     // main loop installs the slash commands for autocomplete and every query
@@ -2404,6 +2410,7 @@ async fn run_interactive(
         mcp_manager: tool_ctx.mcp_manager.clone(),
         mcp_auth_runner: None,
         permission_manager: tool_ctx.permission_manager.clone(),
+        disabled_mcp_servers: settings.disabled_mcp_servers.clone(),
     };
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
@@ -3041,6 +3048,38 @@ async fn run_interactive(
                                         "MCP OAuth — '{}' started. Complete authentication in your browser.\nURL: {}\nCallback URL: {}",
                                         server_name, auth_url, redirect_uri
                                     ));
+                                }
+                                Some(CommandResult::McpServersToggled { server_name, enabled }) => {
+                                    // `/mcp enable|disable` persisted the toggle in
+                                    // global settings; reload them so the reconnect
+                                    // gate below sees the new disabled set, then
+                                    // rebuild the manager + tool list. If the reload
+                                    // fails, keep the runtime as-is: rebuilding
+                                    // against stale settings could relaunch a
+                                    // server the user just disabled.
+                                    match claurst_core::config::Settings::load_hierarchical(
+                                        &tool_ctx.working_dir,
+                                    )
+                                    .await
+                                    {
+                                        Ok(reloaded) => {
+                                            settings = reloaded;
+                                            app.pending_mcp_reconnect = true;
+                                            app.status_message = Some(format!(
+                                                "MCP server '{}' {}. Rebuilding connections...",
+                                                server_name,
+                                                if enabled { "enabled" } else { "disabled" }
+                                            ));
+                                        }
+                                        Err(err) => {
+                                            app.status_message = Some(format!(
+                                                "MCP server '{}' {}, but reloading settings failed: {}. Restart to apply the change.",
+                                                server_name,
+                                                if enabled { "enabled" } else { "disabled" },
+                                                err
+                                            ));
+                                        }
+                                    }
                                 }
                                 Some(CommandResult::Message(msg)) => {
                                     // Suppress text output when TUI already opened an
@@ -4754,10 +4793,48 @@ async fn run_interactive(
                 settings.trust_project_mcp_servers,
                 &app.mcp_session_trusted,
                 &store,
+                &settings.disabled_mcp_servers,
             );
             let new_mcp_manager = start_mcp_manager(&decision.allowed);
+            // Shut the old manager down before installing the new one so its
+            // transports (stdio children, HTTP sessions) are closed and no
+            // server runs twice (issue #418 review).
+            if let Some(old_manager) = tool_ctx.mcp_manager.clone() {
+                old_manager.shutdown().await;
+            }
+            // Log the roster change for post-mortem: which servers the rebuild
+            // keeps, which are dropped (disabled by the user, untrusted, or
+            // failed to connect — per-server connect errors are logged inside
+            // `McpManager::connect_all`).
+            {
+                let kept: Vec<String> = new_mcp_manager
+                    .as_ref()
+                    .map(|m| m.server_names())
+                    .unwrap_or_default();
+                let dropped: Vec<String> = cmd_ctx
+                    .config
+                    .mcp_servers
+                    .iter()
+                    .filter(|s| !kept.contains(&s.name))
+                    .map(|s| {
+                        if settings.disabled_mcp_servers.contains(&s.name) {
+                            format!("{} (disabled)", s.name)
+                        } else {
+                            s.name.clone()
+                        }
+                    })
+                    .collect();
+                info!(
+                    connected = ?kept,
+                    dropped = ?dropped,
+                    "MCP runtime rebuilt"
+                );
+            }
             tool_ctx.mcp_manager = new_mcp_manager.clone();
             app.mcp_manager = new_mcp_manager.clone();
+            cmd_ctx.mcp_manager = new_mcp_manager.clone();
+            app.disabled_mcp_servers = settings.disabled_mcp_servers.clone();
+            cmd_ctx.disabled_mcp_servers = settings.disabled_mcp_servers.clone();
             // Read the generation before building: a connect task that bumps
             // it in between then still triggers a rebuild in the idle block.
             mcp_seen_generation = new_mcp_manager.as_ref().map(|manager| manager.generation());
@@ -5545,7 +5622,9 @@ mod bare_mode_tests {
         // (a) unapproved project-plugin server is pending; (b) with no
         // settings-derived project root, approvals are keyed by cwd.
         let mut root = None;
-        let pending = pending_project_plugin_mcp(&servers, &mut root, &cwd, false, &store);
+        let disabled = std::collections::HashSet::new();
+        let pending =
+            pending_project_plugin_mcp(&servers, &mut root, &cwd, false, &store, &disabled);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].name, "repo-srv");
         assert_eq!(root.as_deref(), Some(cwd.as_path()));
@@ -5553,20 +5632,27 @@ mod bare_mode_tests {
         // An existing project root is kept.
         let other = std::env::temp_dir().join("claurst-493-settings-root");
         let mut root = Some(other.clone());
-        pending_project_plugin_mcp(&servers, &mut root, &cwd, false, &store);
+        pending_project_plugin_mcp(&servers, &mut root, &cwd, false, &store, &disabled);
         assert_eq!(root, Some(other));
 
         // (c) nothing pending once approved for cwd, or with global trust.
         store.approve(&cwd, &servers[1]);
         let mut root = None;
-        assert!(pending_project_plugin_mcp(&servers, &mut root, &cwd, false, &store).is_empty());
+        assert!(
+            pending_project_plugin_mcp(&servers, &mut root, &cwd, false, &store, &disabled)
+                .is_empty()
+        );
         let mut root = None;
         let empty = McpTrustStore::default();
-        assert!(pending_project_plugin_mcp(&servers, &mut root, &cwd, true, &empty).is_empty());
+        assert!(
+            pending_project_plugin_mcp(&servers, &mut root, &cwd, true, &empty, &disabled)
+                .is_empty()
+        );
 
         // User-only plugin servers leave the root untouched.
         let mut root = None;
-        assert!(pending_project_plugin_mcp(&servers[..1], &mut root, &cwd, false, &empty).is_empty());
+        assert!(pending_project_plugin_mcp(&servers[..1], &mut root, &cwd, false, &empty, &disabled)
+            .is_empty());
         assert!(root.is_none());
     }
 

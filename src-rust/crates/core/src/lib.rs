@@ -1561,6 +1561,13 @@ pub mod config {
         /// Names of plugins that have been explicitly disabled by the user.
         #[serde(default, rename = "disabledPlugins")]
         pub disabled_plugins: std::collections::HashSet<String>,
+        /// Names of MCP servers the user has explicitly disabled. Disabled
+        /// servers stay in `config.mcpServers` but are not connected and their
+        /// tools are not registered, until re-enabled via `/mcp enable`.
+        /// User-global only: a project settings file cannot re-enable a server
+        /// the user disabled (same security reasoning as the plugin sets).
+        #[serde(default, rename = "disabledMcpServers")]
+        pub disabled_mcp_servers: std::collections::HashSet<String>,
         /// Whether the user has completed the first-launch onboarding flow.
         /// Mirrors TS `hasAcknowledgedSafetyNotice` / `hasCompletedOnboarding`.
         #[serde(default, rename = "hasCompletedOnboarding")]
@@ -2418,6 +2425,10 @@ pub mod config {
                 permission_rules: base.permission_rules,
                 enabled_plugins: base.enabled_plugins,
                 disabled_plugins: { let mut s = base.disabled_plugins; s.extend(over.disabled_plugins); s },
+                // SECURITY: only the user's global settings may flip MCP server
+                // enablement — a project file must not be able to re-enable a
+                // server the user disabled.
+                disabled_mcp_servers: base.disabled_mcp_servers,
                 has_completed_onboarding: over.has_completed_onboarding || base.has_completed_onboarding,
                 last_seen_version: over.last_seen_version.or(base.last_seen_version),
                 provider: over.provider.or(base.provider),
@@ -2576,6 +2587,47 @@ pub mod config {
             assert_eq!(
                 tokio::fs::read_to_string(path).await.unwrap(),
                 MALFORMED_SETTINGS
+            );
+        }
+
+        /// `disabledMcpServers` survives a save/load roundtrip through the
+        /// global settings file, so `/mcp disable` persists across restarts.
+        #[test]
+        fn disabled_mcp_servers_roundtrip() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            let mut settings = Settings::default();
+            settings
+                .disabled_mcp_servers
+                .insert("my-server".to_string());
+            settings.save_to_path_sync(&path).unwrap();
+
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                raw.contains("disabledMcpServers"),
+                "field must serialize under its camelCase name"
+            );
+
+            let restored = Settings::load_from_path_sync(&path).unwrap();
+            assert!(restored.disabled_mcp_servers.contains("my-server"));
+            assert_eq!(restored.disabled_mcp_servers.len(), 1);
+        }
+
+        /// Security: a project settings file must not be able to re-enable an
+        /// MCP server the user disabled globally. The merge keeps the global
+        /// `disabledMcpServers` untouched by the overlay.
+        #[test]
+        fn project_settings_cannot_clear_disabled_mcp_servers() {
+            let mut base = Settings::default();
+            base.disabled_mcp_servers.insert("locked".to_string());
+
+            let mut over = Settings::default();
+            over.disabled_mcp_servers.clear();
+
+            let merged = Settings::merge(base, over);
+            assert!(
+                merged.disabled_mcp_servers.contains("locked"),
+                "project settings must not re-enable a user-disabled MCP server"
             );
         }
     }

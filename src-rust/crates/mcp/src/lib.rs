@@ -972,6 +972,14 @@ pub mod client {
             Ok(self.backend()?.subscribe_to_notifications())
         }
 
+        /// Close the transport behind this client and wait for cleanup.
+        /// Safe on an already-closed client or one built without a backend.
+        pub async fn close(&self) {
+            if let Some(backend) = self.backend.as_ref() {
+                backend.close().await;
+            }
+        }
+
         /// A copy of this client with a refreshed tool list, sharing the same
         /// live backend session.
         pub(crate) fn with_tools(&self, tools: Vec<McpTool>) -> Self {
@@ -1073,6 +1081,9 @@ struct ManagerState {
     /// configured server's. Fixed at start so exposed names do not depend on
     /// which of them connected first.
     ambiguous_servers: std::collections::HashSet<String>,
+    /// Set by [`McpManager::shutdown`]; afterwards `install_client` closes and
+    /// drops late arrivals instead of admitting them.
+    shutting_down: bool,
 }
 
 impl ManagerState {
@@ -1273,6 +1284,21 @@ impl McpManager {
         let tool_count = client.tools.len();
         {
             let mut state = self.state.write();
+            if state.shutting_down {
+                // A connect task won the race against `shutdown`: the manager
+                // is being replaced. Close the transport in the background so
+                // its child process does not outlive this manager, and do not
+                // install the client.
+                let client = Arc::new(client);
+                tokio::spawn(async move {
+                    client.close().await;
+                });
+                warn!(
+                    server = %name,
+                    "MCP client connected while the manager was shutting down; closed it"
+                );
+                return;
+            }
             state.clients.insert(name.clone(), Arc::new(client));
             state
                 .statuses
@@ -1401,6 +1427,32 @@ impl McpManager {
                 return;
             }
         }
+    }
+
+    /// Close every connected client's transport and wait for their cleanup.
+    /// Meant for the runtime's reconnect path: the old manager must release
+    /// its resources (stdio child processes, HTTP sessions) before the
+    /// replacement is installed. Idempotent; once called, `install_client`
+    /// closes late arrivals instead of admitting them, so a connect task
+    /// still in flight cannot re-leak its child.
+    pub async fn shutdown(&self) {
+        let clients = {
+            let mut state = self.state.write();
+            state.shutting_down = true;
+            let clients = std::mem::take(&mut state.clients);
+            state.tools.clear();
+            state.routes.clear();
+            // Dropping the statuses makes `server_status` report the default
+            // `Disconnected` for every server, so `/mcp status` and the TUI
+            // do not show stale `connected` badges after a shutdown.
+            state.statuses.clear();
+            clients
+        };
+        for (name, client) in &clients {
+            client.close().await;
+            debug!(server = %name, "MCP client transport closed");
+        }
+        info!(servers = clients.len(), "MCP manager shut down");
     }
 
     /// Number of servers still starting and servers whose startup failed.
