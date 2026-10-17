@@ -1,0 +1,8 @@
+[package]
+name = "claurst-command-risk"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+authors.workspace = true
+
+[dependencies]

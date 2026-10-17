@@ -10,17 +10,20 @@
 //  Windows → falls back to the existing cmd.exe approach; ConPTY is available
 //             in portable_pty but adds complexity for minimal gain on Windows.
 
-use crate::sandbox::SeatbeltProfile;
-use crate::{CompletionNotifier, PermissionLevel, Tool, ToolContext, ToolResult, session_shell_state};
-use async_trait::async_trait;
-use claurst_core::bash_classifier::{BashRiskLevel, classify_bash_command};
-use claurst_core::sandbox::SEATBELT_EXECUTABLE;
-use claurst_core::tasks::{BackgroundTask, global_registry};
-use claurst_core::truncate::bound_head_tail;
 use crate::output_spill::{
-    Captured, OutputAccumulator, RAW_HEAD_BYTES, RAW_TAIL_BYTES, finish_spill, spill_bytes,
-    with_full_output,
+    finish_spill, spill_bytes, with_full_output, Captured, OutputAccumulator, RAW_HEAD_BYTES,
+    RAW_TAIL_BYTES,
 };
+use crate::sandbox::SeatbeltProfile;
+use crate::{
+    session_shell_state, CompletionNotifier, PermissionLevel, Tool, ToolContext, ToolResult,
+};
+use async_trait::async_trait;
+use claurst_command_risk::{assess, gate, GateOutcome, Justification, RiskContext, RiskLevel};
+use claurst_core::bash_classifier::{classify_bash_command, BashRiskLevel};
+use claurst_core::sandbox::SEATBELT_EXECUTABLE;
+use claurst_core::tasks::{global_registry, BackgroundTask};
+use claurst_core::truncate::bound_head_tail;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -34,7 +37,9 @@ use tracing::debug;
 #[cfg(unix)]
 use crate::ShellState;
 #[cfg(unix)]
-use claurst_core::truncate::{head_window, join_head_tail, tail_window, OUTPUT_WINDOW_BYTES, OUTPUT_WINDOW_LINES};
+use claurst_core::truncate::{
+    head_window, join_head_tail, tail_window, OUTPUT_WINDOW_BYTES, OUTPUT_WINDOW_LINES,
+};
 #[cfg(unix)]
 use regex::Regex;
 #[cfg(unix)]
@@ -77,6 +82,68 @@ struct BashInput {
     /// `None` follows the `completionWakeups.shell` setting (default off).
     #[serde(default)]
     notify: Option<bool>,
+    /// Why this command serves the user's request, in the model's own words.
+    /// Required on the retry of a refused destructive command: the risk gate
+    /// reflects once without it and approves nothing by repetition.
+    #[serde(default)]
+    justification: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Blast-radius risk gate (the two-stage cascade)
+// ---------------------------------------------------------------------------
+
+/// Layered on top of `bash_classifier`: it classifies by blast radius (what the
+/// command destroys, and whether it can be undone) rather than by command name,
+/// so it catches `find -delete`, `shred`, `truncate`, `dd` and `>file` even
+/// though none of those are `rm`.
+///
+/// Catastrophic targets ($HOME, $HOME/.ssh, /, /etc, ...) are denied outright
+/// and no approval unlocks them. A Confirm-tier verdict runs the stage-2
+/// reflection gate: without a substantive `justification` naming the user
+/// request the command serves, the call is refused with a prompt that a blind
+/// retry cannot satisfy. With one, it escalates to a manual approval even in
+/// bypass modes, where `check_permission_for_path` would have allowed the
+/// call without asking. Safe and Low verdicts stay on the normal approval
+/// path.
+///
+/// Returns `Err` with a model-facing refusal when the command must not run,
+/// or `Ok(reason)` when it may proceed, with the reason the approval question
+/// should carry when the risk gate escalated.
+fn gate_by_blast_radius(
+    command: &str,
+    justification: Option<&str>,
+    ctx: &ToolContext,
+) -> Result<Option<String>, String> {
+    // The shell may have `cd`'d earlier in the session; relative targets
+    // resolve against that directory, not the session's starting one.
+    let live_cwd = session_shell_state(&ctx.session_id)
+        .lock()
+        .cwd
+        .clone()
+        .or_else(|| Some(ctx.working_dir.clone()));
+    let risk_ctx = RiskContext::from_env(live_cwd);
+    let assessment = assess(command, &risk_ctx);
+    let justification = Justification {
+        text: justification.map(str::to_string),
+    };
+    match gate(&assessment, &justification) {
+        GateOutcome::Allow if assessment.level <= RiskLevel::Low => Ok(None),
+        // Approved on the strength of the justification: the approval
+        // question repeats it so the user sees the model's account.
+        GateOutcome::Allow => Ok(Some(format!(
+            "The blast radius of this command could not be determined \
+             statically, so it needs explicit approval: {}. Justification: {}",
+            assessment.explanation().replace('\n', "; "),
+            justification.text.as_deref().unwrap_or_default()
+        ))),
+        GateOutcome::Reflect { prompt } => Err(prompt),
+        GateOutcome::Deny { reason } => Err(format!(
+            "Command blocked: it targets a path that must never be destroyed \
+             (home directory, credentials, or a system root), so no approval \
+             can allow it. {reason} Refusing to execute: {command}"
+        )),
+    }
 }
 
 fn default_timeout() -> u64 {
@@ -103,8 +170,15 @@ fn parse_shell_state_block(lines: &[String]) -> Option<(PathBuf, HashMap<String,
             let key = line[..eq].to_string();
             let val = line[eq + 1..].to_string();
             if !key.starts_with('_')
-                && !["SHLVL", "BASH_LINENO", "BASH_SOURCE", "FUNCNAME", "PIPESTATUS", "OLDPWD"]
-                    .contains(&key.as_str())
+                && ![
+                    "SHLVL",
+                    "BASH_LINENO",
+                    "BASH_SOURCE",
+                    "FUNCNAME",
+                    "PIPESTATUS",
+                    "OLDPWD",
+                ]
+                .contains(&key.as_str())
             {
                 env_vars.insert(key, val);
             }
@@ -116,10 +190,9 @@ fn parse_shell_state_block(lines: &[String]) -> Option<(PathBuf, HashMap<String,
 
 #[cfg(unix)]
 fn extract_exports_from_command(command: &str) -> HashMap<String, String> {
-    let re = Regex::new(
-        r#"(?m)^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"]*)"|'([^']*)'|(\S*))"#,
-    )
-    .unwrap();
+    let re =
+        Regex::new(r#"(?m)^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"]*)"|'([^']*)'|(\S*))"#)
+            .unwrap();
     let mut map = HashMap::new();
     for cap in re.captures_iter(command) {
         let key = cap[1].to_string();
@@ -166,10 +239,7 @@ exit $__CC_EXIT_CODE
 /// is inherited, then the restored session env (which may set `TERM`), then
 /// [`CHILD_ENV`], which always wins.
 #[cfg(unix)]
-fn apply_child_env(
-    cmd: &mut portable_pty::CommandBuilder,
-    restored: &HashMap<String, String>,
-) {
+fn apply_child_env(cmd: &mut portable_pty::CommandBuilder, restored: &HashMap<String, String>) {
     if cmd.get_env("TERM").is_none() {
         cmd.env("TERM", DEFAULT_TERM);
     }
@@ -349,7 +419,11 @@ async fn run_in_background(
                     let state = task.status.to_string();
                     notifier.notify(crate::completion_notice(
                         "background-shell",
-                        &[("id", &task.id), ("state", &state), ("command", &command_clone)],
+                        &[
+                            ("id", &task.id),
+                            ("state", &state),
+                            ("command", &command_clone),
+                        ],
                         &task.render_output(),
                     ));
                 }
@@ -394,7 +468,7 @@ fn strip_ansi(s: &str) -> String {
             match chars.peek() {
                 Some('[') => {
                     chars.next(); // consume '['
-                    // CSI: consume parameter + intermediate bytes, stop at final byte
+                                  // CSI: consume parameter + intermediate bytes, stop at final byte
                     for c in &mut chars {
                         if c.is_ascii_alphabetic() || c == '@' {
                             break;
@@ -465,7 +539,10 @@ struct PtyKillGuard {
 #[cfg(unix)]
 impl PtyKillGuard {
     fn new(killer: Box<dyn portable_pty::ChildKiller + Send + Sync>) -> Self {
-        Self { killer, armed: true }
+        Self {
+            killer,
+            armed: true,
+        }
     }
 
     /// The command finished on its own — there is nothing left to kill.
@@ -501,7 +578,7 @@ async fn run_in_pty(
     spill_path: PathBuf,
     sandbox: Option<&SeatbeltProfile>,
 ) -> PtyOutcome {
-    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
     let pty_system = native_pty_system();
 
@@ -743,7 +820,9 @@ fn render_pty_output(captured: Captured, spill_path: &Path) -> (String, Vec<Stri
             let text = strip_ansi(&String::from_utf8_lossy(user));
             let text = text.strip_suffix('\n').unwrap_or(&text);
             let output = match bound_head_tail(text) {
-                Some(bounded) => with_full_output(bounded, spill_bytes(spill_path, text.as_bytes())),
+                Some(bounded) => {
+                    with_full_output(bounded, spill_bytes(spill_path, text.as_bytes()))
+                }
                 None => text.to_string(),
             };
             (output, state)
@@ -935,7 +1014,10 @@ async fn run_windows_fallback(
 /// Wrap already-bounded command output in a tool result keyed on the exit code.
 fn shell_result(output: String, exit_code: i32) -> ToolResult {
     if exit_code != 0 {
-        ToolResult::error(format!("Command exited with code {}\n{}", exit_code, output))
+        ToolResult::error(format!(
+            "Command exited with code {}\n{}",
+            exit_code, output
+        ))
     } else {
         ToolResult::success(output)
     }
@@ -948,7 +1030,9 @@ fn shell_result(output: String, exit_code: i32) -> ToolResult {
 #[async_trait]
 impl Tool for PtyBashTool {
     // Gates itself: calls `ctx.check_permission*` in `execute()` (#210).
-    fn self_gates(&self) -> bool { true }
+    fn self_gates(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
         claurst_core::constants::TOOL_NAME_BASH
@@ -992,6 +1076,10 @@ impl Tool for PtyBashTool {
                 "notify": {
                     "type": "boolean",
                     "description": "With run_in_background: set to true to be sent the command's output automatically when it finishes, instead of checking with the monitor tool. Use it for builds and tests you are waiting on; leave it off for servers and watchers."
+                },
+                "justification": {
+                    "type": "string",
+                    "description": "Required when retrying a command the risk gate refused: name the specific user request this command serves and why the destructive target is necessary. First attempts do not need it."
                 }
             },
             "required": ["command"]
@@ -1007,18 +1095,37 @@ impl Tool for PtyBashTool {
         // `apply_patch <<'EOF' ... EOF` feeds a patch to a program that does
         // not exist here: apply it as ApplyPatch does, with that tool's
         // per-path Edit permission checks, from the shell's current directory.
-        if let Some(result) = crate::apply_patch::run_heredoc_invocation(&params.command, ctx).await {
+        if let Some(result) = crate::apply_patch::run_heredoc_invocation(&params.command, ctx).await
+        {
             return result;
         }
 
         // Permission check
-        let reason = params
-            .description
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("This will execute a shell command.")
-            .to_string();
+        // The two-stage risk gate runs before the permission check: a
+        // catastrophic target is denied outright, and a Confirm-tier verdict
+        // needs a substantive justification or is refused with a reflection
+        // prompt, then still forces a manual approval question even in modes
+        // that would not ask.
+        let escalation =
+            match gate_by_blast_radius(&params.command, params.justification.as_deref(), ctx) {
+                Ok(escalation) => escalation,
+                Err(refusal) => return ToolResult::error(refusal),
+            };
+
+        let reason = match escalation {
+            Some(prefix) => format!(
+                "{}. Command: {}",
+                prefix.trim_end_matches(';'),
+                params.command
+            ),
+            None => params
+                .description
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("This will execute a shell command.")
+                .to_string(),
+        };
 
         if let Err(e) = ctx.check_permission_for_path(
             self.name(),
@@ -1063,7 +1170,15 @@ impl Tool for PtyBashTool {
             } else {
                 None
             };
-            return run_in_background(params.command, cwd, timeout_ms, &spill_dir, sandbox, notifier).await;
+            return run_in_background(
+                params.command,
+                cwd,
+                timeout_ms,
+                &spill_dir,
+                sandbox,
+                notifier,
+            )
+            .await;
         }
 
         debug!(command = %params.command, "Executing bash command via PTY");
@@ -1284,7 +1399,10 @@ async fn run_pty_sandboxed(
     }
     let decision = crate::sandbox::request_unsandboxed_retry(ctx, command).await;
     if decision == crate::sandbox::RetryDecision::Approved {
-        debug!(command, "Rerunning a sandbox-denied command outside the sandbox");
+        debug!(
+            command,
+            "Rerunning a sandbox-denied command outside the sandbox"
+        );
         return run_pty_foreground(
             command,
             shell_state,
@@ -1309,7 +1427,53 @@ async fn run_pty_sandboxed(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use claurst_command_risk::{assess, RiskContext as Ctx, RiskLevel as Lvl};
+    use serde_json::json;
     use std::ffi::OsStr;
+
+    /// The layered risk gate denies catastrophic commands before any
+    /// approval is consulted, so `rm -rf $HOME` is never auto-approved no
+    /// matter how permissive the permission handler is.
+    #[tokio::test]
+    async fn catastrophic_command_is_never_auto_approved() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = crate::test_support::allow_all_context(temp.path().to_path_buf());
+        let tool = PtyBashTool;
+        let input = json!({
+            "command": "rm -rf $HOME",
+            "description": "clean up",
+            "timeout": 5000
+        });
+        let result = tool.execute(input, &ctx).await;
+        assert!(result.is_error, "must refuse, got: {}", result.content);
+        assert!(result.content.contains("Command blocked"));
+        assert!(result.content.contains("protected system or home path"));
+    }
+
+    /// A Confirm-tier command (destructive target not statically determinable)
+    /// is never silently run by a permissive handler either: with an Allow-all
+    /// handler the escalation path still forces a question in interactive
+    /// use, and in this non-interactive test the refusal text is what the
+    /// model would see. What matters here is that the gate does not return
+    /// Safe for it.
+    #[test]
+    fn confirm_tier_commands_are_flagged_by_gate() {
+        // SAFETY: no unsafe; test-only env mutation of HOME.
+        // Use an explicit context so the test does not depend on $HOME.
+        let ctx = Ctx {
+            working_dir: Some(std::path::PathBuf::from("/repo")),
+            home_dir: Some(std::path::PathBuf::from("/home/u")),
+            scratch_dir: None,
+        };
+        assert_eq!(
+            assess("find / -name '*.tmp' -delete", &ctx).level,
+            Lvl::Catastrophic
+        );
+        assert_eq!(assess("shred $UNKNOWN_VAR", &ctx).level, Lvl::Confirm);
+        // Routine work inside the working directory stays Low or Safe, so the
+        // layered gate does not add friction to ordinary commands.
+        assert!(assess("rm -rf /repo/build", &ctx).level <= Lvl::Low);
+    }
 
     /// #211: restored env values (secrets) must NOT be baked into the wrapper
     /// script, because that script becomes an argv element of `bash -c`, which is
@@ -1320,9 +1484,10 @@ mod tests {
         state
             .env_vars
             .insert("SECRET".to_string(), "topsecret".to_string());
-        state
-            .env_vars
-            .insert("AWS_SECRET_ACCESS_KEY".to_string(), "aws-argv-leak".to_string());
+        state.env_vars.insert(
+            "AWS_SECRET_ACCESS_KEY".to_string(),
+            "aws-argv-leak".to_string(),
+        );
 
         let base = PathBuf::from("/tmp");
         let script = build_wrapper_script("echo hi", &state, &base);
@@ -1451,8 +1616,10 @@ mod tests {
     fn render_ignores_sentinel_inside_a_line() {
         let dir = tempfile::tempdir().unwrap();
         let raw = format!("x{SHELL_STATE_SENTINEL}\n");
-        let (output, state) =
-            render_pty_output(Captured::Complete(raw.into_bytes()), &dir.path().join("o.txt"));
+        let (output, state) = render_pty_output(
+            Captured::Complete(raw.into_bytes()),
+            &dir.path().join("o.txt"),
+        );
         assert_eq!(output, format!("x{SHELL_STATE_SENTINEL}"));
         assert!(state.is_empty());
     }
@@ -1518,7 +1685,10 @@ mod tests {
     async fn exported_pager_does_not_survive_into_next_call() {
         let state = parking_lot::Mutex::new(ShellState::new());
         let spill_dir = tempfile::tempdir().unwrap();
-        for command in ["export PAGER=less GIT_PAGER=less", "echo \"$PAGER $GIT_PAGER\""] {
+        for command in [
+            "export PAGER=less GIT_PAGER=less",
+            "echo \"$PAGER $GIT_PAGER\"",
+        ] {
             let result = run_pty_foreground(
                 command,
                 &state,
@@ -1591,7 +1761,13 @@ mod tests {
             .execute(json!({ "command": "ls; rm -rf /" }), &ctx)
             .await;
         assert!(result.is_error);
-        assert!(result.content.contains("Critical"), "{}", result.content);
+        // The blast-radius gate fires before the Critical classifier and
+        // refuses the same command as a protected-path hit.
+        assert!(
+            result.content.contains("Command blocked"),
+            "{}",
+            result.content
+        );
     }
 
     /// #220: a command that exceeds its timeout must have its child KILLED, not
@@ -1692,7 +1868,9 @@ mod tests {
         assert_eq!(spilled.len(), 2_000_000 * 6 + "END\r\n".len());
         assert!(spilled.ends_with(b"line\r\nEND\r\n"));
         assert!(
-            !spilled.windows(SHELL_STATE_SENTINEL.len()).any(|w| w == SHELL_STATE_SENTINEL.as_bytes()),
+            !spilled
+                .windows(SHELL_STATE_SENTINEL.len())
+                .any(|w| w == SHELL_STATE_SENTINEL.as_bytes()),
             "shell-state block (env) leaked into the spill file"
         );
         {
@@ -1704,9 +1882,15 @@ mod tests {
 
     /// Start `command` in the background and wait for its task to finish.
     async fn run_background_to_completion(command: &str, spill_dir: &Path) -> BackgroundTask {
-        let started =
-            run_in_background(command.to_string(), std::env::temp_dir(), 60_000, spill_dir, None, None)
-                .await;
+        let started = run_in_background(
+            command.to_string(),
+            std::env::temp_dir(),
+            60_000,
+            spill_dir,
+            None,
+            None,
+        )
+        .await;
         let task_id = started
             .content
             .lines()
@@ -1719,7 +1903,10 @@ mod tests {
             if !task.is_running() {
                 return task;
             }
-            assert!(std::time::Instant::now() < deadline, "background task never finished");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background task never finished"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
@@ -1742,15 +1929,25 @@ mod tests {
             Some(notifier),
         )
         .await;
-        assert!(started.content.contains("You will be notified"), "{}", started.content);
+        assert!(
+            started.content.contains("You will be notified"),
+            "{}",
+            started.content
+        );
         let notice = tokio::time::timeout(Duration::from_secs(30), rx.recv())
             .await
             .expect("notice within 30s")
             .expect("notifier called");
         assert!(notice.starts_with("<background-shell id=\""), "{notice}");
         assert!(notice.contains(" state=\"completed\""), "{notice}");
-        assert!(notice.contains(" command=\"echo done-marker\">"), "{notice}");
-        assert!(notice.contains("\ndone-marker\n</background-shell>"), "{notice}");
+        assert!(
+            notice.contains(" command=\"echo done-marker\">"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("\ndone-marker\n</background-shell>"),
+            "{notice}"
+        );
     }
 
     /// #442 (Monitor path): a chatty background task keeps bounded windows in
@@ -1789,7 +1986,8 @@ mod tests {
         assert!(task.output.iter().any(|l| l == "done"));
     }
 
-    const ENV_PROBE: &str = "echo \"$PAGER $GIT_PAGER $GH_PAGER $GIT_TERMINAL_PROMPT $CLAURST $AGENT ${TERM:+term}\"";
+    const ENV_PROBE: &str =
+        "echo \"$PAGER $GIT_PAGER $GH_PAGER $GIT_TERMINAL_PROMPT $CLAURST $AGENT ${TERM:+term}\"";
 
     /// #442: the PTY child runs with pagers off, no git prompts, the agent
     /// markers, and a TERM.
@@ -1837,13 +2035,11 @@ mod tests {
         });
 
         let started = std::time::Instant::now();
-        let result =
-            tokio::time::timeout(Duration::from_secs(10), tool.execute(input, &ctx)).await;
+        let result = tokio::time::timeout(Duration::from_secs(10), tool.execute(input, &ctx)).await;
         let elapsed = started.elapsed();
 
-        let result = result.expect(
-            "execute hung waiting on the detached grandchild's pty (regression of #184)",
-        );
+        let result = result
+            .expect("execute hung waiting on the detached grandchild's pty (regression of #184)");
         assert!(
             !result.is_error,
             "command should have succeeded, got: {}",
@@ -1899,11 +2095,24 @@ mod tests {
             .await;
         let leaked = outside.exists();
         let _ = std::fs::remove_file(&outside);
-        assert!(!leaked, "the sandbox let a write outside the workspace through");
+        assert!(
+            !leaked,
+            "the sandbox let a write outside the workspace through"
+        );
         assert!(denied.is_error, "{}", denied.content);
-        assert!(denied.content.contains("Operation not permitted"), "{}", denied.content);
+        assert!(
+            denied.content.contains("Operation not permitted"),
+            "{}",
+            denied.content
+        );
         // Detected as a denial; headless, so nobody is asked and the note explains.
-        assert!(denied.content.contains("[sandbox] This command ran in the macOS Seatbelt sandbox (workspace-write)"), "{}", denied.content);
+        assert!(
+            denied.content.contains(
+                "[sandbox] This command ran in the macOS Seatbelt sandbox (workspace-write)"
+            ),
+            "{}",
+            denied.content
+        );
 
         let init = std::process::Command::new("git")
             .args(["init", "-q"])
@@ -1921,13 +2130,142 @@ mod tests {
             .execute(json!({ "command": "touch .git/probe" }), &ctx)
             .await;
         assert!(git_write.is_error, "{}", git_write.content);
-        assert!(git_write.content.contains("[sandbox]"), "{}", git_write.content);
+        assert!(
+            git_write.content.contains("[sandbox]"),
+            "{}",
+            git_write.content
+        );
         assert!(!workspace.path().join(".git/probe").exists());
 
         // An ordinary failure is not reported as a sandbox denial.
         let failed = tool.execute(json!({ "command": "false" }), &ctx).await;
         assert!(failed.is_error);
         assert!(!failed.content.contains("[sandbox]"), "{}", failed.content);
+    }
+
+    /// The stage-2 reflection gate: a Confirm-tier command without a
+    /// justification is refused with the reflection prompt before any
+    /// permission handler is consulted.
+    #[tokio::test]
+    async fn confirm_without_justification_reflects_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = crate::test_support::allow_all_context_with_session(
+            temp.path().to_path_buf(),
+            "gate-reflect-test",
+        );
+        let tool = PtyBashTool;
+
+        let refused = tool
+            .execute(
+                json!({
+                    "command": "shred $UNKNOWN_VAR",
+                    "description": "wipe temp file"
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(refused.is_error, "must reflect, got: {}", refused.content);
+        assert!(
+            refused.content.contains("was not run"),
+            "expected the reflection prompt, got: {}",
+            refused.content
+        );
+    }
+
+    /// A substantive justification on the retry passes the reflection gate,
+    /// and the approval question it escalates to carries the justification
+    /// so the user sees the model's account.
+    #[test]
+    fn justified_confirm_escalates_with_the_reason() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = crate::test_support::allow_all_context_with_session(
+            temp.path().to_path_buf(),
+            "gate-justify-test",
+        );
+        let without = gate_by_blast_radius("shred $UNKNOWN_VAR", None, &ctx);
+        assert!(without.is_err(), "no justification must reflect");
+
+        let escalation = gate_by_blast_radius(
+            "shred $UNKNOWN_VAR",
+            Some("The user asked me to securely wipe the scratch file named in the request"),
+            &ctx,
+        )
+        .expect("substantive justification passes the gate")
+        .expect("escalated verdicts carry an approval reason");
+        assert!(
+            escalation.contains("Justification:"),
+            "approval question must carry the justification, got: {escalation}"
+        );
+        assert!(
+            escalation.contains("scratch file"),
+            "approval question must quote the justification, got: {escalation}"
+        );
+    }
+
+    /// The risk gate resolves relative targets against the shell's live cwd
+    /// from the session state, not the session's starting directory: after a
+    /// `cd` earlier in the session, `rm -rf .` is judged from where the shell
+    /// actually is. Judged directly on the gate, so the command is never
+    /// executed in the test.
+    #[test]
+    fn gate_uses_the_live_shell_cwd_for_relative_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = crate::test_support::allow_all_context_with_session(
+            temp.path().to_path_buf(),
+            "gate-livecwd-test",
+        );
+        let state = session_shell_state(&ctx.session_id);
+        state.lock().cwd = Some(std::path::PathBuf::from("/etc"));
+
+        let denied = gate_by_blast_radius("rm -rf .", None, &ctx);
+        assert!(
+            denied.is_err(),
+            "`rm -rf .` from /etc must be denied, got: {denied:?}"
+        );
+        let refusal = denied.err().unwrap_or_default();
+        assert!(
+            refusal.contains("Command blocked"),
+            "expected the catastrophic denial, got: {refusal}"
+        );
+
+        // Without a tracked `cd`, the same command resolves against the
+        // session's working directory and stays on the normal approval path.
+        crate::clear_session_shell_state(&ctx.session_id);
+        let routine = gate_by_blast_radius("rm -rf .", None, &ctx);
+        assert!(
+            routine
+                .as_ref()
+                .is_ok_and(|escalation| escalation.is_none()),
+            "`rm -rf .` inside the working directory must not escalate, got: {routine:?}"
+        );
+    }
+
+    /// A Catastrophic verdict is denied outright: no justification field, no
+    /// matter how plausible, unlocks `rm -rf ~`.
+    #[tokio::test]
+    async fn catastrophic_stays_denied_with_any_justification() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = crate::test_support::allow_all_context_with_session(
+            temp.path().to_path_buf(),
+            "gate-deny-test",
+        );
+        let tool = PtyBashTool;
+        let result = tool
+            .execute(
+                json!({
+                    "command": "rm -rf ~",
+                    "description": "clean up",
+                    "justification": "The user explicitly asked me to remove everything in the home directory"
+                }),
+                &ctx,
+            )
+            .await;
+        assert!(result.is_error, "must deny, got: {}", result.content);
+        assert!(
+            result.content.contains("Command blocked"),
+            "expected the catastrophic denial, got: {}",
+            result.content
+        );
     }
 }
 

@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 claurst-core = { workspace = true }
+claurst-command-risk = { workspace = true }
 claurst-api = { workspace = true }
 claurst-mcp = { workspace = true }
 tokio = { workspace = true }
