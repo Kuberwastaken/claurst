@@ -406,6 +406,11 @@ impl App {
     /// Switch the session to a failover route chosen from the failover
     /// dialog. The route is either `"provider/model"` or a bare provider id;
     /// a provider-only route falls back to that provider's default model.
+    ///
+    /// A slash-less route that names a known model rather than a provider
+    /// (a regression in route building) is applied through `set_model`,
+    /// which infers the provider from the model name, instead of being
+    /// treated as a provider id and poisoning the session config.
     pub(super) fn apply_failover_route(&mut self, route: &str) {
         match route.split_once('/') {
             Some((provider_id, model)) => {
@@ -413,7 +418,10 @@ impl App {
                 self.model_name = model.to_string();
                 self.config.model = Some(model.to_string());
             }
-            None => self.set_provider_default(route.to_string()),
+            None if claurst_api::registry::is_known_provider_id(route) => {
+                self.set_provider_default(route.to_string())
+            }
+            None => self.set_model(route.to_string()),
         }
         self.sync_cost_pricing();
         self.refresh_context_window_size();

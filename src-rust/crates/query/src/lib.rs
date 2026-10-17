@@ -347,12 +347,17 @@ fn first_line(text: &str) -> String {
 
 /// Provider-qualified default model for a provider id, mirroring the TUI
 /// picker's resolution so a failover switch lands on a real model.
+///
+/// Every route must contain a `/`: the TUI's `apply_failover_route` treats a
+/// slash-less route as a bare provider id, so an unqualified anthropic model
+/// would switch the session to a bogus provider. Anthropic models live
+/// unprefixed in the registry, so their default is qualified by hand.
 fn claurst_query_default_model(provider_id: &str, registry: &claurst_api::ModelRegistry) -> String {
     if provider_id == "anthropic" {
         if let Some(best) = registry.best_model_for_provider(provider_id) {
-            return best;
+            return format!("anthropic/{best}");
         }
-        return "claude-sonnet-5".to_string();
+        return "anthropic/claude-sonnet-5".to_string();
     }
     if let Some(best) = registry.best_model_for_provider(provider_id) {
         return format!("{}/{}", provider_id, best);
@@ -4181,6 +4186,27 @@ mod tests {
                 route.split_once('/').map(|(p, _)| p).unwrap_or(route),
                 "scriptprov",
                 "routes must not include the failed provider: {route}"
+            );
+        }
+    }
+
+    #[test]
+    fn failover_routes_are_always_provider_qualified() {
+        // The TUI's apply_failover_route treats a slash-less route as a
+        // provider id, so every offered route must carry its provider
+        // prefix. Anthropic models are unprefixed in the registry and
+        // used to leak out bare (e.g. "claude-sonnet-5").
+        let registry = claurst_api::ModelRegistry::new();
+        for provider_id in ["anthropic", "openai", "codex", "free"] {
+            let route = claurst_query_default_model(provider_id, &registry);
+            assert!(
+                route.contains('/'),
+                "failover route for {provider_id} must be provider-qualified: {route}"
+            );
+            let (route_provider, _) = route.split_once('/').expect("checked '/' above");
+            assert_eq!(
+                route_provider, provider_id,
+                "route prefix must name the provider: {route}"
             );
         }
     }

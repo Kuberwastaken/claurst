@@ -23,6 +23,33 @@ use tracing::{debug, warn};
 // ---------------------------------------------------------------------------
 // Modules
 // ---------------------------------------------------------------------------
+
+/// Shared lock for tests that mutate process-global state (`CLAURST_HOME`,
+/// auth-store fixtures). Every env-mutating test in this crate must hold it
+/// for its whole body, or parallel test threads can observe each other's
+/// homes.
+#[cfg(test)]
+pub(crate) mod test_env_lock {
+    use std::sync::{Mutex, OnceLock};
+
+    fn lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Guard held for the duration of an env-mutating test. Holds the
+    /// crate-wide lock until dropped; the guard inside is never read, only
+    /// kept alive.
+    pub(crate) struct EnvGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    pub(crate) fn acquire() -> EnvGuard {
+        // A poisoned lock means another env test panicked mid-body; keep
+        // going so this test still runs with a consistent environment.
+        let guard = lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        EnvGuard(guard)
+    }
+}
+
 pub mod bun_tls;
 pub mod codex_adapter;
 

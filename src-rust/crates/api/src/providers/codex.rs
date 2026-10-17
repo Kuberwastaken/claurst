@@ -1642,6 +1642,10 @@ mod tests {
 
     #[tokio::test]
     async fn access_token_adopts_fresh_tokens_refreshed_by_another_instance() {
+        // Holds the shared crate lock: this test repoints the process-global
+        // CLAURST_HOME, and other env-mutating tests (registry failover
+        // candidates) must not interleave with it.
+        let _env = crate::test_env_lock::acquire();
         let home = std::env::temp_dir().join(format!("claurst-codex-{}", uuid::Uuid::new_v4()));
         let prev_home = std::env::var_os("CLAURST_HOME");
         std::env::set_var("CLAURST_HOME", &home);
