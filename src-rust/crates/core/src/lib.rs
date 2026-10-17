@@ -5952,6 +5952,7 @@ pub mod context_collapse;
 pub mod team_memory_sync;
 pub mod system_prompt;
 pub mod memdir;
+pub mod memory_types;
 pub mod oauth_config;
 pub mod codex_oauth;
 pub mod accounts;
