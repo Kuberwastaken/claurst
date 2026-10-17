@@ -142,7 +142,11 @@ impl RiskContext {
 }
 
 fn dirs_home() -> Option<std::path::PathBuf> {
+    // HOME is also set by Git Bash, WSL and MSYS environments on Windows, so it
+    // stays the first-choice spelling. USERPROFILE covers native Windows
+    // shells where HOME is absent, which keeps from_env useful there too.
     std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .filter(|h| !h.is_empty())
         .map(std::path::PathBuf::from)
 }
@@ -294,7 +298,7 @@ fn track_cd(segment: &[Token], ctx: &RiskContext, cwd: &mut Option<std::path::Pa
         return;
     }
     let expanded = paths::expand(arg, ctx);
-    *cwd = expanded.is_absolute().then_some(expanded);
+    *cwd = expanded.has_root().then_some(expanded);
 }
 
 fn assess_segment(tokens: &[Token], ctx: &RiskContext, findings: &mut Vec<RiskFinding>) {

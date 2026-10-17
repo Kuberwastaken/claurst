@@ -76,6 +76,19 @@ impl ProtectedPaths {
     }
 }
 
+/// The gate analyzes command *text* that may run under any shell: Git Bash,
+/// WSL, or a cross-platform runner. Whether a spelling points somewhere concrete
+/// must therefore not depend on the host OS. `Path::is_absolute()` is exactly
+/// that: it answers false for `/` and `/home/u` on Windows because they carry no
+/// drive prefix, so the Windows build demoted every Unix-style destructive
+/// path to "relative" and the gate lost its absolute tier. A string is
+/// absolute for our purposes when it starts with a separator (or a Windows
+/// drive), i.e. `Path::has_root()`, which is identical to `is_absolute()` on
+/// Unix and stays true for rooted paths on Windows.
+fn is_absolute_for_shell(path: &Path) -> bool {
+    path.has_root()
+}
+
 /// Resolve `~`, `$HOME`, and relative paths into something comparable.
 ///
 /// This is lexical only: it never touches the filesystem, so it is safe to call
@@ -88,7 +101,7 @@ pub fn expand(raw: &str, ctx: &RiskContext) -> PathBuf {
     }
 
     let path = PathBuf::from(&text);
-    if path.is_absolute() {
+    if is_absolute_for_shell(&path) {
         return normalize(&path);
     }
     match &ctx.working_dir {
@@ -129,21 +142,44 @@ fn expand_known_prefix(raw: &str, ctx: &RiskContext) -> String {
 /// Without this, `rm -rf ~/../..` would walk straight past the protected-path
 /// check. Note this is intentionally *not* symlink-aware; see the crate docs on
 /// defense in depth.
+///
+/// Paths are reassembled from components, which on Windows would rebuild with
+/// `\\` separators (`\home\u`) and leak into explanations and comparisons
+/// against the `/`-shaped constants above. The gate classifies command text,
+/// not host files, so everything it builds or reports uses `/` separators
+/// regardless of the platform it runs on.
 fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
+    let mut out = String::new();
     for component in path.components() {
         match component {
-            Component::ParentDir => {
-                out.pop();
-            }
+            Component::ParentDir => match out.rfind('/') {
+                // Popping the root directory must clamp at `/` rather than
+                // erase it, or later components would lose the root
+                // (`/home/../etc` would become `etc`).
+                Some(0) => out = "/".to_string(),
+                Some(sep) => out.truncate(sep),
+                // No root yet (empty or a bare drive prefix): nothing to pop.
+                None => out.clear(),
+            },
             Component::CurDir => {}
-            other => out.push(other.as_os_str()),
+            other => {
+                let text = other.as_os_str().to_string_lossy();
+                if text.chars().all(|c| c == '/' || c == '\\') {
+                    // Root (or verbatim prefix) separator: establish the
+                    // leading `/`, also normalizing the `\\` Windows emits.
+                    if !out.ends_with('/') {
+                        out.push('/');
+                    }
+                } else {
+                    if !out.is_empty() && !out.ends_with('/') {
+                        out.push('/');
+                    }
+                    out.push_str(&text);
+                }
+            }
         }
     }
-    if out.as_os_str().is_empty() {
-        return PathBuf::from("/");
-    }
-    out
+    PathBuf::from(if out.is_empty() { "/".to_string() } else { out })
 }
 
 /// Whether destroying this path is categorically unacceptable.
@@ -250,7 +286,7 @@ pub fn classify_target(
     // somewhere the classifier cannot see (`cd $dir; rm -rf .`). No protected
     // comparison is meaningful before resolution, so escalate instead of
     // guessing that it lands somewhere harmless.
-    if ctx.working_dir.is_none() && !expanded.is_absolute() {
+    if ctx.working_dir.is_none() && !is_absolute_for_shell(expanded) {
         return Some(RiskFinding {
             level: RiskLevel::Confirm,
             reason: "relative target resolves against an unknown working directory".to_string(),

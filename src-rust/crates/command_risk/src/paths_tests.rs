@@ -252,6 +252,63 @@ fn known_variable_logs_are_bounded_but_unknown_expansions_still_confirm() {
     }
 }
 
+/// The gate classifies command text, so Unix-shaped paths must behave
+/// identically on every host. `Path::is_absolute()` is false for these on
+/// Windows (no drive prefix), which demoted every Unix-style destructive
+/// target to "relative" on windows-latest CI; the root check in expand() is
+/// what must not regress. Matching must also survive backslash input: Git Bash on
+/// Windows prints `\\`-separated paths and a model can echo one back, and the
+/// component walker reads both separators identically.
+#[test]
+fn unix_style_paths_classify_identically_off_unix() {
+    let ctx = ctx();
+    for spelling in [
+        "/home/u",
+        "/",
+        "/etc",
+        "/home/u/.ssh/id_ed25519",
+        "~",
+        "$HOME",
+        "/home/u/../..",
+    ] {
+        let expanded = expand(spelling, &ctx);
+        assert!(
+            expanded.has_root(),
+            "{spelling:?} must be rooted on every platform, got {expanded:?}"
+        );
+        assert!(
+            is_catastrophic_target(&expanded, &ctx),
+            "{spelling:?} must stay catastrophic on every platform, got {expanded:?}"
+        );
+    }
+
+    // On Windows `\home\u` and `/home/u` tokenize into the same components,
+    // so a backslash spelling of home must hit the same protected comparison.
+    // (All components before the root are dropped on Unix, which is why this
+    // case is written as a one-off rather than part of the loop above.)
+    let windows_home = if cfg!(windows) {
+        "\\home\\u"
+    } else {
+        "/home/u"
+    };
+    let expanded = expand(windows_home, &ctx);
+    assert!(
+        is_catastrophic_target(&expanded, &ctx),
+        "{windows_home:?} must match the protected home path"
+    );
+
+    // Reports carry the raw expanded spelling, so it must not gain host
+    // separators on the way out.
+    let finding = classify_target(&expand("~", &ctx), "~", true, &ctx).unwrap();
+    let Some(target) = finding.target else {
+        panic!("the catastrophic finding must name its target");
+    };
+    assert!(
+        !target.contains('\\'),
+        "the reported target must stay /-shaped: {target}"
+    );
+}
+
 #[test]
 fn known_variables_do_not_bypass_protected_paths() {
     let ctx = ctx();

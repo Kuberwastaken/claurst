@@ -810,3 +810,38 @@ fn cd_tracking_resolves_relative_targets_across_segments() {
         assert_eq!(level(command), RiskLevel::Catastrophic, "{command:?}");
     }
 }
+
+/// The gate statically analyzes command *text*, which can be shipped to any
+/// shell: Git Bash, WSL, or a Unix box reached over ssh. Whether a Unix-style
+/// destructive path is absolute must not depend on the OS the gate runs on.
+/// On Windows `Path::is_absolute()` answers false for drive-less rooted paths
+/// (`/`, `/home/u`), which demoted the crate's worst commands to "relative"
+/// and broke both the cd tracker and the protected-path comparison
+/// (windows-latest CI, PR 513).
+#[test]
+fn unix_style_paths_are_absolute_on_every_platform() {
+    // Absolute Unix targets must reach the catastrophic tier unconditionally.
+    for command in [
+        "cd /; rm -rf .",
+        "cd /tmp; rm -rf $HOME",
+        "rm -rf ~",
+        "rm -rf /",
+    ] {
+        assert_eq!(level(command), RiskLevel::Catastrophic, "{command:?}");
+    }
+
+    // The raw spelling and the report must stay `/`-shaped. `normalize()`
+    // rebuilds paths from components; rebuilding with the host separator
+    // produced `target: \home\u` on windows-latest, breaking the explanation
+    // and the user-facing refusal text.
+    let assessment = assess("rm -rf ~", &ctx());
+    let text = assessment.explanation();
+    assert!(
+        text.contains("/home/u"),
+        "explanation must name a /-shaped path on every platform: {text}"
+    );
+    assert!(
+        !text.contains('\\'),
+        "explanation must not carry host-native separators: {text}"
+    );
+}
