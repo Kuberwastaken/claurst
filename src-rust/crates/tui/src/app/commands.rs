@@ -46,6 +46,7 @@ pub(super) const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("new", "Start a fresh session (keeps model, provider & directory)"),
     ("output-style", "Show or switch the output style / persona"),
     ("plugin", "Manage plugins (list/info/enable/disable/reload)"),
+    ("poke", "Toggle or configure auto-poke (on/off/status)"),
     ("providers", "List available AI providers and their status"),
     ("caveman", "Caveman persona output style — save big token"),
     ("rocky", "Rocky persona output style — amaze amaze amaze"),
@@ -81,7 +82,7 @@ pub(super) fn help_command_category(name: &str) -> &'static str {
         | "cc-statusline" => {
             "Workspace"
         }
-        "agent" | "agents" | "memory" | "plugin" | "survey" | "turns" => "Tools",
+        "agent" | "agents" | "memory" | "plugin" | "poke" | "survey" | "turns" => "Tools",
         "session" | "resume" | "rename" | "fork" | "clear" | "new" | "move" | "compact"
         | "quit" | "exit" => "Session",
         _ => "Commands",
@@ -150,9 +151,70 @@ impl App {
         }
     }
 
+    /// Handle `/poke [on|off|status]`. Toggles auto-poke, which sends a
+    /// continuation prompt when the model stops with incomplete todos.
+    /// Opt-in only: the default is OFF. Persists to settings.json.
+    pub fn handle_poke_command(&mut self, args: &str) {
+        let mut settings = claurst_core::Settings::load_sync().unwrap_or_default();
+        // Persist first, flip the live flag only when the save succeeded;
+        // otherwise the setting would revert on the next launch while the
+        // status message claims it changed.
+        let mut persist =
+            |settings: &claurst_core::Settings, flag: bool, enabled_msg: &str| -> String {
+                match settings.save_sync() {
+                    Ok(()) => {
+                        self.config.auto_poke_enabled = flag;
+                        enabled_msg.to_string()
+                    }
+                    Err(e) => format!("Auto-poke unchanged: could not save settings ({e})."),
+                }
+            };
+        match args.trim() {
+            "on" | "enable" => {
+                settings.config.auto_poke_enabled = true;
+                self.status_message = Some(persist(&settings, true, "Auto-poke enabled."));
+            }
+            "off" | "disable" => {
+                settings.config.auto_poke_enabled = false;
+                self.status_message = Some(persist(&settings, false, "Auto-poke disabled."));
+            }
+            "status" => {
+                let budget_left = claurst_tools::todo_write::MAX_AUTO_POKES
+                    .saturating_sub(self.auto_poke_count);
+                let incomplete =
+                    claurst_tools::todo_write::count_incomplete_todos(&self.session_id);
+                self.status_message = Some(format!(
+                    "Auto-poke: {} | Pokes: {}/{} | Budget left: {} | Incomplete: {}",
+                    if self.config.auto_poke_enabled { "ON" } else { "OFF" },
+                    self.auto_poke_count,
+                    claurst_tools::todo_write::MAX_AUTO_POKES,
+                    budget_left,
+                    incomplete,
+                ));
+            }
+            "" => {
+                settings.config.auto_poke_enabled = !settings.config.auto_poke_enabled;
+                let now_on = settings.config.auto_poke_enabled;
+                self.status_message = Some(persist(
+                    &settings,
+                    now_on,
+                    if now_on { "Auto-poke enabled." } else { "Auto-poke disabled." },
+                ));
+            }
+            _ => {
+                self.status_message =
+                    Some("Usage: /poke [on|off|status] (no arg toggles).".to_string());
+            }
+        }
+    }
+
     /// Handle slash commands that should open UI screens rather than execute
     /// as normal commands. Returns `true` if the command was intercepted.
     pub fn intercept_slash_command_with_args(&mut self, cmd: &str, args: &str) -> bool {
+        if cmd == "poke" {
+            self.handle_poke_command(args);
+            return true;
+        }
         if cmd == "turns" {
             let args = args.trim();
             if args.is_empty() {

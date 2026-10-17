@@ -2154,6 +2154,9 @@ async fn run_interactive(
     // OAuth session must report zero cost (issue #499).
     app.anthropic_bearer_auth = anthropic_bearer_auth;
     app.sync_cost_pricing();
+    // Sync the session id at startup so auto-poke reads this session's
+    // todos from the first turn on, not only after /new or a resume.
+    app.session_id = tool_ctx.session_id.clone();
     // Startup skill discovery runs on the blocking pool so a cold
     // `skills.urls` clone never holds the terminal. When it finishes, the
     // main loop installs the slash commands for autocomplete and every query
@@ -2688,6 +2691,14 @@ async fn run_interactive(
                             continue;
                         }
 
+                        // A fresh user message is new work: drop any stale
+                        // auto-poke queued for the previous task and reset the
+                        // no-progress tracker, so its counter does not carry
+                        // over to unrelated work.
+                        app.queued_messages
+                            .retain(|m| !claurst_tools::todo_write::is_auto_poke_message(m));
+                        app.no_progress_turns = 0;
+
                         // Check for slash command
                         if input.starts_with('/') {
                             let (cmd_name, cmd_args) =
@@ -2787,6 +2798,11 @@ async fn run_interactive(
                                     tool_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_title = None;
+                                    // Keep the TUI's session id in sync so
+                                    // auto-poke reads the new session's todos,
+                                    // and reset its per-session counters.
+                                    app.session_id = tool_ctx.session_id.clone();
+                                    app.reset_auto_poke_state();
                                     // Reset per-turn diff/turn bookkeeping, as
                                     // ResumeSession does when swapping sessions.
                                     tool_ctx.file_history = Arc::new(ParkingMutex::new(
@@ -2944,6 +2960,11 @@ async fn run_interactive(
                                     tool_ctx.current_turn = Arc::new(
                                         std::sync::atomic::AtomicUsize::new(0),
                                     );
+                                    app.session_id = tool_ctx.session_id.clone();
+                                    // Fresh session: the budget and no-progress
+                                    // counters documented as per-session must
+                                    // not carry over from the old one.
+                                    app.reset_auto_poke_state();
                                     cmd_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_title = session.title.clone();
                                     if let Some(saved_dir) = session.working_dir.as_ref() {
