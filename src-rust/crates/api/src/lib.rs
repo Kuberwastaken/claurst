@@ -48,6 +48,7 @@ pub mod providers;
 
 // Model Registry (Phase 3).
 pub mod model_registry;
+pub mod memory_sidecar;
 
 // Model-adaptive effort ladders (#267).
 pub mod effort_support;

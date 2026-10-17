@@ -1661,6 +1661,10 @@ pub mod config {
         /// Note: @include in CLAUDE.md/AGENTS.md always injects regardless of this limit.
         #[serde(default = "default_file_injection_max_size", rename = "fileInjectionMaxSize")]
         pub file_injection_max_size: usize,
+        /// Memory system settings (sidecar model, backend, fallback, gates).
+        /// See [`crate::memory_config::MemorySettings`].
+        #[serde(default)]
+        pub memory: crate::memory_config::MemorySettings,
     }
 
     /// A user-defined slash command template.
@@ -2162,6 +2166,19 @@ pub mod config {
             self.save_to_path_sync(&path)
         }
 
+        /// Update the persisted memory sidecar model in settings.json.
+        ///
+        /// Mirrors jcode's `Config::set_memory_model`: load, mutate the
+        /// memory block, persist. The sidecar reads this on next use, so no
+        /// cache invalidation is needed on the claurst side.
+        pub fn set_memory_model(model: &str) -> anyhow::Result<()> {
+            let mut settings = Self::load_sync()?;
+            settings.memory.memory_model = Some(model.to_string());
+            settings.save_sync()?;
+            tracing::info!("Saved memory sidecar model: {}", model);
+            Ok(())
+        }
+
         /// Return the effective `Config`, merging top-level provider settings
         /// into the embedded `config` field.
         ///
@@ -2446,6 +2463,23 @@ pub mod config {
                 file_autocomplete_show_hidden_files: over.file_autocomplete_show_hidden_files || base.file_autocomplete_show_hidden_files,
                 file_injection_enabled: over.file_injection_enabled || base.file_injection_enabled,
                 file_injection_max_size: if over.file_injection_max_size != 0 { over.file_injection_max_size } else { base.file_injection_max_size },
+                memory: Self::merge_memory_settings(base.memory.clone(), over.memory.clone()),
+            }
+        }
+
+        /// Merge memory settings: the overlay (project/user override) wins
+        /// for each Some/true field; the master gates stay on only when the
+        /// base allows them.
+        fn merge_memory_settings(
+            base: crate::memory_config::MemorySettings,
+            over: crate::memory_config::MemorySettings,
+        ) -> crate::memory_config::MemorySettings {
+            crate::memory_config::MemorySettings {
+                memory_model: over.memory_model.or(base.memory_model),
+                memory_sidecar_backend: over.memory_sidecar_backend.or(base.memory_sidecar_backend),
+                memory_sidecar_fallback: over.memory_sidecar_fallback.or(base.memory_sidecar_fallback),
+                memory_sidecar_enabled: over.memory_sidecar_enabled || base.memory_sidecar_enabled,
+                memory_enabled: over.memory_enabled || base.memory_enabled,
             }
         }
     }
@@ -5952,6 +5986,8 @@ pub mod context_collapse;
 pub mod team_memory_sync;
 pub mod system_prompt;
 pub mod memdir;
+pub mod memory_types;
+pub mod memory_config;
 pub mod oauth_config;
 pub mod codex_oauth;
 pub mod accounts;
