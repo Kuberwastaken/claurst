@@ -7,6 +7,7 @@ edition.workspace = true
 claurst-core = { workspace = true }
 claurst-api = { workspace = true }
 claurst-mcp = { workspace = true }
+claurst-codemode = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }

@@ -13,6 +13,7 @@ members = [
     "crates/buddy",
     "crates/plugins",
     "crates/acp",
+    "crates/codemode",
 ]
 
 [workspace.package]
@@ -121,6 +122,7 @@ claurst-mcp = { path = "crates/mcp" }
 claurst-bridge = { path = "crates/bridge" }
 claurst-buddy = { path = "crates/buddy" }
 claurst-plugins = { path = "crates/plugins" }
+claurst-codemode = { path = "crates/codemode" }
 
 # Shipped binaries statically link two TLS stacks (rustls + BoringSSL),
 # bundled SQLite, syntect, and image codecs — LTO and symbol stripping cut
