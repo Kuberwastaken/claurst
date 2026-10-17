@@ -756,6 +756,17 @@ pub async fn run_query_loop(
             }
         }
 
+        // Durable steering (soft interrupts): for the interactive session's
+        // queue — journaled (#449) and not a sub-agent — push, remove and
+        // drain mirror into the soft-interrupt store, and interrupts a
+        // previous run persisted are restored here, before the first drain.
+        // Sub-agents and headless runs persist nothing.
+        if let Some(queue) = config.command_queue.as_ref() {
+            if config.session_journal.is_some() && !config.is_subagent {
+                queue.enable_persistence(&tool_ctx.session_id);
+            }
+        }
+
         // Step boundary (#444): deliver queued input — steers typed while the
         // turn ran and background-task completion notices — before the next
         // model request. They are appended after the last tool results, in
