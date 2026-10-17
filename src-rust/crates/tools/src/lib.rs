@@ -1061,7 +1061,7 @@ pub trait Tool: Send + Sync {
 
 /// Return all built-in tools (excluding AgentTool, which lives in cc-query).
 pub fn all_tools() -> Vec<Box<dyn Tool>> {
-    vec![
+    let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(PtyBashTool),
         Box::new(FileReadTool),
         Box::new(FileEditTool),
@@ -1109,7 +1109,13 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         // Computer Use is only available when compiled with the feature flag.
         #[cfg(feature = "computer-use")]
         Box::new(computer_use::ComputerUseTool),
-    ]
+    ];
+    // The opt-in codemode tool joins the set only when its feature gate is
+    // on, so sessions without it never see the tool at all.
+    if codemode_enabled() {
+        tools.push(Box::new(CodemodeTool));
+    }
+    tools
 }
 
 /// Find a tool by name (case-sensitive).

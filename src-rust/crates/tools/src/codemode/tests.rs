@@ -11,6 +11,19 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+/// Serializes tests that mutate the codemode feature-gate env vars, which are
+/// process-wide and would otherwise race with each other.
+static CODEMODE_ENV_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
+
+/// Runs `f` with both codemode env vars removed and the gate mutex held.
+async fn with_codemode_gate<R>(f: impl std::future::Future<Output = R>) -> R {
+    let _guard = CODEMODE_ENV_LOCK.lock().await;
+    std::env::remove_var("CLAURST_FEATURE_CODEMODE");
+    std::env::remove_var("CLAURST_CODEMODE");
+    f.await
+}
+
 struct AllowAllHandler;
 
 impl PermissionHandler for AllowAllHandler {
@@ -219,12 +232,36 @@ async fn unknown_tool_is_reported_to_the_script() {
 #[tokio::test(flavor = "multi_thread")]
 async fn disabled_by_default() {
     // No env var set in the test process: the tool must refuse to run.
-    std::env::remove_var("CLAURST_FEATURE_CODEMODE");
+    with_codemode_gate(async {
+        let ctx = test_tool_context(Arc::new(AllowAllHandler));
+        let result = CodemodeTool
+            .execute(json!({ "code": "return 1;" }), &ctx)
+            .await;
+        assert!(result.is_error, "codemode must be opt-in");
+        assert!(result.content.contains("disabled"), "{}", result.content);
+    })
+    .await
+}
+
+/// The registry only offers the codemode tool while its feature gate is on;
+/// with the gate off the tool stays invisible, so default-off is preserved.
+#[tokio::test(flavor = "multi_thread")]
+async fn registered_only_when_enabled() {
+    let _guard = CODEMODE_ENV_LOCK.lock().await;
+
+    std::env::set_var("CLAURST_CODEMODE", "1");
+    let names: Vec<String> = crate::all_tools()
+        .into_iter()
+        .map(|t| t.name().to_string())
+        .collect();
+    assert!(names.contains(&"codemode".to_string()), "{names:?}");
+    assert!(crate::find_tool("codemode").is_some());
+
     std::env::remove_var("CLAURST_CODEMODE");
-    let ctx = test_tool_context(Arc::new(AllowAllHandler));
-    let result = CodemodeTool
-        .execute(json!({ "code": "return 1;" }), &ctx)
-        .await;
-    assert!(result.is_error, "codemode must be opt-in");
-    assert!(result.content.contains("disabled"), "{}", result.content);
+    let names: Vec<String> = crate::all_tools()
+        .into_iter()
+        .map(|t| t.name().to_string())
+        .collect();
+    assert!(!names.contains(&"codemode".to_string()), "{names:?}");
+    assert!(crate::find_tool("codemode").is_none());
 }
