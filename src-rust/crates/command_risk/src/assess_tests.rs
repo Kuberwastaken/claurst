@@ -798,4 +798,15 @@ fn cd_tracking_resolves_relative_targets_across_segments() {
     for command in ["cd $var; rm -rf .", "cd -; rm -rf .", "cd `pwd`; rm -rf ."] {
         assert_eq!(level(command), RiskLevel::Confirm, "{command:?}");
     }
+
+    // Shell grammar words may prefix the `cd` segment itself. Without the
+    // prefix skip in track_cd, `do cd /` would never register and `rm -rf .`
+    // would pass as in-project cleanup.
+    for command in [
+        "while :; do cd /; rm -rf .; done",
+        "if true; then cd /; rm -rf .; fi",
+        "case x in x) cd /; rm -rf .;; esac",
+    ] {
+        assert_eq!(level(command), RiskLevel::Catastrophic, "{command:?}");
+    }
 }
