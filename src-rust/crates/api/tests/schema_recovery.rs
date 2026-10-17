@@ -217,3 +217,64 @@ fn filter_and_recover_round_trip_through_the_same_dialect() {
         "the property itself must survive"
     );
 }
+
+/// `CLAURST_SCHEMA_QUIRKS_PATH` must isolate the store even though this test
+/// binary compiles claurst-schema-dialect with test-support, where the
+/// fail-closed gate would otherwise return None. A dependent's test binary
+/// that forgets `use_test_path` has the env var as its only lever; without
+/// this, learning a rejection here would poison the developer's real
+/// `~/.claurst/schema-quirks.json`.
+#[test]
+fn env_var_isolation_directs_the_store_in_test_builds() {
+    // No use_test_path here: the env var must be honored on its own. Other
+    // tests in this binary set their own thread-local override first, so the
+    // process-global env var is only visible to this thread's store access.
+    struct EnvGuard {
+        saved: Option<std::ffi::OsString>,
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var("CLAURST_SCHEMA_QUIRKS_PATH", v),
+                None => std::env::remove_var("CLAURST_SCHEMA_QUIRKS_PATH"),
+            }
+        }
+    }
+    let _guard = EnvGuard {
+        saved: std::env::var_os("CLAURST_SCHEMA_QUIRKS_PATH"),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("quirks.json");
+    std::env::set_var("CLAURST_SCHEMA_QUIRKS_PATH", &store);
+
+    // A rejection naming a keyword the table has not rejected live yet.
+    let learned = recover_description(
+        "openai",
+        "[openai] Invalid request: 'uniqueItems' is not permitted",
+    )
+    .expect("the rejection must be learned");
+    assert!(learned.contains("uniqueItems"), "{learned}");
+
+    let persisted = std::fs::read_to_string(&store).expect("env-directed store must be written");
+    assert!(
+        persisted.contains("uniqueItems"),
+        "the learned keyword must land in the env-directed store, not the real home: {persisted}"
+    );
+    // Reads must come back from the same store, including after the cache is
+    // dropped (simulating a restart).
+    quirks::reset_cache_for_tests();
+    let tools = vec![ToolDefinition {
+        name: "t".to_string(),
+        description: "d".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": { "tags": { "type": "array", "uniqueItems": true } }
+        }),
+    }];
+    assert!(
+        !filter_tools("openai", &tools)[0].input_schema["properties"]["tags"]
+            .get("uniqueItems")
+            .is_some(),
+        "the learned keyword must be stripped from later requests via the env-directed store"
+    );
+}

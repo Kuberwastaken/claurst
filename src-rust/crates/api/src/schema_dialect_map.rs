@@ -12,6 +12,12 @@ use claurst_schema_dialect::{normalize, recover_from_error, RecoveryAction};
 
 /// Dialect for `provider_id`, or `None` when no entry covers it. Unmapped
 /// providers keep receiving their schemas untouched.
+///
+/// azure / copilot / cohere speak the OpenAI function-calling subset: their
+/// request builders emit tools via the OpenAI wire format, so both the
+/// prevention filter and rejection recovery must apply the OpenAI dialect to
+/// them. Without this, a 400 naming a rejected keyword on those routes kills
+/// the turn where the same error on the openai route would self-heal.
 pub fn spec_for(provider_id: &str) -> Option<&'static DialectSpec> {
     match provider_id {
         "google" | "gemini" | "antigravity" => Some(match provider_id {
@@ -20,7 +26,7 @@ pub fn spec_for(provider_id: &str) -> Option<&'static DialectSpec> {
         }),
         "bedrock" => Some(&registry::BEDROCK),
         "anthropic" => Some(&registry::ANTHROPIC),
-        "openai" => Some(&registry::OPENAI),
+        "openai" | "azure" | "copilot" | "cohere" => Some(&registry::OPENAI),
         "openrouter" => Some(&registry::OPENROUTER),
         _ => None,
     }
@@ -88,6 +94,34 @@ mod tests {
         let tools = tool(json!({ "$schema": "https://example.com", "type": "object" }));
         let filtered = filter_tools("someunknown", &tools);
         assert!(filtered[0].input_schema.get("$schema").is_some());
+    }
+
+    #[test]
+    fn openai_wire_providers_share_the_openai_dialect() {
+        // azure / copilot / cohere emit tools through the OpenAI wire format,
+        // so both prevention and rejection recovery must use the OpenAI
+        // dialect for them.
+        let tools = tool(json!({
+            "type": "object",
+            "properties": { "data": { "type": "object", "propertyNames": { "type": "string" } } },
+        }));
+        for provider in ["openai", "azure", "copilot", "cohere"] {
+            let filtered = filter_tools(provider, &tools);
+            assert!(
+                filtered[0].input_schema["properties"]["data"]
+                    .get("propertyNames")
+                    .is_none(),
+                "prevention must strip for {provider}"
+            );
+            let recovered = recover_description(
+                provider,
+                "[openai] Invalid request: 'uniqueItems' is not permitted.",
+            );
+            assert!(
+                recovered.is_some(),
+                "a rejection naming a keyword must be actionable for {provider}"
+            );
+        }
     }
 
     #[test]

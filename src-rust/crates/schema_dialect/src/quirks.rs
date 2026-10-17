@@ -33,6 +33,17 @@ fn store_path() -> Option<PathBuf> {
     if let Some(override_path) = test_override() {
         return Some(override_path);
     }
+    // An explicit CLAURST_SCHEMA_QUIRKS_PATH opts into a specific store even
+    // under test builds: integration tests of dependents compile this crate
+    // without dev-dep visibility of use_test_path, and the env var is their
+    // only isolation lever. Checked before the fail-closed gate below so the
+    // opt-in is honored wherever it is set.
+    if let Some(explicit) = std::env::var("CLAURST_SCHEMA_QUIRKS_PATH")
+        .ok()
+        .filter(|path| !path.is_empty())
+    {
+        return Some(PathBuf::from(explicit));
+    }
     // A test that forgot to isolate itself must not read or write the real
     // store. This is not hypothetical: an earlier version of the test hook used
     // a process-global env var, and because tests run in parallel one of them
@@ -47,9 +58,6 @@ fn store_path() -> Option<PathBuf> {
     }
     #[cfg(not(any(test, feature = "test-support")))]
     {
-        if let Ok(explicit) = std::env::var("CLAURST_SCHEMA_QUIRKS_PATH") {
-            return Some(PathBuf::from(explicit));
-        }
         let home = if let Ok(claurst_home) = std::env::var("CLAURST_HOME") {
             PathBuf::from(claurst_home)
         } else {

@@ -753,6 +753,9 @@ pub async fn run_query_loop(
         // recoverable: learn the construct globally, then restart the turn so
         // `provider_tools` is re-filtered without it. Once per turn: a retry
         // the dialect cannot improve would loop on a byte-identical request.
+        // The transient budgets reset with the fresh request, matching the
+        // fresh-continuation reset above: a turn that already spent retries
+        // before the rejection must not re-enter with a depleted budget.
         macro_rules! recover_schema {
             ($provider_id:expr, $err:expr) => {{
                 if !schema_recovery_used {
@@ -761,6 +764,8 @@ pub async fn run_query_loop(
                         &$err.to_string(),
                     ) {
                         schema_recovery_used = true;
+                        retry_attempt = 0;
+                        max_tokens_recovery_count = 0;
                         warn!(
                             provider = %$provider_id,
                             learned = %what,
@@ -4402,6 +4407,196 @@ mod tests {
             .filter(|m| m.get_all_text() == MAX_STEPS_DEGRADATION_MSG)
             .count();
         assert_eq!(prompts, 1, "summary prompt must appear exactly once");
+    }
+
+    // ---- schema-rejection recovery (claurst-schema-dialect) ----------------
+
+    /// Serializes tests that mutate process env. The schema-recovery test
+    /// redirects the quirk store and the auth store via env vars, which are
+    /// process-global while tests run in parallel.
+    static SCHEMA_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// Saves and clears the env keys the schema-recovery test needs, restoring
+    /// them on drop.
+    struct SchemaEnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl SchemaEnvGuard {
+        fn new(keys: &[&'static str]) -> Self {
+            let saved = keys
+                .iter()
+                .map(|k| (*k, std::env::var_os(k)))
+                .collect::<Vec<_>>();
+            for k in keys {
+                std::env::remove_var(k);
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for SchemaEnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// A 400-class rejection naming a JSON Schema keyword, shaped like what
+    /// `parse_error_response` produces for an OpenAI-wire provider.
+    fn schema_rejection() -> claurst_api::ProviderError {
+        claurst_api::parse_error_response(
+            400,
+            r#"{"error":{"message":"'uniqueItems' is not permitted","type":"invalid_request_error"}}"#,
+            &claurst_core::provider_id::ProviderId::new("azure"),
+        )
+    }
+
+    /// Drive the loop against a scripted provider registered under a real
+    /// provider id ("azure" speaks the OpenAI wire dialect, so `recover_schema!`
+    /// sees a dialect-mapped route, while route resolution has no real azure
+    /// credentials to prefer over the scripted double).
+    async fn drive_schema_scripted(steps: Vec<ScriptStep>, max_retries: u32) -> ScriptedRun {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = Arc::new(ScriptedProvider {
+            id: claurst_core::provider_id::ProviderId::new("azure"),
+            steps: StdMutex::new(steps.into()),
+            calls: calls.clone(),
+        });
+        let mut registry = claurst_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+
+        let mut ctx = deny_all_context();
+        ctx.session_id = "schema-recovery-test".to_string();
+        ctx.config.provider = Some("azure".to_string());
+
+        let mut config = make_config(None, None);
+        config.model = "mock-model".to_string();
+        config.provider_registry = Some(Arc::new(registry));
+        config.retry = claurst_api::RetryConfig {
+            max_retries,
+            initial_delay: std::time::Duration::from_millis(1),
+            ..claurst_api::RetryConfig::default()
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut messages = vec![Message::user("start")];
+        let mut pending = Vec::new();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &noop_tools(),
+                &ctx,
+                &config,
+                claurst_core::cost::CostTracker::new(),
+                Some(tx),
+                tokio_util::sync::CancellationToken::new(),
+                Some(&mut pending),
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        ScriptedRun {
+            outcome,
+            calls: calls.load(std::sync::atomic::Ordering::SeqCst),
+            events,
+            messages,
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    // SCHEMA_ENV_LOCK must stay held across the scripted run below: the env
+    // vars it protects are process-global and other parallel tests would
+    // observe them mid-run. tokio::test runs single-threaded, so the sync
+    // mutex can never actually contend here.
+    async fn schema_recovery_retries_the_turn_and_refreshes_transient_budgets() {
+        // Route resolution prefers auth-store providers, and the quirk store
+        // defaults to the developer's real file, so both must be redirected
+        // for the duration of this test.
+        let _env_lock = SCHEMA_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let quirks_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let _guard = SchemaEnvGuard::new(&[
+            "CLAURST_SCHEMA_QUIRKS_PATH",
+            "CLAURST_HOME",
+            "AZURE_API_KEY",
+            "AZURE_RESOURCE_NAME",
+        ]);
+        std::env::set_var(
+            "CLAURST_SCHEMA_QUIRKS_PATH",
+            quirks_dir.path().join("quirks.json"),
+        );
+        std::env::set_var("CLAURST_HOME", home_dir.path());
+
+        // The single transient retry is spent on a 503; the fresh request then
+        // hits a schema rejection naming `uniqueItems`, which recovers the
+        // turn. The request after the recovery gets another 503: it must be
+        // retried again, because the schema recovery refreshed the transient
+        // budget along with the turn.
+        let run = drive_schema_scripted(
+            vec![
+                ScriptStep::Fail(server_error(503)),
+                ScriptStep::Fail(schema_rejection()),
+                ScriptStep::Fail(server_error(503)),
+            ],
+            1,
+        )
+        .await;
+        assert!(
+            matches!(run.outcome, QueryOutcome::EndTurn { .. }),
+            "both recoveries must chain, not fail the run: {:?}",
+            run.outcome
+        );
+        // 503 retry, schema-recovery retry, post-recovery 503 retry, final.
+        assert_eq!(run.calls, 4, "every recovery must restart the request");
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    QueryEvent::Retry {
+                        attempt: 1,
+                        max_attempts: 1,
+                        ..
+                    }
+                ))
+                .count(),
+            2,
+            "the transient budget must be full again after schema recovery: {:?}",
+            run.events
+        );
+        assert!(
+            run.messages
+                .iter()
+                .any(|m| m.get_all_text().contains("final answer")),
+            "the recovered turn must complete normally"
+        );
+        // The learned keyword must live in the redirected store, never the
+        // developer's real one.
+        let store = std::fs::read_to_string(quirks_dir.path().join("quirks.json"))
+            .expect("the learned quirk must be persisted");
+        assert!(
+            store.contains("uniqueItems"),
+            "the learned keyword must be recorded: {store}"
+        );
     }
 
     // ---- Issue #441: compaction check points --------------------------------
