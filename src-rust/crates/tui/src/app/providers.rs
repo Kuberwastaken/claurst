@@ -424,6 +424,11 @@ impl App {
             None => self.set_model(route.to_string()),
         }
         self.sync_cost_pricing();
+        self.status_message = Some(format!(
+            "Switched to {} · {}.",
+            self.config.provider.as_deref().unwrap_or("anthropic"),
+            self.model_name,
+        ));
         self.refresh_context_window_size();
         self.context_used_tokens = 0;
     }

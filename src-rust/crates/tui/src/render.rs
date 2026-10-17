@@ -811,6 +811,11 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_dialog_select(frame, &app.connect_dialog, size);
     }
 
+    // Provider-failover chooser (opened from a failover-class error).
+    if let Some(picker) = app.failover_dialog.picker.as_ref() {
+        render_dialog_select(frame, picker, size);
+    }
+
     // API key input dialog (opened from /connect for key-based providers)
     if app.key_input_dialog.visible {
         render_key_input_dialog(frame, &app.key_input_dialog, size);

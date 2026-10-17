@@ -4524,6 +4524,21 @@ async fn run_interactive(
                     while app.notifications.current_is_error() {
                         app.notifications.dismiss_current();
                     }
+                    // A failover-class error already opened the interactive
+                    // chooser; the error modal would only cover it.
+                    if claurst_api::failover::parse_failover_prompt_message(&err.to_string())
+                        .map(|prompt| app.failover_dialog.open_for(&prompt).is_some())
+                        .unwrap_or(false)
+                    {
+                        // Sync the updated conversation back to our local vector
+                        messages = msgs_arc.lock().await.clone();
+                        if aborted {
+                            messages.push(claurst_core::types::Message::user(
+                                claurst_core::system_prompt::TURN_ABORTED_MESSAGE,
+                            ));
+                        }
+                        continue;
+                    }
                     app.notifications.push(
                         claurst_tui::notifications::NotificationKind::Error,
                         err.to_string(),

@@ -1164,6 +1164,76 @@ use super::types::{ContextMenuItem, ContextMenuState};
 
     // ---- failover route application (interactive provider failover) ----
 
+    fn failover_prompt(routes: &[&str]) -> claurst_api::failover::ProviderFailoverPrompt {
+        claurst_api::failover::ProviderFailoverPrompt {
+            from_provider: "anthropic".into(),
+            from_label: "Anthropic".into(),
+            from_model: "claude-sonnet-5".into(),
+            routes: routes.iter().map(|r| r.to_string()).collect(),
+            reason: "429".into(),
+            mark_unavailable: false,
+        }
+    }
+
+    #[test]
+    fn failover_dialog_opens_with_routes_and_closes_cleanly() {
+        let mut app = make_app();
+        assert!(!app.failover_dialog.is_open());
+        app.failover_dialog
+            .open_for(&failover_prompt(&["google/gemini-3-pro", "openai/gpt-5.4"]))
+            .expect("routes should build a picker");
+        assert!(app.failover_dialog.is_open());
+        assert_eq!(
+            app.failover_dialog.from_provider.as_deref(),
+            Some("anthropic")
+        );
+        app.failover_dialog.close();
+        assert!(!app.failover_dialog.is_open());
+        assert_eq!(app.failover_dialog.from_provider, None);
+    }
+
+    #[test]
+    fn failover_dialog_rejects_empty_routes() {
+        let mut app = make_app();
+        assert!(app.failover_dialog.open_for(&failover_prompt(&[])).is_none());
+        assert!(!app.failover_dialog.is_open());
+    }
+
+    #[test]
+    fn failover_a_key_switches_and_marks_provider_unavailable() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = make_app();
+        app.config.provider = Some("anthropic".into());
+        app.failover_dialog
+            .open_for(&failover_prompt(&["google/gemini-3-pro", "openai/gpt-5.4"]))
+            .expect("routes should build a picker");
+        let handled = app.handle_key_event(press_key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(!handled, "failover chooser consumes the key");
+        assert!(!app.failover_dialog.is_open());
+        assert!(app.failover_dialog.unavailable.contains(&"anthropic".to_string()));
+        assert_eq!(app.config.provider.as_deref(), Some("google"));
+        assert_eq!(app.config.model.as_deref(), Some("gemini-3-pro"));
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("anthropic: Switched to google · gemini-3-pro.")
+        );
+    }
+
+    #[test]
+    fn failover_enter_key_switches_without_marking_unavailable() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = make_app();
+        app.config.provider = Some("anthropic".into());
+        app.failover_dialog
+            .open_for(&failover_prompt(&["google/gemini-3-pro", "openai/gpt-5.4"]))
+            .expect("routes should build a picker");
+        let handled = app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!handled, "failover chooser consumes the key");
+        assert!(!app.failover_dialog.is_open());
+        assert!(app.failover_dialog.unavailable.is_empty());
+        assert_eq!(app.config.provider.as_deref(), Some("google"));
+    }
+
     #[test]
     fn failover_route_applies_provider_and_model() {
         let mut app = make_app();

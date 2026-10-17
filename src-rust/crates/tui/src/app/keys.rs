@@ -618,6 +618,11 @@ impl App {
                                 if let Some(selected) = picker.selected().cloned() {
                                     self.failover_dialog.close();
                                     self.apply_failover_route(&selected.id);
+                                    self.status_message = Some(format!(
+                                        "{}: {}",
+                                        from,
+                                        self.status_message.take().unwrap_or_default(),
+                                    ));
                                 }
                             }
                         }
