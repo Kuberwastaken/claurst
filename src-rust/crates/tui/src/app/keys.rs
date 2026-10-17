@@ -112,6 +112,7 @@ pub(super) fn key_event_to_keystroke(key: &KeyEvent) -> Option<ParsedKeystroke> 
         KeyCode::Enter     => "enter".to_string(),
         KeyCode::Esc       => "escape".to_string(),
         KeyCode::Home      => "home".to_string(),
+        KeyCode::Insert    => "insert".to_string(),
         KeyCode::Left      => "left".to_string(),
         KeyCode::PageDown  => "pagedown".to_string(),
         KeyCode::PageUp    => "pageup".to_string(),
@@ -244,27 +245,53 @@ impl App {
         // Accepting is remembered in settings.json (skipDangerousModePermissionPrompt)
         // so the warning is shown once, not on every launch.
         if self.bypass_permissions_dialog.visible {
-            match key.code {
-                KeyCode::Char('1') | KeyCode::Esc => {
-                    // "No, exit" — quit immediately
-                    self.should_exit = true;
+            // When the dialog was opened by `/yolo` at runtime, acceptance
+            // activates YOLO mode and declining cancels the toggle (no exit).
+            let yolo_runtime = self.yolo_pending;
+            let accepted = match key.code {
+                // "No, exit"
+                KeyCode::Char('1') | KeyCode::Esc => Some(false),
+                // "Yes, I accept"
+                KeyCode::Char('2') => Some(true),
+                KeyCode::Enter => Some(self.bypass_permissions_dialog.is_accept_selected()),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.bypass_permissions_dialog.select_prev();
+                    None
                 }
-                KeyCode::Char('2') => {
-                    // "Yes, I accept" — dismiss and continue
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.bypass_permissions_dialog.select_next();
+                    None
+                }
+                _ => None,
+            };
+            match accepted {
+                Some(true) => {
                     self.bypass_permissions_dialog.dismiss();
-                    let _ = Self::persist_bypass_permissions_accepted();
-                }
-                KeyCode::Up | KeyCode::Char('k') => self.bypass_permissions_dialog.select_prev(),
-                KeyCode::Down | KeyCode::Char('j') => self.bypass_permissions_dialog.select_next(),
-                KeyCode::Enter => {
-                    if self.bypass_permissions_dialog.is_accept_selected() {
-                        self.bypass_permissions_dialog.dismiss();
+                    if yolo_runtime {
+                        // Runtime `/yolo` is session-only: never write settings.json.
+                        self.yolo_pending = false;
+                        self.config.permission_mode =
+                            claurst_core::PermissionMode::BypassPermissions;
+                        self.status_message = Some(
+                            "YOLO mode on. All permission prompts bypassed.".to_string(),
+                        );
+                    } else {
                         let _ = Self::persist_bypass_permissions_accepted();
+                    }
+                }
+                Some(false) => {
+                    // For the startup gate, quit immediately. For `/yolo`,
+                    // just cancel the toggle (and hide the dialog).
+                    if yolo_runtime {
+                        self.yolo_pending = false;
+                        self.yolo_previous_mode = None;
+                        self.bypass_permissions_dialog.dismiss();
+                        self.status_message = Some("YOLO mode cancelled.".to_string());
                     } else {
                         self.should_exit = true;
                     }
                 }
-                _ => {}
+                None => {}
             }
             return false;
         }
@@ -833,21 +860,57 @@ impl App {
         }
 
         // Session browser: Rename and Confirm modes intercept raw character
-        // input here. Browse mode falls through to the keybinding resolver,
-        // which handles its actions via KeyContext::SessionBrowser (see
-        // handle_keybinding_action) so all keys stay configurable.
+        // input here. Browse mode routes every key through the keybinding
+        // resolver in SessionBrowser context: matched keys run their action,
+        // unmatched keys are swallowed so they never leak into the prompt
+        // editor (issue #407 review).
         if self.session_browser.visible {
             use crate::session_browser::SessionBrowserMode;
             match self.session_browser.mode {
                 SessionBrowserMode::Browse => {
-                    // Handled by the keybinding resolver below; keep flowing.
+                    // The generic resolver at the bottom of this function
+                    // never runs while an overlay owns the screen, so resolve
+                    // here, in this overlay's context. Chord state stays
+                    // coherent because both call sites share one resolver.
+                    if let Some(keystroke) = key_event_to_keystroke(&key) {
+                        match self
+                            .keybindings
+                            .process(keystroke, &KeyContext::SessionBrowser)
+                        {
+                            KeybindingResult::Action(action) => {
+                                self.handle_keybinding_action(&action);
+                            }
+                            KeybindingResult::Pending
+                            | KeybindingResult::NoMatch
+                            | KeybindingResult::Unbound => {}
+                        }
+                    } else {
+                        self.keybindings.cancel_chord();
+                    }
+                    return false;
                 }
                 SessionBrowserMode::Rename => {
                     match key.code {
                         KeyCode::Esc => self.session_browser.cancel(),
                         KeyCode::Enter => {
-                            if let Some((_id, name)) = self.session_browser.confirm_rename() {
-                                self.session_title = Some(name.clone());
+                            if let Some((id, name)) = self.session_browser.confirm_rename() {
+                                // Persist the rename for the selected session
+                                // (any entry, not just the live one) in the
+                                // background so the key handler stays sync.
+                                let persisted_id = id.clone();
+                                let persisted_name = name.clone();
+                                tokio::spawn(async move {
+                                    let _ = claurst_core::history::rename_session(
+                                        &persisted_id,
+                                        &persisted_name,
+                                    )
+                                    .await;
+                                });
+                                // The live-session title only changes when the
+                                // renamed entry IS the current session.
+                                if Some(id.as_str()) == self.current_session_id.as_deref() {
+                                    self.session_title = Some(name.clone());
+                                }
                                 self.status_message = Some(format!("Renamed to: {}", name));
                             }
                         }
@@ -855,7 +918,6 @@ impl App {
                         KeyCode::Char(c) => self.session_browser.push_rename_char(c),
                         _ => {}
                     }
-                    return false;
                 }
                 SessionBrowserMode::Confirm => {
                     match key.code {
@@ -865,9 +927,9 @@ impl App {
                         }
                         _ => {}
                     }
-                    return false;
                 }
             }
+            return false;
         }
 
         // Tasks overlay intercepts navigation and Esc
@@ -1183,6 +1245,10 @@ impl App {
         if let Some(keystroke) = key_event_to_keystroke(&key) {
             let had_pending_chord = self.keybindings.has_pending_chord();
             match self.keybindings.process(keystroke, &key_context) {
+                // Contextual actions that do not apply right now fall through,
+                // so their key keeps its ordinary meaning (Alt+Up scrolls when
+                // nothing is queued).
+                KeybindingResult::Action(action) if !self.keybinding_action_applies(&action) => {}
                 KeybindingResult::Action(action) => {
                     return self.handle_keybinding_action(&action);
                 }
@@ -1344,17 +1410,6 @@ impl App {
         }
 
         match key.code {
-            // ---- ESC: cancel streaming (status bar advertises "esc interrupt") ----
-            KeyCode::Esc if self.is_streaming => {
-                self.is_streaming = false;
-                self.spinner_verb = None;
-                self.streaming_text.clear();
-                self.streaming_thinking.clear();
-                self.tool_use_blocks.clear();
-                self.status_message = Some("Cancelled.".to_string());
-                self.complete_current_turn_snapshot(true);
-            }
-
             // ---- Quit / cancel ----------------------------------------
             // Accept both 'c' and 'C' so Shift+Ctrl+C also triggers copy
             // (issue #149 follow-up).
@@ -1370,15 +1425,8 @@ impl App {
                     if copied {
                         self.push_notification(NotificationKind::Info, "Copied to clipboard".to_string(), Some(2));
                     }
-                } else if self.is_streaming {
-                    // Cancel streaming.
-                    self.is_streaming = false;
-                    self.spinner_verb = None;
-                    self.streaming_text.clear();
-                    self.streaming_thinking.clear();
-                    self.tool_use_blocks.clear();
-                    self.status_message = Some("Cancelled.".to_string());
-                    self.complete_current_turn_snapshot(true);
+                } else if self.turn_running() {
+                    self.interrupt_turn();
                 } else {
                     // No text selected and not streaming: handle exit confirmation sequence.
                     // Always clear the prompt input on Ctrl+C.
@@ -1499,7 +1547,21 @@ impl App {
             KeyCode::Char(c) => {
                 let c = self.shift_normalize(c, key.modifiers);
                 if self.prompt_input.vim_enabled && self.prompt_input.vim_mode != VimMode::Insert {
-                    self.prompt_input.vim_command(&c.to_string());
+                    // Ctrl+V is vim's block-visual key: feed the vim state
+                    // machine the \x16 control code instead of the plain 'v'
+                    // character so it reaches the `key == "\x16"` branch in
+                    // `vim_command` (issue #495). In insert mode the clipboard
+                    // paste handler earlier in this function consumed it
+                    // instead.
+                    let vim_key = if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && c == 'v'
+                        && self.prompt_input.vim_mode == VimMode::Normal
+                    {
+                        "\x16".to_string()
+                    } else {
+                        c.to_string()
+                    };
+                    self.prompt_input.vim_command(&vim_key);
                 } else {
                     self.prompt_input.insert_char(c);
                 }
@@ -1703,8 +1765,6 @@ impl App {
     pub(super) fn current_key_context(&self) -> KeyContext {
         if self.diff_viewer.visible {
             KeyContext::DiffDialog
-        } else if self.session_browser.visible {
-            KeyContext::SessionBrowser
         } else if self.agents_menu.visible || self.mcp_view.visible || self.stats_dialog.visible {
             KeyContext::Select
         } else if self.import_config_dialog.visible {
@@ -1965,14 +2025,21 @@ impl App {
             },
             RewindStep::Confirming { .. } => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    if let Some(idx) = self.rewind_flow.accept_confirm() {
-                        // Truncate conversation to the selected message index.
-                        self.messages.truncate(idx);
-                        // Remove system annotations placed after the truncation point.
-                        self.system_annotations.retain(|a| a.after_index <= idx);
+                    if let Some(position) = self.rewind_flow.accept_confirm() {
+                        // Below `rewind_archive_len` the position is inside a
+                        // compaction's replaced head (issue #449): the host
+                        // restores that history from the session. Either way
+                        // the host maps it onto the model history (#484).
+                        if let Some(idx) = position.checked_sub(self.rewind_archive_len) {
+                            // Truncate conversation to the selected message index.
+                            self.messages.truncate(idx);
+                            // Remove system annotations placed after the truncation point.
+                            self.system_annotations.retain(|a| a.after_index <= idx);
+                        }
+                        self.pending_rewind = Some(position);
                         self.push_notification(
                             NotificationKind::Success,
-                            format!("Rewound to message #{}", idx),
+                            format!("Rewound to message #{}", position),
                             Some(4),
                         );
                     }
@@ -2045,16 +2112,27 @@ impl App {
         self.exit_key_sequence_start = Some(key_char);
     }
 
+    /// Whether a contextual keybinding action has anything to act on.
+    /// Actions that do not apply leave the key to the hardcoded handlers.
+    fn keybinding_action_applies(&self, action: &str) -> bool {
+        match action {
+            "editQueued" | "removeQueued" => self.pending_prompts().next().is_some(),
+            // Idle Esc keeps its other meanings (vim, transcript focus). There
+            // is no backtrack picker, so Esc-Esc on an idle prompt does nothing.
+            "cancelTurn" => self.turn_running(),
+            _ => true,
+        }
+    }
+
     pub(super) fn handle_keybinding_action(&mut self, action: &str) -> bool {
         match action {
+            "cancelTurn" => {
+                self.interrupt_turn();
+                false
+            }
             "interrupt" => {
-                if self.is_streaming {
-                    self.is_streaming = false;
-                    self.spinner_verb = None;
-                    self.streaming_text.clear();
-                    self.streaming_thinking.clear();
-                    self.tool_use_blocks.clear();
-                    self.status_message = Some("Cancelled.".to_string());
+                if self.turn_running() {
+                    self.interrupt_turn();
                 } else {
                     // Handle exit confirmation: require two exit key presses within 2 seconds.
                     // Always clear the prompt input on Ctrl+C.
@@ -2097,15 +2175,11 @@ impl App {
                 false
             }
             "prevSessionPage" => {
-                for _ in 0..8 {
-                    self.session_browser.select_prev();
-                }
+                self.session_browser.select_prev_page();
                 false
             }
             "nextSessionPage" => {
-                for _ in 0..8 {
-                    self.session_browser.select_next();
-                }
+                self.session_browser.select_next_page();
                 false
             }
             "closeSessionBrowser" => {
@@ -2131,7 +2205,11 @@ impl App {
                 self.session_browser.toggle_show_paths();
                 self.status_message = Some(format!(
                     "Session paths {}.",
-                    if self.session_browser.show_paths { "shown" } else { "hidden" }
+                    if self.session_browser.show_paths {
+                        "shown"
+                    } else {
+                        "hidden"
+                    }
                 ));
                 false
             }
@@ -2147,7 +2225,11 @@ impl App {
                 self.history_search = Some(hs);
                 false
             }
-            "openSearch" => {
+            // `globalSearch` is the legacy/default action name and
+            // `openSearch` is the live one; both open project search
+            // (issue #495). Keep them aliased so old keybindings.json
+            // files and the default ctrl+shift+f binding keep working.
+            "openSearch" | "globalSearch" => {
                 self.global_search.open();
                 self.refresh_global_search();
                 false
@@ -2416,6 +2498,23 @@ impl App {
                 }
                 false
             }
+            "editQueued" => {
+                self.edit_last_pending();
+                false
+            }
+            "removeQueued" => {
+                self.remove_last_pending();
+                false
+            }
+            "indent" if self.turn_running() && self.prompt_input.suggestions.is_empty() => {
+                // Tab during a turn: queue the prompt as a new turn for after
+                // this one ends (#444). Enter would steer it into this turn.
+                let input = self.take_input();
+                if !input.is_empty() {
+                    self.queued_messages.push_back(input);
+                }
+                false
+            }
             "indent" => {
                 // Tab: cycle agent mode when prompt is empty, accept
                 // slash-command suggestion otherwise.
@@ -2491,99 +2590,17 @@ impl App {
     }
 
     /// Handle a key event while a permission dialog is active.
+    ///
+    /// The decision itself (and any rule it saves) is applied by the event
+    /// loop that owns the pending request; this only drives the dialog and
+    /// closes it once an option is confirmed.
     pub(super) fn handle_permission_key(&mut self, key: KeyEvent) {
-        let pr = match self.permission_request.as_mut() {
-            Some(p) => p,
-            None => return,
-        };
-
-        match key.code {
-            KeyCode::Char(c) => {
-                if let Some(digit) = c.to_digit(10) {
-                    let idx = (digit as usize).saturating_sub(1);
-                    if idx < pr.options.len() {
-                        pr.selected_option = idx;
-                    }
-                } else {
-                    // Check if any option matches this key.
-                    let mut matched_idx = None;
-                    for (i, opt) in pr.options.iter().enumerate() {
-                        if opt.key == c {
-                            matched_idx = Some(i);
-                            break;
-                        }
-                    }
-                    if let Some(idx) = matched_idx {
-                        pr.selected_option = idx;
-                        // If this is the prefix-allow option ('P'), record the prefix.
-                        self.maybe_record_bash_prefix();
-                        self.permission_request = None;
-                    }
-                }
-            }
-            KeyCode::Enter => {
-                // If the currently selected option is the prefix-allow option, record it.
-                self.maybe_record_bash_prefix();
-                self.permission_request = None;
-            }
-            KeyCode::Up => {
-                let pr = self.permission_request.as_mut().unwrap();
-                if pr.selected_option > 0 {
-                    pr.selected_option -= 1;
-                }
-            }
-            KeyCode::Down => {
-                let pr = self.permission_request.as_mut().unwrap();
-                if pr.selected_option + 1 < pr.options.len() {
-                    pr.selected_option += 1;
-                }
-            }
-            KeyCode::Esc => {
-                self.permission_request = None;
-            }
-            _ => {}
-        }
-    }
-
-    /// If the active permission dialog's selected option is the prefix-allow
-    /// option ('P') for a Bash dialog, extract the suggested prefix and add it
-    /// to `bash_prefix_allowlist` so future requests with the same prefix are
-    /// silently approved.
-    pub(super) fn maybe_record_bash_prefix(&mut self) {
-        use crate::dialogs::PermissionDialogKind;
-        let pr = match self.permission_request.as_ref() {
-            Some(p) => p,
-            None => return,
-        };
-        // Only act on Bash dialogs where the selected option key is 'P'.
-        let selected_key = pr.options.get(pr.selected_option).map(|o| o.key);
-        if selected_key != Some('P') {
+        let Some(pr) = self.permission_request.as_mut() else {
             return;
+        };
+        if crate::dialogs::handle_permission_key(pr, key) {
+            self.permission_request = None;
         }
-        if let PermissionDialogKind::Bash { command, .. } = &pr.kind {
-            // Always normalize to the first whitespace-delimited word so
-            // that the allowlist check in `bash_command_allowed_by_prefix`
-            // (which also uses `split_whitespace().next()`) matches correctly.
-            let first_word = command.split_whitespace().next().unwrap_or("").to_string();
-            if !first_word.is_empty() {
-                self.bash_prefix_allowlist.insert(first_word.clone());
-                // Persist so the "always allow" choice survives restarts.
-                if let Ok(mut settings) = claurst_core::config::Settings::load_sync() {
-                    if !settings.allowed_bash_prefixes.contains(&first_word) {
-                        settings.allowed_bash_prefixes.push(first_word);
-                        let _ = settings.save_sync();
-                    }
-                }
-            }
-        }
-    }
-
-    /// Returns `true` if the given bash `command` is covered by the session-local
-    /// prefix allowlist (i.e. its first word matches an entry in
-    /// `bash_prefix_allowlist`).  Used by callers to skip the permission dialog.
-    pub fn bash_command_allowed_by_prefix(&self, command: &str) -> bool {
-        let first_word = command.split_whitespace().next().unwrap_or("");
-        !first_word.is_empty() && self.bash_prefix_allowlist.contains(first_word)
     }
 
     pub(super) fn prompt_can_accept_selection_paste(&self) -> bool {

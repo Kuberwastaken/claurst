@@ -2963,6 +2963,7 @@ async fn run_interactive(
                                     }
                                     app.config.project_dir =
                                         Some(tool_ctx.working_dir.clone());
+                                    app.current_session_id = Some(session.id.clone());
                                     app.attach_turn_diff_state(
                                         tool_ctx.file_history.clone(),
                                         tool_ctx.current_turn.clone(),
@@ -4403,6 +4404,7 @@ async fn run_interactive(
                         claurst_core::file_history::FileHistory::new(),
                     ));
                     tool_ctx.current_turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    app.current_session_id = Some(session.id.clone());
                     app.attach_turn_diff_state(
                         tool_ctx.file_history.clone(),
                         tool_ctx.current_turn.clone(),

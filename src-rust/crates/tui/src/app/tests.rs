@@ -1162,11 +1162,14 @@ use crate::session_browser::SessionBrowserMode;
             last_updated: "just now".to_string(),
             message_count: 1,
             cost_usd: 0.0,
+            working_dir: None,
         }]);
         app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(!app.session_browser.visible);
-        assert_eq!(app.prompt_input.text, "/resume abc-123");
-        assert!(app.pending_auto_submit);
+        // Enter routes through the keybinding resolver: the resume is
+        // signalled to the main loop, not typed into the prompt.
+        assert_eq!(app.session_resume_pending.as_deref(), Some("abc-123"));
+        assert!(app.prompt_input.text.is_empty());
     }
 
     // ---- free-mode context window (issues #393, #394) ----

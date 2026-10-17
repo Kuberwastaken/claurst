@@ -5,7 +5,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::overlays::centered_rect;
@@ -113,6 +113,23 @@ impl SessionBrowserState {
         self.selected_idx = (self.selected_idx + 1) % count;
     }
 
+    /// How many entries one PageUp/PageDown press jumps.
+    pub const PAGE_STEP: usize = 8;
+
+    /// Move selection up one page, clamping at the first entry (no wrap).
+    pub fn select_prev_page(&mut self) {
+        self.selected_idx = self.selected_idx.saturating_sub(Self::PAGE_STEP);
+    }
+
+    /// Move selection down one page, clamping at the last entry (no wrap).
+    pub fn select_next_page(&mut self) {
+        let count = self.sessions.len();
+        if count == 0 {
+            return;
+        }
+        self.selected_idx = (self.selected_idx + Self::PAGE_STEP).min(count - 1);
+    }
+
     /// Toggle whether each session's working-directory path is shown.
     pub fn toggle_show_paths(&mut self) {
         self.show_paths = !self.show_paths;
@@ -128,10 +145,16 @@ impl SessionBrowserState {
         self.sessions.get(self.selected_idx)
     }
 
-    /// Switch to rename mode, pre-populating the input with the current title.
+    /// Switch to rename mode. A real title pre-populates the input; a
+    /// placeholder like "(untitled)" must not, or it would be baked into the
+    /// saved name.
     pub fn start_rename(&mut self) {
         if let Some(session) = self.sessions.get(self.selected_idx) {
-            self.rename_input = session.title.clone();
+            self.rename_input = if session.title == "(untitled)" {
+                String::new()
+            } else {
+                session.title.clone()
+            };
             self.mode = SessionBrowserMode::Rename;
         }
     }
@@ -257,16 +280,21 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
 
     // --- Layout: list area, preview area, hint area ------------------------
     // Borders consume 2 rows; the hint bar gets 2 lines (hint + spacer).
+    // Every region is clamped to `inner` so short terminals degrade instead
+    // of panicking on out-of-bounds renders.
     let inner = Rect {
         x: dialog_area.x + 1,
         y: dialog_area.y + 1,
         width: dialog_area.width.saturating_sub(2),
         height: dialog_area.height.saturating_sub(2),
     };
-    let hint_h: u16 = 2;
-    let preview_h: u16 = if state.show_preview { 6 } else { 0 };
+    let hint_h: u16 = inner.height.min(2);
+    let preview_h: u16 = if state.show_preview {
+        inner.height.saturating_sub(hint_h).min(6)
+    } else {
+        0
+    };
     let list_h = inner.height.saturating_sub(hint_h + preview_h);
-    let list_area = Rect { height: list_h, ..inner };
     let preview_area = Rect {
         y: inner.y + list_h,
         height: preview_h,
@@ -294,7 +322,10 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
         let date_w: usize = 14;
         let msgs_w: usize = 5;
         let cost_w: usize = 9;
-        let fixed = date_w + msgs_w + cost_w + 6; // separators & padding
+        // 8 separator columns: 2 leading indent + 3 double spaces between
+        // the four cells. The rows must fit `inner_w` exactly or the Paragraph
+        // wraps them and each entry consumes two lines.
+        let fixed = date_w + msgs_w + cost_w + 8; // separators & padding
         let title_w = inner_w.saturating_sub(fixed).max(10);
 
         // Header row
@@ -317,11 +348,22 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
         list_lines.push(Line::from(""));
 
         // Visible-row window: show at most list_h-2 rows (header + blank),
-        // keeping the selection inside the window.
+        // keeping the selection inside the window. The budget is in LINES,
+        // so entries with a working-dir row (show_paths) count twice.
         let list_rows = list_h.saturating_sub(2) as usize;
-        let (window_start, window_end) = list_window(state.selected_idx, state.sessions.len(), list_rows);
+        let (window_start, window_end) = list_window(
+            state.selected_idx,
+            state.sessions.len(),
+            list_rows,
+            state.show_paths,
+        );
 
+        let mut lines_used = 0usize;
         for i in window_start..window_end {
+            if lines_used >= list_rows {
+                break;
+            }
+            lines_used += if state.show_paths { 2 } else { 1 };
             let session = &state.sessions[i];
             let is_selected = i == state.selected_idx;
 
@@ -373,15 +415,10 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
 
             // Optional working-directory row under each entry (toggle: `a`).
             if state.show_paths {
-                let path_display = session
-                    .working_dir
-                    .as_deref()
-                    .unwrap_or("(no working dir)");
+                let path_display = session.working_dir.as_deref().unwrap_or("(no working dir)");
                 let path_cell = truncate_display(path_display, inner_w.saturating_sub(4));
                 let path_style = if is_selected {
-                    Style::default()
-                        .fg(Color::Rgb(140, 160, 180))
-                        .bg(row_bg)
+                    Style::default().fg(Color::Rgb(140, 160, 180)).bg(row_bg)
                 } else {
                     Style::default().fg(Color::DarkGray)
                 };
@@ -442,32 +479,44 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
                 Span::styled("  ", Style::default()),
                 Span::styled(
                     "\u{2191}\u{2193}",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(" navigate  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "Enter",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=resume  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "r",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=rename  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "a",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=paths  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "p",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=preview  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "Esc",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=close", Style::default().fg(Color::DarkGray)),
             ]),
@@ -476,7 +525,9 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
             Line::from(vec![
                 Span::styled(
                     "  Rename: ",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("{}\u{2588}", state.rename_input),
@@ -489,12 +540,16 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
                 Span::styled("  ", Style::default()),
                 Span::styled(
                     "Enter",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=confirm  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "Esc",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=cancel", Style::default().fg(Color::DarkGray)),
             ]),
@@ -530,15 +585,11 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
         .title_alignment(Alignment::Center)
         .border_style(Style::default().fg(Color::Cyan));
 
-    use ratatui::widgets::Widget;
-    let inner_block = Block::default().borders(Borders::ALL);
-    let _ = inner_block; // layout already accounts for the outer borders
-
     Paragraph::new(list_lines)
-        .block(block.clone())
+        .block(block)
         .alignment(Alignment::Left)
         .wrap(Wrap { trim: false })
-        .render(list_area, buf);
+        .render(dialog_area, buf);
 
     if state.show_preview {
         Paragraph::new(preview_lines)
@@ -558,18 +609,22 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
         .render(hint_area, buf);
 }
 
-/// Compute the `[start, end)` window of rows to render so the selection stays
-/// visible. Scrolls the window only when the selection would leave it.
-fn list_window(selected: usize, total: usize, rows: usize) -> (usize, usize) {
-    if total == 0 || rows == 0 {
+/// Compute the `[start, end)` window of entries to render so the selection
+/// stays visible. `rows` is a budget in LINES: with `show_paths` each entry
+/// renders two lines, so the number of entries that fit is halved. Scrolls
+/// the window only when the selection would leave it.
+fn list_window(selected: usize, total: usize, rows: usize, show_paths: bool) -> (usize, usize) {
+    let lines_per_entry = if show_paths { 2 } else { 1 };
+    let capacity = rows.checked_div(lines_per_entry).unwrap_or(0);
+    if total == 0 || capacity == 0 {
         return (0, 0);
     }
-    let rows = rows.min(total);
-    if selected < rows {
-        return (0, rows);
+    let capacity = capacity.min(total);
+    if selected < capacity {
+        return (0, capacity);
     }
-    let start = (selected + 1).saturating_sub(rows);
-    (start, start + rows)
+    let start = (selected + 1).saturating_sub(capacity);
+    (start, start + capacity)
 }
 
 // ---------------------------------------------------------------------------
@@ -651,6 +706,50 @@ mod tests {
         assert_eq!(s.selected_idx, 2);
     }
 
+    // 4b. Page moves jump PAGE_STEP entries and clamp at both ends
+    // (no wrap), with an empty list staying put.
+    #[test]
+    fn select_page_clamps_and_steps() {
+        let mut s = SessionBrowserState::new();
+        let sessions: Vec<SessionEntry> = (0..20)
+            .map(|i| SessionEntry {
+                id: format!("sess-{:03}", i),
+                title: format!("Session {}", i),
+                last_updated: "1h ago".to_string(),
+                message_count: i,
+                cost_usd: 0.0,
+                working_dir: None,
+            })
+            .collect();
+        s.open(sessions);
+        assert_eq!(s.selected_idx, 0);
+
+        // Down from index 0: exactly PAGE_STEP forward, no wrap.
+        s.select_next_page();
+        assert_eq!(s.selected_idx, SessionBrowserState::PAGE_STEP);
+
+        // Up from PAGE_STEP: exactly PAGE_STEP back to the first entry.
+        s.select_prev_page();
+        assert_eq!(s.selected_idx, 0);
+
+        // Up at the top clamps at 0 instead of wrapping.
+        s.select_prev_page();
+        assert_eq!(s.selected_idx, 0);
+
+        // Down past the end clamps at the last entry.
+        for _ in 0..4 {
+            s.select_next_page();
+        }
+        assert_eq!(s.selected_idx, 19);
+
+        // Empty list: both directions are no-ops.
+        let mut empty = SessionBrowserState::new();
+        empty.open(vec![]);
+        empty.select_next_page();
+        empty.select_prev_page();
+        assert_eq!(empty.selected_idx, 0);
+    }
+
     // 5. selected_session() returns correct entry.
     #[test]
     fn selected_session_correct() {
@@ -670,6 +769,20 @@ mod tests {
         s.start_rename();
         assert_eq!(s.mode, SessionBrowserMode::Rename);
         assert_eq!(s.rename_input, "Refactor auth module");
+    }
+
+    // 6b. Renaming an untitled session starts from an empty input; the
+    // placeholder must not leak into the saved name.
+    #[test]
+    fn start_rename_untitled_starts_empty() {
+        let mut s = SessionBrowserState::new();
+        let mut sessions = sample_sessions();
+        sessions[0].title = "(untitled)".to_string();
+        s.open(sessions);
+        s.selected_idx = 0;
+        s.start_rename();
+        assert_eq!(s.mode, SessionBrowserMode::Rename);
+        assert_eq!(s.rename_input, "");
     }
 
     // 7. push_rename_char / pop_rename_char edit the input buffer.
@@ -695,7 +808,10 @@ mod tests {
         s.start_rename();
         s.rename_input = "  New Title  ".to_string(); // intentional whitespace
         let result = s.confirm_rename();
-        assert_eq!(result, Some(("sess-001".to_string(), "New Title".to_string())));
+        assert_eq!(
+            result,
+            Some(("sess-001".to_string(), "New Title".to_string()))
+        );
         assert_eq!(s.mode, SessionBrowserMode::Browse);
         assert!(s.rename_input.is_empty());
         // Also check local title was updated
@@ -721,7 +837,10 @@ mod tests {
         s.start_rename();
         s.cancel();
         assert_eq!(s.mode, SessionBrowserMode::Browse);
-        assert!(s.visible, "overlay should remain visible after cancel-from-rename");
+        assert!(
+            s.visible,
+            "overlay should remain visible after cancel-from-rename"
+        );
     }
 
     // 11. cancel() in Browse mode closes the overlay.
@@ -752,7 +871,11 @@ mod tests {
         let mut buf = Buffer::empty(area);
         render_session_browser(&s, area, &mut buf);
         for cell in buf.content() {
-            assert_eq!(cell.symbol(), " ", "buffer should be empty when browser is hidden");
+            assert_eq!(
+                cell.symbol(),
+                " ",
+                "buffer should be empty when browser is hidden"
+            );
         }
     }
 
@@ -787,16 +910,20 @@ mod tests {
     #[test]
     fn list_window_keeps_selection_visible() {
         // Early selection: window starts at 0.
-        assert_eq!(list_window(2, 50, 10), (0, 10));
+        assert_eq!(list_window(2, 50, 10, false), (0, 10));
         // Selection past the first page: window scrolls to keep it.
-        assert_eq!(list_window(15, 50, 10), (6, 16));
+        assert_eq!(list_window(15, 50, 10, false), (6, 16));
         // Selection at the end.
-        assert_eq!(list_window(49, 50, 10), (40, 50));
+        assert_eq!(list_window(49, 50, 10, false), (40, 50));
         // Degenerate inputs.
-        assert_eq!(list_window(0, 0, 10), (0, 0));
-        assert_eq!(list_window(0, 5, 0), (0, 0));
+        assert_eq!(list_window(0, 0, 10, false), (0, 0));
+        assert_eq!(list_window(0, 5, 0, false), (0, 0));
         // Rows larger than total: everything fits.
-        assert_eq!(list_window(3, 5, 10), (0, 5));
+        assert_eq!(list_window(3, 5, 10, false), (0, 5));
+        // With paths shown, each entry takes two lines, halving capacity.
+        assert_eq!(list_window(2, 50, 10, true), (0, 5));
+        assert_eq!(list_window(15, 50, 10, true), (11, 16));
+        assert_eq!(list_window(49, 50, 10, true), (45, 50));
     }
 
     // Rendering with paths and preview shown must not panic.
@@ -834,11 +961,70 @@ mod tests {
         }
     }
 
+    // Rows must fit the dialog width exactly: if a rendered row is wider
+    // than `inner`, the wrapping Paragraph spills it onto a second line and
+    // every entry silently consumes two rows. Title and cost of each visible
+    // entry must share one buffer row.
+    #[test]
+    fn render_rows_do_not_wrap() {
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        render_session_browser(&s, area, &mut buf);
+
+        // Collect each buffer row as a trimmed string.
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            })
+            .collect();
+
+        for (title, cost) in [
+            ("Refactor auth module", "$0.0124"),
+            ("Write unit tests", "$0.0045"),
+            ("Debug memory leak", "$0.0289"),
+        ] {
+            let row = rows
+                .iter()
+                .find(|r| r.contains(title))
+                .unwrap_or_else(|| panic!("title {:?} not found in any row", title));
+            assert!(
+                row.contains(cost),
+                "row for {:?} misses cost {:?} (wrapped?): {:?}",
+                title,
+                cost,
+                row
+            );
+        }
+    }
+
+    // Degenerate terminals: the geometry clamps every region to `inner`, so
+    // tiny areas must degrade to a sliver (or nothing) instead of panicking.
+    #[test]
+    fn render_tiny_areas_do_not_panic() {
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        s.toggle_show_paths(); // two-line entries: worst case for the budget
+        for (w, h) in [(0, 0), (1, 1), (10, 2), (30, 4), (70, 6), (20, 1)] {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            render_session_browser(&s, area, &mut buf);
+        }
+    }
+
     #[test]
     fn truncate_display_trims() {
         let long = "abcdefghij"; // 10 chars
         let result = truncate_display(long, 5);
-        assert!(result.width() <= 6, "truncated string should fit within budget");
+        assert!(
+            result.width() <= 6,
+            "truncated string should fit within budget"
+        );
         assert!(result.ends_with('…'));
     }
 }
