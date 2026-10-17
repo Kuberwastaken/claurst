@@ -63,6 +63,12 @@ Section headings below use the implementation type names; the model sees these n
 
 When one response contains several tool calls, their PreToolUse hooks run one at a time, then every call that was not blocked runs concurrently and the results are returned in the original order. `Write`, `Edit`, `BatchEdit`, `ApplyPatch` and `NotebookEdit` lock each file they change for the whole call, so two calls on the same file do not interleave.
 
+### Schema Dialects
+
+Providers accept different subsets of JSON Schema, so tool schemas are normalized per provider before each request (`src-rust/crates/schema_dialect`, wired through `claurst-api`'s `schema_dialect_map`). Gemini gets the narrowest subset, Bedrock and Anthropic their own, OpenAI-compatible routes theirs. Keywords a dialect does not support are stripped, `oneOf` is rewritten to `anyOf` where required, and dangling `required` entries are pruned.
+
+When a provider still rejects a schema, the rejection is not fatal if the error names the offending construct: the keyword is learned (persisted in `~/.claurst/schema-quirks.json`), the tool schemas are re-filtered without it, and the same turn is retried once. A rejection that names nothing actionable fails the turn as before. Learned quirks apply to every later request for that provider.
+
 ---
 
 ## Permission System
