@@ -221,6 +221,9 @@ pub struct ModelEntry {
     pub description: String,
     /// Whether this is the currently active model.
     pub is_current: bool,
+    /// Whether this model is marked as the memory sidecar model (Alt+M).
+    /// Ported from jcode's `PickerEntry::is_memory_model`.
+    pub is_memory_model: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +237,7 @@ fn model_entry(id: &str, name: &str, desc: &str) -> ModelEntry {
         display_name: name.to_string(),
         description: desc.to_string(),
         is_current: false,
+        is_memory_model: false,
     }
 }
 
@@ -307,6 +311,7 @@ pub fn models_for_provider_from_registry(
                 display_name: e.info.name.clone(),
                 description: cost_str,
                 is_current: false,
+                is_memory_model: false,
             }
         })
         .collect()
@@ -455,6 +460,7 @@ fn codex_provider_models(registry: &claurst_api::ModelRegistry) -> Vec<ModelEntr
                     format_context_window(ctx)
                 ),
                 is_current: false,
+                is_memory_model: false,
             }
         })
         .collect()
@@ -477,6 +483,7 @@ fn codex_fallback_models() -> Vec<ModelEntry> {
                     format_context_window(ctx)
                 ),
                 is_current: false,
+                is_memory_model: false,
             }
         })
         .collect()
@@ -491,6 +498,7 @@ fn free_provider_models() -> Vec<ModelEntry> {
         display_name: "Auto (round-robin across configured providers)".to_string(),
         description: "stacks every free-tier key you've added · $0.00 per M".to_string(),
         is_current: false,
+        is_memory_model: false,
     }];
 
     for upstream in claurst_api::FREE_CATALOG {
@@ -499,6 +507,7 @@ fn free_provider_models() -> Vec<ModelEntry> {
             display_name: format!("{} \u{2014} {}", upstream.title, upstream.default_model),
             description: format!("{} · $0.00 per M", upstream.note),
             is_current: false,
+            is_memory_model: false,
         });
     }
 
@@ -575,8 +584,12 @@ impl ModelPickerState {
         effort: EffortLevel,
         fast_mode: bool,
     ) {
+        // Mark the persisted memory sidecar model so the Alt+M indicator
+        // survives picker reopenings (jcode re-derives it on every open).
+        let memory_store = claurst_core::memory_config::load_memory_model_store();
         for m in &mut self.models {
             m.is_current = m.id == current_model;
+            m.is_memory_model = memory_store.model.as_deref() == Some(m.id.as_str());
         }
         self.selected_idx = self
             .models
@@ -589,6 +602,30 @@ impl ModelPickerState {
         self.fast_mode = fast_mode;
         self.fast_mode_model = fast_mode.then_some(current_model.to_string());
         self.visible = true;
+    }
+
+    /// Toggle the memory-sidecar mark on the currently selected model
+    /// (Alt+M in the open picker). Mirrors jcode's
+    /// `toggle_selected_model_memory`: unmark when the selected model is
+    /// already the memory model, otherwise mark it (replacing any previous).
+    /// Persists through `memory_model.json` and returns a status string for
+    /// the caller to surface.
+    pub fn toggle_selected_memory_model(&mut self) -> Option<String> {
+        let entry = self.models.get(self.selected_idx)?;
+        let base_name = entry.id.clone();
+        let mut store = claurst_core::memory_config::load_memory_model_store();
+        let (marked, notice) = if store.model.as_deref() == Some(base_name.as_str()) {
+            store.model = None;
+            (false, format!("Unmarked memory model: {}", base_name))
+        } else {
+            store.model = Some(base_name.clone());
+            (true, format!("Marked as memory model: {}", base_name))
+        };
+        claurst_core::memory_config::save_memory_model_store(&store);
+        for m in &mut self.models {
+            m.is_memory_model = marked && m.id == base_name;
+        }
+        Some(notice)
     }
 
     /// Close the overlay without selecting.
@@ -943,6 +980,12 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
 
             spans.push(Span::styled(model.display_name.clone(), Style::default().fg(fg).bg(bg)));
 
+            // Memory model marker (Alt+M), ported from jcode's " 🧠"
+            // suffix in `picker_entry_display_name`.
+            if model.is_memory_model {
+                spans.push(Span::styled(" \u{1f9e0}", Style::default().fg(Color::Magenta).bg(bg)));
+            }
+
             // Effort indicator — show the effort clamped onto this model's
             // variants ladder so it never displays a tier the model can't do.
             if supports_effort && is_selected {
@@ -1002,6 +1045,9 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
         }
     }
     footer_spans.push(Span::raw("  "));
+    footer_spans.push(Span::styled("alt+m", Style::default().fg(dim)));
+    footer_spans.push(Span::styled(" memory model", Style::default().fg(dim)));
+    footer_spans.push(Span::raw("  "));
     footer_spans.push(Span::styled(" /connect", Style::default().fg(Color::Rgb(233, 30, 99))));
     footer_spans.push(Span::styled(" providers", Style::default().fg(dim)));
     Paragraph::new(Line::from(footer_spans)).bg(dialog_bg).render(footer_area, buf);
@@ -1026,18 +1072,21 @@ mod tests {
                 display_name: "Claude Opus 4.6".to_string(),
                 description: "200K context".to_string(),
                 is_current: false,
+                is_memory_model: false,
             },
             ModelEntry {
                 id: "claude-sonnet-4-6".to_string(),
                 display_name: "Claude Sonnet 4.6".to_string(),
                 description: "200K context".to_string(),
                 is_current: false,
+                is_memory_model: false,
             },
             ModelEntry {
                 id: "claude-haiku-4-5".to_string(),
                 display_name: "Claude Haiku 4.5".to_string(),
                 description: "200K context".to_string(),
                 is_current: false,
+                is_memory_model: false,
             },
         ]
     }
@@ -1478,6 +1527,7 @@ mod tests {
                 display_name: "LIVE OVERWRITE".to_string(),
                 description: "live desc".to_string(),
                 is_current: false,
+                is_memory_model: false,
             },
             // A brand-new live id absent from the catalog — must be appended.
             ModelEntry {
@@ -1485,6 +1535,7 @@ mod tests {
                 display_name: "GPT-5.5 (live)".to_string(),
                 description: "live only".to_string(),
                 is_current: false,
+                is_memory_model: false,
             },
         ];
         p.merge_models(live);
@@ -1536,6 +1587,7 @@ mod tests {
             display_name: "Llama 3.3".to_string(),
             description: "local".to_string(),
             is_current: false,
+            is_memory_model: false,
         }]);
         assert!(
             !p.models.iter().any(|m| m.id == "default"),

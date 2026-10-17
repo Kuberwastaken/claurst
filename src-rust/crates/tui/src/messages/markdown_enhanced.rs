@@ -162,7 +162,7 @@ pub fn render_table(table: &Table) -> Vec<Line<'static>> {
                 let hdr_width = UnicodeWidthStr::width(header.as_str());
                 let total_pad = width.saturating_sub(hdr_width);
                 let left_pad = total_pad / 2;
-                format!("{:>width$}", &format!("{}{}", " ".repeat(left_pad), header), width = width + left_pad)
+                format!("{:>width$}", format!("{}{}", " ".repeat(left_pad), header), width = width + left_pad)
             }
         };
         header_spans.push(Span::styled(
@@ -202,7 +202,7 @@ pub fn render_table(table: &Table) -> Vec<Line<'static>> {
                         let cell_width = UnicodeWidthStr::width(cell.as_str());
                         let total_pad = width.saturating_sub(cell_width);
                         let left_pad = total_pad / 2;
-                        format!("{:>width$}", &format!("{}{}", " ".repeat(left_pad), cell), width = width + left_pad)
+                        format!("{:>width$}", format!("{}{}", " ".repeat(left_pad), cell), width = width + left_pad)
                     }
                 };
                 row_spans.push(Span::raw(padded));

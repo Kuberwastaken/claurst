@@ -303,6 +303,7 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("escape", "cancel", KeyContext::MessageSelector),
 
         // ========== THEME & MODEL PICKERS ==========
+        ("alt+m", "toggleMemoryModel", KeyContext::ModelPicker),
         ("up", "prev", KeyContext::ThemePicker),
         ("down", "next", KeyContext::ThemePicker),
         ("k", "prev", KeyContext::ThemePicker),
