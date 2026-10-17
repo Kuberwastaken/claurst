@@ -179,7 +179,7 @@ See [Permission Modes](#permission-modes) for a full description of each value.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `theme` | string | `"default"` | Color theme for the TUI. One of `"default"`, `"dark"`, `"light"`, `"deuteranopia"`. |
+| `theme` | string | `"default"` | Color theme for the TUI. Built-ins: `"default"`, `"dark"`, `"light"`, `"deuteranopia"`, `"solarized"`, `"nord"`, `"dracula"`, `"monokai"`. Also accepts a custom theme name loaded from `~/.claurst/themes/<name>.toml` (see [Custom Themes](#custom-themes)). |
 | `output_style` | string \| null | null | Named output style. Built-in values: `"default"`, `"concise"`, `"explanatory"`, `"learning"`, `"caveman"`, `"rocky"`. Custom styles can be added as `.md` or `.json` files under `~/.claurst/output-styles/`. Set by `/output-style`, `/caveman`, `/rocky` and `/normal`. |
 | `output_format` | string | `"text"` | Not used by headless runs: `--output-format` (default `text`) decides. See [Headless mode](advanced.md#headless-mode) for the `json` and `stream-json` shapes. |
 | `verbose` | boolean | false | Not used: replaced at startup by `--verbose`, which sets the log level to `debug` (default `warn`). |
@@ -960,6 +960,40 @@ The `managed_agents` key stores the managed-agents architecture configuration se
 Configure via `/managed-agents configure` or `/managed-agents preset <name>`. Set `enabled: false` to disable without removing the configuration.
 
 ---
+
+## Custom Themes
+
+Custom themes are TOML palettes under `~/.claurst/themes/<name>.toml`. Each file
+maps theme roles to colors. Unspecified roles are inherited from the palette
+named in `base` (any built-in except `default`; defaults to `dark`).
+
+```toml
+# ~/.claurst/themes/my-palette.toml
+base = "dark"
+
+[colors]
+background = "#1a1b26"
+accent = "#7aa2f7"
+secondary-accent = "#bb9af7"
+error = "#f7768e"
+success = "#9ece6a"
+warning = "#e0af68"
+info = "#7dcfff"
+action = "#7aa2f7"
+disabled = "darkgray"
+text = "#c0caf5"
+border = "#414f68"
+panel-bg = "#1f2335"
+overlay-bg = "#16161e"
+```
+
+Color values accept `#rrggbb` hex, ratatui named colors (`red`, `light-cyan`,
+`darkgray`, ...), or `reset` for the terminal default. Role keys accept
+snake_case or kebab-case (`secondary_accent` or `secondary-accent`).
+
+Select a custom theme with `/theme <name>` in the TUI or by setting
+`"theme": "<name>"` in the `config` object of `settings.json`. Unknown theme
+names are rejected with an error listing available themes.
 
 ## File Formatters
 

@@ -1439,7 +1439,7 @@ pub mod config {
         Plan,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    #[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
     #[serde(rename_all = "camelCase")]
     pub enum Theme {
         #[default]
@@ -1448,6 +1448,74 @@ pub mod config {
         Light,
         Custom(String),
         Deuteranopia,
+    }
+
+    impl<'de> serde::Deserialize<'de> for Theme {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            // Accept both the enum forms (`"dark"`, `{"custom": "my-theme"}`)
+            // and any bare string as `Custom` (`"solarized"`, `"nord"`, or a
+            // custom palette name from ~/.claurst/themes/). Without this,
+            // `"theme": "solarized"` fails to parse and the whole settings
+            // file falls back to defaults.
+            struct ThemeVisitor;
+
+            impl<'de> serde::de::Visitor<'de> for ThemeVisitor {
+                type Value = Theme;
+
+                fn expecting(
+                    &self,
+                    formatter: &mut std::fmt::Formatter<'_>,
+                ) -> std::fmt::Result {
+                    formatter.write_str("a theme name or a custom theme object")
+                }
+
+                fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Theme, E> {
+                    Ok(match value {
+                        "default" => Theme::Default,
+                        "dark" => Theme::Dark,
+                        "light" => Theme::Light,
+                        "deuteranopia" => Theme::Deuteranopia,
+                        other => Theme::Custom(other.to_string()),
+                    })
+                }
+
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Theme, A::Error> {
+                    // The externally tagged {"custom": name} form.
+                    let key = map
+                        .next_key::<String>()?
+                        .ok_or_else(|| serde::de::Error::custom("empty theme object"))?;
+                    let value: String = map.next_value()?;
+                    if key == "custom" {
+                        Ok(Theme::Custom(value))
+                    } else {
+                        self.visit_str(&value)
+                    }
+                }
+            }
+
+            deserializer.deserialize_any(ThemeVisitor)
+        }
+    }
+
+    impl Theme {
+        /// Canonical theme name: the string `/theme <name>` accepts, the
+        /// picker highlights, and settings round-trip. `Custom` passes the
+        /// user's name through unchanged.
+        pub fn name(&self) -> &str {
+            match self {
+                Theme::Default => "default",
+                Theme::Dark => "dark",
+                Theme::Light => "light",
+                Theme::Deuteranopia => "deuteranopia",
+                Theme::Custom(name) => name.as_str(),
+            }
+        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -6252,6 +6320,44 @@ pub mod tasks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_deserializes_bare_names_and_enum_forms() {
+        // Built-in names keep their unit-variant form.
+        assert_eq!(
+            serde_json::from_str::<config::Theme>("\"default\"").unwrap(),
+            config::Theme::Default
+        );
+        assert_eq!(
+            serde_json::from_str::<config::Theme>("\"dark\"").unwrap(),
+            config::Theme::Dark
+        );
+        // Any other bare string becomes Custom so a settings file can say
+        // "theme": "solarized" (or a custom palette name) without breaking
+        // the whole settings parse.
+        assert_eq!(
+            serde_json::from_str::<config::Theme>("\"nord\"").unwrap(),
+            config::Theme::Custom("nord".to_string())
+        );
+        // The externally tagged object form still works.
+        assert_eq!(
+            serde_json::from_str::<config::Theme>("{\"custom\":\"nord\"}").unwrap(),
+            config::Theme::Custom("nord".to_string())
+        );
+        // Roundtrip: a Custom theme serializes back to the object form and
+        // re-parses.
+        let theme = config::Theme::Custom("solarized".to_string());
+        let json = serde_json::to_string(&theme).unwrap();
+        assert_eq!(serde_json::from_str::<config::Theme>(&json).unwrap(), theme);
+        // A Config with a custom theme name parses without breaking the
+        // surrounding settings. Build a full default Config as JSON, swap in
+        // the theme, and re-parse: proves bare-string themes don't break the
+        // parse while covering every required field.
+        let mut value = serde_json::to_value(config::Config::default()).unwrap();
+        value["theme"] = serde_json::Value::String("solarized".to_string());
+        let cfg: config::Config = serde_json::from_value(value).unwrap();
+        assert_eq!(cfg.theme, config::Theme::Custom("solarized".to_string()));
+    }
 
     #[test]
     fn test_message_user() {

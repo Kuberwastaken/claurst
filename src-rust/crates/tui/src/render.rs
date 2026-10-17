@@ -903,6 +903,10 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     apply_selection_highlight(frame, app);
     cache_selectable_row_text(frame, app);
     render_context_menu(frame, app);
+
+    // Apply the active theme palette last, over everything rendered above,
+    // so overlays and widgets are remapped consistently in a single pass.
+    crate::theme::apply_theme_pass(frame.buffer_mut());
 }
 
 /// Snapshot the rendered text of every row inside the selectable area into
