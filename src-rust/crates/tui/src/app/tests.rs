@@ -1162,6 +1162,49 @@ use super::types::{ContextMenuItem, ContextMenuState};
         assert_eq!(pin.max_output_tokens, 131_072);
     }
 
+    // ---- failover route application (interactive provider failover) ----
+
+    #[test]
+    fn failover_route_applies_provider_and_model() {
+        let mut app = make_app();
+        app.apply_failover_route("openai/gpt-5.4");
+        assert_eq!(app.config.provider.as_deref(), Some("openai"));
+        assert_eq!(app.config.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(app.model_name, "gpt-5.4");
+    }
+
+    #[test]
+    fn failover_route_bare_provider_falls_back_to_its_default_model() {
+        let mut app = make_app();
+        app.apply_failover_route("openai");
+        assert_eq!(app.config.provider.as_deref(), Some("openai"));
+        // A bare provider route leaves config.model unset (the provider
+        // default applies at request time) and pins model_name to the
+        // picker's qualified default for that provider.
+        assert_eq!(app.config.model, None);
+        let default = crate::model_picker::default_model_for_provider(
+            "openai",
+            &app.model_registry,
+        );
+        assert_eq!(app.model_name, default);
+    }
+
+    #[test]
+    fn failover_route_bare_model_name_is_not_treated_as_a_provider() {
+        // Route building used to emit bare anthropic model ids
+        // ("claude-sonnet-5"); applying one must not poison the session
+        // with a bogus provider of the same name.
+        let mut app = make_app();
+        app.apply_failover_route("claude-sonnet-5");
+        assert_eq!(
+            app.config.provider.as_deref(),
+            Some("anthropic"),
+            "a bare model name must resolve to its provider, not become one"
+        );
+        assert_eq!(app.config.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(app.model_name, "claude-sonnet-5");
+    }
+
     // ---- /rewind into the compaction archive (issue #449) ----
 
     #[test]

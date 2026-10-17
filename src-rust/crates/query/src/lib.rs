@@ -204,6 +204,11 @@ pub struct QueryConfig {
     /// Sandbox line for the dynamic system prompt (#470). Always filled by
     /// `run_query_loop` from the tool context's sandbox settings.
     pub sandbox_state: Option<String>,
+    /// Providers the user marked unavailable this session (interactive
+    /// failover, `a` key). Failover offers skip them. In-memory only:
+    /// cleared on restart because a provider marked unavailable in one
+    /// session may be healthy in the next.
+    pub unavailable_providers: Option<Vec<String>>,
 }
 
 impl Default for QueryConfig {
@@ -243,12 +248,131 @@ impl Default for QueryConfig {
             session_journal: None,
             is_subagent: false,
             sandbox_state: None,
+            unavailable_providers: None,
         }
     }
 }
 
 /// Journal the history (issue #449). A failed write is logged, never fatal:
 /// the turn goes on and the snapshot at its end is the fallback.
+/// Build the interactive failover offer for a failover-class error, or
+/// `None` when the error is transient or no alternative route exists.
+///
+/// The returned message carries the structured
+/// `[claurst-provider-failover]` prefix on its first line; the TUI parses
+/// it and renders a one-keypress provider switch. Pure with respect to
+/// the session: availability filtering is done by the caller through
+/// `unavailable`.
+pub fn build_failover_error_message(
+    error_text: &str,
+    from_provider: &str,
+    from_model: &str,
+    candidate_provider_ids: &[&str],
+    unavailable: &[String],
+) -> Option<String> {
+    use claurst_api::failover::{ProviderFailoverPrompt, classify_failover_error_message};
+    use claurst_api::fallback_pick::{
+        FallbackPickOptions, error_looks_like_credential_failure, ranked_fallback_routes,
+    };
+
+    let decision = classify_failover_error_message(error_text);
+    if !decision.should_failover() {
+        return None;
+    }
+
+    // The candidate list arrives as provider ids only; qualify each with
+    // its default model via the shared model registry so switching lands
+    // on a concrete route.
+    let model_reg = claurst_api::ModelRegistry::new();
+    let candidates: Vec<(&str, String)> = candidate_provider_ids
+        .iter()
+        .map(|&id| (id, claurst_query_default_model(id, &model_reg)))
+        .collect();
+    let candidate_refs: Vec<(&str, &str)> = candidates
+        .iter()
+        .map(|(id, model)| (*id, model.as_str()))
+        .collect();
+
+    let unavailable_static: Vec<&str> = unavailable.iter().map(String::as_str).collect();
+    let routes = ranked_fallback_routes(
+        &candidate_refs,
+        from_provider,
+        from_model,
+        FallbackPickOptions {
+            credential_failure: error_looks_like_credential_failure(error_text),
+            unavailable: &unavailable_static,
+        },
+    );
+    if routes.is_empty() {
+        return None;
+    }
+
+    let prompt = ProviderFailoverPrompt {
+        from_provider: from_provider.to_string(),
+        from_label: from_provider.to_string(),
+        from_model: from_model.to_string(),
+        routes: routes.iter().map(|r| r.model.clone()).collect(),
+        reason: first_line(error_text),
+        mark_unavailable: decision.should_mark_provider_unavailable(),
+    };
+    Some(prompt.to_error_message())
+}
+
+/// Wrap a ClaudeError from the raw Anthropic client path in a failover
+/// offer when it is failover-class, otherwise pass it through unchanged.
+fn failover_claude_error(
+    e: ClaudeError,
+    from_model: &str,
+    candidate_provider_ids: &[&str],
+    unavailable: &[String],
+) -> ClaudeError {
+    let text = e.to_string();
+    let wrapped = build_failover_error_message(
+        &text,
+        "anthropic",
+        from_model,
+        candidate_provider_ids,
+        unavailable,
+    );
+    match wrapped {
+        Some(msg) => ClaudeError::Api(msg),
+        None => e,
+    }
+}
+
+/// First line of a (possibly multi-line) error text, trimmed.
+fn first_line(text: &str) -> String {
+    text.lines().next().unwrap_or("").trim().to_string()
+}
+
+/// Provider-qualified default model for a provider id, mirroring the TUI
+/// picker's resolution so a failover switch lands on a real model.
+///
+/// Every route must contain a `/`: the TUI's `apply_failover_route` treats a
+/// slash-less route as a bare provider id, so an unqualified anthropic model
+/// would switch the session to a bogus provider. Anthropic models live
+/// unprefixed in the registry, so their default is qualified by hand.
+fn claurst_query_default_model(provider_id: &str, registry: &claurst_api::ModelRegistry) -> String {
+    if provider_id == "anthropic" {
+        if let Some(best) = registry.best_model_for_provider(provider_id) {
+            return format!("anthropic/{best}");
+        }
+        return "anthropic/claude-sonnet-5".to_string();
+    }
+    if let Some(best) = registry.best_model_for_provider(provider_id) {
+        return format!("{}/{}", provider_id, best);
+    }
+    match provider_id {
+        "free" => "free/auto".to_string(),
+        "codex" | "openai-codex" => format!(
+            "{}/{}",
+            provider_id,
+            claurst_core::codex_oauth::DEFAULT_CODEX_MODEL
+        ),
+        other => format!("{}/default", other),
+    }
+}
+
 fn persist_step(config: &QueryConfig, messages: &[Message]) {
     if let Some(journal) = config.session_journal.as_deref() {
         if let Err(e) = journal.sync_messages(messages) {
@@ -521,6 +645,23 @@ pub async fn run_query_loop(
     }
 
     let mut used_fallback = false;
+    // Interactive failover (#failover): provider ids with usable
+    // credentials, computed once, and providers the TUI marked unavailable
+    // this session. A failover-class error surfaces a structured prompt
+    // the TUI turns into a one-keypress provider switch.
+    let failover_candidates: Vec<&str> =
+        claurst_api::registry::failover_candidate_providers(|id| {
+            if id == "anthropic" && !client.api_key_is_empty() {
+                Some("anthropic".to_string())
+            } else {
+                tool_ctx.config.resolve_provider_api_key(id)
+            }
+        });
+    let failover_unavailable: Vec<String> = config
+        .unavailable_providers
+        .as_deref()
+        .unwrap_or(&[])
+        .to_vec();
     // Retries spent on the current model request (#439). Bounded by
     // `config.retry.max_retries`; reset once a response streams to completion.
     let mut retry_attempt: u32 = 0;
@@ -1212,7 +1353,16 @@ pub async fn run_query_loop(
                                 retry_turn!(e.to_string(), after);
                             }
                             error!(provider = %provider_id_str, error = %e, "Provider stream failed");
-                            return QueryOutcome::Error(ClaudeError::Api(e.to_string()));
+                            return QueryOutcome::Error(ClaudeError::Api(
+                                build_failover_error_message(
+                                    &e.to_string(),
+                                    &provider_id_str,
+                                    &model_id_str,
+                                    &failover_candidates,
+                                    &failover_unavailable,
+                                )
+                                .unwrap_or_else(|| e.to_string()),
+                            ));
                         }
                     };
 
@@ -1409,10 +1559,20 @@ pub async fn run_query_loop(
                             error = %err,
                             "Provider stream error — not retryable or retries exhausted"
                         );
-                        return QueryOutcome::Error(ClaudeError::Api(format!(
+                        let plain = format!(
                             "Provider '{}' stream error (model '{}'): {}",
                             provider_id_str, model_id_str, err
-                        )));
+                        );
+                        return QueryOutcome::Error(ClaudeError::Api(
+                            build_failover_error_message(
+                                &plain,
+                                &provider_id_str,
+                                &model_id_str,
+                                &failover_candidates,
+                                &failover_unavailable,
+                            )
+                            .unwrap_or(plain),
+                        ));
                     }
                     // Ended without `MessageStop`: truncated, never a finished turn.
                     if !saw_message_stop {
@@ -1719,7 +1879,11 @@ pub async fn run_query_loop(
                 // attempt one switch to the fallback model.
                 let unavailable = matches!(
                     e,
-                    ClaudeError::RateLimit | ClaudeError::ApiStatus { status: 429 | 529, .. }
+                    ClaudeError::RateLimit
+                        | ClaudeError::ApiStatus {
+                            status: 429 | 529,
+                            ..
+                        }
                 ) || e.to_string().to_lowercase().contains("overloaded");
                 if !used_fallback && unavailable {
                     if let Some(ref fb) = config.fallback_model {
@@ -1742,7 +1906,12 @@ pub async fn run_query_loop(
                     }
                 }
                 error!(error = %e, "API request failed");
-                return QueryOutcome::Error(e);
+                return QueryOutcome::Error(failover_claude_error(
+                    e,
+                    &effective_model,
+                    &failover_candidates,
+                    &failover_unavailable,
+                ));
             }
         };
 
@@ -1841,10 +2010,17 @@ pub async fn run_query_loop(
             if let claurst_api::RetryDecision::Retry { after } = decision {
                 retry_turn!(reason.clone(), after);
             }
-            return QueryOutcome::Error(ClaudeError::Api(format!(
-                "Stream error (model '{}'): {}",
-                effective_model, reason
-            )));
+            let plain = format!("Stream error (model '{}'): {}", effective_model, reason);
+            return QueryOutcome::Error(ClaudeError::Api(
+                build_failover_error_message(
+                    &plain,
+                    "anthropic",
+                    &effective_model,
+                    &failover_candidates,
+                    &failover_unavailable,
+                )
+                .unwrap_or(plain),
+            ));
         }
         if !saw_message_stop {
             let reason = "stream ended before message_stop".to_string();
@@ -2372,6 +2548,7 @@ mod tests {
             session_journal: None,
             is_subagent: false,
             sandbox_state: None,
+            unavailable_providers: None,
         }
     }
 
@@ -3978,6 +4155,72 @@ mod tests {
 
     fn server_error(status: u16) -> claurst_api::ProviderError {
         claurst_api::parse_error_response(status, "upstream unavailable", &pid_scripted())
+    }
+
+    /// Interactive failover: a 401 from the active provider must surface a
+    /// structured failover prompt carrying ranked alternative routes from
+    /// the fixture candidate list, and marked-unavailable providers must
+    /// be filtered out of the offer.
+    #[tokio::test]
+    async fn auth_401_surfaces_failover_prompt_with_alternative_routes() {
+        let run = drive_scripted(vec![ScriptStep::Fail(server_error(401))], 0, noop_tools()).await;
+
+        let QueryOutcome::Error(ClaudeError::Api(msg)) = &run.outcome else {
+            panic!("expected surfaced error, got {:?}", run.outcome);
+        };
+        let prompt = claurst_api::failover::parse_failover_prompt_message(msg)
+            .expect("error message must carry a failover prompt");
+        assert_eq!(prompt.from_provider, "scriptprov");
+        assert!(
+            prompt.mark_unavailable,
+            "auth failures mark the provider unavailable"
+        );
+        assert!(
+            !prompt.routes.is_empty(),
+            "fixture candidates must yield at least one alternative route"
+        );
+        // Every offered route is a provider/model pair from the candidate
+        // fixture, never the failed provider itself.
+        for route in &prompt.routes {
+            assert_ne!(
+                route.split_once('/').map(|(p, _)| p).unwrap_or(route),
+                "scriptprov",
+                "routes must not include the failed provider: {route}"
+            );
+        }
+    }
+
+    #[test]
+    fn failover_routes_are_always_provider_qualified() {
+        // The TUI's apply_failover_route treats a slash-less route as a
+        // provider id, so every offered route must carry its provider
+        // prefix. Anthropic models are unprefixed in the registry and
+        // used to leak out bare (e.g. "claude-sonnet-5").
+        let registry = claurst_api::ModelRegistry::new();
+        for provider_id in ["anthropic", "openai", "codex", "free"] {
+            let route = claurst_query_default_model(provider_id, &registry);
+            assert!(
+                route.contains('/'),
+                "failover route for {provider_id} must be provider-qualified: {route}"
+            );
+            let (route_provider, _) = route.split_once('/').expect("checked '/' above");
+            assert_eq!(
+                route_provider, provider_id,
+                "route prefix must name the provider: {route}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_500_does_not_attach_failover_prompt() {
+        let run = drive_scripted(vec![ScriptStep::Fail(server_error(500))], 0, noop_tools()).await;
+        let QueryOutcome::Error(ClaudeError::Api(msg)) = &run.outcome else {
+            panic!("expected surfaced error, got {:?}", run.outcome);
+        };
+        assert!(
+            claurst_api::failover::parse_failover_prompt_message(msg).is_none(),
+            "a transient 500 must not trigger failover: {msg}"
+        );
     }
 
     #[tokio::test]

@@ -79,6 +79,8 @@ pub mod rustle;
 pub mod context_viz;
 /// Export format picker dialog (/export).
 pub mod export_dialog;
+/// Interactive provider-failover chooser (opened on auth-class errors).
+pub mod failover_dialog;
 /// Clipboard image paste and Ctrl+V text paste.
 pub mod image_paste;
 /// Inline image rendering via the Kitty graphics protocol (with text fallback).

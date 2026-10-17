@@ -37,13 +37,13 @@ use crate::dialog_select::{DialogSelectState, SelectItem};
 use crate::dialogs::{McpApprovalDialogState, PermissionRequest};
 use crate::diff_viewer::DiffViewerState;
 use crate::export_dialog::ExportDialogState;
+use crate::failover_dialog::FailoverDialogState;
 use crate::import_config_dialog::ImportConfigDialogState;
 use crate::mcp_view::McpViewState;
 use crate::model_picker::{EffortLevel, ModelPickerState};
 use crate::notifications::NotificationQueue;
 use crate::overlays::{
-    GlobalSearchState, HelpOverlay, HistorySearchOverlay,
-    MessageSelectorOverlay, RewindFlowOverlay,
+    GlobalSearchState, HelpOverlay, HistorySearchOverlay, MessageSelectorOverlay, RewindFlowOverlay,
 };
 use crate::plugin_views::PluginHintBanner;
 use crate::prompt_input::PromptInputState;
@@ -434,6 +434,9 @@ pub struct App {
     pub pending_auto_submit: bool,
     /// Connect-a-provider dialog (/connect command).
     pub connect_dialog: DialogSelectState,
+    /// Interactive provider-failover chooser (opened from a failover-class
+    /// error). Holds the session's unavailable-provider marks.
+    pub failover_dialog: FailoverDialogState,
     /// Import-config source picker (/import-config command).
     pub import_config_picker: DialogSelectState,
     /// Import-config preview and confirmation dialog.
@@ -768,7 +771,11 @@ impl App {
             pending_steers: Vec::new(),
             pending_auto_submit: false,
             connect_dialog: DialogSelectState::new("Connect a provider", provider_picker_items()),
-            import_config_picker: DialogSelectState::new("Import config", import_config_picker_items()),
+            failover_dialog: FailoverDialogState::default(),
+            import_config_picker: DialogSelectState::new(
+                "Import config",
+                import_config_picker_items(),
+            ),
             import_config_dialog: ImportConfigDialogState::new(),
             command_palette: {
                 let items: Vec<SelectItem> = PROMPT_SLASH_COMMANDS

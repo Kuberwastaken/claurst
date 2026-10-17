@@ -692,6 +692,80 @@ impl Default for ProviderRegistry {
     }
 }
 
+/// Provider ids that can be offered as interactive failover targets.
+///
+/// `anthropic-oauth` is excluded on purpose: it dispatches through the raw
+/// Anthropic client with a Bearer flag managed by the TUI, not through the
+/// provider registry, so an automatic switch to it could not rebuild the
+/// auth path reliably.
+pub const FAILOVER_CANDIDATE_PROVIDERS: &[&str] = &[
+    "codex",
+    "github-copilot",
+    "free",
+    "openai",
+    "google",
+    "anthropic",
+    "minimax",
+    "cohere",
+];
+
+/// Providers that need no credential at all (local servers and the keyless
+/// upstreams). They are always viable failover targets.
+pub const KEYLESS_FAILOVER_PROVIDERS: &[&str] = &["ollama", "lmstudio", "llamacpp"];
+
+/// Whether `provider_id` has a stored OAuth login that makes it a usable
+/// failover target even without an API key.
+///
+/// - `codex` / `openai-codex`: per-profile `codex_tokens.json` (via the
+///   account registry, legacy single-file fallback included).
+/// - `github-copilot`: an `OAuthToken` credential written by `/connect`,
+///   which `api_key_for` already surfaces as a key.
+fn has_stored_oauth_login(provider_id: &str, auth_store: &claurst_core::AuthStore) -> bool {
+    match provider_id {
+        "codex" | "openai-codex" => claurst_core::oauth_config::get_codex_tokens()
+            .is_some_and(|tokens| !tokens.access_token.is_empty()),
+        "github-copilot" => auth_store.get(provider_id).is_some_and(
+            |credential| matches!(credential, claurst_core::StoredCredential::OAuthToken { .. }),
+        ),
+        _ => false,
+    }
+}
+
+/// Collect the provider ids that have usable credentials right now, for
+/// the interactive failover ranking. Reads the auth store and environment
+/// once per call.
+///
+/// `with_env` injects extra `(provider_id, credential-present)` pairs; the
+/// query loop uses it to fold in the pre-built Anthropic client's auth
+/// state so a provider configured only through `ANTHROPIC_API_KEY` (never
+/// stored in the auth store) still shows up. Tests inject a fixture list.
+///
+/// OAuth-backed ids (`codex`, `github-copilot`) also count when a stored
+/// login exists even though no API key is present for them.
+pub fn failover_candidate_providers(
+    with_env: impl Fn(&str) -> Option<String>,
+) -> Vec<&'static str> {
+    let auth_store = claurst_core::AuthStore::load();
+    let mut out: Vec<&'static str> = Vec::new();
+    for id in KEYLESS_FAILOVER_PROVIDERS {
+        out.push(id);
+    }
+    for id in FAILOVER_CANDIDATE_PROVIDERS {
+        if auth_store.api_key_for(id).is_some() {
+            out.push(id);
+            continue;
+        }
+        if with_env(id).is_some_and(|key| !key.is_empty()) {
+            out.push(id);
+            continue;
+        }
+        if has_stored_oauth_login(id, &auth_store) {
+            out.push(id);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,5 +818,92 @@ mod tests {
         for id in ["anthropik", "", ProviderId::GOOGLE_VERTEX, ProviderId::GITLAB] {
             assert!(!is_known_provider_id(id), "{id} has no backend and should be rejected");
         }
+    }
+
+    /// Points `CLAURST_HOME` at a fresh temp dir for the test body and
+    /// restores the previous value. Without it the candidate scan would
+    /// read the real `~/.claurst` auth store. Returns the dir path.
+    fn scoped_home() -> (std::path::PathBuf, Option<std::ffi::OsString>) {
+        let home = std::env::temp_dir().join(format!("claurst-failover-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let saved = std::env::var_os("CLAURST_HOME");
+        std::env::set_var("CLAURST_HOME", &home);
+        (home, saved)
+    }
+
+    fn restore_home(home: std::path::PathBuf, saved: Option<std::ffi::OsString>) {
+        match saved {
+            Some(v) => std::env::set_var("CLAURST_HOME", v),
+            None => std::env::remove_var("CLAURST_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Run `body` with `CLAURST_HOME` pointed at a fresh temp dir, restoring
+    /// the previous value afterwards even when the body panics, so a failed
+    /// assertion cannot leak the temp dir into other tests.
+    fn with_scoped_home(body: impl FnOnce()) {
+        let (home, saved) = scoped_home();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        restore_home(home, saved);
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn stored_codex_login_is_a_failover_candidate_without_any_api_key() {
+        let _guard = crate::test_env_lock::acquire();
+        with_scoped_home(|| {
+            // The production login path registers the profile in the
+            // account registry; get_codex_tokens reads the registry
+            // first, so the register variant is the realistic save.
+            claurst_core::oauth_config::save_codex_tokens_and_register(
+                &claurst_core::oauth_config::CodexTokens {
+                    access_token: "access".to_string(),
+                    refresh_token: Some("refresh".to_string()),
+                    ..Default::default()
+                },
+                Some("work"),
+            )
+            .expect("save codex tokens");
+
+            let candidates = failover_candidate_providers(|_| None);
+            assert!(
+                candidates.contains(&"codex"),
+                "a stored Codex OAuth login must be offered even with no API key: {candidates:?}"
+            );
+            assert!(
+                !candidates.contains(&"free"),
+                "free mode needs upstream keys, not an OAuth login: {candidates:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn no_stored_login_means_no_oauth_failover_candidate() {
+        let _guard = crate::test_env_lock::acquire();
+        with_scoped_home(|| {
+            let candidates = failover_candidate_providers(|_| None);
+            assert!(
+                !candidates.contains(&"codex"),
+                "no tokens on disk means codex must not be offered: {candidates:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn env_key_still_promotes_a_candidate() {
+        let _guard = crate::test_env_lock::acquire();
+        with_scoped_home(|| {
+            let candidates = failover_candidate_providers(|id| {
+                (id == "openai").then(|| "sk-test".to_string())
+            });
+            assert!(candidates.contains(&"openai"));
+            assert!(
+                !candidates.contains(&"google"),
+                "providers without keys, tokens or env vars stay out: {candidates:?}"
+            );
+        });
     }
 }

@@ -595,18 +595,86 @@ impl App {
             return false;
         }
 
+        // Provider-failover chooser (opened from a failover-class error).
+        // Digit keys pick a route directly; this is direct input handling
+        // inside an active overlay, matching how the connect dialog
+        // intercepts plain characters for its filter.
+        if self.failover_dialog.is_open() {
+            if let Some(picker) = self.failover_dialog.picker.as_mut() {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.failover_dialog.close();
+                    }
+                    KeyCode::Enter => {
+                        if let Some(selected) = picker.selected().cloned() {
+                            self.failover_dialog.close();
+                            self.apply_failover_route(&selected.id);
+                        }
+                    }
+                    KeyCode::Char('a') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if let Some(from) = self.failover_dialog.from_provider.clone() {
+                            self.failover_dialog.mark_provider_unavailable(&from);
+                            if let Some(picker) = self.failover_dialog.picker.as_mut() {
+                                if let Some(selected) = picker.selected().cloned() {
+                                    self.failover_dialog.close();
+                                    self.apply_failover_route(&selected.id);
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Char(c)
+                        if !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && c.is_ascii_digit()
+                            && c != '0' =>
+                    {
+                        let index = c as usize - '1' as usize;
+                        if let Some(selected) = picker.filtered_id(index) {
+                            self.failover_dialog.close();
+                            self.apply_failover_route(&selected);
+                        }
+                    }
+                    KeyCode::Up => picker.move_up(),
+                    KeyCode::Down => picker.move_down(),
+                    KeyCode::Home => picker.move_home(),
+                    KeyCode::End => picker.move_end(),
+                    KeyCode::PageUp => picker.page_up(),
+                    KeyCode::PageDown => picker.page_down(),
+                    _ => {}
+                }
+            }
+            return false;
+        }
+
         // Connect-a-provider dialog (/connect command)
         if self.connect_dialog.visible {
             match key.code {
-                KeyCode::Esc => { self.connect_dialog.close(); }
-                KeyCode::Home => { self.connect_dialog.move_home(); }
-                KeyCode::End => { self.connect_dialog.move_end(); }
-                KeyCode::Up => { self.connect_dialog.move_up(); }
-                KeyCode::Down => { self.connect_dialog.move_down(); }
-                KeyCode::PageUp => { self.connect_dialog.page_up(); }
-                KeyCode::PageDown => { self.connect_dialog.page_down(); }
-                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.connect_dialog.move_up(); }
-                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.connect_dialog.move_down(); }
+                KeyCode::Esc => {
+                    self.connect_dialog.close();
+                }
+                KeyCode::Home => {
+                    self.connect_dialog.move_home();
+                }
+                KeyCode::End => {
+                    self.connect_dialog.move_end();
+                }
+                KeyCode::Up => {
+                    self.connect_dialog.move_up();
+                }
+                KeyCode::Down => {
+                    self.connect_dialog.move_down();
+                }
+                KeyCode::PageUp => {
+                    self.connect_dialog.page_up();
+                }
+                KeyCode::PageDown => {
+                    self.connect_dialog.page_down();
+                }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.connect_dialog.move_up();
+                }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.connect_dialog.move_down();
+                }
                 KeyCode::Enter => {
                     if let Some(selected) = self.connect_dialog.selected().cloned() {
                         self.connect_dialog.close();
