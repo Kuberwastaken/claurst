@@ -44,10 +44,13 @@ impl ProviderFailoverPrompt {
 }
 
 /// Parse a failover prompt from the first line of an error message.
+///
+/// The marker may be prefixed (e.g. by the `API error: ` display of
+/// `ClaudeError::Api`), so locate it anywhere on the first line.
 pub fn parse_failover_prompt_message(message: &str) -> Option<ProviderFailoverPrompt> {
     let line = message.lines().next()?.trim();
-    let json = line.strip_prefix(PROVIDER_FAILOVER_PROMPT_PREFIX)?;
-    serde_json::from_str(json).ok()
+    let json = line.find(PROVIDER_FAILOVER_PROMPT_PREFIX)?;
+    serde_json::from_str(&line[json + PROVIDER_FAILOVER_PROMPT_PREFIX.len()..]).ok()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
