@@ -1130,12 +1130,23 @@ pub async fn run_query_loop(
                         })
                         .collect();
 
+                    // Per-model `maxOutputTokens` from the custom provider's
+                    // model catalog overrides the global `max_tokens` setting,
+                    // mirroring jcode's per-provider sizing. Falls back to
+                    // `config.max_tokens` when the model has no override.
+                    let effective_max_tokens = runner::provider_options::custom_model_max_output_tokens(
+                        &provider_id_str,
+                        &model_id_str,
+                        &tool_ctx.config.custom_providers,
+                    )
+                    .unwrap_or(config.max_tokens);
+
                     let provider_request = claurst_api::ProviderRequest {
                         model: model_id_str.to_owned(),
                         messages: provider_messages,
                         system_prompt: Some(system_for_provider.clone()),
                         tools: provider_tools,
-                        max_tokens: config.max_tokens,
+                        max_tokens: effective_max_tokens,
                         temperature: effective_temperature.map(|t| t as f64),
                         top_p: None,
                         top_k: None,
@@ -2582,6 +2593,87 @@ mod tests {
         assert_eq!(options["reasoningEffort"], serde_json::json!("medium"));
         assert_eq!(options["textVerbosity"], serde_json::json!("low"));
         assert_eq!(options["usage"]["include"], serde_json::json!(true));
+    }
+
+    /// Builds a one-provider custom map with the given model entry, for the
+    /// per-model max-output-tokens tests below.
+    fn custom_providers_with_model(
+        model_id: &str,
+        max_output_tokens: Option<u32>,
+        reasoning_effort: Option<&str>,
+    ) -> std::collections::HashMap<String, claurst_core::config::CustomProviderDef> {
+        let mut models = std::collections::HashMap::new();
+        models.insert(
+            model_id.to_string(),
+            claurst_core::config::CustomModelDef {
+                max_output_tokens,
+                reasoning_effort: reasoning_effort.map(str::to_string),
+                ..Default::default()
+            },
+        );
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "llmg-coding".to_string(),
+            claurst_core::config::CustomProviderDef {
+                models,
+                ..Default::default()
+            },
+        );
+        providers
+    }
+
+    #[test]
+    fn test_custom_model_max_output_tokens_override() {
+        let custom = custom_providers_with_model("together_ai/revolut-ltd/glm-5-2-nvfp4", Some(131_072), None);
+        // Exact-case match wins.
+        assert_eq!(
+            runner::provider_options::custom_model_max_output_tokens(
+                "llmg-coding",
+                "together_ai/revolut-ltd/glm-5-2-nvfp4",
+                &custom,
+            ),
+            Some(131_072)
+        );
+        // Mixed-case input resolves via the lowercased fallback lookup.
+        assert_eq!(
+            runner::provider_options::custom_model_max_output_tokens(
+                "llmg-coding",
+                "Together_AI/Revolut-Ltd/GLM-5-2-NVFP4",
+                &custom,
+            ),
+            Some(131_072)
+        );
+        // Unknown provider → no override.
+        assert_eq!(
+            runner::provider_options::custom_model_max_output_tokens(
+                "nvidia-direct",
+                "together_ai/revolut-ltd/glm-5-2-nvfp4",
+                &custom,
+            ),
+            None
+        );
+        // Unknown model → no override.
+        assert_eq!(
+            runner::provider_options::custom_model_max_output_tokens(
+                "llmg-coding",
+                "other/model",
+                &custom,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_custom_model_max_output_tokens_zero_means_no_override() {
+        let custom = custom_providers_with_model("z-ai/glm-5.3", Some(0), None);
+        assert_eq!(
+            runner::provider_options::custom_model_max_output_tokens(
+                "llmg-coding",
+                "z-ai/glm-5.3",
+                &custom,
+            ),
+            None
+        );
     }
 
     #[test]

@@ -107,6 +107,25 @@ pub(crate) fn is_openaiish_provider(
     )
 }
 
+/// Per-model `maxOutputTokens` from a custom provider's model catalog.
+///
+/// Returns `None` when the provider is not custom, the model is not in its
+/// catalog, or the value is absent/zero — all meaning "keep the caller's
+/// own max-tokens setting". Lookup is exact-case first, then lowercased,
+/// mirroring the `reasoningEffort` fallback in `build_provider_options`.
+pub(crate) fn custom_model_max_output_tokens(
+    provider_id: &str,
+    model_id: &str,
+    custom_providers: &std::collections::HashMap<String, claurst_core::config::CustomProviderDef>,
+) -> Option<u32> {
+    let cp = custom_providers.get(provider_id)?;
+    let model_def = cp
+        .models
+        .get(model_id)
+        .or_else(|| cp.models.get(&model_id.to_ascii_lowercase()))?;
+    model_def.max_output_tokens.filter(|m| *m > 0)
+}
+
 pub(crate) fn build_provider_options(
     provider_id: &str,
     model_id: &str,
