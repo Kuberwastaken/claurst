@@ -155,6 +155,16 @@ In the TUI, `/session` opens the session browser. The text form shows the curren
 /session list
 ```
 
+The browser overlay lists saved sessions for the current project with their
+title, last-updated time, message count, and cost. In the overlay:
+
+- `↑`/`↓` navigate, `Enter` resumes the selected session, `r` renames it, `Esc` closes.
+- `a` toggles each session's working-directory path under its row. Paths are
+  shown for the sessions already listed — it does not reveal sessions from
+  other projects.
+- `p` toggles the preview panel under the list (selected session's title,
+  stats, and working directory).
+
 ---
 
 ### /fork

@@ -859,36 +859,58 @@ impl App {
             return false;
         }
 
-        // Session browser intercepts navigation and Esc
+        // Session browser: Rename and Confirm modes intercept raw character
+        // input here. Browse mode routes every key through the keybinding
+        // resolver in SessionBrowser context: matched keys run their action,
+        // unmatched keys are swallowed so they never leak into the prompt
+        // editor (issue #407 review).
         if self.session_browser.visible {
             use crate::session_browser::SessionBrowserMode;
             match self.session_browser.mode {
                 SessionBrowserMode::Browse => {
-                    match key.code {
-                        KeyCode::Esc => self.session_browser.close(),
-                        KeyCode::Enter => {
-                            // Hand the pick to the CLI's `/resume <id>` path,
-                            // which owns session swapping (issue #382).
-                            if let Some(id) =
-                                self.session_browser.selected_session().map(|s| s.id.clone())
-                            {
-                                self.session_browser.close();
-                                self.set_prompt_text(format!("/resume {}", id));
-                                self.pending_auto_submit = true;
+                    // The generic resolver at the bottom of this function
+                    // never runs while an overlay owns the screen, so resolve
+                    // here, in this overlay's context. Chord state stays
+                    // coherent because both call sites share one resolver.
+                    if let Some(keystroke) = key_event_to_keystroke(&key) {
+                        match self
+                            .keybindings
+                            .process(keystroke, &KeyContext::SessionBrowser)
+                        {
+                            KeybindingResult::Action(action) => {
+                                self.handle_keybinding_action(&action);
                             }
+                            KeybindingResult::Pending
+                            | KeybindingResult::NoMatch
+                            | KeybindingResult::Unbound => {}
                         }
-                        KeyCode::Up => self.session_browser.select_prev(),
-                        KeyCode::Down => self.session_browser.select_next(),
-                        KeyCode::Char('r') => self.session_browser.start_rename(),
-                        _ => {}
+                    } else {
+                        self.keybindings.cancel_chord();
                     }
+                    return false;
                 }
                 SessionBrowserMode::Rename => {
                     match key.code {
                         KeyCode::Esc => self.session_browser.cancel(),
                         KeyCode::Enter => {
-                            if let Some((_id, name)) = self.session_browser.confirm_rename() {
-                                self.session_title = Some(name.clone());
+                            if let Some((id, name)) = self.session_browser.confirm_rename() {
+                                // Persist the rename for the selected session
+                                // (any entry, not just the live one) in the
+                                // background so the key handler stays sync.
+                                let persisted_id = id.clone();
+                                let persisted_name = name.clone();
+                                tokio::spawn(async move {
+                                    let _ = claurst_core::history::rename_session(
+                                        &persisted_id,
+                                        &persisted_name,
+                                    )
+                                    .await;
+                                });
+                                // The live-session title only changes when the
+                                // renamed entry IS the current session.
+                                if Some(id.as_str()) == self.current_session_id.as_deref() {
+                                    self.session_title = Some(name.clone());
+                                }
                                 self.status_message = Some(format!("Renamed to: {}", name));
                             }
                         }
@@ -2143,6 +2165,58 @@ impl App {
                 false
             }
             "redraw" => false,
+            // ---- Session browser (KeyContext::SessionBrowser) ----
+            "prevSession" => {
+                self.session_browser.select_prev();
+                false
+            }
+            "nextSession" => {
+                self.session_browser.select_next();
+                false
+            }
+            "prevSessionPage" => {
+                self.session_browser.select_prev_page();
+                false
+            }
+            "nextSessionPage" => {
+                self.session_browser.select_next_page();
+                false
+            }
+            "closeSessionBrowser" => {
+                self.session_browser.close();
+                false
+            }
+            "renameSession" => {
+                self.session_browser.start_rename();
+                false
+            }
+            "resumeSession" => {
+                // Signal the main loop to swap in the selected session. The
+                // loop drains `session_resume_pending` and performs the same
+                // swap as the /resume command (load, replace messages, reset
+                // file history and turn bookkeeping).
+                if let Some(session) = self.session_browser.selected_session() {
+                    self.session_resume_pending = Some(session.id.clone());
+                    self.session_browser.close();
+                }
+                false
+            }
+            "toggleSessionPaths" => {
+                self.session_browser.toggle_show_paths();
+                self.status_message = Some(format!(
+                    "Session paths {}.",
+                    if self.session_browser.show_paths {
+                        "shown"
+                    } else {
+                        "hidden"
+                    }
+                ));
+                false
+            }
+            "toggleSessionPreview" => {
+                self.session_browser.toggle_show_preview();
+                false
+            }
             "historySearch" => {
                 let overlay = HistorySearchOverlay::open(&self.prompt_input.history);
                 self.history_search_overlay = overlay;
