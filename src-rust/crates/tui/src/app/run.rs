@@ -1,19 +1,13 @@
 //! Main event loop, query events, jump-to-error, file open.
 
-use std::io::Stdout;
-
 use claurst_core::types::Message;
 use claurst_core::{sample_completion_verb, sample_spinner_verb};
 use claurst_query::QueryEvent;
 use crate::notifications::NotificationKind;
-use crate::render;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
 use tracing::debug;
 use super::App;
 use super::turns::format_elapsed_ms;
-use super::types::{RecentSession, ToolStatus, ToolUseBlock, recent_session_label};
+use super::types::{RecentSession, SystemMessageStyle, ToolStatus, ToolUseBlock, recent_session_label};
 use crate::session_browser::SessionEntry;
 
 /// Load the `/session` / `/resume` browser entries from the store that
@@ -378,11 +372,14 @@ impl App {
 
     /// Spawn and drain the background session-list loads requested by
     /// `session_list_pending` (the `/session` / `/resume` browser) and
-    /// `recent_sessions_pending` (the welcome screen). Whichever loop drives
-    /// the TUI must call this every frame: the CLI's interactive loop does not
-    /// go through [`App::run`], and before #382 these loads only lived there,
-    /// so the browser always opened empty.
+    /// `recent_sessions_pending` (the welcome screen), plus the
+    /// bang-command result and voice transcription events. Whichever loop
+    /// drives the TUI must call this every frame; the CLI's interactive loop
+    /// does (issue #382).
     pub fn poll_session_loads(&mut self) {
+        self.poll_bang_command();
+        self.poll_voice_events();
+
         if let Some(ref mut rx) = self.session_list_rx {
             match rx.try_recv() {
                 Ok(entries) => {
@@ -430,188 +427,80 @@ impl App {
         }
     }
 
-    /// Run the TUI event loop. Returns `Some(input)` when the user submits
-    /// a message, or `None` when the user quits.
-    pub fn run(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    ) -> anyhow::Result<Option<String>> {
-        loop {
-            self.frame_count = self.frame_count.wrapping_add(1);
-
-            self.poll_session_loads();
-
-            // Drain voice transcription events (non-blocking).
-            // When the background recording/transcription task emits a
-            // TranscriptReady event we insert the text directly into the
-            // prompt so the user can review and submit it.
-            {
-                use claurst_core::voice::VoiceEvent;
-                let mut events = Vec::new();
-                if let Some(ref mut rx) = self.voice_event_rx {
-                    while let Ok(ev) = rx.try_recv() {
-                        events.push(ev);
-                    }
-                }
-                for ev in events {
-                    match ev {
-                        VoiceEvent::RecordingStarted => {
-                            self.voice_recording = true;
-                            self.status_message =
-                                Some("Recording\u{2026} (Alt+V or Esc to stop)".to_string());
-                        }
-                        VoiceEvent::RecordingStopped => {
-                            self.voice_recording = false;
-                            self.status_message =
-                                Some("Transcribing\u{2026}".to_string());
-                        }
-                        VoiceEvent::TranscriptReady(text) => {
-                            if !text.is_empty() {
-                                // Append to existing prompt text with a space separator
-                                // so the user can combine voice + typed input.
-                                if !self.prompt_input.text.is_empty()
-                                    && !self.prompt_input.text.ends_with(' ')
-                                {
-                                    self.prompt_input.paste(" ");
-                                }
-                                self.prompt_input.paste(&text);
-                                self.refresh_prompt_input();
-                                self.status_message = Some(
-                                    format!("Transcribed: {}", &text[..text.len().min(60)])
-                                );
-                            }
-                            // Clear the channel once we have the result.
-                            self.voice_event_rx = None;
-                        }
-                        VoiceEvent::Error(msg) => {
-                            self.voice_recording = false;
-                            self.voice_event_rx = None;
-                            self.push_notification(
-                                NotificationKind::Warning,
-                                format!("Voice: {}", msg),
-                                Some(8),
-                            );
-                        }
-                    }
-                }
-            }
-
-            // Draw the frame, and immediately scan the *just-rendered*
-            // buffer for URL runs. ratatui swaps its two buffers at the
-            // end of draw(), so by the time draw() returns,
-            // `terminal.current_buffer_mut()` points at the empty next-frame
-            // slot. `CompletedFrame.buffer` is the one we actually want.
-            let osc8_hits = {
-                let completed = terminal.draw(|f| render::render_app(f, self))?;
-                crate::osc8::scan_buffer_for_urls(completed.buffer)
-            };
-
-            // Post-paint OSC 8 overlay: re-emit URL cells wrapped in
-            // hyperlink escapes so terminals that support OSC 8 (Windows
-            // Terminal, iTerm2, WezTerm, Kitty, Konsole, VS Code, …) make
-            // them Ctrl/Cmd-clickable. Failure is non-fatal — we never want
-            // an overlay glitch to kill the TUI.
-            if let Err(err) = crate::osc8::emit_hits(&osc8_hits) {
-                tracing::debug!(target: "osc8", "hyperlink overlay write failed: {err}");
-            }
-
-            // Replay a key that was saved by try_detect_paste_burst in a
-            // previous iteration (e.g. a modifier key that terminated a burst).
-            let pending = self.pending_key.take();
-
-            // Poll for events with a short timeout so we can redraw for animation
-            let got_event = pending.is_some()
-                || event::poll(std::time::Duration::from_millis(50))?;
-
-            if got_event {
-                let event = if let Some(k) = pending {
-                    Event::Key(k)
+    /// Drain the pending bang-command result from its spawned task and
+    /// show it in the transcript. Called every frame by the live loop.
+    fn poll_bang_command(&mut self) {
+        let Some(ref mut rx) = self.bang_command_pending else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((command, output)) => {
+                self.bang_command_pending = None;
+                if self.config.bang_commands.show_in_transcript {
+                    let formatted = if output.is_empty() {
+                        format!("$ ! {} (no output)", command)
+                    } else {
+                        format!("$ ! {}\n{}", command, output)
+                    };
+                    self.push_system_message(formatted, SystemMessageStyle::Info);
                 } else {
-                    event::read()?
-                };
-                match event {
-                    Event::Key(key) => {
-                        // On Windows crossterm fires both Press and Release events.
-                        // We normally skip non-press events, but when voice PTT mode
-                        // is active we need the Release event for the `V` key so we
-                        // can stop recording as soon as the user lifts the key.
-                        if key.kind != crossterm::event::KeyEventKind::Press {
-                            // Handle V-key release to stop PTT recording.
-                            if key.kind == crossterm::event::KeyEventKind::Release
-                                && key.code == KeyCode::Char('v')
-                                && key.modifiers == KeyModifiers::NONE
-                                && self.voice_recording
-                                && self.voice_recorder.is_some()
-                            {
-                                self.handle_voice_ptt_stop();
-                            }
-                            continue;
-                        }
+                    self.status_message = Some(format!("! {} finished.", command));
+                }
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                self.bang_command_pending = None;
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+        }
+    }
 
-                        // ---- Paste-burst detection -----------------------------------------
-                        // On Windows Terminal, Ctrl+V causes the terminal to write clipboard
-                        // content as raw character events (not as Event::Paste).  Every `\n`
-                        // fires as Enter (submitting the prompt) and stray `v` chars trigger
-                        // voice PTT.  We detect this by draining the event queue with a
-                        // zero-timeout immediately after the first character arrives — a paste
-                        // dumps every character at once while normal typing rarely queues more
-                        // than one char in the same 50 ms window.
-                        if key.modifiers == KeyModifiers::NONE
-                            || key.modifiers == KeyModifiers::SHIFT
+    /// Drain voice transcription events (non-blocking). When the background
+    /// recording/transcription task emits a TranscriptReady event we insert
+    /// the text directly into the prompt so the user can review and submit it.
+    fn poll_voice_events(&mut self) {
+        use claurst_core::voice::VoiceEvent;
+        let mut events = Vec::new();
+        if let Some(ref mut rx) = self.voice_event_rx {
+            while let Ok(ev) = rx.try_recv() {
+                events.push(ev);
+            }
+        }
+        for ev in events {
+            match ev {
+                VoiceEvent::RecordingStarted => {
+                    self.voice_recording = true;
+                    self.status_message =
+                        Some("Recording\u{2026} (Alt+V or Esc to stop)".to_string());
+                }
+                VoiceEvent::RecordingStopped => {
+                    self.voice_recording = false;
+                    self.status_message = Some("Transcribing\u{2026}".to_string());
+                }
+                VoiceEvent::TranscriptReady(text) => {
+                    if !text.is_empty() {
+                        // Append to existing prompt text with a space separator
+                        // so the user can combine voice + typed input.
+                        if !self.prompt_input.text.is_empty()
+                            && !self.prompt_input.text.ends_with(' ')
                         {
-                            if let KeyCode::Char(c) = key.code {
-                                if self.prompt_is_accepting_text() {
-                                    if let Some(burst) = self.try_detect_paste_burst(c) {
-                                        self.handle_paste_data(burst);
-                                        self.refresh_prompt_input();
-                                        continue;
-                                    }
-                                }
-                            }
+                            self.prompt_input.paste(" ");
                         }
-                        // -------------------------------------------------------------------
-
-                        let should_submit = self.handle_key_event(key);
-                        // Honour `:q`/`:wq` from vim command-line mode
-                        if self.prompt_input.vim_quit_requested {
-                            self.prompt_input.vim_quit_requested = false;
-                            self.should_exit = true;
-                        }
-                        if self.should_exit {
-                            return Ok(None);
-                        }
-                        if should_submit {
-                            // Dismiss any active error modal when the user sends a message
-                            self.dismiss_error_notifications();
-                            // Check if this is a slash command that should open a UI screen
-                            if crate::input::is_slash_command(&self.prompt_input.text) {
-                                let slash_input = self.prompt_input.text.clone();
-                                let (cmd, args) =
-                                        crate::input::parse_slash_command(&slash_input);
-                                if self.intercept_slash_command_with_args(cmd, args) {
-                                    self.clear_prompt();
-                                    continue;
-                                }
-                            }
-                            let input = self.take_input();
-                            if !input.is_empty() {
-                                return Ok(Some(input));
-                            }
-                        }
-                    }
-                    Event::Paste(data)
-                        if !self.is_streaming
-                            && self.permission_request.is_none()
-                            && !self.history_search_overlay.visible
-                            && self.history_search.is_none() =>
-                    {
-                        self.handle_paste_data(data);
+                        self.prompt_input.paste(&text);
                         self.refresh_prompt_input();
+                        self.status_message =
+                            Some(format!("Transcribed: {}", &text[..text.len().min(60)]));
                     }
-                    Event::Mouse(mouse_event) => {
-                        self.handle_mouse_event(mouse_event);
-                    }
-                    _ => {}
+                    // Clear the channel once we have the result.
+                    self.voice_event_rx = None;
+                }
+                VoiceEvent::Error(msg) => {
+                    self.voice_recording = false;
+                    self.voice_event_rx = None;
+                    self.push_notification(
+                        NotificationKind::Warning,
+                        format!("Voice: {}", msg),
+                        Some(8),
+                    );
                 }
             }
         }

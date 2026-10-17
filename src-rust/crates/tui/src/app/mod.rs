@@ -271,6 +271,8 @@ pub struct App {
     /// when the background discovery spawned at startup finishes, via
     /// [`App::set_discovered_slash_commands`]; never contains built-ins.
     pub discovered_slash_commands: Vec<(String, String)>,
+    /// Pending bang command result to display (from a spawned task).
+    pub bang_command_pending: Option<tokio::sync::mpsc::Receiver<(String, String)>>,
     /// Queued request for a real MCP reconnect from the interactive loop.
     pub pending_mcp_reconnect: bool,
     /// Set after an in-session provider connection (e.g. a Claude Pro/Max OAuth
@@ -703,6 +705,7 @@ impl App {
             remote_session_url: None,
             mcp_manager: None,
             discovered_slash_commands: Vec::new(),
+            bang_command_pending: None,
             pending_mcp_reconnect: false,
             pending_provider_reload: false,
             pending_mcp_panel_auth: None,
