@@ -9,6 +9,7 @@ ultraplan = ["claurst-core/ultraplan"]
 
 [dependencies]
 claurst-core = { workspace = true }
+claurst-productivity = { workspace = true }
 claurst-api = { workspace = true }
 claurst-tools = { workspace = true }
 claurst-query = { workspace = true }

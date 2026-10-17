@@ -9,9 +9,9 @@ use claurst_core::config::{Config, Settings, Theme};
 use claurst_core::cost::CostTracker;
 use claurst_core::types::{ContentBlock, Message};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 #[allow(unused_imports)]
 use std::path::PathBuf;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Core trait
@@ -178,10 +178,14 @@ fn resolve_fast_model_id(config: &Config) -> String {
     provider_lookup_ids(provider_id)
         .into_iter()
         .find_map(|lookup_id| registry.best_small_model_for_provider(lookup_id))
-        .unwrap_or_else(|| stripped_model_for_provider(provider_id, config.effective_model()).to_string())
+        .unwrap_or_else(|| {
+            stripped_model_for_provider(provider_id, config.effective_model()).to_string()
+        })
 }
 
-async fn provider_for_config(config: &Config) -> Option<std::sync::Arc<dyn claurst_api::LlmProvider>> {
+async fn provider_for_config(
+    config: &Config,
+) -> Option<std::sync::Arc<dyn claurst_api::LlmProvider>> {
     let anthropic_auth = config.resolve_anthropic_auth_async().await;
     let registry = claurst_api::ProviderRegistry::from_config(
         config,
@@ -201,7 +205,11 @@ async fn provider_for_config(config: &Config) -> Option<std::sync::Arc<dyn claur
 
     provider_lookup_ids(config.selected_provider_id())
         .into_iter()
-        .find_map(|lookup_id| registry.get(&claurst_core::ProviderId::new(lookup_id)).cloned())
+        .find_map(|lookup_id| {
+            registry
+                .get(&claurst_core::ProviderId::new(lookup_id))
+                .cloned()
+        })
 }
 
 fn text_from_content_blocks(blocks: &[ContentBlock]) -> String {
@@ -270,6 +278,8 @@ mod search;
 pub use search::*;
 mod session_tools;
 pub use session_tools::*;
+mod productivity;
+pub use productivity::*;
 mod display;
 pub use display::*;
 mod maintenance;
@@ -429,10 +439,7 @@ fn generate_keybindings_template() -> anyhow::Result<String> {
             .collect(),
     };
 
-    Ok(format!(
-        "{}\n",
-        serde_json::to_string_pretty(&template)?
-    ))
+    Ok(format!("{}\n", serde_json::to_string_pretty(&template)?))
 }
 
 fn parse_theme(name: &str) -> Option<Theme> {
@@ -511,34 +518,41 @@ fn execute_named_command_from_slash(
 /// Category labels for help grouping.
 fn command_category(name: &str) -> &'static str {
     match name {
-        "clear" | "new" | "compact" | "rewind" | "summary" | "export" | "rename" | "branch" | "fork" => {
-            "Conversation"
-        }
-        "model" | "config" | "theme" | "color" | "vim" | "fast" | "effort"
-        | "voice" | "statusline" | "output-style" | "keybindings"
-        | "privacy-settings" | "rate-limit-options" | "sandbox-toggle" => "Settings",
-        "cost" | "stats" | "usage" | "extra-usage" | "context" | "ctx-viz" => "Usage & Cost",
+        "clear" | "new" | "compact" | "rewind" | "summary" | "export" | "rename" | "branch"
+        | "fork" => "Conversation",
+        "model" | "config" | "theme" | "color" | "vim" | "fast" | "effort" | "voice"
+        | "statusline" | "output-style" | "keybindings" | "privacy-settings"
+        | "rate-limit-options" | "sandbox-toggle" => "Settings",
+        "cost" | "stats" | "usage" | "extra-usage" | "context" | "ctx-viz" | "productivity"
+        | "wrapped" => "Usage & Cost",
         "status" | "doctor" | "terminal-setup" | "version" | "update" | "upgrade"
         | "release-notes" => "System",
         "login" | "logout" | "refresh" | "permissions" => "Auth & Permissions",
-        "memory" | "files" | "diff" | "init" | "commit" | "review"
-        | "security-review" | "import-config" => "Project",
+        "memory" | "files" | "diff" | "init" | "commit" | "review" | "security-review"
+        | "import-config" => "Project",
         "mcp" | "hooks" | "ide" | "chrome" => "Integrations",
-        "session" | "resume" | "remote-control" | "remote-env"
-        | "teleport" | "move" => "Sessions & Remote",
+        "session" | "resume" | "remote-control" | "remote-env" | "teleport" | "move" => {
+            "Sessions & Remote"
+        }
         "help" | "exit" => "General",
         "think-back" | "thinkback-play" | "thinking" | "plan" | "tasks" => "AI & Thinking",
-        "copy" | "skills" | "agents" | "plugin" | "reload-plugins"
-        | "stickers" | "passes" | "desktop" | "mobile" | "btw" => "Tools & Extras",
+        "copy" | "skills" | "agents" | "plugin" | "reload-plugins" | "stickers" | "passes"
+        | "desktop" | "mobile" | "btw" => "Tools & Extras",
         _ => "Other",
     }
 }
 
 #[async_trait]
 impl SlashCommand for HelpCommand {
-    fn name(&self) -> &str { "help" }
-    fn aliases(&self) -> Vec<&str> { vec!["h", "?"] }
-    fn description(&self) -> &str { "Show available commands and usage information" }
+    fn name(&self) -> &str {
+        "help"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["h", "?"]
+    }
+    fn description(&self) -> &str {
+        "Show available commands and usage information"
+    }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
         if !args.is_empty() {
@@ -550,7 +564,11 @@ impl SlashCommand for HelpCommand {
                 } else {
                     format!(
                         "\nAliases: {}",
-                        aliases.iter().map(|a| format!("/{}", a)).collect::<Vec<_>>().join(", ")
+                        aliases
+                            .iter()
+                            .map(|a| format!("/{}", a))
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     )
                 };
                 return CommandResult::Message(format!(
@@ -595,13 +613,18 @@ impl SlashCommand for HelpCommand {
             } else {
                 format!(
                     " ({})",
-                    aliases.iter().map(|a| format!("/{}", a)).collect::<Vec<_>>().join(", ")
+                    aliases
+                        .iter()
+                        .map(|a| format!("/{}", a))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )
             };
-            by_cat
-                .entry(cat)
-                .or_default()
-                .push(format!("  /{:<20} {}", format!("{}{}", cmd.name(), alias_str), cmd.description()));
+            by_cat.entry(cat).or_default().push(format!(
+                "  /{:<20} {}",
+                format!("{}{}", cmd.name(), alias_str),
+                cmd.description()
+            ));
         }
 
         let mut output = String::from("Claurst — Slash Commands\n");
@@ -625,9 +648,15 @@ impl SlashCommand for HelpCommand {
 
 #[async_trait]
 impl SlashCommand for ClearCommand {
-    fn name(&self) -> &str { "clear" }
-    fn aliases(&self) -> Vec<&str> { vec!["c", "reset"] }
-    fn description(&self) -> &str { "Clear the conversation history" }
+    fn name(&self) -> &str {
+        "clear"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["c", "reset"]
+    }
+    fn description(&self) -> &str {
+        "Clear the conversation history"
+    }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
         CommandResult::ClearConversation
@@ -638,8 +667,12 @@ impl SlashCommand for ClearCommand {
 
 #[async_trait]
 impl SlashCommand for CompactCommand {
-    fn name(&self) -> &str { "compact" }
-    fn description(&self) -> &str { "Compact the conversation to reduce token usage" }
+    fn name(&self) -> &str {
+        "compact"
+    }
+    fn description(&self) -> &str {
+        "Compact the conversation to reduce token usage"
+    }
 
     fn help(&self) -> &str {
         "Usage: /compact [instructions]\n\n\
@@ -733,8 +766,12 @@ async fn compact_now(
 
 #[async_trait]
 impl SlashCommand for CostCommand {
-    fn name(&self) -> &str { "cost" }
-    fn description(&self) -> &str { "Show token usage and cost for this session" }
+    fn name(&self) -> &str {
+        "cost"
+    }
+    fn description(&self) -> &str {
+        "Show token usage and cost for this session"
+    }
     fn help(&self) -> &str {
         "Usage: /cost\n\n\
          Shows per-category token counts and the estimated cost for this session.\n\
@@ -778,10 +815,10 @@ impl SlashCommand for CostCommand {
         let pricing = pricing_opt.unwrap_or(claurst_core::cost::ModelPricing::FREE);
 
         // Per-category cost breakdown.
-        let input_cost    = (input as f64 * pricing.input_per_mtk) / 1_000_000.0;
-        let output_cost   = (output as f64 * pricing.output_per_mtk) / 1_000_000.0;
-        let cc_cost       = (cache_create as f64 * pricing.cache_creation_per_mtk) / 1_000_000.0;
-        let cr_cost       = (cache_read as f64 * pricing.cache_read_per_mtk) / 1_000_000.0;
+        let input_cost = (input as f64 * pricing.input_per_mtk) / 1_000_000.0;
+        let output_cost = (output as f64 * pricing.output_per_mtk) / 1_000_000.0;
+        let cc_cost = (cache_create as f64 * pricing.cache_creation_per_mtk) / 1_000_000.0;
+        let cr_cost = (cache_read as f64 * pricing.cache_read_per_mtk) / 1_000_000.0;
 
         // Pricing info line.
         let pricing_line = match pricing_opt {
@@ -799,10 +836,12 @@ impl SlashCommand for CostCommand {
         // Cache savings note: how much input cost was avoided by using cache-read
         // instead of re-sending those tokens as normal input.
         let savings = if cache_read > 0 {
-            let saved =
-                (cache_read as f64 * (pricing.input_per_mtk - pricing.cache_read_per_mtk))
-                    / 1_000_000.0;
-            format!("\n  Cache savings:  ${:.4}  ({} tokens served from cache)", saved, cache_read)
+            let saved = (cache_read as f64 * (pricing.input_per_mtk - pricing.cache_read_per_mtk))
+                / 1_000_000.0;
+            format!(
+                "\n  Cache savings:  ${:.4}  ({} tokens served from cache)",
+                saved, cache_read
+            )
         } else {
             String::new()
         };
@@ -840,9 +879,15 @@ impl SlashCommand for CostCommand {
 
 #[async_trait]
 impl SlashCommand for ExitCommand {
-    fn name(&self) -> &str { "exit" }
-    fn aliases(&self) -> Vec<&str> { vec!["quit", "q"] }
-    fn description(&self) -> &str { "Exit Claurst" }
+    fn name(&self) -> &str {
+        "exit"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["quit", "q"]
+    }
+    fn description(&self) -> &str {
+        "Exit Claurst"
+    }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
         CommandResult::Exit
@@ -853,8 +898,12 @@ impl SlashCommand for ExitCommand {
 
 #[async_trait]
 impl SlashCommand for ModelCommand {
-    fn name(&self) -> &str { "model" }
-    fn description(&self) -> &str { "Show or change the current model" }
+    fn name(&self) -> &str {
+        "model"
+    }
+    fn description(&self) -> &str {
+        "Show or change the current model"
+    }
     fn help(&self) -> &str {
         "Usage: /model [<model-id>]\n\n\
          Without arguments, shows the current model.\n\n\
@@ -871,10 +920,7 @@ impl SlashCommand for ModelCommand {
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         let args = args.trim();
         if args.is_empty() {
-            CommandResult::Message(format!(
-                "Current model: {}",
-                ctx.config.effective_model()
-            ))
+            CommandResult::Message(format!("Current model: {}", ctx.config.effective_model()))
         } else {
             // Accept both "provider/model" and bare model names.
             // The config stores the full string (including provider prefix when present)
@@ -903,15 +949,18 @@ impl SlashCommand for ModelCommand {
 
 #[async_trait]
 impl SlashCommand for VersionCommand {
-    fn name(&self) -> &str { "version" }
-    fn aliases(&self) -> Vec<&str> { vec!["v"] }
-    fn description(&self) -> &str { "Show version information" }
+    fn name(&self) -> &str {
+        "version"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["v"]
+    }
+    fn description(&self) -> &str {
+        "Show version information"
+    }
 
     async fn execute(&self, _args: &str, _ctx: &mut CommandContext) -> CommandResult {
-        CommandResult::Message(format!(
-            "Claurst v{}",
-            claurst_core::constants::APP_VERSION
-        ))
+        CommandResult::Message(format!("Claurst v{}", claurst_core::constants::APP_VERSION))
     }
 }
 
@@ -919,9 +968,15 @@ impl SlashCommand for VersionCommand {
 
 #[async_trait]
 impl SlashCommand for ResumeCommand {
-    fn name(&self) -> &str { "resume" }
-    fn aliases(&self) -> Vec<&str> { vec!["r", "continue"] }
-    fn description(&self) -> &str { "Resume a previous conversation" }
+    fn name(&self) -> &str {
+        "resume"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["r", "continue"]
+    }
+    fn description(&self) -> &str {
+        "Resume a previous conversation"
+    }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
         if args.is_empty() {
@@ -932,19 +987,16 @@ impl SlashCommand for ResumeCommand {
             let last = &sessions[0];
             match claurst_core::history::load_session(&last.id).await {
                 Ok(session) => CommandResult::ResumeSession(session),
-                Err(e) => CommandResult::Error(format!(
-                    "Failed to load session {}: {}",
-                    last.id, e
-                )),
+                Err(e) => {
+                    CommandResult::Error(format!("Failed to load session {}: {}", last.id, e))
+                }
             }
         } else {
             match claurst_core::history::load_session(args.trim()).await {
                 Ok(session) => CommandResult::ResumeSession(session),
-                Err(e) => CommandResult::Error(format!(
-                    "Failed to load session {}: {}",
-                    args.trim(),
-                    e
-                )),
+                Err(e) => {
+                    CommandResult::Error(format!("Failed to load session {}: {}", args.trim(), e))
+                }
             }
         }
     }
@@ -954,8 +1006,12 @@ impl SlashCommand for ResumeCommand {
 
 #[async_trait]
 impl SlashCommand for StatusCommand {
-    fn name(&self) -> &str { "status" }
-    fn description(&self) -> &str { "Show comprehensive system and session status" }
+    fn name(&self) -> &str {
+        "status"
+    }
+    fn description(&self) -> &str {
+        "Show comprehensive system and session status"
+    }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         // Auth status
@@ -982,7 +1038,13 @@ impl SlashCommand for StatusCommand {
         };
 
         // Hook status (settings hooks; plugin hooks are listed by /hooks)
-        let hook_count: usize = ctx.config.hooks.values().flatten().map(|g| g.hooks.len()).sum();
+        let hook_count: usize = ctx
+            .config
+            .hooks
+            .values()
+            .flatten()
+            .map(|g| g.hooks.len())
+            .sum();
 
         // UI settings
         let ui = load_ui_settings();
@@ -1041,8 +1103,12 @@ impl SlashCommand for StatusCommand {
 
 #[async_trait]
 impl SlashCommand for DiffCommand {
-    fn name(&self) -> &str { "diff" }
-    fn description(&self) -> &str { "Show git diff of changes in the working directory" }
+    fn name(&self) -> &str {
+        "diff"
+    }
+    fn description(&self) -> &str {
+        "Show git diff of changes in the working directory"
+    }
     fn help(&self) -> &str {
         "Usage: /diff [--stat|--staged|<ref>]\n\n\
          Shows git diff output for the current working directory.\n\n\
@@ -1113,8 +1179,12 @@ impl SlashCommand for DiffCommand {
 
 #[async_trait]
 impl SlashCommand for InitCommand {
-    fn name(&self) -> &str { "init" }
-    fn description(&self) -> &str { "Initialize a new project with AGENTS.md" }
+    fn name(&self) -> &str {
+        "init"
+    }
+    fn description(&self) -> &str {
+        "Initialize a new project with AGENTS.md"
+    }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         let path = ctx.working_dir.join("AGENTS.md");
@@ -1133,10 +1203,7 @@ impl SlashCommand for InitCommand {
             - List important files and their purposes\n";
 
         match tokio::fs::write(&path, default_content).await {
-            Ok(()) => CommandResult::Message(format!(
-                "Created AGENTS.md at {}",
-                path.display()
-            )),
+            Ok(()) => CommandResult::Message(format!("Created AGENTS.md at {}", path.display())),
             Err(e) => CommandResult::Error(format!("Failed to create AGENTS.md: {}", e)),
         }
     }
@@ -1146,8 +1213,12 @@ impl SlashCommand for InitCommand {
 
 #[async_trait]
 impl SlashCommand for ImportConfigCommand {
-    fn name(&self) -> &str { "import-config" }
-    fn description(&self) -> &str { "Import CLAUDE.md and settings.json from ~/.claude" }
+    fn name(&self) -> &str {
+        "import-config"
+    }
+    fn description(&self) -> &str {
+        "Import CLAUDE.md and settings.json from ~/.claude"
+    }
     fn help(&self) -> &str {
         "Usage: /import-config\n\
          Import user-level Claude Code configuration from ~/.claude:\n\
@@ -1165,8 +1236,12 @@ impl SlashCommand for ImportConfigCommand {
 
 #[async_trait]
 impl SlashCommand for HooksCommand {
-    fn name(&self) -> &str { "hooks" }
-    fn description(&self) -> &str { "Show configured event hooks" }
+    fn name(&self) -> &str {
+        "hooks"
+    }
+    fn description(&self) -> &str {
+        "Show configured event hooks"
+    }
     fn help(&self) -> &str {
         "Usage: /hooks\n\
          Show the hooks that run: settings hooks (the 'hooks' key of ~/.claurst/settings.json)\n\
@@ -1207,9 +1282,15 @@ impl SlashCommand for HooksCommand {
 
 #[async_trait]
 impl SlashCommand for ThinkingCommand {
-    fn name(&self) -> &str { "thinking" }
-    fn description(&self) -> &str { "Toggle extended thinking mode" }
-    fn aliases(&self) -> Vec<&str> { vec!["think"] }
+    fn name(&self) -> &str {
+        "thinking"
+    }
+    fn description(&self) -> &str {
+        "Toggle extended thinking mode"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["think"]
+    }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
         // Extended thinking is configured through the model; just inform the user
@@ -1217,7 +1298,8 @@ impl SlashCommand for ThinkingCommand {
         if model.contains("claude-3-5") || model.contains("claude-3.5") {
             CommandResult::Message(
                 "Extended thinking is not available for Claude 3.5 models.\n\
-                 Use claude-opus-4-6 or claude-sonnet-4-6 for extended thinking.".to_string()
+                 Use claude-opus-4-6 or claude-sonnet-4-6 for extended thinking."
+                    .to_string(),
             )
         } else {
             CommandResult::Message(format!(
@@ -1234,13 +1316,21 @@ impl SlashCommand for ThinkingCommand {
 
 #[async_trait]
 impl SlashCommand for NamedCommandAdapter {
-    fn name(&self) -> &str { self.slash_name }
+    fn name(&self) -> &str {
+        self.slash_name
+    }
 
-    fn aliases(&self) -> Vec<&str> { self.slash_aliases.to_vec() }
+    fn aliases(&self) -> Vec<&str> {
+        self.slash_aliases.to_vec()
+    }
 
-    fn description(&self) -> &str { self.slash_description }
+    fn description(&self) -> &str {
+        self.slash_description
+    }
 
-    fn help(&self) -> &str { self.slash_help }
+    fn help(&self) -> &str {
+        self.slash_help
+    }
 
     async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
         execute_named_command_from_slash(self.target_name, args, ctx)
@@ -1301,6 +1391,7 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
         Box::new(SkillsCommand),
         Box::new(RewindCommand),
         Box::new(StatsCommand),
+        Box::new(ProductivityCommand),
         Box::new(FilesCommand),
         Box::new(RenameCommand),
         Box::new(EffortCommand),
@@ -1445,9 +1536,9 @@ pub fn all_commands() -> Vec<Box<dyn SlashCommand>> {
 /// Find a command by name or alias.
 pub fn find_command(name: &str) -> Option<Box<dyn SlashCommand>> {
     let name = name.trim_start_matches('/');
-    all_commands().into_iter().find(|c| {
-        c.name() == name || c.aliases().contains(&name)
-    })
+    all_commands()
+        .into_iter()
+        .find(|c| c.name() == name || c.aliases().contains(&name))
 }
 
 /// Build `HelpEntry` values for all non-hidden commands, suitable for
@@ -1477,15 +1568,22 @@ struct TemplateCommand {
 
 #[async_trait]
 impl SlashCommand for TemplateCommand {
-    fn name(&self) -> &str { &self.name }
+    fn name(&self) -> &str {
+        &self.name
+    }
     fn description(&self) -> &str {
-        self.template.description.as_deref().unwrap_or("Custom command")
+        self.template
+            .description
+            .as_deref()
+            .unwrap_or("Custom command")
     }
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
         let mut words = args.split_whitespace();
         let arg1 = words.next().unwrap_or("");
         let arg2 = words.next().unwrap_or("");
-        let prompt = self.template.template
+        let prompt = self
+            .template
+            .template
             .replace("$ARGUMENTS", args)
             .replace("$1", arg1)
             .replace("$2", arg2);
@@ -1496,12 +1594,16 @@ impl SlashCommand for TemplateCommand {
 /// Build slash commands from user-defined command templates stored in
 /// `settings.commands`.
 pub fn commands_from_settings(settings: &claurst_core::Settings) -> Vec<Box<dyn SlashCommand>> {
-    settings.commands.iter().map(|(name, template)| {
-        Box::new(TemplateCommand {
-            name: name.clone(),
-            template: template.clone(),
-        }) as Box<dyn SlashCommand>
-    }).collect()
+    settings
+        .commands
+        .iter()
+        .map(|(name, template)| {
+            Box::new(TemplateCommand {
+                name: name.clone(),
+                template: template.clone(),
+            }) as Box<dyn SlashCommand>
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1517,14 +1619,19 @@ struct SkillCommand {
 
 #[async_trait]
 impl SlashCommand for SkillCommand {
-    fn name(&self) -> &str { &self.name }
-    fn description(&self) -> &str { &self.description }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        &self.description
+    }
 
     async fn execute(&self, args: &str, _ctx: &mut CommandContext) -> CommandResult {
         let mut words = args.split_whitespace();
         let arg1 = words.next().unwrap_or("");
         let arg2 = words.next().unwrap_or("");
-        let prompt = self.template
+        let prompt = self
+            .template
             .replace("$ARGUMENTS", args)
             .replace("$1", arg1)
             .replace("$2", arg2);
@@ -1551,11 +1658,10 @@ pub fn skill_command_entries(registry: &claurst_core::SkillRegistry) -> Vec<(Str
 }
 
 /// Execute a slash command string (with leading /).
-pub async fn execute_command(
-    input: &str,
-    ctx: &mut CommandContext,
-) -> Option<CommandResult> {
-    if !claurst_tui::input::is_slash_command(input) { return None; }
+pub async fn execute_command(input: &str, ctx: &mut CommandContext) -> Option<CommandResult> {
+    if !claurst_tui::input::is_slash_command(input) {
+        return None;
+    }
     let (name, args) = claurst_tui::input::parse_slash_command(input);
 
     // First check built-in commands.
@@ -1566,7 +1672,10 @@ pub async fn execute_command(
     // Check user-defined command templates from settings.
     let cmd_name = name.trim_start_matches('/');
     if let Some(tmpl) = ctx.config.commands.get(cmd_name).cloned() {
-        let tc = TemplateCommand { name: cmd_name.to_string(), template: tmpl };
+        let tc = TemplateCommand {
+            name: cmd_name.to_string(),
+            template: tmpl,
+        };
         return Some(tc.execute(args, ctx).await);
     }
 
@@ -1690,13 +1799,40 @@ mod tests {
     #[test]
     fn test_core_commands_present() {
         let expected = [
-            "help", "clear", "compact", "cost", "exit", "model",
-            "config", "version", "status", "diff", "memory", "hooks",
-            "permissions", "plan", "tasks", "session", "login", "logout", "refresh",
-            "usage", "plugin", "reload-plugins",
-            "add-dir", "agents", "branch", "tag",
-            "passes", "ide", "pr-comments", "desktop", "mobile",
-            "install-github-app", "web-setup", "stickers",
+            "help",
+            "clear",
+            "compact",
+            "cost",
+            "exit",
+            "model",
+            "config",
+            "version",
+            "status",
+            "diff",
+            "memory",
+            "hooks",
+            "permissions",
+            "plan",
+            "tasks",
+            "session",
+            "login",
+            "logout",
+            "refresh",
+            "usage",
+            "plugin",
+            "reload-plugins",
+            "add-dir",
+            "agents",
+            "branch",
+            "tag",
+            "passes",
+            "ide",
+            "pr-comments",
+            "desktop",
+            "mobile",
+            "install-github-app",
+            "web-setup",
+            "stickers",
         ];
         for name in &expected {
             assert!(
@@ -1729,7 +1865,10 @@ mod tests {
         let CommandResult::Message(text) = result else {
             panic!("empty /output-style should list styles, got {result:?}");
         };
-        assert!(text.contains("caveman"), "personas must appear in the list: {text}");
+        assert!(
+            text.contains("caveman"),
+            "personas must appear in the list: {text}"
+        );
         assert!(text.contains("rocky"));
         assert!(text.contains("default"));
         // Default config → default is the current style.
@@ -1777,7 +1916,10 @@ mod tests {
         let template = generate_keybindings_template().expect("template must generate");
         let parsed: serde_json::Value =
             serde_json::from_str(&template).expect("template must be valid JSON");
-        assert!(parsed.get("bindings").is_some(), "template needs a bindings block");
+        assert!(
+            parsed.get("bindings").is_some(),
+            "template needs a bindings block"
+        );
     }
 
     #[test]
@@ -1905,9 +2047,7 @@ mod tests {
         let result = cmd.execute("--codex --label work", &mut ctx).await;
         match result {
             CommandResult::StartLoginForProvider {
-                provider,
-                label,
-                ..
+                provider, label, ..
             } => {
                 assert_eq!(provider, claurst_core::accounts::PROVIDER_CODEX);
                 assert_eq!(label.as_deref(), Some("work"));
@@ -2039,16 +2179,27 @@ mod tests {
 
     #[tokio::test]
     async fn compact_runs_now_and_reports_before_and_after_tokens() {
-        let provider = SummaryProvider { id: claurst_core::ProviderId::new("google") };
+        let provider = SummaryProvider {
+            id: claurst_core::ProviderId::new("google"),
+        };
         let messages: Vec<Message> = (0..9)
             .map(|i| {
                 let text = format!("turn {} {}", i, "z".repeat(30_000));
-                if i % 2 == 0 { Message::user(text) } else { Message::assistant(text) }
+                if i % 2 == 0 {
+                    Message::user(text)
+                } else {
+                    Message::assistant(text)
+                }
             })
             .collect();
 
         let result = compact_now(&provider, "gemini-test", &messages, 32_000, None).await;
-        let CommandResult::Compacted { messages: compacted, record, report } = result else {
+        let CommandResult::Compacted {
+            messages: compacted,
+            record,
+            report,
+        } = result
+        else {
             panic!("expected a compaction, got {:?}", result);
         };
         assert!(compacted[0].get_all_text().contains("Manual summary."));
@@ -2067,9 +2218,13 @@ mod tests {
 
     #[tokio::test]
     async fn compact_reports_when_nothing_fits_the_cut() {
-        let provider = SummaryProvider { id: claurst_core::ProviderId::new("ollama") };
+        let provider = SummaryProvider {
+            id: claurst_core::ProviderId::new("ollama"),
+        };
         let messages = vec![Message::user("hi"), Message::assistant("hello")];
         let result = compact_now(&provider, "llama", &messages, 8_000, None).await;
-        assert!(matches!(result, CommandResult::Message(ref m) if m.starts_with("Nothing to compact")));
+        assert!(
+            matches!(result, CommandResult::Message(ref m) if m.starts_with("Nothing to compact"))
+        );
     }
 }

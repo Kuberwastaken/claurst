@@ -837,6 +837,7 @@ dependencies = [
  "claurst-core",
  "claurst-mcp",
  "claurst-plugins",
+ "claurst-productivity",
  "claurst-query",
  "claurst-tools",
  "claurst-tui",
@@ -954,6 +955,19 @@ dependencies = [
  "urlencoding",
  "walkdir",
  "zip",
+]
+
+[[package]]
+name = "claurst-productivity"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "chrono",
+ "claurst-core",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
