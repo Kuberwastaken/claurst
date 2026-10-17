@@ -969,6 +969,41 @@ The schema given to `--json-schema` (it must have `"type": "object"`) is the too
 
 ---
 
+### CodemodeTool
+
+**Tool name:** `codemode` · **Permission level:** Execute
+
+Run a model-written JavaScript program inside an embedded QuickJS sandbox
+(`src-rust/crates/codemode`) that can call the session's other tools. Use it
+to chain, loop over, or parallelize many tool calls in one step so
+intermediate results stay out of the conversation. Only what the script
+`return`s (plus captured `console.log` output) comes back to the model.
+
+The tool is opt-in and disabled by default. Enable it with
+`CLAURST_FEATURE_CODEMODE=1` or `CLAURST_CODEMODE=1`; without one of those
+the tool refuses to run. It is also absent from builds on FreeBSD, where the
+QuickJS bindings do not compile.
+
+Inside the script, `await tools.<Name>(args)` (or `await callTool(name,
+args)`) invokes a tool with its normal arguments. `listTools()` /
+`describeTool(name)` expose tool metadata, and `store(key, value)` / `load(key)`
+keep JSON values across codemode calls within one session.
+
+Safety model: the sandbox has no filesystem, network, timer, or process APIs.
+The only way to affect the host is a tool call, and every tool call goes
+through the same dispatch path as a top-level call, so tool-wide deny rules,
+the central permission backstop, and per-tool permission levels apply
+unchanged. Per run the sandbox is limited to a 64 MB heap, 300 s wall clock,
+2000 tool calls, and 64 KB of captured console output; exceeding a limit ends
+the run with an error. The tool cannot call itself, so scripts cannot nest
+sandboxes.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `code` | string | yes | Body of an async JavaScript function; `await` and `return` work directly |
+
+---
+
 ## Tool Framework Internals
 
 ### ToolContext

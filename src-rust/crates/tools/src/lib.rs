@@ -61,6 +61,7 @@ pub mod remote_trigger;
 pub mod formatter;
 pub mod monitor_tool;
 pub mod goal_complete;
+pub mod codemode;
 
 // Re-exports for convenience.
 pub use formatter::try_format_file;
@@ -100,6 +101,7 @@ pub use team_tool::{TeamCreateTool, TeamDeleteTool, register_agent_runner, Agent
 pub use remote_trigger::RemoteTriggerTool;
 pub use monitor_tool::MonitorTool;
 pub use goal_complete::GoalCompleteTool;
+pub use codemode::{CodemodeTool, codemode_enabled};
 
 // ---------------------------------------------------------------------------
 // AskUser question channel
@@ -1059,7 +1061,7 @@ pub trait Tool: Send + Sync {
 
 /// Return all built-in tools (excluding AgentTool, which lives in cc-query).
 pub fn all_tools() -> Vec<Box<dyn Tool>> {
-    vec![
+    let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(PtyBashTool),
         Box::new(FileReadTool),
         Box::new(FileEditTool),
@@ -1107,12 +1109,63 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         // Computer Use is only available when compiled with the feature flag.
         #[cfg(feature = "computer-use")]
         Box::new(computer_use::ComputerUseTool),
-    ]
+    ];
+    // The opt-in codemode tool joins the set only when its feature gate is
+    // on, so sessions without it never see the tool at all.
+    if codemode_enabled() {
+        tools.push(Box::new(CodemodeTool));
+    }
+    tools
 }
 
 /// Find a tool by name (case-sensitive).
 pub fn find_tool(name: &str) -> Option<Box<dyn Tool>> {
     all_tools().into_iter().find(|t| t.name() == name)
+}
+
+/// Whether a `PermissionLevel` must be gated before a tool runs.
+/// Mirrors the central permission backstop in the query loop: only `None`
+/// and `ReadOnly` are exempt.
+pub fn permission_level_is_gated(level: PermissionLevel) -> bool {
+    !matches!(level, PermissionLevel::None | PermissionLevel::ReadOnly)
+}
+
+/// Dispatch one tool call through the shared gating path. Used by sandboxed
+/// callers (codemode): a tool-wide deny rule refuses the call, and a tool that
+/// does not gate itself is checked by the central permission backstop before
+/// it runs, exactly as for a top-level call in the query loop.
+pub async fn execute_tool_dispatch(
+    name: &str,
+    input: &Value,
+    tools: &[Box<dyn Tool>],
+    ctx: &ToolContext,
+) -> ToolResult {
+    let tool = tools.iter().find(|t| t.name() == name);
+
+    if tool.is_some() && ctx.tool_is_disallowed(name) {
+        return ToolResult::error(format!(
+            "Tool '{}' is disallowed by the permission rules (disallowed_tools).",
+            name
+        ));
+    }
+
+    let Some(tool) = tool else {
+        return ToolResult::error(format!("Unknown tool: {}", name));
+    };
+
+    if !tool.self_gates() && permission_level_is_gated(tool.permission_level()) {
+        let rendered = serde_json::to_string(input).unwrap_or_default();
+        let preview: String = rendered.chars().take(200).collect();
+        let description = if preview.is_empty() || preview == "{}" || preview == "null" {
+            format!("Run tool '{}'", name)
+        } else {
+            format!("Run tool '{}' with input: {}", name, preview)
+        };
+        if let Err(e) = ctx.check_permission(name, &description, false) {
+            return ToolResult::error(e.to_string());
+        }
+    }
+    tool.execute(input.clone(), ctx).await
 }
 
 // ---------------------------------------------------------------------------
