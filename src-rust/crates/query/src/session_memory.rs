@@ -566,6 +566,25 @@ pub async fn extract_and_store(
 // Tests
 // ---------------------------------------------------------------------------
 
+/// The spawn registry is process-global; every test that spawns or awaits
+/// tracked extractions (here or in the lib-level loop tests) must hold this
+/// guard, or one test's `await` drains another's in-flight handles.
+///
+/// Returns the acquired `MutexGuard` (not the `Mutex`) so a plain
+/// `let _guard = test_registry_lock();` actually serializes — binding a
+/// bare reference never locks anything.
+///
+/// The guard is deliberately held across `.await` points: the whole point
+/// is serializing async tests that share the process-global spawn registry
+/// and `CLAURST_REMOTE_MEMORY_DIR` env var, so clippy's `await_holding_lock`
+/// (sound for blocking-runtime code) is allowed at the call sites below.
+#[cfg(test)]
+#[allow(clippy::await_holding_lock)]
+pub(crate) fn test_registry_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -854,21 +873,25 @@ MEMORY: code_pattern | 7 | Uses builder pattern";
 
     // ---- spawn registry -------------------------------------------
 
-    /// The spawn registry is process-global; tests that touch it must not
-    /// run concurrently or one test's `await` drains another's handles.
-    fn registry_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        &LOCK
+    /// Backwards-compat alias for the shared registry lock. Returns the
+    /// acquired guard; `let _guard = registry_lock();` serializes.
+    fn registry_lock() -> std::sync::MutexGuard<'static, ()> {
+        super::test_registry_lock()
     }
 
+    // Same deliberate guard-across-await as the tests below.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn await_pending_with_no_tasks_returns_zero() {
         let _guard = registry_lock();
         let unfinished = await_pending_extractions(std::time::Duration::from_millis(10)).await;
         assert_eq!(unfinished, 0);
     }
 
+    // The registry lock guard is deliberately held across the awaits below:
+    // the test must own the process-global spawn registry for its full body.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn await_pending_waits_for_running_task() {
         let _guard = registry_lock();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -890,6 +913,7 @@ MEMORY: code_pattern | 7 | Uses builder pattern";
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn spawn_registry_retains_only_32_handles() {
         let _guard = registry_lock();
         // 33 tracked spawns: the oldest is evicted beyond the cap.

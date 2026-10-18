@@ -3558,10 +3558,29 @@ mod tests {
     /// Drive the loop against `ExtractionProbeProvider` with memory extraction
     /// enabled and a history long enough to pass `MIN_MESSAGES_TO_EXTRACT`.
     /// Returns (outcome, non-stream call count, systems seen by those calls).
+    ///
+    /// The registry guard is deliberately held across the awaits below: the
+    /// test must own the process-global spawn registry AND the
+    /// `CLAURST_REMOTE_MEMORY_DIR` env var for its full body, or a sibling
+    /// test's cleanup unsets the env var mid-loop and the store dir silently
+    /// falls back to the real `~/.claurst`.
+    #[allow(clippy::await_holding_lock)]
     async fn drive_extraction_loop(
         messages: Vec<Message>,
         tool_config: claurst_core::config::Config,
     ) -> (QueryOutcome, usize, Vec<Option<SystemPrompt>>) {
+        // Serialize against every other test that touches the process-global
+        // spawn registry, or this `await` can drain another test's handles
+        // (and vice versa).
+        let _registry = session_memory::test_registry_lock();
+        // The store dir resolves through CLAURST_REMOTE_MEMORY_DIR; isolate
+        // it per test so no cursor or entry ever lands in the real ~/.claurst
+        // and no stale cursor from a previous run suppresses extraction. The
+        // guard also owns the tempdir and restores the previous value on
+        // drop, so a panic inside the loop below cannot leak the override
+        // into later tests.
+        let store_root = tempfile::tempdir().expect("temp store root");
+        let _env_guard = RemoteMemoryDirOverride::set(store_root);
         let nonstream_calls = Arc::new(StdAtomicUsize::new(0));
         let nonstream_systems = Arc::new(StdMutex::new(Vec::new()));
         let provider = Arc::new(ExtractionProbeProvider {
@@ -3617,6 +3636,36 @@ mod tests {
         let calls = nonstream_calls.load(AtomicOrdering::SeqCst);
         let systems = nonstream_systems.lock().unwrap().clone();
         (outcome, calls, systems)
+    }
+
+    /// Points `CLAURST_REMOTE_MEMORY_DIR` at `dir` for its lifetime and
+    /// restores the previous value on drop, so a failing test cannot leak
+    /// the override into the rest of the process. Tests using this must
+    /// hold `session_memory::test_registry_lock()` first: the env var is
+    /// process-global and the lock serializes its readers in this binary.
+    struct RemoteMemoryDirOverride {
+        saved: Option<std::ffi::OsString>,
+        // Owned so the tempdir outlives every store write that resolves
+        // through the override, including detached extraction tasks that
+        // are still draining when the test body ends.
+        _dir: tempfile::TempDir,
+    }
+
+    impl RemoteMemoryDirOverride {
+        fn set(_dir: tempfile::TempDir) -> Self {
+            let saved = std::env::var_os("CLAURST_REMOTE_MEMORY_DIR");
+            std::env::set_var("CLAURST_REMOTE_MEMORY_DIR", _dir.path());
+            Self { saved, _dir }
+        }
+    }
+
+    impl Drop for RemoteMemoryDirOverride {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var("CLAURST_REMOTE_MEMORY_DIR", v),
+                None => std::env::remove_var("CLAURST_REMOTE_MEMORY_DIR"),
+            }
+        }
     }
 
     /// (extraction) Provider-dispatch end-turn fires exactly one extraction
