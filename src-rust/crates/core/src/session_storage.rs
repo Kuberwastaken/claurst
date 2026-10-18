@@ -1097,7 +1097,15 @@ mod tests {
         }
     }
 
-    /// Write a linear, properly-chained transcript to disk and return the path.
+    /// Write a linear transcript to disk in ONE synchronous write and return
+    /// the path.
+    ///
+    /// Mirrors the hermetic-fixture pattern from 84d4840 (stats.rs): writing
+    /// each entry via the async `write_transcript_entry` (open/append/close per
+    /// entry on the tokio blocking pool) left a write-then-read visibility gap
+    /// on loaded CI runners that scrambled loaded entry order ([a1, u1, u2]
+    /// instead of [u1, a1, u2], seen twice on macOS runners, never in 120+
+    /// local runs). One std::fs::write removes the gap deterministically.
     async fn write_chain(dir: &std::path::Path, chained: bool) -> PathBuf {
         let path = dir.join("chain.jsonl");
         // u1 -> a1 -> u2 -> a2
@@ -1107,6 +1115,7 @@ mod tests {
             (Role::User, "u2", Some("a1"), "next"),
             (Role::Assistant, "a2", Some("u2"), "reply"),
         ];
+        let mut buf = String::new();
         for (role, uuid, parent, text) in steps {
             let parent = if chained { parent } else { None };
             let is_assistant = role == Role::Assistant;
@@ -1116,8 +1125,10 @@ mod tests {
             } else {
                 make_user_entry(msg, uuid, parent, "sess", "/proj")
             };
-            write_transcript_entry(&path, &entry).await.unwrap();
+            buf.push_str(&serde_json::to_string(&entry).unwrap());
+            buf.push('\n');
         }
+        std::fs::write(&path, buf).unwrap();
         path
     }
 
