@@ -1271,6 +1271,15 @@ pub mod config {
         /// makes the loop return cold (last assistant message) immediately.
         #[serde(default, rename = "degradationSummaryEnabled", skip_serializing_if = "Option::is_none")]
         pub degradation_summary_enabled: Option<bool>,
+        /// Global-only: a project settings file must not be able to turn on
+        /// turn-end memory extraction (it spends extra API calls).
+        #[serde(default, rename = "memoryExtractionEnabled")]
+        pub memory_extraction_enabled: bool,
+        /// Master switch for the automatic memory system (`autoMemoryEnabled`).
+        /// `None` (default) enables it; `Some(false)` together with
+        /// `CLAURST_DISABLE_AUTO_MEMORY`/`CLAURST_SIMPLE` disables it.
+        #[serde(default, rename = "autoMemoryEnabled", skip_serializing_if = "Option::is_none")]
+        pub auto_memory_enabled: Option<bool>,
         /// External status line command configuration. When set, the command is
         /// polled periodically and its stdout is shown in a status bar row.
         #[serde(default, rename = "statusLine", alias = "status_line", skip_serializing_if = "Option::is_none")]
@@ -2393,6 +2402,13 @@ pub mod config {
                 // Global-only: a project file must not be able to turn on
                 // autonomous wake-up turns.
                 completion_wakeups: base.config.completion_wakeups,
+                // Global-only: extraction spends extra API calls per turn, so
+                // only the user's global settings may enable it.
+                memory_extraction_enabled: base.config.memory_extraction_enabled,
+                auto_memory_enabled: over
+                    .config
+                    .auto_memory_enabled
+                    .or(base.config.auto_memory_enabled),
             };
             Self {
                 config: merged_config,

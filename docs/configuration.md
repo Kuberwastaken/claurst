@@ -325,6 +325,8 @@ Inside `config`:
 | `fileAutocompleteShowHiddenFiles` | boolean | false | Include hidden files in `@` suggestions. |
 | `fileInjectionEnabled` | boolean | true | Inject the contents of `@file` references into the message. |
 | `fileInjectionMaxSize` | integer | 100 | Size limit in KB for an injected file; `0` means no limit. |
+| `memoryExtractionEnabled` | boolean | false | After a turn ends, run one extra request through the active provider/model to extract facts worth remembering into the project memory store. Global-only: a project `.claurst/settings.json` cannot enable it. |
+| `autoMemoryEnabled` | boolean \| null | null (on) | Master switch for the automatic memory system. `false` disables both the memory prompt injection and turn-end extraction. |
 
 Top-level:
 

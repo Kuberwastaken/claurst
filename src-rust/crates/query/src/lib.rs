@@ -50,7 +50,8 @@ pub use compact::{
     CompactionRecord, CompactionTrigger, UsageMark,
 };
 pub use session_memory::{
-    ExtractedMemory, MemoryCategory, SessionMemoryExtractor, SessionMemoryState,
+    ExtractionCursor, ExtractionRoute, build_transcript, extract_and_store, extraction_allowed,
+    parse_extraction_response,
 };
 
 use claurst_api::{
@@ -784,6 +785,17 @@ pub async fn run_query_loop(
         let route = config.provider_registry.as_deref().map(|registry| {
             resolve_provider_route(registry, config, tool_ctx, &effective_model, client)
         });
+        // Stash for the turn-end memory extraction hook: the provider Arc is
+        // cheap to clone and `route` is moved into the dispatch block below.
+        let extraction_provider = route.as_ref().and_then(|r| r.provider.clone());
+        let extraction_provider_id = route
+            .as_ref()
+            .map(|r| r.provider_id.clone())
+            .unwrap_or_else(|| "anthropic".to_string());
+        let extraction_model_id = route
+            .as_ref()
+            .map(|r| r.model_id.clone())
+            .unwrap_or_else(|| effective_model.clone());
 
         // Pre-request compaction check point (issue #441). It runs before
         // every request, including the one that follows each tool batch, so
@@ -1935,59 +1947,30 @@ pub async fn run_query_loop(
             "end_turn" => {
                 fire_stop_hooks!(assistant_msg);
 
-                // Asynchronously extract and persist session memories if warranted.
-                // Runs in a detached Tokio task so it doesn't block the query loop.
-                if session_memory::SessionMemoryExtractor::should_extract(messages) {
-                    let model_clone = config.model.clone();
+                // Turn-end memory extraction: one extra request through the
+                // session's ACTIVE provider/model, results written into the
+                // memdir store. Off unless `memoryExtractionEnabled` is set
+                // globally and the auto-memory switches allow it; subagents
+                // and every other detached loop never extract. Detached task;
+                // failures are debug-logged and never affect the turn.
+                if session_memory::extraction_allowed(&tool_ctx.config, config.is_subagent) {
+                    let route = session_memory::ExtractionRoute {
+                        provider_id: extraction_provider_id.clone(),
+                        model_id: extraction_model_id.clone(),
+                        provider: extraction_provider.clone(),
+                        anthropic_client: client.clone(),
+                        store_dir: claurst_core::memdir::auto_memory_path(&tool_ctx.working_dir),
+                    };
                     let messages_clone = messages.clone();
                     let working_dir_clone = tool_ctx.working_dir.clone();
-
-                    // Build a fresh client using the same API key.  This avoids
-                    // requiring an Arc in the existing run_query_loop signature.
-                    if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-                        if !api_key.is_empty() {
-                            if let Ok(sm_client) = claurst_api::AnthropicClient::new(
-                                claurst_api::client::ClientConfig {
-                                    api_key,
-                                    ..Default::default()
-                                },
-                            ) {
-                                let sm_client = std::sync::Arc::new(sm_client);
-                                tokio::spawn(async move {
-                                    let extractor =
-                                        session_memory::SessionMemoryExtractor::new(&model_clone);
-                                    match extractor
-                                        .extract(&messages_clone, &working_dir_clone, &sm_client)
-                                        .await
-                                    {
-                                        Ok(memories) if !memories.is_empty() => {
-                                            let target = working_dir_clone
-                                                .join(".claurst")
-                                                .join("AGENTS.md");
-                                            if let Err(e) =
-                                                session_memory::SessionMemoryExtractor::persist(
-                                                    &memories, &target,
-                                                )
-                                                .await
-                                            {
-                                                tracing::warn!(
-                                                    error = %e,
-                                                    "Failed to persist session memories"
-                                                );
-                                            }
-                                        }
-                                        Ok(_) => {} // no memories extracted
-                                        Err(e) => {
-                                            tracing::debug!(
-                                                error = %e,
-                                                "Session memory extraction failed (non-fatal)"
-                                            );
-                                        }
-                                    }
-                                });
-                            }
-                        }
-                    }
+                    tokio::spawn(async move {
+                        session_memory::extract_and_store(
+                            &route,
+                            &messages_clone,
+                            &working_dir_clone,
+                        )
+                        .await;
+                    });
                 }
 
                 // Trigger AutoDream consolidation check (non-blocking, best-effort).

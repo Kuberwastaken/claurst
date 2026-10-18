@@ -1,360 +1,394 @@
-// Session Memory Extraction for cc-query.
-//
-// Runs a background task after a session to extract key facts worth
-// remembering and persist them to AGENTS.md.
-//
-// This mirrors TypeScript services/SessionMemory/sessionMemory.ts and
-// services/extractMemories/extractMemories.ts.
-//
-// Strategy:
-//   1. After sessions with 20+ messages (or on compact), call the API with a
-//      structured extraction prompt.
-//   2. Parse the response into typed ExtractedMemory entries.
-//   3. Append entries under "## Auto-extracted memories" in AGENTS.md
-//      (creating the file if it doesn't exist).
-//   4. Track state so we don't re-extract from already-processed messages.
+//! Memory extraction: turn-end facts into the memdir store.
+//!
+//! After a turn ends, a single extra request through the session's ACTIVE
+//! provider and model extracts facts worth remembering. Results are written
+//! into the memdir store (`claurst_core::memdir`), so the existing read path
+//! (`MEMORY.md` index injected into the system prompt) serves them; there is
+//! no parallel store and no separate memory model.
+//!
+//! Cost stays bounded: extraction is off unless the global setting
+//! `memoryExtractionEnabled` is on AND the existing auto-memory switches
+//! (`CLAURST_DISABLE_AUTO_MEMORY`, `CLAURST_SIMPLE`, `autoMemoryEnabled`)
+//! allow it; only subagents of the top-level loop opt in, so detached loops
+//! (subagents, cron, ACP, auto-dream) never extract; the request sees only
+//! messages since the last extraction, capped in messages and characters.
+//! Failures are logged at debug and never break the turn.
 
-use claurst_api::{
-    AnthropicStreamEvent, ApiMessage, CreateMessageRequest, StreamAccumulator, StreamHandler,
-    SystemPrompt,
-};
+use claurst_api::{AnthropicClient, LlmProvider, ProviderRequest, SystemPrompt};
+use claurst_core::config::Config;
+use claurst_core::memdir::{self, AutoMemoryEntry, MemoryType};
 use claurst_core::types::{Message, Role};
-use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::fs;
 use tracing::{debug, info, warn};
 
-// ---------------------------------------------------------------------------
-// Threshold constants (mirrors TypeScript sessionMemoryUtils.ts defaults)
-// ---------------------------------------------------------------------------
-
-/// Minimum messages before extraction is attempted.
+/// Minimum messages before the FIRST extraction of a session. Mirrors the
+/// original threshold from the TypeScript extractor.
 const MIN_MESSAGES_TO_EXTRACT: usize = 20;
 
-/// Minimum tool calls since last extraction before we run again.
-const MIN_TOOL_CALLS_BETWEEN_EXTRACTIONS: usize = 3;
+/// Messages sent per extraction request: everything since the last
+/// extraction, newest kept, bounded so cost grows linearly, not
+/// quadratically.
+const MAX_MESSAGES_PER_EXTRACTION: usize = 20;
+
+/// Hard character cap on the transcript body sent to the model.
+const MAX_TRANSCRIPT_CHARS: usize = 8_000;
+
+/// Tool-result preview length in the transcript.
+const TOOL_RESULT_PREVIEW_CHARS: usize = 200;
 
 // ---------------------------------------------------------------------------
-// Public types
+// Gate
 // ---------------------------------------------------------------------------
 
-/// Category of an extracted memory entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MemoryCategory {
-    UserPreference,
-    ProjectFact,
-    CodePattern,
-    Decision,
-    Constraint,
-}
-
-impl MemoryCategory {
-    /// Parse from the string tag produced by the model.
-    fn from_str(s: &str) -> Self {
-        match s.to_lowercase().trim() {
-            "user_preference" | "userpreference" | "preference" => Self::UserPreference,
-            "project_fact" | "projectfact" | "fact" => Self::ProjectFact,
-            "code_pattern" | "codepattern" | "pattern" => Self::CodePattern,
-            "decision" => Self::Decision,
-            "constraint" => Self::Constraint,
-            _ => Self::ProjectFact, // default
-        }
+/// Whether turn-end extraction may run at all.
+///
+/// All of the following must hold:
+/// - `memoryExtractionEnabled` is `true` in the merged settings (global-only
+///   in the merge, so a project file cannot flip it on);
+/// - the memdir auto-memory switches allow it: `CLAURST_DISABLE_AUTO_MEMORY`
+///   truthy or `CLAURST_SIMPLE` disables, `autoMemoryEnabled: false`
+///   disables (all via `claurst_core::memdir::is_auto_memory_enabled`);
+/// - this loop is not a subagent (subagents, cron, ACP and auto-dream all
+///   reach the query loop; only the top-level session may spend the extra
+///   call).
+pub fn extraction_allowed(config: &Config, is_subagent: bool) -> bool {
+    if !config.memory_extraction_enabled {
+        return false;
     }
-
-    /// Display label used in the persisted markdown.
-    fn label(&self) -> &'static str {
-        match self {
-            Self::UserPreference => "user-preference",
-            Self::ProjectFact => "project-fact",
-            Self::CodePattern => "code-pattern",
-            Self::Decision => "decision",
-            Self::Constraint => "constraint",
-        }
+    if is_subagent {
+        return false;
     }
-}
-
-/// A single fact extracted from the conversation.
-#[derive(Debug, Clone)]
-pub struct ExtractedMemory {
-    /// The fact to remember, as a markdown bullet point or sentence.
-    pub content: String,
-    /// Semantic category for the fact.
-    pub category: MemoryCategory,
-    /// Model confidence, 0.0–1.0.
-    pub confidence: f32,
+    memdir::is_auto_memory_enabled(config.auto_memory_enabled)
 }
 
 // ---------------------------------------------------------------------------
-// Session state (tracks what has already been extracted)
+// Incremental cursor
 // ---------------------------------------------------------------------------
 
-/// Mutable per-session state for the memory extractor.
-#[derive(Debug, Default)]
-pub struct SessionMemoryState {
-    /// UUID of the last message that was fully extracted.
-    pub last_extracted_message_uuid: Option<String>,
-    /// Token count at the time of the last extraction.
-    pub tokens_at_last_extraction: u64,
-    /// Whether session memory has been initialised for this session.
-    pub initialized: bool,
+/// Which messages a run has already extracted, persisted next to the store so
+/// a second extraction only sees messages added since the last one.
+///
+/// The cursor stores the last message's UUID plus the history length at the
+/// time. UUIDs survive compaction rewrites better than indices; the length
+/// detects a compacted/truncated history where the UUID no longer resolves
+/// (fall back to re-extracting the capped tail).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ExtractionCursor {
+    /// UUID of the last message covered by the previous extraction.
+    pub last_uuid: Option<String>,
+    /// History length at the previous extraction.
+    pub message_count: usize,
 }
 
-impl SessionMemoryState {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Return `true` if the last extracted message UUID is still present in
-    /// `messages`, which tells us new messages have been added since then.
-    pub fn has_new_messages_since_last_extraction(&self, messages: &[Message]) -> bool {
-        match &self.last_extracted_message_uuid {
-            None => true, // Nothing extracted yet → treat all messages as new
-            Some(uuid) => messages.iter().any(|m| m.uuid.as_deref() == Some(uuid.as_str()))
-                && messages
-                    .last()
-                    .and_then(|m| m.uuid.as_deref())
-                    != Some(uuid.as_str()),
-        }
-    }
-
-    /// Advance the cursor to the last message in `messages`.
-    pub fn advance_cursor(&mut self, messages: &[Message]) {
-        self.last_extracted_message_uuid = messages
-            .last()
-            .and_then(|m| m.uuid.clone());
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SessionMemoryExtractor
-// ---------------------------------------------------------------------------
-
-/// Extracts and persists key memories from a conversation.
-pub struct SessionMemoryExtractor {
-    pub model: String,
-    pub max_tokens: u32,
-}
-
-impl SessionMemoryExtractor {
-    /// Create a new extractor using the given model.
-    pub fn new(model: &str) -> Self {
-        Self {
-            model: model.to_string(),
-            max_tokens: 4096,
-        }
-    }
-
-    /// Return `true` if we have enough messages to warrant extraction.
+impl ExtractionCursor {
+    /// The slice of `messages` the next extraction should see.
     ///
-    /// Mirrors `shouldExtractMemory` from TypeScript sessionMemory.ts:
-    /// - At least `MIN_MESSAGES_TO_EXTRACT` messages total
-    /// - The last assistant turn must not have pending tool calls (safe extraction point)
-    pub fn should_extract(messages: &[Message]) -> bool {
-        let model_visible = messages
-            .iter()
-            .filter(|m| m.role == Role::User || m.role == Role::Assistant)
-            .count();
-
-        if model_visible < MIN_MESSAGES_TO_EXTRACT {
-            return false;
-        }
-
-        // Don't extract mid-tool-call chain — wait for a clean end-turn
-        let last_assistant = messages.iter().rev().find(|m| m.role == Role::Assistant);
-        if let Some(last) = last_assistant {
-            if last.has_tool_use() {
-                return false; // still in a tool chain
-            }
-        }
-
-        true
-    }
-
-    /// Count tool calls since the last extracted message UUID.
-    fn count_tool_calls_since(messages: &[Message], since_uuid: Option<&str>) -> usize {
-        let mut found_start = since_uuid.is_none();
-        let mut count = 0usize;
-
-        for msg in messages {
-            if !found_start {
-                if msg.uuid.as_deref() == since_uuid {
-                    found_start = true;
+    /// Slicing happens before any transcript building, so the gate and the
+    /// cursor are the only work done when extraction does not fire.
+    pub fn window<'a>(&self, messages: &'a [Message]) -> &'a [Message] {
+        let start = match &self.last_uuid {
+            None => 0,
+            Some(uuid) => {
+                let pos = messages
+                    .iter()
+                    .position(|m| m.uuid.as_deref() == Some(uuid.as_str()));
+                match pos {
+                    // Cursor resolved: everything strictly after it is new.
+                    Some(pos) if self.message_count <= messages.len() => pos + 1,
+                    // History was rewritten (compaction, rewind): fall back
+                    // to the capped tail; the cap bounds the cost of the
+                    // re-extraction.
+                    _ => messages.len().saturating_sub(MAX_MESSAGES_PER_EXTRACTION),
                 }
-                continue;
             }
-            if msg.role == Role::Assistant {
-                count += msg.get_tool_use_blocks().len();
-            }
-        }
-        count
-    }
-
-    /// Check whether extraction should run given the current session state.
-    pub fn should_extract_with_state(messages: &[Message], state: &SessionMemoryState) -> bool {
-        if !Self::should_extract(messages) {
-            return false;
-        }
-
-        // Require minimum tool calls between updates (mirrors TS toolCallsBetweenUpdates)
-        let tool_calls_since = Self::count_tool_calls_since(
-            messages,
-            state.last_extracted_message_uuid.as_deref(),
-        );
-
-        tool_calls_since >= MIN_TOOL_CALLS_BETWEEN_EXTRACTIONS
-            || !state.has_new_messages_since_last_extraction(messages)
-    }
-
-    /// Extract key memories from a conversation.
-    ///
-    /// Calls the API with a structured extraction prompt and parses the
-    /// response into `ExtractedMemory` entries.
-    pub async fn extract(
-        &self,
-        messages: &[Message],
-        working_dir: &Path,
-        api_client: &claurst_api::AnthropicClient,
-    ) -> anyhow::Result<Vec<ExtractedMemory>> {
-        let model_visible: Vec<&Message> = messages
-            .iter()
-            .filter(|m| m.role == Role::User || m.role == Role::Assistant)
-            .collect();
-
-        if model_visible.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Build a compact transcript for the extraction prompt
-        let mut transcript = String::new();
-        for msg in &model_visible {
-            let role_label = match msg.role {
-                Role::User => "Human",
-                Role::Assistant => "Assistant",
-            };
-            let text = msg.get_all_text();
-            if !text.is_empty() {
-                transcript.push_str(&format!("{}: {}\n\n", role_label, text));
-            }
-        }
-
-        let working_dir_str = working_dir.display().to_string();
-        let prompt = build_extraction_prompt(&transcript, &working_dir_str);
-
-        let api_msgs = vec![ApiMessage {
-            role: "user".to_string(),
-            content: Value::String(prompt),
-        }];
-
-        let request = CreateMessageRequest::builder(&self.model, self.max_tokens)
-            .messages(api_msgs)
-            .system(SystemPrompt::Text(EXTRACTION_SYSTEM_PROMPT.to_string()))
-            .build();
-
-        let handler: Arc<dyn StreamHandler> = Arc::new(claurst_api::streaming::NullStreamHandler);
-        let mut rx = api_client
-            .create_message_stream(request, handler)
-            .await
-            .map_err(|e| anyhow::anyhow!("API error: {}", e))?;
-
-        let mut acc = StreamAccumulator::new();
-        while let Some(evt) = rx.recv().await {
-            acc.on_event(&evt);
-            if matches!(evt, AnthropicStreamEvent::MessageStop) {
-                break;
-            }
-        }
-
-        let (response_msg, _usage, _stop) = acc.finish();
-        let response_text = response_msg.get_all_text();
-
-        if response_text.is_empty() {
-            debug!("Session memory extraction produced empty response");
-            return Ok(vec![]);
-        }
-
-        let memories = parse_extraction_response(&response_text);
-        info!(
-            count = memories.len(),
-            "Session memory extraction complete"
-        );
-
-        Ok(memories)
-    }
-
-    /// Persist extracted memories to `target_path` (creates directories and
-    /// the file if they don't exist).  Appends under `## Auto-extracted memories`.
-    pub async fn persist(
-        memories: &[ExtractedMemory],
-        target_path: &Path,
-    ) -> anyhow::Result<()> {
-        if memories.is_empty() {
-            return Ok(());
-        }
-
-        // Ensure parent directory exists
-        if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-
-        // Read existing content (or start fresh)
-        let existing = match fs::read_to_string(target_path).await {
-            Ok(content) => content,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(e.into()),
         };
+        let start = start.min(messages.len());
+        // Cap at the tail: never more than MAX_MESSAGES_PER_EXTRACTION
+        // messages. `max` (not `min`) so an empty window (nothing new since
+        // the cursor) stays empty instead of being re-expanded to the cap.
+        let start = start.max(messages.len().saturating_sub(MAX_MESSAGES_PER_EXTRACTION));
+        &messages[start..]
+    }
 
-        // Build the new entries block
-        let date_str = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let mut new_block = format!("\n### Session memories — {}\n\n", date_str);
-        for memory in memories {
-            new_block.push_str(&format!(
-                "- **[{}]** {} *(confidence: {:.0}%)*\n",
-                memory.category.label(),
-                memory.content,
-                memory.confidence * 100.0
-            ));
-        }
-
-        // Insert under the auto-extracted memories section header (or append it)
-        const SECTION_HEADER: &str = "## Auto-extracted memories";
-
-        let updated = if existing.contains(SECTION_HEADER) {
-            // Find the section and append to it
-            if let Some(section_pos) = existing.find(SECTION_HEADER) {
-                // Find the end of the section (next ## or end of file)
-                let after_header = &existing[section_pos + SECTION_HEADER.len()..];
-                let section_end = after_header
-                    .find("\n## ")
-                    .map(|p| p + section_pos + SECTION_HEADER.len())
-                    .unwrap_or(existing.len());
-
-                let mut result = existing[..section_end].to_string();
-                result.push_str(&new_block);
-                result.push_str(&existing[section_end..]);
-                result
-            } else {
-                existing
-            }
-        } else {
-            // Append the section at the end
-            let mut result = existing;
-            if !result.is_empty() && !result.ends_with('\n') {
-                result.push('\n');
-            }
-            result.push_str(&format!("\n{}\n", SECTION_HEADER));
-            result.push_str(&new_block);
-            result
-        };
-
-        fs::write(target_path, updated).await?;
-        info!(path = %target_path.display(), count = memories.len(), "Memories persisted");
-        Ok(())
+    /// Advance to `messages` (the full history, not the window).
+    pub fn advance(&mut self, messages: &[Message]) {
+        self.last_uuid = messages.last().and_then(|m| m.uuid.clone());
+        self.message_count = messages.len();
     }
 }
 
 // ---------------------------------------------------------------------------
-// Extraction prompt
+// Transcript building (runs only after the gate passes)
+// ---------------------------------------------------------------------------
+
+/// Build the extraction transcript from a window of messages: text with role
+/// labels, tool uses summarised, tool results cut to a preview, system
+/// reminders skipped, capped to `MAX_MESSAGES_PER_EXTRACTION` messages and
+/// `MAX_TRANSCRIPT_CHARS` characters.
+pub fn build_transcript(messages: &[Message]) -> String {
+    let window = &messages[messages.len().saturating_sub(MAX_MESSAGES_PER_EXTRACTION)..];
+    let mut transcript = String::new();
+    for msg in window {
+        let role = match msg.role {
+            Role::User => "User",
+            Role::Assistant => "Assistant",
+        };
+        let mut block = format!("{role}: ");
+        push_message_text(&mut block, msg);
+        if block.trim() == format!("{role}:").trim_end() {
+            continue; // nothing model-visible in this message
+        }
+        transcript.push_str(&block);
+        transcript.push_str("\n\n");
+        if transcript.len() >= MAX_TRANSCRIPT_CHARS {
+            break;
+        }
+    }
+    if transcript.len() > MAX_TRANSCRIPT_CHARS {
+        let mut cut = MAX_TRANSCRIPT_CHARS;
+        while !transcript.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        transcript.truncate(cut);
+        transcript.push_str("\n[...]");
+    }
+    transcript
+}
+
+/// Append the model-visible content of one message to `out`, skipping
+/// `<system-reminder>` blocks (internal instrumentation, not user signal).
+fn push_message_text(out: &mut String, msg: &Message) {
+    use claurst_core::types::{ContentBlock, MessageContent};
+    match &msg.content {
+        MessageContent::Text(text) => {
+            if !text.trim_start().starts_with("<system-reminder>") {
+                out.push_str(text);
+            }
+        }
+        MessageContent::Blocks(blocks) => {
+            for block in blocks {
+                match block {
+                    ContentBlock::Text { text } => {
+                        if !text.trim_start().starts_with("<system-reminder>") {
+                            out.push_str(text);
+                        }
+                    }
+                    ContentBlock::ToolUse { name, .. } => {
+                        out.push_str(&format!("[used tool: {name}]"));
+                    }
+                    ContentBlock::ToolResult { content, .. } => {
+                        let preview = tool_result_preview(content);
+                        out.push_str(&format!("[result: {preview}]"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Cut a tool result to a short preview for the transcript.
+fn tool_result_preview(content: &claurst_core::types::ToolResultContent) -> String {
+    use claurst_core::types::{ContentBlock, ToolResultContent};
+    let text = match content {
+        ToolResultContent::Text(t) => t.clone(),
+        ToolResultContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    if text.chars().count() <= TOOL_RESULT_PREVIEW_CHARS {
+        return text;
+    }
+    let mut end = TOOL_RESULT_PREVIEW_CHARS;
+    for (idx, _) in text.char_indices() {
+        if idx >= end {
+            end = idx;
+            break;
+        }
+    }
+    format!("{}...", text[..end].trim_end())
+}
+
+// ---------------------------------------------------------------------------
+// Extraction call (ACTIVE provider and model only)
+// ---------------------------------------------------------------------------
+
+/// Where one extraction request goes and where its results land.
+#[derive(Clone)]
+pub struct ExtractionRoute {
+    /// Provider id and model of the session, resolved the same way the main
+    /// request resolves them. No fallback: if the active provider cannot
+    /// serve the request, extraction silently skips.
+    pub provider_id: String,
+    pub model_id: String,
+    /// Dispatch target: the provider when set, otherwise the raw Anthropic
+    /// client (mirrors the main loop's `use_provider_dispatch`).
+    pub provider: Option<Arc<dyn LlmProvider>>,
+    pub anthropic_client: AnthropicClient,
+    /// memdir store directory for the project.
+    pub store_dir: std::path::PathBuf,
+}
+
+/// Send one extraction request through the active route and return the raw
+/// model text. Any failure maps to `None` (debug log, turn unaffected).
+pub async fn run_extraction_request(
+    route: &ExtractionRoute,
+    transcript: &str,
+    working_dir: &Path,
+) -> Option<String> {
+    let prompt = build_extraction_prompt(transcript, &working_dir.display().to_string());
+    let user_msg = Message::user(prompt);
+
+    match &route.provider {
+        Some(provider) => {
+            let request = ProviderRequest {
+                model: route.model_id.clone(),
+                messages: vec![user_msg],
+                system_prompt: Some(SystemPrompt::Text(EXTRACTION_SYSTEM_PROMPT.to_string())),
+                tools: Vec::new(),
+                max_tokens: 1024,
+                temperature: Some(0.0),
+                top_p: None,
+                top_k: None,
+                stop_sequences: Vec::new(),
+                thinking: None,
+                provider_options: serde_json::Value::Object(serde_json::Map::new()),
+            };
+            match provider.create_message(request).await {
+                Ok(response) => {
+                    let text = response
+                        .content
+                        .iter()
+                        .filter_map(|b| match b {
+                            claurst_core::types::ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    Some(text)
+                }
+                Err(e) => {
+                    debug!(
+                        provider = %route.provider_id,
+                        error = %e,
+                        "memory extraction skipped: active provider failed"
+                    );
+                    None
+                }
+            }
+        }
+        None => {
+            use claurst_api::{ApiMessage, CreateMessageRequest};
+            let request = CreateMessageRequest::builder(&route.model_id, 1024)
+                .messages(vec![ApiMessage {
+                    role: "user".to_string(),
+                    content: serde_json::Value::String(user_msg.get_all_text()),
+                }])
+                .system(SystemPrompt::Text(EXTRACTION_SYSTEM_PROMPT.to_string()))
+                .temperature(0.0)
+                .build();
+            match route.anthropic_client.create_message(request).await {
+                Ok(response) => {
+                    let text = response
+                        .content
+                        .iter()
+                        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("");
+                    Some(text)
+                }
+                Err(e) => {
+                    debug!(
+                        error = %e,
+                        "memory extraction skipped: active provider failed"
+                    );
+                    None
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parsing into memdir entries
+// ---------------------------------------------------------------------------
+
+/// Parse the model's `MEMORY:` lines into memdir entries, mapping the
+/// extraction categories onto the canonical memdir types.
+///
+/// Expected line format (unchanged from the previous engine):
+/// `MEMORY: <category> | <confidence 0-10> | <concise fact>`
+pub fn parse_extraction_response(response: &str) -> Vec<AutoMemoryEntry> {
+    let mut entries = Vec::new();
+    for line in response.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("MEMORY:") else {
+            continue;
+        };
+        let parts: Vec<&str> = rest.splitn(3, '|').collect();
+        if parts.len() < 3 {
+            warn!("Skipping malformed memory line: {line}");
+            continue;
+        }
+        let (category, _confidence, fact) = (parts[0].trim(), parts[1].trim(), parts[2].trim());
+        let fact = fact.trim();
+        if fact.is_empty() {
+            continue;
+        }
+        entries.push(AutoMemoryEntry {
+            name: topic_name(category, fact),
+            description: one_line(fact),
+            content: fact.to_string(),
+            memory_type: category_to_memdir_type(category),
+        });
+    }
+    entries
+}
+
+/// Map an extraction category onto a memdir `MemoryType`.
+fn category_to_memdir_type(category: &str) -> MemoryType {
+    match category.to_lowercase().trim() {
+        "user_preference" | "userpreference" | "preference" => MemoryType::User,
+        "code_pattern" | "codepattern" | "pattern" | "constraint" => MemoryType::Feedback,
+        "decision" => MemoryType::Project,
+        // "project_fact" and anything unrecognized: a fact about the project.
+        _ => MemoryType::Project,
+    }
+}
+
+/// Short topic label used as the file slug and frontmatter name.
+fn topic_name(category: &str, fact: &str) -> String {
+    format!("{category}: {}", first_words(fact, 6))
+}
+
+/// First `n` words of `s`, for slug-sized labels.
+fn first_words(s: &str, n: usize) -> String {
+    let words: Vec<&str> = s.split_whitespace().collect();
+    words[..words.len().min(n)].join(" ")
+}
+
+/// Single-line, length-capped hook for the MEMORY.md index.
+fn one_line(fact: &str) -> String {
+    let flat: String = fact
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    let trimmed = flat.trim();
+    if trimmed.chars().count() > 160 {
+        first_words(trimmed, 20)
+    } else {
+        trimmed.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Extraction prompt (unchanged output contract)
 // ---------------------------------------------------------------------------
 
 const EXTRACTION_SYSTEM_PROMPT: &str = "You are a memory extraction assistant. Your job is to \
@@ -387,38 +421,73 @@ Only output MEMORY: lines — no other text.  If there are no useful memories, o
     )
 }
 
-/// Parse the model's response into `ExtractedMemory` entries.
-/// Expected line format: `MEMORY: <category> | <confidence 0-10> | <fact>`
-fn parse_extraction_response(response: &str) -> Vec<ExtractedMemory> {
-    let mut memories = Vec::new();
+// ---------------------------------------------------------------------------
+// End-to-end turn-end hook
+// ---------------------------------------------------------------------------
 
-    for line in response.lines() {
-        let line = line.trim();
-        if !line.starts_with("MEMORY:") {
-            continue;
-        }
+/// Turn-end extraction entry point, called from the query loop's `end_turn`
+/// branch AFTER the gate (`extraction_allowed`) has passed.
+///
+/// Runs synchronously (the loop spawns it as a detached task): builds the
+/// incremental window, makes the single request through the active route,
+/// writes new facts into the memdir store, and persists the cursor. Returns
+/// the number of new entries stored.
+pub async fn extract_and_store(
+    route: &ExtractionRoute,
+    messages: &[Message],
+    working_dir: &Path,
+) -> usize {
+    let cursor_path = route.store_dir.join(".extraction_cursor.json");
+    let cursor: ExtractionCursor = tokio::fs::read_to_string(&cursor_path)
+        .await
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
 
-        let rest = line["MEMORY:".len()..].trim();
-        let parts: Vec<&str> = rest.splitn(3, '|').collect();
-        if parts.len() < 3 {
-            warn!("Skipping malformed memory line: {}", line);
-            continue;
-        }
-
-        let category = MemoryCategory::from_str(parts[0].trim());
-        let confidence_raw: f32 = parts[1].trim().parse().unwrap_or(5.0);
-        // Normalize confidence from 0-10 scale to 0.0-1.0
-        let confidence = (confidence_raw / 10.0).clamp(0.0, 1.0);
-        let content = parts[2].trim().to_string();
-
-        if content.is_empty() {
-            continue;
-        }
-
-        memories.push(ExtractedMemory { content, category, confidence });
+    let window = cursor.window(messages);
+    if window.is_empty() {
+        return 0;
+    }
+    // The session must be long enough to be worth a request at all; the
+    // cursor keeps later extractions cheap.
+    if messages.len() < MIN_MESSAGES_TO_EXTRACT {
+        return 0;
     }
 
-    memories
+    let transcript = build_transcript(window);
+    if transcript.trim().is_empty() {
+        return 0;
+    }
+
+    let Some(response) = run_extraction_request(route, &transcript, working_dir).await else {
+        return 0;
+    };
+    let entries = parse_extraction_response(&response);
+    let new_count = entries.len();
+    if new_count > 0 {
+        let written = tokio::task::spawn_blocking({
+            let dir = route.store_dir.clone();
+            move || memdir::append_auto_memories(&dir, &entries)
+        })
+        .await
+        .unwrap_or_default();
+        info!(
+            count = written.len(),
+            "Memory extraction stored new entries"
+        );
+    }
+
+    // Advance the cursor whether or not the model produced anything: the
+    // window was seen. Write through the same atomic path as the store.
+    let mut advanced = cursor;
+    advanced.advance(messages);
+    if let Ok(json) = serde_json::to_string(&advanced) {
+        let tmp = cursor_path.with_extension("json.tmp");
+        if tokio::fs::write(&tmp, &json).await.is_ok() {
+            let _ = tokio::fs::rename(&tmp, &cursor_path).await;
+        }
+    }
+    new_count
 }
 
 // ---------------------------------------------------------------------------
@@ -428,233 +497,231 @@ fn parse_extraction_response(response: &str) -> Vec<ExtractedMemory> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use claurst_core::types::Message;
-
-    fn make_user(text: &str) -> Message {
-        Message::user(text)
-    }
-
-    fn make_assistant(text: &str) -> Message {
-        Message::assistant(text)
-    }
+    use claurst_core::types::{ContentBlock, MessageContent};
 
     fn make_messages(n: usize) -> Vec<Message> {
         (0..n)
             .map(|i| {
-                if i % 2 == 0 {
-                    make_user(&format!("user message {}", i))
+                let mut msg = if i % 2 == 0 {
+                    Message::user(format!("user message {i}"))
                 } else {
-                    make_assistant(&format!("assistant reply {}", i))
-                }
+                    Message::assistant(format!("assistant reply {i}"))
+                };
+                msg.uuid = Some(format!("uuid-{i}"));
+                msg
             })
             .collect()
     }
 
-    // ---- should_extract ------------------------------------------------
+    // ---- gate -----------------------------------------------------------
 
     #[test]
-    fn test_should_not_extract_too_few_messages() {
-        let msgs = make_messages(5);
-        assert!(!SessionMemoryExtractor::should_extract(&msgs));
+    fn gate_off_by_default_and_by_setting_and_env() {
+        // Default config: extraction disabled (memoryExtractionEnabled
+        // defaults to false).
+        let config = Config::default();
+        assert!(!extraction_allowed(&config, false), "off by default");
+
+        // Explicitly enabled.
+        let config = Config {
+            memory_extraction_enabled: true,
+            ..Config::default()
+        };
+        assert!(extraction_allowed(&config, false));
+
+        // Subagents never extract.
+        assert!(!extraction_allowed(&config, true));
+
+        // autoMemoryEnabled false disables extraction.
+        let config = Config {
+            memory_extraction_enabled: true,
+            auto_memory_enabled: Some(false),
+            ..Config::default()
+        };
+        assert!(!extraction_allowed(&config, false));
+
+        // CLAURST_DISABLE_AUTO_MEMORY truthy disables extraction.
+        // (Sandboxed: can't set env vars per-test safely in the same
+        // process; is_auto_memory_enabled's own logic covers this branch.)
+    }
+
+    // ---- incremental cursor ---------------------------------------------
+
+    #[test]
+    fn cursor_first_extraction_sees_all_messages() {
+        let cursor = ExtractionCursor::default();
+        let msgs = make_messages(30);
+        let window = cursor.window(&msgs);
+        assert_eq!(window.len(), 20, "first extraction caps at the tail");
+        assert_eq!(
+            window.last().and_then(|m| m.uuid.as_deref()),
+            Some("uuid-29")
+        );
     }
 
     #[test]
-    fn test_should_extract_enough_messages() {
-        let msgs = make_messages(MIN_MESSAGES_TO_EXTRACT);
-        // All messages are simple text (no tool use), so the last assistant
-        // doesn't have pending tool calls — should be ok to extract.
-        assert!(SessionMemoryExtractor::should_extract(&msgs));
+    fn cursor_second_extraction_sees_only_new_messages() {
+        let msgs = make_messages(30);
+        let mut cursor = ExtractionCursor::default();
+        cursor.advance(&msgs);
+
+        // Ten new messages arrive.
+        let mut msgs2 = msgs.clone();
+        for i in 30..40 {
+            let mut msg = Message::user(format!("user message {i}"));
+            msg.uuid = Some(format!("uuid-{i}"));
+            msgs2.push(msg);
+        }
+        let window = cursor.window(&msgs2);
+        assert_eq!(window.len(), 10);
+        assert_eq!(
+            window.first().and_then(|m| m.uuid.as_deref()),
+            Some("uuid-30")
+        );
+        assert_eq!(
+            window.last().and_then(|m| m.uuid.as_deref()),
+            Some("uuid-39")
+        );
     }
 
     #[test]
-    fn test_should_not_extract_mid_tool_chain() {
-        use claurst_core::types::ContentBlock;
-        let mut msgs = make_messages(MIN_MESSAGES_TO_EXTRACT);
-        // Replace the last assistant message with one that has a tool_use block
-        let last = msgs.last_mut().unwrap();
-        *last = Message::assistant_blocks(vec![ContentBlock::ToolUse {
-            id: "tool-123".to_string(),
-            name: "bash".to_string(),
-            input: serde_json::json!({"command": "ls"}),
-            thought_signature: None,
-        }]);
-        // Last assistant has tool_use → extraction should be deferred
-        assert!(!SessionMemoryExtractor::should_extract(&msgs));
-    }
-
-    // ---- parse_extraction_response -------------------------------------
-
-    #[test]
-    fn test_parse_empty_response() {
-        let memories = parse_extraction_response("");
-        assert!(memories.is_empty());
+    fn cursor_no_new_messages_yields_empty_window() {
+        let msgs = make_messages(30);
+        let mut cursor = ExtractionCursor::default();
+        cursor.advance(&msgs);
+        assert!(cursor.window(&msgs).is_empty());
     }
 
     #[test]
-    fn test_parse_single_memory() {
-        let response = "MEMORY: project_fact | 8 | The project uses Rust 2021 edition";
-        let memories = parse_extraction_response(response);
-        assert_eq!(memories.len(), 1);
-        assert_eq!(memories[0].category, MemoryCategory::ProjectFact);
-        assert!((memories[0].confidence - 0.8).abs() < 0.01);
-        assert!(memories[0].content.contains("Rust 2021"));
+    fn cursor_unresolved_uuid_falls_back_to_capped_tail() {
+        // Cursor names a UUID that no longer exists (compaction rewrote the
+        // history) and a length longer than the history: re-extract the
+        // capped tail rather than everything.
+        let cursor = ExtractionCursor {
+            last_uuid: Some("gone".to_string()),
+            message_count: 50,
+        };
+        let msgs = make_messages(30);
+        let window = cursor.window(&msgs);
+        assert_eq!(window.len(), 20);
+        assert_eq!(
+            window.last().and_then(|m| m.uuid.as_deref()),
+            Some("uuid-29")
+        );
+    }
+
+    // ---- transcript ------------------------------------------------------
+
+    #[test]
+    fn transcript_skips_system_reminders_and_labels_roles() {
+        let blocks = vec![
+            ContentBlock::Text {
+                text: "<system-reminder>noise</system-reminder>".to_string(),
+            },
+            ContentBlock::Text {
+                text: "hello world".to_string(),
+            },
+        ];
+        let msg = Message::user_blocks(blocks);
+        let transcript = build_transcript(&[msg]);
+        assert!(transcript.contains("User:"));
+        assert!(transcript.contains("hello world"));
+        assert!(!transcript.contains("system-reminder"));
     }
 
     #[test]
-    fn test_parse_multiple_memories() {
+    fn transcript_summarises_tool_use_and_previews_results() {
+        let blocks = vec![
+            ContentBlock::ToolUse {
+                id: "t1".to_string(),
+                name: "Bash".to_string(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "t1".to_string(),
+                content: claurst_core::types::ToolResultContent::Text("x".repeat(500)),
+                is_error: None,
+            },
+        ];
+        let msg = Message::user_blocks(blocks);
+        let transcript = build_transcript(&[msg]);
+        assert!(transcript.contains("[used tool: Bash]"));
+        assert!(transcript.contains("[result: "));
+        assert!(transcript.contains("..."));
+        assert!(transcript.len() < 400, "preview must be short");
+    }
+
+    #[test]
+    fn transcript_caps_messages_and_chars() {
+        let mut msgs = make_messages(60);
+        // Force one long assistant message over the char cap.
+        msgs.push(Message::assistant("y".repeat(20_000)));
+        let transcript = build_transcript(&msgs);
+        assert!(
+            transcript.len() <= MAX_TRANSCRIPT_CHARS + 8,
+            "hard cap holds"
+        );
+        assert!(transcript.ends_with("[...]"));
+    }
+
+    #[test]
+    fn transcript_char_cap_respects_multibyte_boundaries() {
+        let mut msg = Message::user("é".repeat(10_000));
+        msg.content = MessageContent::Text("é".repeat(10_000));
+        let transcript = build_transcript(&[msg]);
+        assert!(transcript.len() <= MAX_TRANSCRIPT_CHARS + 8);
+        assert!(String::from_utf8(transcript.into_bytes()).is_ok());
+    }
+
+    // ---- parsing ---------------------------------------------------------
+
+    #[test]
+    fn parse_empty_response() {
+        assert!(parse_extraction_response("").is_empty());
+    }
+
+    #[test]
+    fn parse_maps_categories_to_memdir_types() {
         let response = "\
 MEMORY: user_preference | 9 | User prefers verbose error messages\n\
 MEMORY: decision | 7 | Decided to use tokio async runtime\n\
-MEMORY: constraint | 6 | Must support Windows paths";
-        let memories = parse_extraction_response(response);
-        assert_eq!(memories.len(), 3);
-        assert_eq!(memories[0].category, MemoryCategory::UserPreference);
-        assert_eq!(memories[1].category, MemoryCategory::Decision);
-        assert_eq!(memories[2].category, MemoryCategory::Constraint);
+MEMORY: constraint | 6 | Must support Windows paths\n\
+MEMORY: project_fact | 8 | The project uses Rust 2021 edition\n\
+MEMORY: code_pattern | 7 | Uses builder pattern";
+        let entries = parse_extraction_response(response);
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[0].memory_type, MemoryType::User);
+        assert_eq!(entries[1].memory_type, MemoryType::Project);
+        assert_eq!(entries[2].memory_type, MemoryType::Feedback);
+        assert_eq!(entries[3].memory_type, MemoryType::Project);
+        assert_eq!(entries[4].memory_type, MemoryType::Feedback);
+        assert!(entries[0].content.contains("verbose error messages"));
     }
 
     #[test]
-    fn test_parse_ignores_non_memory_lines() {
+    fn parse_ignores_non_memory_and_malformed_lines() {
         let response = "Here are the memories:\n\
 MEMORY: project_fact | 8 | Uses serde for JSON\n\
-This is some extra text.\n\
+MEMORY: only_two_parts | no_confidence\n\
+extra text\n\
 MEMORY: code_pattern | 7 | Uses builder pattern";
-        let memories = parse_extraction_response(response);
-        assert_eq!(memories.len(), 2);
+        let entries = parse_extraction_response(response);
+        assert_eq!(entries.len(), 2);
     }
 
     #[test]
-    fn test_parse_malformed_line_skipped() {
-        let response = "MEMORY: only_two_parts | no_confidence";
-        let memories = parse_extraction_response(response);
-        assert!(memories.is_empty());
+    fn parse_empty_fact_is_skipped() {
+        let response = "MEMORY: project_fact | 8 |    ";
+        assert!(parse_extraction_response(response).is_empty());
     }
 
     #[test]
-    fn test_parse_confidence_normalization() {
-        let response = "MEMORY: decision | 10 | High confidence fact";
-        let memories = parse_extraction_response(response);
-        assert!((memories[0].confidence - 1.0).abs() < 0.01);
-    }
-
-    // ---- MemoryCategory parsing ----------------------------------------
-
-    #[test]
-    fn test_category_from_str_variants() {
-        assert_eq!(MemoryCategory::from_str("user_preference"), MemoryCategory::UserPreference);
-        assert_eq!(MemoryCategory::from_str("project_fact"), MemoryCategory::ProjectFact);
-        assert_eq!(MemoryCategory::from_str("code_pattern"), MemoryCategory::CodePattern);
-        assert_eq!(MemoryCategory::from_str("decision"), MemoryCategory::Decision);
-        assert_eq!(MemoryCategory::from_str("constraint"), MemoryCategory::Constraint);
-    }
-
-    #[test]
-    fn test_category_unknown_defaults_to_project_fact() {
-        assert_eq!(MemoryCategory::from_str("totally_unknown"), MemoryCategory::ProjectFact);
-    }
-
-    // ---- persist (integration-ish with tempfile) -----------------------
-
-    #[tokio::test]
-    async fn test_persist_creates_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join(".claurst").join("AGENTS.md");
-
-        let memories = vec![
-            ExtractedMemory {
-                content: "Uses async Rust".to_string(),
-                category: MemoryCategory::ProjectFact,
-                confidence: 0.9,
-            },
-        ];
-
-        SessionMemoryExtractor::persist(&memories, &target).await.unwrap();
-
-        let content = fs::read_to_string(&target).await.unwrap();
-        assert!(content.contains("Auto-extracted memories"));
-        assert!(content.contains("Uses async Rust"));
-        assert!(content.contains("project-fact"));
-    }
-
-    #[tokio::test]
-    async fn test_persist_appends_to_existing() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("AGENTS.md");
-
-        // Write initial content
-        fs::write(&target, "# My Project\n\nExisting content.\n").await.unwrap();
-
-        let memories = vec![
-            ExtractedMemory {
-                content: "Prefers explicit error handling".to_string(),
-                category: MemoryCategory::UserPreference,
-                confidence: 0.8,
-            },
-        ];
-
-        SessionMemoryExtractor::persist(&memories, &target).await.unwrap();
-
-        let content = fs::read_to_string(&target).await.unwrap();
-        assert!(content.contains("Existing content."));
-        assert!(content.contains("Auto-extracted memories"));
-        assert!(content.contains("Prefers explicit error handling"));
-    }
-
-    #[tokio::test]
-    async fn test_persist_appends_under_existing_section() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("AGENTS.md");
-
-        // Pre-populate the auto-extracted section
-        let initial = "# Notes\n\n## Auto-extracted memories\n\n### Old memories\n- old fact\n";
-        fs::write(&target, initial).await.unwrap();
-
-        let memories = vec![
-            ExtractedMemory {
-                content: "New fact discovered".to_string(),
-                category: MemoryCategory::ProjectFact,
-                confidence: 0.7,
-            },
-        ];
-
-        SessionMemoryExtractor::persist(&memories, &target).await.unwrap();
-
-        let content = fs::read_to_string(&target).await.unwrap();
-        // Should have both old and new facts
-        assert!(content.contains("old fact"));
-        assert!(content.contains("New fact discovered"));
-        // Section header should appear only once
-        assert_eq!(content.matches("## Auto-extracted memories").count(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_persist_no_op_for_empty_memories() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("AGENTS.md");
-
-        SessionMemoryExtractor::persist(&[], &target).await.unwrap();
-
-        // File should NOT be created when there are no memories to persist
-        assert!(!target.exists());
-    }
-
-    // ---- SessionMemoryState --------------------------------------------
-
-    #[test]
-    fn test_state_has_new_messages_no_cursor() {
-        let state = SessionMemoryState::new();
-        let msgs = vec![make_user("Hello")];
-        // No cursor → always has new messages
-        assert!(state.has_new_messages_since_last_extraction(&msgs));
-    }
-
-    #[test]
-    fn test_state_advance_cursor() {
-        let mut state = SessionMemoryState::new();
-        let mut msg = make_user("hello");
-        msg.uuid = Some("uuid-1".to_string());
-        let msgs = vec![msg];
-        state.advance_cursor(&msgs);
-        assert_eq!(state.last_extracted_message_uuid.as_deref(), Some("uuid-1"));
+    fn parse_entry_shape_is_single_line() {
+        let response =
+            "MEMORY: project_fact | 8 | First line\nsecond line that is quite long indeed";
+        let entries = parse_extraction_response(response);
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].description.contains('\n'));
     }
 }

@@ -7,9 +7,9 @@
 //!   - `memdir.ts`       → `build_memory_prompt_content`, `load_memory_index`, `ensure_memory_dir_exists`
 //!   - `paths.ts`        → `auto_memory_path`, `is_auto_memory_enabled`
 
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Memory type taxonomy
@@ -129,7 +129,10 @@ fn collect_md_files(base: &Path, current_dir: &Path, out: &mut Vec<MemoryFileMet
         if path.is_dir() {
             collect_md_files(base, &path, out);
         } else if path.extension().map(|e| e == "md").unwrap_or(false) {
-            let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let file_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             if file_name == "MEMORY.md" {
                 continue;
             }
@@ -381,7 +384,7 @@ pub fn is_auto_memory_enabled(settings_enabled: Option<bool>) -> bool {
         // Truthy values (non-empty, non-"0", non-"false") disable memory.
         match val.to_lowercase().as_str() {
             "" | "0" | "false" | "no" | "off" => return true, // defined-falsy → ON
-            _ => return false,                                  // truthy → OFF
+            _ => return false,                                // truthy → OFF
         }
     }
 
@@ -454,10 +457,7 @@ pub fn truncate_entrypoint_content(raw: &str) -> EntrypointTruncation {
             "{} bytes (limit: {}) — index entries are too long",
             byte_count, MAX_ENTRYPOINT_BYTES
         ),
-        _ => format!(
-            "{} lines and {} bytes",
-            line_count, byte_count
-        ),
+        _ => format!("{} lines and {} bytes", line_count, byte_count),
     };
 
     truncated.push_str(&format!(
@@ -565,7 +565,11 @@ pub fn find_relevant_memories_simple(
                 })
                 .sum();
 
-            if score > 0.0 { Some((score, meta)) } else { None }
+            if score > 0.0 {
+                Some((score, meta))
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -590,6 +594,251 @@ pub fn find_relevant_memories_simple(
 /// Mirrors `getTeamMemPath` in `teamMemPaths.ts`.
 pub fn team_memory_path(auto_memory_dir: &Path) -> PathBuf {
     auto_memory_dir.join("team")
+}
+
+// ---------------------------------------------------------------------------
+// Auto-memory store (write side of the memdir system)
+// ---------------------------------------------------------------------------
+//
+// Extraction results persist here as ordinary memdir files so the existing
+// read path (`load_memory_index` -> `build_memory_prompt_content`) serves
+// them with no parallel store. Writers take a per-directory `fslock` and
+// publish every file through a same-directory temp file + rename, so two
+// sessions (or a subagent) writing concurrently never lose an entry.
+
+/// One extracted fact destined for the memdir store.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutoMemoryEntry {
+    /// Human-readable topic label (frontmatter `name`).
+    pub name: String,
+    /// One-line hook for the `MEMORY.md` index (frontmatter `description`).
+    pub description: String,
+    /// The fact body.
+    pub content: String,
+    /// Canonical memdir type tag for the frontmatter.
+    pub memory_type: MemoryType,
+}
+
+/// Persist a batch of extracted memories into the memdir store `dir`.
+///
+/// Each entry lands in its own topic file under `auto/<seq>-<slug>.md` and
+/// `MEMORY.md` gains one index line per file. Writing is atomic (temp +
+/// rename) and serialized against other writers by a lock file in `dir`, so
+/// overlapping turns, subagents or a second session in the same repository
+/// cannot wipe the store. A busy or failing writer skips silently: memory
+/// extraction is best-effort and must never break the turn.
+///
+/// Returns the paths of the topic files written; empty when nothing was
+/// stored.
+pub fn append_auto_memories(dir: &Path, entries: &[AutoMemoryEntry]) -> Vec<PathBuf> {
+    if entries.is_empty() || std::fs::create_dir_all(dir).is_err() {
+        return Vec::new();
+    }
+    let lock_path = dir.join(".memdir.lock");
+    let mut lock = match fslock::LockFile::open(&lock_path) {
+        Ok(lock) => lock,
+        Err(e) => {
+            tracing::debug!(path = %lock_path.display(), error = %e, "memdir lock open failed");
+            return Vec::new();
+        }
+    };
+    if !lock.try_lock_with_pid().unwrap_or(false) {
+        tracing::debug!(path = %lock_path.display(), "memdir store busy; skipping append");
+        return Vec::new();
+    }
+
+    let mut written = Vec::new();
+    for entry in entries {
+        if let Some(path) = write_entry_locked(dir, entry) {
+            written.push(path);
+        }
+    }
+    written
+}
+
+/// Write one entry under the store lock. `None` means the entry was already
+/// stored (a topic file carrying the same fact exists) or the write failed.
+fn write_entry_locked(dir: &Path, entry: &AutoMemoryEntry) -> Option<PathBuf> {
+    let auto_dir = dir.join("auto");
+    if std::fs::create_dir_all(&auto_dir).is_err() {
+        return None;
+    }
+    let slug = slug_for(&entry.name);
+
+    // Same topic written before: extend that file instead of spawning a
+    // near-duplicate. Same fact already present anywhere: keep the first
+    // copy and drop this one.
+    let topic_files = matching_topic_files(&auto_dir, &slug);
+    for path in &topic_files {
+        if let Ok(existing) = std::fs::read_to_string(path) {
+            if existing.contains(&entry.content) {
+                return None;
+            }
+        }
+    }
+    let seq = next_seq(&auto_dir, &slug);
+    let filename = format!("{seq}-{slug}.md");
+    let path = auto_dir.join(&filename);
+    let body = format!(
+        "---\nname: {}\ndescription: {}\ntype: {}\n---\n\n{}\n",
+        escape_frontmatter(&entry.name),
+        escape_frontmatter(&entry.description),
+        entry.memory_type.as_str(),
+        entry.content
+    );
+    if atomic_write(&path, body.as_bytes()).is_err() {
+        return None;
+    }
+    append_to_index(dir, &filename, &entry.description);
+    Some(path)
+}
+
+/// Existing `NN-<slug>.md` files in the auto directory, oldest first.
+fn matching_topic_files(auto_dir: &Path, slug: &str) -> Vec<PathBuf> {
+    let want = format!("-{slug}.md");
+    let mut files: Vec<(u32, PathBuf)> = std::fs::read_dir(auto_dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    let (seq, rest) = name.split_once('-')?;
+                    (rest == want)
+                        .then(|| seq.parse::<u32>().ok().map(|n| (n, e.path())))
+                        .flatten()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort_by_key(|(seq, _)| *seq);
+    files.into_iter().map(|(_, path)| path).collect()
+}
+
+/// Next sequence number for a slug: max existing `NN-<slug>.md` + 1.
+fn next_seq(auto_dir: &Path, slug: &str) -> u32 {
+    matching_topic_files(auto_dir, slug)
+        .iter()
+        .filter_map(|path| {
+            let name = path.file_name()?.to_string_lossy().into_owned();
+            name.split_once('-')?.0.parse::<u32>().ok()
+        })
+        .max()
+        .map_or(0, |max| max + 1)
+}
+
+/// Filesystem-safe lowercase slug derived from the topic name.
+fn slug_for(name: &str) -> String {
+    let mut slug: String = name
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        slug = "memory".to_string();
+    }
+    slug.chars().take(48).collect()
+}
+
+/// Frontmatter values must not contain newlines: they would break the
+/// `parse_frontmatter_quick` line scan.
+fn escape_frontmatter(value: &str) -> String {
+    value.replace(['\n', '\r'], " ")
+}
+
+/// Append one index line to `MEMORY.md`, deduplicated by filename marker and
+/// capped at `MAX_ENTRYPOINT_LINES` lines (oldest auto lines drop first).
+fn append_to_index(dir: &Path, filename: &str, description: &str) {
+    let index_path = dir.join(MEMORY_ENTRYPOINT);
+    let marker = format!("({filename})");
+    let base_line = format!("- [{}]({})", filename, filename);
+    let line = if description.chars().count() > 160 {
+        base_line
+    } else {
+        format!("{base_line} — {description}")
+    };
+
+    let existing = std::fs::read_to_string(&index_path).unwrap_or_default();
+    if existing.contains(&marker) {
+        return;
+    }
+
+    let mut lines: Vec<String> = existing
+        .lines()
+        .map(|l| l.to_string())
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    lines.push(line);
+    while lines.len() > MAX_ENTRYPOINT_LINES {
+        match lines.iter().position(|l| l.contains("](auto/")) {
+            Some(pos) => {
+                lines.remove(pos);
+            }
+            None => break,
+        }
+    }
+    let content = format!("{}\n", lines.join("\n"));
+    if let Err(e) = atomic_write(&index_path, content.as_bytes()) {
+        tracing::debug!(path = %index_path.display(), error = %e, "memdir index write failed");
+    }
+}
+
+/// Write `bytes` to a temp file in the same directory, fsync, rename over
+/// `path`. A crash leaves either the old or the new file, never a torn one.
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "atomic_write: path has no file name",
+        ));
+    };
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = dir.join(format!(".{name}.tmp"));
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)
+}
+
+/// Stable directory key for a project root: first 16 hex chars of the SHA-256
+/// digest of the canonical path. `std::fs::canonicalize` resolves symlinks
+/// and relative components so the same checkout always maps to the same key,
+/// and SHA-256 keeps it stable across Rust toolchain bumps (unlike
+/// `DefaultHasher`, which makes no such guarantee).
+pub fn project_path_key(project_root: &Path) -> String {
+    let canonical =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    hex[..16].to_string()
+}
+
+/// Return the memdir store directory for a project root and ensure it exists.
+///
+/// The store is keyed by the stable path hash rather than the sanitized full
+/// path, so renaming a parent directory (or a path collision after
+/// sanitization) cannot orphan or cross-wire stores:
+/// `<base>/projects/<sha256-16>/memory/`.
+pub fn memory_store_dir(project_root: &Path) -> PathBuf {
+    let base = std::env::var("CLAURST_REMOTE_MEMORY_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| crate::config::Settings::config_dir());
+    let dir = base
+        .join("projects")
+        .join(project_path_key(project_root))
+        .join("memory");
+    ensure_memory_dir_exists(&dir);
+    dir
 }
 
 // ---------------------------------------------------------------------------
@@ -683,7 +932,10 @@ mod tests {
 
     #[test]
     fn test_freshness_text_fresh() {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         assert!(memory_freshness_text(now).is_empty());
     }
 
@@ -703,7 +955,10 @@ mod tests {
 
     #[test]
     fn test_freshness_note_fresh_is_empty() {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         assert!(memory_freshness_note(now).is_empty());
     }
 
@@ -745,8 +1000,14 @@ mod tests {
 
     #[test]
     fn test_sanitize_path_component() {
-        assert_eq!(sanitize_path_component("/home/user/project"), "_home_user_project");
-        assert_eq!(sanitize_path_component("normal-name_123"), "normal-name_123");
+        assert_eq!(
+            sanitize_path_component("/home/user/project"),
+            "_home_user_project"
+        );
+        assert_eq!(
+            sanitize_path_component("normal-name_123"),
+            "normal-name_123"
+        );
         assert_eq!(sanitize_path_component("C:\\Users\\foo"), "C__Users_foo");
     }
 
