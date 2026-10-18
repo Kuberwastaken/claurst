@@ -216,6 +216,57 @@ fn tool_result_preview(content: &claurst_core::types::ToolResultContent) -> Stri
 }
 
 // ---------------------------------------------------------------------------
+// Spawn registry (process-lifetime tracking)
+// ---------------------------------------------------------------------------
+
+/// Handles of in-flight extraction tasks, so embedders that exit right after
+/// the loop (headless `--print`, ACP session end) can await them instead of
+/// dropping the work mid-request.
+static PENDING_EXTRACTIONS: std::sync::Mutex<Vec<tokio::task::JoinHandle<usize>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Spawn `extract_and_store` as a detached task and track its handle. Keep
+/// the list bounded: retain finished handles and drop those beyond 32 so a
+/// long-lived TUI session cannot grow it without end.
+pub fn spawn_extraction<F>(fut: F)
+where
+    F: std::future::Future<Output = usize> + Send + 'static,
+{
+    let handle = tokio::spawn(fut);
+    if let Ok(mut list) = PENDING_EXTRACTIONS.lock() {
+        list.retain(|h| !h.is_finished());
+        list.push(handle);
+        let len = list.len();
+        if len > 32 {
+            list.drain(..len - 32);
+        }
+    }
+}
+
+/// Wait (bounded) for tracked extraction tasks to finish. Returns the number
+/// still unfinished when the timeout elapsed. Best-effort: lock poisoning or
+/// a missing runtime still returns 0.
+pub async fn await_pending_extractions(timeout: std::time::Duration) -> usize {
+    let handles = {
+        let Ok(mut list) = PENDING_EXTRACTIONS.lock() else {
+            return 0;
+        };
+        std::mem::take(&mut *list)
+    };
+    if handles.is_empty() {
+        return 0;
+    }
+    let mut remaining = handles.len();
+    if tokio::time::timeout(timeout, futures::future::join_all(handles))
+        .await
+        .is_ok()
+    {
+        remaining = 0;
+    }
+    remaining
+}
+
+// ---------------------------------------------------------------------------
 // Extraction call (ACTIVE provider and model only)
 // ---------------------------------------------------------------------------
 
