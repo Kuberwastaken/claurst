@@ -26,6 +26,12 @@ use tracing::{debug, info, warn};
 /// original threshold from the TypeScript extractor.
 const MIN_MESSAGES_TO_EXTRACT: usize = 20;
 
+/// Minimum NEW messages (since the previous extraction) before a follow-up
+/// extraction runs. Without it, every end-turn after the first extraction
+/// re-fires on any delta, spending a request per turn. A smaller delta just
+/// accumulates in the cursor window until it crosses this threshold.
+const MIN_DELTA_MESSAGES_TO_EXTRACT: usize = 10;
+
 /// Messages sent per extraction request: everything since the last
 /// extraction, newest kept, bounded so cost grows linearly, not
 /// quadratically.
@@ -476,6 +482,23 @@ Only output MEMORY: lines — no other text.  If there are no useful memories, o
 // End-to-end turn-end hook
 // ---------------------------------------------------------------------------
 
+/// Whether a turn-end extraction is worth a request.
+///
+/// The first extraction of a session waits for `MIN_MESSAGES_TO_EXTRACT`
+/// messages (the original TypeScript extractor's threshold). Follow-ups
+/// wait for `MIN_DELTA_MESSAGES_TO_EXTRACT` NEW messages since the previous
+/// extraction, so a long session costs one request per delta, not one per
+/// turn.
+fn should_extract(cursor: &ExtractionCursor, messages: &[Message]) -> bool {
+    if cursor.last_uuid.is_none() {
+        return messages.len() >= MIN_MESSAGES_TO_EXTRACT;
+    }
+    messages.len()
+        >= cursor
+            .message_count
+            .saturating_add(MIN_DELTA_MESSAGES_TO_EXTRACT)
+}
+
 /// Turn-end extraction entry point, called from the query loop's `end_turn`
 /// branch AFTER the gate (`extraction_allowed`) has passed.
 ///
@@ -499,9 +522,7 @@ pub async fn extract_and_store(
     if window.is_empty() {
         return 0;
     }
-    // The session must be long enough to be worth a request at all; the
-    // cursor keeps later extractions cheap.
-    if messages.len() < MIN_MESSAGES_TO_EXTRACT {
+    if !should_extract(&cursor, messages) {
         return 0;
     }
 
@@ -549,6 +570,7 @@ pub async fn extract_and_store(
 mod tests {
     use super::*;
     use claurst_core::types::{ContentBlock, MessageContent};
+    use futures::FutureExt as _;
 
     fn make_messages(n: usize) -> Vec<Message> {
         (0..n)
@@ -659,6 +681,60 @@ mod tests {
             window.last().and_then(|m| m.uuid.as_deref()),
             Some("uuid-29")
         );
+    }
+
+    // ---- turn-end delta gate --------------------------------------------
+
+    #[test]
+    fn first_extraction_waits_for_min_messages() {
+        let cursor = ExtractionCursor::default();
+        assert!(!should_extract(&cursor, &make_messages(19)));
+        assert!(should_extract(&cursor, &make_messages(20)));
+    }
+
+    #[test]
+    fn followup_extraction_waits_for_message_delta() {
+        let msgs = make_messages(20);
+        let mut cursor = ExtractionCursor::default();
+        cursor.advance(&msgs);
+
+        // Two new messages: below the follow-up delta, no request.
+        let mut small = msgs.clone();
+        small.extend(make_messages_starting_at(20, 2));
+        assert!(!should_extract(&cursor, &small));
+
+        // Ten new messages: crosses the delta, one request.
+        let mut big = msgs.clone();
+        big.extend(make_messages_starting_at(20, 10));
+        assert!(should_extract(&cursor, &big));
+    }
+
+    #[test]
+    fn followup_gate_s6_shape_no_double_fire() {
+        // S6 shape: extraction fired at 20 messages (cursor advanced), then
+        // one more turn adds 2 more messages (22 total). The old gate fired
+        // again immediately; the delta gate must hold.
+        let msgs = make_messages(20);
+        let mut cursor = ExtractionCursor::default();
+        cursor.advance(&msgs);
+        let mut next_turn = msgs.clone();
+        next_turn.extend(make_messages_starting_at(20, 2));
+        assert!(!should_extract(&cursor, &next_turn));
+    }
+
+    /// `make_messages` with explicit starting index, for delta windows.
+    fn make_messages_starting_at(start: usize, n: usize) -> Vec<Message> {
+        (start..start + n)
+            .map(|i| {
+                let mut msg = if i % 2 == 0 {
+                    Message::user(format!("user message {i}"))
+                } else {
+                    Message::assistant(format!("assistant reply {i}"))
+                };
+                msg.uuid = Some(format!("uuid-{i}"));
+                msg
+            })
+            .collect()
     }
 
     // ---- transcript ------------------------------------------------------
@@ -774,5 +850,53 @@ MEMORY: code_pattern | 7 | Uses builder pattern";
         let entries = parse_extraction_response(response);
         assert_eq!(entries.len(), 1);
         assert!(!entries[0].description.contains('\n'));
+    }
+
+    // ---- spawn registry -------------------------------------------
+
+    /// The spawn registry is process-global; tests that touch it must not
+    /// run concurrently or one test's `await` drains another's handles.
+    fn registry_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        &LOCK
+    }
+
+    #[tokio::test]
+    async fn await_pending_with_no_tasks_returns_zero() {
+        let _guard = registry_lock();
+        let unfinished = await_pending_extractions(std::time::Duration::from_millis(10)).await;
+        assert_eq!(unfinished, 0);
+    }
+
+    #[tokio::test]
+    async fn await_pending_waits_for_running_task() {
+        let _guard = registry_lock();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        spawn_extraction(async move {
+            let _ = rx.await;
+            0
+        });
+        // The tracked task is still parked on the channel: awaiting with a
+        // tiny budget must report it unfinished...
+        let unfinished = await_pending_extractions(std::time::Duration::from_millis(20)).await;
+        assert_eq!(unfinished, 1);
+        // ...and the timeout path drains the registry: the contract is
+        // one await per process (call sites are exit hooks), so a second
+        // call sees an empty registry and returns 0 without waiting.
+        let unfinished = await_pending_extractions(std::time::Duration::from_millis(20)).await;
+        assert_eq!(unfinished, 0);
+        // Release the task so the runtime shuts down clean.
+        tx.send(()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_registry_retains_only_32_handles() {
+        let _guard = registry_lock();
+        // 33 tracked spawns: the oldest is evicted beyond the cap.
+        for _ in 0..33 {
+            spawn_extraction(std::future::pending::<()>().then(|()| async { 0 }));
+        }
+        let unfinished = await_pending_extractions(std::time::Duration::from_millis(20)).await;
+        assert_eq!(unfinished, 32, "cap keeps at most 32 tracked handles");
     }
 }

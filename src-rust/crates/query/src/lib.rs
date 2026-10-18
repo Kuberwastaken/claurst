@@ -2848,6 +2848,7 @@ mod tests {
     //      execute() runs even though the handler would deny;
     //  (c) a ReadOnly / None tool is never gated centrally.
 
+    use std::sync::atomic::AtomicUsize as StdAtomicUsize;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
     /// Permission handler that denies everything (returns `Ask`, which in a
@@ -3363,6 +3364,103 @@ mod tests {
         })]
     }
 
+    /// Provider that serves the main loop from a scripted stream (always
+    /// `end_turn`) and counts non-stream `create_message` calls — the only
+    /// such calls in these tests are turn-end memory-extraction requests.
+    struct ExtractionProbeProvider {
+        id: claurst_core::provider_id::ProviderId,
+        nonstream_calls: Arc<StdAtomicUsize>,
+        /// System prompts seen by non-stream requests (the extraction route).
+        nonstream_systems: Arc<StdMutex<Vec<Option<SystemPrompt>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl claurst_api::LlmProvider for ExtractionProbeProvider {
+        fn id(&self) -> &claurst_core::provider_id::ProviderId {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            "extraction-probe"
+        }
+
+        async fn create_message(
+            &self,
+            request: claurst_api::ProviderRequest,
+        ) -> Result<claurst_api::ProviderResponse, claurst_api::ProviderError> {
+            self.nonstream_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.nonstream_systems
+                .lock()
+                .unwrap()
+                .push(request.system_prompt.clone());
+            Ok(claurst_api::ProviderResponse {
+                id: uuid::Uuid::new_v4().to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "MEMORY: project_fact | 8 | probe hit".to_string(),
+                }],
+                stop_reason: claurst_api::provider_types::StopReason::EndTurn,
+                usage: UsageInfo::default(),
+                model: "mock-model".to_string(),
+            })
+        }
+
+        async fn create_message_stream(
+            &self,
+            _request: claurst_api::ProviderRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<claurst_api::StreamEvent, claurst_api::ProviderError>,
+                        > + Send,
+                >,
+            >,
+            claurst_api::ProviderError,
+        > {
+            use claurst_api::provider_types::StopReason;
+            use claurst_api::StreamEvent;
+
+            let msg_id = uuid::Uuid::new_v4().to_string();
+            let events: Vec<Result<StreamEvent, claurst_api::ProviderError>> = vec![
+                Ok(StreamEvent::MessageStart {
+                    id: msg_id,
+                    model: "mock-model".to_string(),
+                    usage: UsageInfo::default(),
+                }),
+                Ok(StreamEvent::TextDelta {
+                    index: 0,
+                    text: "Done.".to_string(),
+                }),
+                Ok(StreamEvent::MessageDelta {
+                    stop_reason: Some(StopReason::EndTurn),
+                    usage: Some(UsageInfo::default()),
+                }),
+                Ok(StreamEvent::MessageStop),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+
+        async fn health_check(
+            &self,
+        ) -> Result<claurst_api::ProviderStatus, claurst_api::ProviderError> {
+            Ok(claurst_api::ProviderStatus::Healthy)
+        }
+
+        fn capabilities(&self) -> claurst_api::ProviderCapabilities {
+            claurst_api::ProviderCapabilities {
+                streaming: true,
+                tool_calling: true,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: claurst_api::SystemPromptStyle::TopLevel,
+            }
+        }
+    }
+
     /// Drive `run_query_loop` against the recording provider. Returns the
     /// outcome, the per-request "tools were empty" record, and the final
     /// message history.
@@ -3455,6 +3553,130 @@ mod tests {
 
         let recorded = recorded.lock().unwrap().clone();
         (outcome, recorded, messages)
+    }
+
+    /// Drive the loop against `ExtractionProbeProvider` with memory extraction
+    /// enabled and a history long enough to pass `MIN_MESSAGES_TO_EXTRACT`.
+    /// Returns (outcome, non-stream call count, systems seen by those calls).
+    async fn drive_extraction_loop(
+        messages: Vec<Message>,
+        tool_config: claurst_core::config::Config,
+    ) -> (QueryOutcome, usize, Vec<Option<SystemPrompt>>) {
+        let nonstream_calls = Arc::new(StdAtomicUsize::new(0));
+        let nonstream_systems = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(ExtractionProbeProvider {
+            id: claurst_core::provider_id::ProviderId::new("mockprov"),
+            nonstream_calls: nonstream_calls.clone(),
+            nonstream_systems: nonstream_systems.clone(),
+        });
+        let mut registry = claurst_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+
+        let mut ctx = deny_all_context();
+        ctx.session_id = "extraction-test".to_string();
+        ctx.config = tool_config;
+        ctx.config.provider = Some("mockprov".to_string());
+
+        let mut config = make_config(None, None);
+        config.model = "mock-model".to_string();
+        config.provider_registry = Some(Arc::new(registry));
+
+        let cost = claurst_core::cost::CostTracker::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut messages = messages;
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &[],
+                &ctx,
+                &config,
+                cost,
+                None,
+                cancel,
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        // The spawn is tracked; drain it so the extraction completes before
+        // the assertions read the probe counters.
+        let unfinished =
+            session_memory::await_pending_extractions(std::time::Duration::from_secs(5)).await;
+        assert_eq!(unfinished, 0, "extraction task must finish within budget");
+
+        let calls = nonstream_calls.load(AtomicOrdering::SeqCst);
+        let systems = nonstream_systems.lock().unwrap().clone();
+        (outcome, calls, systems)
+    }
+
+    /// (extraction) Provider-dispatch end-turn fires exactly one extraction
+    /// request through the ACTIVE provider, carrying the extraction system
+    /// prompt. Regression for the bug where the hook was legacy-path-only.
+    #[tokio::test]
+    async fn provider_dispatch_end_turn_fires_memory_extraction() {
+        // 25 messages: above MIN_MESSAGES_TO_EXTRACT (20).
+        let mut messages = vec![Message::user("start")];
+        for i in 0..24 {
+            messages.push(if i % 2 == 0 {
+                Message::user(format!("turn {i}"))
+            } else {
+                Message::assistant(format!("reply {i}"))
+            });
+        }
+        let tool_config = claurst_core::config::Config {
+            memory_extraction_enabled: true,
+            ..Default::default()
+        };
+
+        let (outcome, calls, systems) = drive_extraction_loop(messages, tool_config).await;
+
+        assert!(
+            matches!(outcome, QueryOutcome::EndTurn { .. }),
+            "loop must end normally"
+        );
+        assert_eq!(
+            calls, 1,
+            "exactly one extraction request must fire at end_turn"
+        );
+        assert_eq!(systems.len(), 1);
+        match &systems[0] {
+            Some(SystemPrompt::Text(text)) => {
+                assert!(
+                    text.contains("memory extraction assistant"),
+                    "extraction request must carry the extraction system prompt"
+                );
+            }
+            other => panic!("expected extraction system prompt, got {other:?}"),
+        }
+    }
+
+    /// (extraction) The gate stays closed when `memoryExtractionEnabled` is
+    /// unset: no second request, even with a long history.
+    #[tokio::test]
+    async fn provider_dispatch_extraction_off_by_default() {
+        let mut messages = vec![Message::user("start")];
+        for i in 0..24 {
+            messages.push(if i % 2 == 0 {
+                Message::user(format!("turn {i}"))
+            } else {
+                Message::assistant(format!("reply {i}"))
+            });
+        }
+        let (outcome, calls, _systems) =
+            drive_extraction_loop(messages, claurst_core::config::Config::default()).await;
+
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(calls, 0, "no extraction request when the gate is off");
     }
 
     /// Issue #440: across a scripted multi-turn run the stable system block is

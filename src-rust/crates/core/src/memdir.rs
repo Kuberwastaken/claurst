@@ -665,16 +665,26 @@ fn write_entry_locked(dir: &Path, entry: &AutoMemoryEntry) -> Option<PathBuf> {
     }
     let slug = slug_for(&entry.name);
 
-    // Same topic written before: extend that file instead of spawning a
-    // near-duplicate. Same fact already present anywhere: keep the first
-    // copy and drop this one.
+    // Same topic written before: append the fact to the oldest topic file
+    // instead of spawning a near-duplicate. Same fact already present in it:
+    // keep the first copy and drop this one.
     let topic_files = matching_topic_files(&auto_dir, &slug);
-    for path in &topic_files {
-        if let Ok(existing) = std::fs::read_to_string(path) {
-            if existing.contains(&entry.content) {
-                return None;
-            }
+    if let Some(oldest) = topic_files.first() {
+        let existing_bodies: Vec<String> = topic_files
+            .iter()
+            .map(|p| std::fs::read_to_string(p).unwrap_or_default())
+            .collect();
+        if existing_bodies
+            .iter()
+            .any(|body| body.contains(&entry.content))
+        {
+            return None;
         }
+        let body = format!("{}\n{}\n", existing_bodies[0].trim_end(), entry.content);
+        if atomic_write(oldest, body.as_bytes()).is_err() {
+            return None;
+        }
+        return Some(oldest.clone());
     }
     let seq = next_seq(&auto_dir, &slug);
     let filename = format!("{seq}-{slug}.md");
@@ -695,7 +705,9 @@ fn write_entry_locked(dir: &Path, entry: &AutoMemoryEntry) -> Option<PathBuf> {
 
 /// Existing `NN-<slug>.md` files in the auto directory, oldest first.
 fn matching_topic_files(auto_dir: &Path, slug: &str) -> Vec<PathBuf> {
-    let want = format!("-{slug}.md");
+    // `split_once('-')` yields what follows the seq dash, so the suffix must
+    // not carry a dash of its own: `<seq>-<slug>.md` -> `<slug>.md`.
+    let want = format!("{slug}.md");
     let mut files: Vec<(u32, PathBuf)> = std::fs::read_dir(auto_dir)
         .map(|rd| {
             rd.flatten()
@@ -1132,5 +1144,184 @@ mod tests {
         // function handles Some(false) without panicking.
         // (The full env-var paths are integration-tested separately.)
         let _ = is_auto_memory_enabled(Some(false));
+    }
+
+    // ---- append_auto_memories ----------------------------------------------
+
+    fn auto_entry(name: &str, description: &str, content: &str) -> AutoMemoryEntry {
+        AutoMemoryEntry {
+            name: name.to_string(),
+            description: description.to_string(),
+            content: content.to_string(),
+            memory_type: MemoryType::Project,
+        }
+    }
+
+    #[test]
+    fn test_append_writes_topic_file_and_index_line() {
+        let dir = make_temp_dir();
+        let written = append_auto_memories(
+            dir.path(),
+            &[auto_entry(
+                "Build tool",
+                "uses cargo",
+                "The project uses cargo.",
+            )],
+        );
+        assert_eq!(written.len(), 1);
+        let path = &written[0];
+        assert!(path.starts_with(dir.path().join("auto")));
+        let body = std::fs::read_to_string(path).unwrap();
+        assert!(body.contains("---\nname: Build tool\n"));
+        assert!(body.contains("type: project\n"));
+        assert!(body.contains("The project uses cargo."));
+        let index = std::fs::read_to_string(dir.path().join(MEMORY_ENTRYPOINT)).unwrap();
+        assert!(index.contains(&format!(
+            "({})",
+            path.file_name().unwrap().to_string_lossy()
+        )));
+    }
+
+    #[test]
+    fn test_append_same_fact_stored_once() {
+        let dir = make_temp_dir();
+        let entry = auto_entry("Build tool", "uses cargo", "The project uses cargo.");
+        let first = append_auto_memories(dir.path(), std::slice::from_ref(&entry));
+        let second = append_auto_memories(dir.path(), &[entry]);
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty());
+        let auto_dir = dir.path().join("auto");
+        let count = std::fs::read_dir(&auto_dir).unwrap().count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_append_same_topic_extends_one_file() {
+        let dir = make_temp_dir();
+        let first = append_auto_memories(
+            dir.path(),
+            &[auto_entry(
+                "Build tool",
+                "uses cargo",
+                "The project uses cargo.",
+            )],
+        );
+        let second = append_auto_memories(
+            dir.path(),
+            &[auto_entry(
+                "Build tool",
+                "targets wasm",
+                "Wasm is a build target.",
+            )],
+        );
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(first[0], second[0]);
+        let auto_dir = dir.path().join("auto");
+        let count = std::fs::read_dir(&auto_dir).unwrap().count();
+        assert_eq!(count, 1);
+        let body = std::fs::read_to_string(&second[0]).unwrap();
+        assert!(body.contains("The project uses cargo."));
+        assert!(body.contains("Wasm is a build target."));
+    }
+
+    #[test]
+    fn test_next_seq_counts_per_topic() {
+        let dir = make_temp_dir();
+        let auto_dir = dir.path().join("auto");
+        std::fs::create_dir_all(&auto_dir).unwrap();
+        write_file(&auto_dir, "3-build-tool.md", "body");
+        write_file(&auto_dir, "10-other.md", "body");
+        assert_eq!(next_seq(&auto_dir, "build-tool"), 4);
+        assert_eq!(next_seq(&auto_dir, "other"), 11);
+        assert_eq!(next_seq(&auto_dir, "missing"), 0);
+    }
+
+    #[test]
+    fn test_append_different_topics_get_separate_files() {
+        let dir = make_temp_dir();
+        let written = append_auto_memories(
+            dir.path(),
+            &[
+                auto_entry("Build tool", "uses cargo", "The project uses cargo."),
+                auto_entry(
+                    "Test style",
+                    "prefers unit tests",
+                    "Unit tests are preferred.",
+                ),
+            ],
+        );
+        assert_eq!(written.len(), 2);
+        let names: Vec<String> = written
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"0-build-tool.md".to_string()));
+        assert!(names.contains(&"0-test-style.md".to_string()));
+    }
+
+    // ---- project_path_key / memory_store_dir --------------------------------
+
+    #[test]
+    fn test_project_path_key_stable_across_calls() {
+        let dir = make_temp_dir();
+        let key1 = project_path_key(dir.path());
+        let key2 = project_path_key(dir.path());
+        assert_eq!(key1, key2);
+        assert_eq!(key1.len(), 16);
+        assert!(key1.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_project_path_key_distinct_paths() {
+        let dir1 = make_temp_dir();
+        let dir2 = make_temp_dir();
+        assert_ne!(project_path_key(dir1.path()), project_path_key(dir2.path()));
+    }
+
+    // ---- atomic_write -------------------------------------------------------
+
+    #[test]
+    fn test_atomic_write_leaves_no_temp_file() {
+        let dir = make_temp_dir();
+        let path = dir.path().join("out.md");
+        atomic_write(&path, b"hello").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+        let leftover: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftover.is_empty());
+    }
+
+    #[test]
+    fn test_append_concurrent_writer_skips_without_data_loss() {
+        let dir = make_temp_dir();
+        let lock_path = dir.path().join(".memdir.lock");
+        let mut lock = fslock::LockFile::open(&lock_path).unwrap();
+        assert!(lock.try_lock_with_pid().unwrap());
+        let written = append_auto_memories(
+            dir.path(),
+            &[auto_entry(
+                "Build tool",
+                "uses cargo",
+                "The project uses cargo.",
+            )],
+        );
+        assert!(written.is_empty());
+        // The held lock must not corrupt the directory or drop files that
+        // were already there.
+        assert!(!dir.path().join("auto").exists());
+        lock.unlock().unwrap();
+        let after = append_auto_memories(
+            dir.path(),
+            &[auto_entry(
+                "Build tool",
+                "uses cargo",
+                "The project uses cargo.",
+            )],
+        );
+        assert_eq!(after.len(), 1);
     }
 }
