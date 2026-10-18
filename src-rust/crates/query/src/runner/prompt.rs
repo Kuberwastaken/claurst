@@ -20,9 +20,11 @@ pub(crate) fn build_system_prompt(config: &QueryConfig) -> SystemPrompt {
         custom_system_prompt: config.system_prompt.clone(),
         append_system_prompt: config.append_system_prompt.clone(),
         session_context: config.session_context.clone(),
+        // Turn-refreshed memory index (MEMORY.md) lands in the dynamic
+        // block's <memory> section; stable block stays byte-identical.
+        memory_content: config.memory_content.clone(),
         // All other fields use sensible defaults:
         // - prefix:                auto-detect from env
-        // - memory_content:        empty (callers inject via append if needed)
         // - replace_system_prompt: false (additive mode)
         // - coordinator_mode:      false
         output_style: config.output_style,

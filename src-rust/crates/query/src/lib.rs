@@ -110,6 +110,11 @@ pub struct QueryConfig {
     /// Session context gathered at startup (git status, IDE context).
     /// Sent in the dynamic system block, after the cached stable block.
     pub session_context: Option<String>,
+    /// Memory index content injected into the dynamic system block
+    /// (`<memory>` section) when auto-memory is enabled. Refreshed by the
+    /// query loop each turn from the memdir store so extracted facts
+    /// surface on the next turn. Empty: no memory section.
+    pub memory_content: String,
     pub output_style: claurst_core::system_prompt::OutputStyle,
     pub output_style_prompt: Option<String>,
     pub working_directory: Option<String>,
@@ -221,6 +226,7 @@ impl Default for QueryConfig {
             system_prompt: None,
             append_system_prompt: None,
             session_context: None,
+            memory_content: String::new(),
             output_style: claurst_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             working_directory: None,
@@ -261,6 +267,23 @@ fn persist_step(config: &QueryConfig, messages: &[Message]) {
     }
 }
 
+/// Load the memory index content for a config, or an empty string when
+/// auto-memory is disabled or the project dir is unknown. Used to seed
+/// `QueryConfig::memory_content` at construction; the query loop refreshes
+/// it every turn so turn-end extraction surfaces on the next request.
+fn memory_content_for_config(cfg: &Config) -> String {
+    if !claurst_core::memdir::is_auto_memory_enabled(cfg.auto_memory_enabled) {
+        return String::new();
+    }
+    match &cfg.project_dir {
+        Some(dir) => {
+            let store_dir = claurst_core::memdir::memory_store_dir(dir);
+            claurst_core::memdir::build_memory_prompt_content(&store_dir)
+        }
+        None => String::new(),
+    }
+}
+
 impl QueryConfig {
     pub fn from_config(cfg: &Config) -> Self {
         Self {
@@ -269,6 +292,7 @@ impl QueryConfig {
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
             working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
+            memory_content: memory_content_for_config(cfg),
             managed_agents: cfg.managed_agents.clone(),
             effort_level: cfg.effective_effort_level(),
             degradation_enabled: cfg.degradation_summary_enabled_or_default(),
@@ -290,6 +314,7 @@ impl QueryConfig {
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
             working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
+            memory_content: memory_content_for_config(cfg),
             managed_agents: cfg.managed_agents.clone(),
             effort_level: cfg.effective_effort_level(),
             degradation_enabled: cfg.degradation_summary_enabled_or_default(),
@@ -942,6 +967,21 @@ pub async fn run_query_loop(
             }
             patched.sandbox_state =
                 claurst_core::sandbox::render_sandbox_state(&tool_ctx.config.sandbox);
+
+            // Memory index injection: when the auto-memory switches allow it,
+            // load the store's MEMORY.md index and inject it into the
+            // dynamic system block. The store dir is the same hash-keyed dir
+            // the turn-end extractor writes to (`memory_store_dir`), so
+            // facts extracted at the end of turn N surface in turn N+1's
+            // prompt. Read fresh each turn (the index is small, capped at
+            // 200 lines / 25 KiB) and routed through `memory_content`, which
+            // `build_system_prompt` places after the dynamic boundary so the
+            // cached stable block stays byte-identical across turns.
+            if claurst_core::memdir::is_auto_memory_enabled(tool_ctx.config.auto_memory_enabled) {
+                let store_dir = claurst_core::memdir::memory_store_dir(&tool_ctx.working_dir);
+                patched.memory_content =
+                    claurst_core::memdir::build_memory_prompt_content(&store_dir);
+            }
 
             // Apply agent system-prompt prefix: prepend before the main system prompt.
             if let Some(ref agent) = config.agent_definition {
@@ -2449,6 +2489,7 @@ mod tests {
             system_prompt: sys.map(String::from),
             append_system_prompt: append.map(String::from),
             session_context: None,
+            memory_content: String::new(),
             output_style: claurst_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             working_directory: None,
@@ -3405,7 +3446,7 @@ mod tests {
 
         async fn create_message_stream(
             &self,
-            _request: claurst_api::ProviderRequest,
+            request: claurst_api::ProviderRequest,
         ) -> Result<
             std::pin::Pin<
                 Box<
@@ -3416,6 +3457,13 @@ mod tests {
             >,
             claurst_api::ProviderError,
         > {
+            // Main-loop turns ride this route; record their system prompt so
+            // read-path tests can assert on the prompt the model actually
+            // sees (the non-stream vec above stays extraction-only).
+            self.nonstream_systems
+                .lock()
+                .unwrap()
+                .push(request.system_prompt.clone());
             use claurst_api::provider_types::StopReason;
             use claurst_api::StreamEvent;
 
@@ -3569,18 +3617,44 @@ mod tests {
         messages: Vec<Message>,
         tool_config: claurst_core::config::Config,
     ) -> (QueryOutcome, usize, Vec<Option<SystemPrompt>>) {
+        drive_extraction_loop_with(messages, tool_config, None).await
+    }
+
+    /// Same as [`Self::drive_extraction_loop`], but lets the caller pass an
+    /// already-held registry guard so tests that need the store seeded before
+    /// the loop starts (or must keep the env override alive across both the
+    /// seeding and the run) do not re-acquire the non-reentrant mutex.
+    #[allow(clippy::await_holding_lock)]
+    async fn drive_extraction_loop_with(
+        messages: Vec<Message>,
+        tool_config: claurst_core::config::Config,
+        mut registry_guard: Option<session_memory::TestRegistryGuard>,
+    ) -> (QueryOutcome, usize, Vec<Option<SystemPrompt>>) {
         // Serialize against every other test that touches the process-global
         // spawn registry, or this `await` can drain another test's handles
-        // (and vice versa).
-        let _registry = session_memory::test_registry_lock();
+        // (and vice versa). When the caller already holds the lock, reuse
+        // their guard; they keep owning the env override and store root.
+        let caller_owns_store = registry_guard.is_some();
+        let _registry = match registry_guard.take() {
+            Some(guard) => guard,
+            None => session_memory::test_registry_lock(),
+        };
         // The store dir resolves through CLAURST_REMOTE_MEMORY_DIR; isolate
         // it per test so no cursor or entry ever lands in the real ~/.claurst
         // and no stale cursor from a previous run suppresses extraction. The
         // guard also owns the tempdir and restores the previous value on
         // drop, so a panic inside the loop below cannot leak the override
         // into later tests.
-        let store_root = tempfile::tempdir().expect("temp store root");
-        let _env_guard = RemoteMemoryDirOverride::set(store_root);
+        //
+        // When the caller passed a registry guard they already own an env
+        // override (and possibly a pre-seeded store); replacing it here would
+        // hide their seeded entries, so keep theirs.
+        let _env_guard = if caller_owns_store {
+            None
+        } else {
+            let store_root = tempfile::tempdir().expect("temp store root");
+            Some(RemoteMemoryDirOverride::set(store_root))
+        };
         let nonstream_calls = Arc::new(StdAtomicUsize::new(0));
         let nonstream_systems = Arc::new(StdMutex::new(Vec::new()));
         let provider = Arc::new(ExtractionProbeProvider {
@@ -3697,15 +3771,87 @@ mod tests {
             calls, 1,
             "exactly one extraction request must fire at end_turn"
         );
-        assert_eq!(systems.len(), 1);
-        match &systems[0] {
-            Some(SystemPrompt::Text(text)) => {
+        // Two recorded prompts now: the main-loop turn (stream route) plus
+        // the extraction request (non-stream route). The extraction prompt
+        // is the last one recorded.
+        assert_eq!(systems.len(), 2);
+        match systems.last() {
+            Some(Some(SystemPrompt::Text(text))) => {
                 assert!(
                     text.contains("memory extraction assistant"),
                     "extraction request must carry the extraction system prompt"
                 );
             }
             other => panic!("expected extraction system prompt, got {other:?}"),
+        }
+    }
+
+    /// (read path) The memory index written to the store by extraction (or a
+    /// prior session) reaches the next turn's system prompt: the loop
+    /// refreshes `memory_content` from `memory_store_dir` every turn and
+    /// `build_system_prompt` places it in the dynamic `<memory>` block.
+    /// Regression for the period where the read path had zero callers and
+    /// extracted facts could never surface in a prompt.
+    #[tokio::test]
+    async fn stored_memory_index_reaches_system_prompt() {
+        // Serialize against every other test that touches the process-global
+        // spawn registry or the CLAURST_REMOTE_MEMORY_DIR override. The guard
+        // is handed to the loop driver below: re-acquiring it there would
+        // self-deadlock (the mutex is not reentrant and the runtime is
+        // current-thread).
+        let registry_guard = session_memory::test_registry_lock();
+        let store_root = tempfile::tempdir().expect("temp store root");
+        let _env_guard = RemoteMemoryDirOverride::set(store_root);
+
+        // Pre-seed the store exactly as `append_auto_memories` would: an
+        // `auto/` topic file plus a MEMORY.md index line for it.
+        let tool_config = claurst_core::config::Config::default();
+        // `deny_all_context` pins working_dir to `/workspace`, so the loop
+        // resolves the store through the same `memory_store_dir` call this
+        // seeding uses; the hash key makes the path deterministic.
+        let store_dir = claurst_core::memdir::memory_store_dir(std::path::Path::new("/workspace"));
+        let entry = claurst_core::memdir::AutoMemoryEntry {
+            name: "build command".to_string(),
+            description: "how to build the workspace".to_string(),
+            content: "cargo build --workspace from src-rust".to_string(),
+            memory_type: claurst_core::memdir::MemoryType::Project,
+        };
+        let written = claurst_core::memdir::append_auto_memories(&store_dir, &[entry]);
+        assert_eq!(written.len(), 1, "seed entry must land in the store");
+
+        // Drive one turn through the provider-dispatch path with auto-memory
+        // enabled (default) and assert the request's system prompt carries the
+        // index line inside the <memory> block.
+        let messages = vec![Message::user("what is the build command?")];
+        let mut tool_config = tool_config;
+        tool_config.provider = Some("mockprov".to_string());
+        let (outcome, calls, systems) =
+            drive_extraction_loop_with(messages, tool_config, Some(registry_guard)).await;
+
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(calls, 0, "history below threshold: no extraction request");
+        assert_eq!(systems.len(), 1);
+        match &systems[0] {
+            Some(SystemPrompt::Blocks(blocks)) => {
+                let dynamic = blocks
+                    .iter()
+                    .map(|b| b.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    dynamic.contains("<memory>"),
+                    "dynamic block must carry the memory section"
+                );
+                assert!(
+                    dynamic.contains("Memory Index (MEMORY.md)"),
+                    "dynamic block must carry the index heading"
+                );
+                assert!(
+                    dynamic.contains("build command") || dynamic.contains("build-command"),
+                    "index line for the seeded entry must reach the prompt"
+                );
+            }
+            other => panic!("expected block system prompt, got {other:?}"),
         }
     }
 

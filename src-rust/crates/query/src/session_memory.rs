@@ -585,6 +585,11 @@ pub(crate) fn test_registry_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Type alias so sibling test modules (lib-level loop tests) can accept a
+/// pre-held registry guard without depending on the `MutexGuard` lifetime.
+#[cfg(test)]
+pub(crate) type TestRegistryGuard = std::sync::MutexGuard<'static, ()>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
