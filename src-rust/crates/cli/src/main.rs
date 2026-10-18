@@ -2522,8 +2522,16 @@ async fn run_interactive(
         // (this loop does not go through `App::run`; issue #382).
         app.poll_session_loads();
 
-        // Draw the UI
-        terminal.draw(|f| render_app(f, &app))?;
+        // Draw the UI. `enter_idle_hibernation` (via the poll below) rechecks
+        // the work guards, so a query or dialog arriving between timer and
+        // paint is never frozen out.
+        let completed = terminal.draw(|f| render_app(f, &app))?;
+        // Idle hibernation: after the frame is on screen, either arm the
+        // freeze (timer expired, no work pending) or capture this
+        // just-completed frame for the frozen-screen hibernation.
+        if app.poll_idle_hibernation() {
+            app.enter_idle_hibernation(Some(completed.buffer));
+        }
 
         // Level-sync the terminal progress indicator (OSC 9;4) to streaming
         // state, so supporting terminals (iTerm2, WezTerm, Windows Terminal, …)
@@ -2593,6 +2601,11 @@ async fn run_interactive(
                     if key.kind != crossterm::event::KeyEventKind::Press {
                         continue;
                     }
+                    // Wake idle hibernation before any of the early paths
+                    // below (paste-burst drain, bare-Enter submit): they run
+                    // ahead of `handle_key_event`, so without this the waking
+                    // keystroke would act against a stale frozen frame.
+                    app.wake_idle_hibernation();
                     // Any key press after a turn ends means the user has seen
                     // its result: OSC 7501 `done` / `error` falls back to `idle`.
                     if current_query.is_none() {
@@ -3617,6 +3630,9 @@ async fn run_interactive(
                     }
                 }
                 Event::Paste(data) => {
+                    // Bracketed paste is user input too: it bypasses
+                    // `handle_key_event`, so wake hibernation here as well.
+                    app.wake_idle_hibernation();
                     // Bracketed paste (Cmd+V on macOS, Ctrl+Shift+V on Linux, any
                     // terminal with bracketed paste). Deliberately NOT gated on
                     // is_streaming: the prompt stays editable during a turn so a

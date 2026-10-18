@@ -527,13 +527,67 @@ fn reset_render_caches() {
     PREFIX_CACHE_MISSES.with(|c| c.set(0));
 }
 
+/// Drop the idle-held rendered-transcript caches (idle hibernation).
+/// Both entries are fully derived from `messages`/`annotations`/width, so
+/// the next render rebuilds them byte-identically.
+pub fn release_idle_render_caches() {
+    MESSAGE_LINES_CACHE.with(|c| *c.borrow_mut() = None);
+    COMPLETED_MSG_CACHE.with(|c| *c.borrow_mut() = None);
+}
+
 // -----------------------------------------------------------------------
 // Top-level layout
 // -----------------------------------------------------------------------
 
+fn dim_status_color(app: &App) -> Color {
+    let theme_name = match &app.config.theme {
+        claurst_core::Theme::Dark => "dark",
+        claurst_core::Theme::Light => "light",
+        claurst_core::Theme::Default => "default",
+        claurst_core::Theme::Deuteranopia => "deuteranopia",
+        claurst_core::Theme::Custom(s) => s.as_str(),
+    };
+    crate::theme_colors::get_warning_color(theme_name)
+}
+
+/// One dim status row at the very bottom of the frozen frame, telling the
+/// user the session is hibernated and that typing resumes it.
+fn render_hibernation_notice(frame: &mut Frame, app: &App, size: Rect, notice: &str) {
+    if size.height == 0 || size.width == 0 {
+        return;
+    }
+    let row = Rect {
+        y: size.y + size.height - 1,
+        height: 1,
+        ..size
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            notice.to_string(),
+            Style::default().fg(dim_status_color(app)),
+        )),
+        row,
+    );
+}
+
 /// Render the entire application into the current frame.
 pub fn render_app(frame: &mut Frame, app: &App) {
     let size = frame.area();
+
+    // Idle hibernation: the derived caches behind the transcript were
+    // released, so paint the frozen copy of the last frame verbatim instead
+    // of rebuilding every line on each idle tick. The status row below the
+    // transcript keeps the state visible and invites the user to type.
+    if let Some(frozen) = app.hibernation_frame() {
+        // Copy the frozen cells straight into the frame buffer; no clone of
+        // the whole Buffer on any tick, steady state is a bounded cell copy.
+        app.paint_hibernation_frame(frame.buffer_mut(), frozen, size);
+        if let Some(notice) = app.hibernation_notice() {
+            render_hibernation_notice(frame, app, size, notice);
+        }
+        return;
+    }
+
     app.last_selectable_area.set(size);
 
     // Fill the entire frame with a black background so the terminal's default

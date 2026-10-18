@@ -874,6 +874,7 @@ dependencies = [
  "glob",
  "hex",
  "indexmap 2.14.0",
+ "libc",
  "nix 0.29.0",
  "once_cell",
  "parking_lot",

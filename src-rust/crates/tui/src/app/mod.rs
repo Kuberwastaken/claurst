@@ -1,6 +1,7 @@
 //! App state struct and main event loop.
 
 mod commands;
+mod idle_hibernation;
 mod keys;
 mod messages;
 mod mouse;
@@ -328,6 +329,10 @@ pub struct App {
     pub memory_update_notification: crate::memory_update_notification::MemoryUpdateNotificationState,
     /// MCP elicitation dialog (form requested by an MCP server).
     pub elicitation: crate::elicitation_dialog::ElicitationDialogState,
+    /// Idle-session hibernation state: derived caches are released after a
+    /// sustained idle period while a frozen copy of the last frame keeps the
+    /// screen intact. See `app/idle_hibernation.rs`.
+    pub idle_hibernation: idle_hibernation::IdleHibernation,
     /// Model picker overlay (/model command).
     pub model_picker: ModelPickerState,
     /// Session browser overlay (/session, /resume, /rename, /export).
@@ -727,6 +732,7 @@ impl App {
             invalid_config_dialog: crate::invalid_config_dialog::InvalidConfigDialogState::new(),
             memory_update_notification: crate::memory_update_notification::MemoryUpdateNotificationState::new(),
             elicitation: crate::elicitation_dialog::ElicitationDialogState::new(),
+            idle_hibernation: idle_hibernation::IdleHibernation::default(),
             model_picker: ModelPickerState::new(),
             session_browser: SessionBrowserState::new(),
             session_branching: crate::session_branching::SessionBranchingState::new(),

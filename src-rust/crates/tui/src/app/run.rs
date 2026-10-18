@@ -503,6 +503,14 @@ impl App {
             // slot. `CompletedFrame.buffer` is the one we actually want.
             let osc8_hits = {
                 let completed = terminal.draw(|f| render::render_app(f, self))?;
+                // Idle hibernation: after the frame is on screen, either arm
+                // the freeze (timer expired, no work pending) or capture this
+                // just-completed frame. `enter_idle_hibernation` rechecks the
+                // work guards so a task arriving between timer and paint is
+                // never frozen out.
+                if self.poll_idle_hibernation() {
+                    self.enter_idle_hibernation(Some(completed.buffer));
+                }
                 crate::osc8::scan_buffer_for_urls(completed.buffer)
             };
 

@@ -12,6 +12,7 @@
 #![allow(clippy::should_implement_trait)]
 
 // Branded provider / model identifier newtypes.
+pub mod process_memory;
 pub mod provider_id;
 pub use provider_id::{ProviderId, ModelId};
 
@@ -788,6 +789,10 @@ pub mod config {
         15
     }
 
+    /// Built-in default for the idle hibernation window when the user never
+    /// set `hibernationIdleSecs` (see `Config::hibernation_idle_secs`).
+    pub const DEFAULT_HIBERNATION_IDLE_SECS: u64 = 1800;
+
     fn default_file_injection_max_size() -> usize {
         100  // 100 KB
     }
@@ -1280,6 +1285,17 @@ pub mod config {
         /// sub-agents on, shell off unless the command asked with `notify`.
         #[serde(default, rename = "completionWakeups", alias = "completion_wakeups", skip_serializing_if = "Option::is_none")]
         pub completion_wakeups: Option<CompletionWakeups>,
+        /// Idle hibernation window in seconds. After this much sustained
+        /// inactivity the TUI releases its derived render caches and keeps
+        /// the last frame frozen on screen; `0` disables the feature.
+        /// `None` (missing from settings) keeps the built-in default.
+        #[serde(
+            default,
+            rename = "hibernationIdleSecs",
+            alias = "hibernation_idle_secs",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub hibernation_idle_secs: Option<u64>,
         /// Shell sandbox settings, copied from the top-level `sandbox` block
         /// of the global settings by [`Settings::effective_config`].
         #[serde(skip)]
@@ -2393,6 +2409,7 @@ pub mod config {
                 // Global-only: a project file must not be able to turn on
                 // autonomous wake-up turns.
                 completion_wakeups: base.config.completion_wakeups,
+                hibernation_idle_secs: base.config.hibernation_idle_secs,
             };
             Self {
                 config: merged_config,

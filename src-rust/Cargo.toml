@@ -24,6 +24,7 @@ license = "GPL-3.0"
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1.44", features = ["full"] }
+libc = "0.2"
 tokio-stream = "0.1"
 futures = "0.3"
 async-trait = "0.1"

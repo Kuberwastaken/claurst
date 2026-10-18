@@ -322,6 +322,7 @@ impl App {
     }
 
     pub fn handle_mouse_event(&mut self, mouse_event: MouseEvent) {
+        self.wake_idle_hibernation();
         use crossterm::event::MouseButton;
 
         // When mouse capture is disabled (mouseCapture: false, issue #104) the

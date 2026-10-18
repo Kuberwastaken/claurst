@@ -203,6 +203,9 @@ impl App {
     /// Process a keyboard event. Returns `true` when the input should be
     /// submitted (Enter pressed with no blocking dialog).
     pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
+        // Any key wakes idle hibernation before the event is processed, so the
+        // waking keystroke lands in the prompt with nothing lost.
+        self.wake_idle_hibernation();
         // Make Ctrl shortcuts layout-independent before any handler runs: on
         // non-Latin layouts (Ukrainian / Russian, …) a Ctrl combo reports the
         // Cyrillic glyph at the physical key, which would otherwise miss the
@@ -2569,6 +2572,7 @@ impl App {
     /// Otherwise the text goes through the normal `prompt_input.paste()` path
     /// which applies the multi-line summary placeholder for large pastes.
     pub fn handle_paste_data(&mut self, data: String) {
+        self.wake_idle_hibernation();
         use crate::prompt_input::detect_pasted_path;
         use crate::image_paste::PastedImage;
 
