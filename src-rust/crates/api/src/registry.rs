@@ -655,6 +655,9 @@ impl ProviderRegistry {
         if std::env::var("NOVITA_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
             self.register(Arc::new(p::novita()));
         }
+        if std::env::var("RUNCRATE_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
+            self.register(Arc::new(p::runcrate()));
+        }
         if std::env::var("OVHCLOUD_API_KEY").map(|v| !v.is_empty()).unwrap_or(false) {
             self.register(Arc::new(p::ovhcloud()));
         }

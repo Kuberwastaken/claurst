@@ -71,6 +71,7 @@ impl ProviderId {
     pub const STEPFUN: &'static str = "stepfun";
     pub const FIREWORKS: &'static str = "fireworks";
     pub const NOVITA: &'static str = "novita";
+    pub const RUNCRATE: &'static str = "runcrate";
     pub const MINIMAX: &'static str = "minimax";
     pub const CODEX: &'static str = "codex";
     pub const OPENCODE_GO: &'static str = "opencode-go";

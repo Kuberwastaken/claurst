@@ -688,6 +688,7 @@ These ids are also accepted by `--provider`. Each reads the listed environment v
 | `zai` | `ZAI_API_KEY` | `https://api.z.ai/api/coding/paas/v4` |
 | `nebius` | `NEBIUS_API_KEY` | `https://api.tokenfactory.nebius.com/v1` |
 | `novita` | `NOVITA_API_KEY` | `https://api.novita.ai/v3/openai` |
+| `runcrate` | `RUNCRATE_API_KEY` | `https://api.runcrate.ai/v1` |
 | `ovhcloud` | `OVHCLOUD_API_KEY` | `https://oai.endpoints.kepler.ai.cloud.ovh.net/v1` |
 | `scaleway` | `SCALEWAY_API_KEY` | `https://api.scaleway.ai/v1` |
 | `vultr` | `VULTR_API_KEY` | `https://api.vultrinference.com/v1` |

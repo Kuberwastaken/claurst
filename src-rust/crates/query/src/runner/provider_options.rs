@@ -78,6 +78,7 @@ pub(crate) fn is_openaiish_provider(provider_id: &str) -> bool {
             | "alibaba"
             | "nebius"
             | "novita"
+            | "runcrate"
             | "ovhcloud"
             | "scaleway"
             | "vultr"

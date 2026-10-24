@@ -63,7 +63,7 @@ pub(crate) fn resolve_provider_route(
             "moonshot", "moonshotai",
             "zhipu", "zhipuai",
             "zai",
-            "nebius", "novita", "ovhcloud", "scaleway",
+            "nebius", "novita", "runcrate", "ovhcloud", "scaleway",
             "vultr", "vultr-ai",
             "baseten", "friendli", "upstage", "stepfun",
         ];

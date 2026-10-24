@@ -828,6 +828,7 @@ pub mod config {
             "siliconflow" => &["SILICONFLOW_API_KEY"],
             "nebius" => &["NEBIUS_API_KEY"],
             "novita" => &["NOVITA_API_KEY"],
+            "runcrate" => &["RUNCRATE_API_KEY"],
             "minimax" => &["MINIMAX_API_KEY"],
             "ovhcloud" => &["OVHCLOUD_API_KEY"],
             "scaleway" => &["SCALEWAY_API_KEY"],

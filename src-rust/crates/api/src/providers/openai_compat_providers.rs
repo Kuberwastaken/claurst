@@ -36,6 +36,7 @@ pub fn provider_for_id(provider_id: &str) -> Option<OpenAiCompatProvider> {
         "zai" => Some(zai()),
         "nebius" => Some(nebius()),
         "novita" => Some(novita()),
+        "runcrate" => Some(runcrate()),
         "ovhcloud" => Some(ovhcloud()),
         "scaleway" => Some(scaleway()),
         "vultr" | "vultr-ai" => Some(vultr_ai()),
@@ -430,6 +431,17 @@ pub fn novita() -> OpenAiCompatProvider {
         ProviderId::NOVITA,
         "Novita",
         "https://api.novita.ai/v3/openai",
+    )
+    .with_api_key(key)
+}
+
+/// Runcrate: open models (DeepSeek, GLM, Qwen, gpt-oss).  Reads `RUNCRATE_API_KEY`.
+pub fn runcrate() -> OpenAiCompatProvider {
+    let key = std::env::var("RUNCRATE_API_KEY").unwrap_or_default();
+    OpenAiCompatProvider::new(
+        ProviderId::RUNCRATE,
+        "Runcrate",
+        "https://api.runcrate.ai/v1",
     )
     .with_api_key(key)
 }

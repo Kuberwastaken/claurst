@@ -167,6 +167,7 @@ impl AuthStore {
             "siliconflow" => "SILICONFLOW_API_KEY",
             "nebius" => "NEBIUS_API_KEY",
             "novita" => "NOVITA_API_KEY",
+            "runcrate" => "RUNCRATE_API_KEY",
             "ovhcloud" => "OVHCLOUD_API_KEY",
             "scaleway" => "SCALEWAY_API_KEY",
             "vultr" | "vultr-ai" => "VULTR_API_KEY",
