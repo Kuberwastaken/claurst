@@ -6214,6 +6214,9 @@ pub mod tasks {
         /// windows (#442).
         #[serde(default)]
         pub output_file: Option<std::path::PathBuf>,
+        /// The capture ended at a timeout, so the attached file is partial.
+        #[serde(default)]
+        pub output_is_partial: bool,
         /// OS process ID, if applicable.
         pub pid: Option<u32>,
         /// Cancellation token for the task's in-process work loop. Signalling it
@@ -6235,6 +6238,7 @@ pub mod tasks {
                 output: Vec::new(),
                 omitted_output_lines: 0,
                 output_file: None,
+                output_is_partial: false,
                 pid: None,
                 cancel_token: None,
             }
@@ -6256,14 +6260,23 @@ pub mod tasks {
                 let split = OUTPUT_WINDOW_LINES.min(self.output.len());
                 let head = self.output[..split].join("\n");
                 let tail = self.output[split..].join("\n");
-                join_head_tail(
-                    head_window(&head, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES),
-                    tail_window(&tail, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES),
-                    &format!("{} lines", self.omitted_output_lines),
-                )
+                let head_cut = head_window(&head, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES);
+                let tail_cut = tail_window(&tail, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES);
+                // The windows' byte caps can drop lines of their own, on top
+                // of the compaction count the registry tracks; the marker
+                // counts both (#465).
+                let omitted = self.omitted_output_lines
+                    + dropped_lines(&head, head_cut)
+                    + dropped_lines(&tail, tail_cut);
+                join_head_tail(head_cut, tail_cut, &format!("{omitted} lines"))
             };
             if let Some(path) = &self.output_file {
-                text.push_str(&format!("\n\nFull output: {}", path.display()));
+                let label = if self.output_is_partial {
+                    "Partial output"
+                } else {
+                    "Full output"
+                };
+                text.push_str(&format!("\n\n{label}: {}", path.display()));
             }
             text
         }
@@ -6272,6 +6285,14 @@ pub mod tasks {
         pub fn is_running(&self) -> bool {
             matches!(self.status, TaskStatus::Running)
         }
+    }
+
+    /// Lines present in `text` but not in `window`, i.e. the lines a
+    /// head/tail window's byte cap dropped (#465). A cut landing mid-line
+    /// leaves a partial line behind, so this is a lower bound.
+    fn dropped_lines(text: &str, window: &str) -> u64 {
+        let lines = |s: &str| (!s.is_empty()) as u64 + s.matches('\n').count() as u64;
+        lines(text).saturating_sub(lines(window))
     }
 
     /// Thread-safe registry of background tasks.
@@ -6297,6 +6318,11 @@ pub mod tasks {
         /// Update the status of a task.  No-op if the ID is unknown.
         pub fn update_status(&self, id: &str, status: TaskStatus) {
             if let Some(mut entry) = self.tasks.get_mut(id) {
+                // A cancelled worker may finish draining after the user stop.
+                // Its late completion must not revive the task or notify.
+                if entry.status == TaskStatus::Cancelled {
+                    return;
+                }
                 let is_terminal = !matches!(status, TaskStatus::Running);
                 entry.status = status;
                 if is_terminal && entry.completed_at.is_none() {
@@ -6361,10 +6387,12 @@ pub mod tasks {
             self.update_status(id, TaskStatus::Cancelled);
         }
 
-        /// Record the file holding a task's full output.  No-op if unknown.
-        pub fn set_output_file(&self, id: &str, path: std::path::PathBuf) {
+        /// Record a task's captured output file and whether it ended early.
+        /// No-op if the task is unknown.
+        pub fn set_output_file(&self, id: &str, path: std::path::PathBuf, is_partial: bool) {
             if let Some(mut entry) = self.tasks.get_mut(id) {
                 entry.output_file = Some(path);
+                entry.output_is_partial = is_partial;
             }
         }
 
@@ -6415,9 +6443,34 @@ pub mod tasks {
             assert!(rendered.contains("lines omitted"));
             assert!(rendered.len() <= 2 * OUTPUT_WINDOW_BYTES + 100);
 
-            registry.set_output_file(&id, std::path::PathBuf::from("/spill/x.txt"));
+            registry.set_output_file(&id, std::path::PathBuf::from("/spill/x.txt"), false);
             let rendered = registry.get(&id).unwrap().render_output();
             assert!(rendered.ends_with("line 99999\n\nFull output: /spill/x.txt"));
+        }
+
+        #[test]
+        fn late_worker_completion_does_not_overwrite_user_cancel() {
+            let registry = TaskRegistry::new();
+            let id = registry.register(BackgroundTask::new("cancelled"));
+            registry.cancel(&id);
+            registry.complete(&id);
+            registry.update_status(&id, TaskStatus::Failed("late exit".into()));
+            assert_eq!(registry.get(&id).unwrap().status, TaskStatus::Cancelled);
+        }
+
+        #[test]
+        fn timeout_file_is_labelled_partial() {
+            let registry = TaskRegistry::new();
+            let id = registry.register(BackgroundTask::new("timeout"));
+            registry.set_output_file(
+                &id,
+                std::path::PathBuf::from("/spill/partial.txt"),
+                true,
+            );
+            assert!(
+                registry.get(&id).unwrap().render_output()
+                    .ends_with("Partial output: /spill/partial.txt")
+            );
         }
 
         #[test]
@@ -6427,6 +6480,36 @@ pub mod tasks {
             registry.append_output(&id, "a");
             registry.append_output(&id, "b");
             assert_eq!(registry.get(&id).unwrap().render_output(), "a\nb");
+        }
+
+        /// #465: window cuts that land mid-line leave partial lines behind;
+        /// the accounting counts the lines a window dropped exactly.
+        #[test]
+        fn dropped_lines_counts_window_line_cuts() {
+            assert_eq!(dropped_lines("", ""), 0);
+            assert_eq!(dropped_lines("a\nb\nc\nd", "a\nb"), 2);
+            // A window that cuts mid-line still counts that partial line (the
+            // cut byte cap is what removed the rest of it).
+            assert_eq!(dropped_lines("a\nb\nc\nd", "a\nb\nc"), 1);
+            assert_eq!(dropped_lines("only", ""), 1);
+        }
+
+        /// #465: when the windows' byte caps drop lines of their own, the
+        /// marker names those on top of the registry's compaction count.
+        #[test]
+        fn render_output_accounts_for_window_line_cuts() {
+            let mut task = BackgroundTask::new("wide");
+            task.omitted_output_lines = 3;
+            // 100 lines of 60,000 bytes put the head window well past its
+            // byte cap with no complete line kept besides the first.
+            task.output = vec!["x".repeat(60_000); 100];
+            let rendered = task.render_output();
+            // 3 omitted in the registry + 99 lines dropped by the byte cap.
+            assert!(
+                rendered.contains("(102 lines omitted)"),
+                "marker missing from a render of {} bytes",
+                rendered.len()
+            );
         }
     }
 }
