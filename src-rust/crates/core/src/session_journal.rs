@@ -9,8 +9,8 @@
 //! - `<id>.jsonl`, the journal: append-only, one `{"seq":N,"entry":{..}}` per
 //!   line. The query loop appends after every assistant message and every
 //!   tool-result batch, so a crash loses at most the step in flight. It is
-//!   never rewritten, so it also holds the messages a later rewind or
-//!   compaction replaced.
+//!   rotated after a durable snapshot. Its base retains the complete session,
+//!   including compaction records and the history available to rewind.
 //! - `<id>.lock`: an advisory lock (`flock` / `LockFileEx`) held by the one
 //!   process writing the session. The OS drops it when that process exits,
 //!   so a crash never leaves a stale lock. Another process can still read
@@ -147,6 +147,8 @@ enum Entry<'a> {
     },
     /// Drop the compactions from `keep` on (a rewind past a compaction).
     DropCompactions { keep: usize },
+    /// Complete recovery base installed after a durable snapshot.
+    Checkpoint { session: Box<ConversationSession> },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -160,7 +162,10 @@ fn apply(session: &mut ConversationSession, entry: Entry<'_>) {
         Entry::Meta { session: meta } => meta.apply(session),
         Entry::Message { message } => session.messages.push(message.into_owned()),
         Entry::Truncate { len } => session.messages.truncate(len),
-        Entry::Compaction { mut record, summary } => {
+        Entry::Compaction {
+            mut record,
+            summary,
+        } => {
             let mut head = std::mem::take(&mut session.messages);
             let tail = head.split_off(record.replaced_len().min(head.len()));
             session.messages.reserve(tail.len() + 1);
@@ -170,6 +175,7 @@ fn apply(session: &mut ConversationSession, entry: Entry<'_>) {
             session.compactions.push(record);
         }
         Entry::DropCompactions { keep } => session.compactions.truncate(keep),
+        Entry::Checkpoint { session: base } => *session = *base,
     }
 }
 
@@ -184,7 +190,10 @@ fn scan_journal(path: &Path) -> std::io::Result<JournalScan> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(JournalScan { entries: Vec::new(), valid_len: 0 })
+            return Ok(JournalScan {
+                entries: Vec::new(),
+                valid_len: 0,
+            });
         }
         Err(e) => return Err(e),
     };
@@ -211,7 +220,10 @@ fn scan_journal(path: &Path) -> std::io::Result<JournalScan> {
             "Ignoring the torn last line of a session journal"
         );
     }
-    Ok(JournalScan { entries, valid_len: start as u64 })
+    Ok(JournalScan {
+        entries,
+        valid_len: start as u64,
+    })
 }
 
 /// `None` when the snapshot does not exist or does not parse.
@@ -265,7 +277,11 @@ fn load_with(dir: &Path, id: &str, skip_older_journal: bool) -> anyhow::Result<L
                 (Ok(snapshot_time), Ok(journal_time)) if journal_time < snapshot_time
             );
         if journal_is_older {
-            return Ok(LoadedSession { session, replayed: 0, rebuilt: false });
+            return Ok(LoadedSession {
+                session,
+                replayed: 0,
+                rebuilt: false,
+            });
         }
         let base = session.journal_seq;
         let mut replayed = 0;
@@ -283,7 +299,11 @@ fn load_with(dir: &Path, id: &str, skip_older_journal: bool) -> anyhow::Result<L
                 "Session journal is newer than the snapshot; replayed the newer entries"
             );
         }
-        return Ok(LoadedSession { session, replayed, rebuilt: false });
+        return Ok(LoadedSession {
+            session,
+            replayed,
+            rebuilt: false,
+        });
     }
 
     if !snapshot_file.exists() && !journal_file.exists() {
@@ -309,10 +329,13 @@ fn load_with(dir: &Path, id: &str, skip_older_journal: bool) -> anyhow::Result<L
     }
     warn!(
         session = id,
-        replayed,
-        "Session snapshot missing or unreadable; rebuilt it from the journal"
+        replayed, "Session snapshot missing or unreadable; rebuilt it from the journal"
     );
-    Ok(LoadedSession { session, replayed, rebuilt: true })
+    Ok(LoadedSession {
+        session,
+        replayed,
+        rebuilt: true,
+    })
 }
 
 /// Every session in `dir` that loads, including ones that only have a journal
@@ -408,11 +431,9 @@ fn history_diff<'m>(persisted: &[u64], messages: &[&'m Message]) -> (Vec<Entry<'
     if common < persisted.len() {
         entries.push(Entry::Truncate { len: common });
     }
-    entries.extend(
-        messages[common..]
-            .iter()
-            .map(|m| Entry::Message { message: Cow::Borrowed(*m) }),
-    );
+    entries.extend(messages[common..].iter().map(|m| Entry::Message {
+        message: Cow::Borrowed(*m),
+    }));
     (entries, hashes)
 }
 
@@ -426,7 +447,13 @@ pub struct SessionJournal {
     base_seq: u64,
     /// Written as the first entry of a new journal.
     header: SessionMeta,
-    open: Mutex<Option<OpenJournal>>,
+    open: Mutex<JournalState>,
+}
+
+#[derive(Default)]
+struct JournalState {
+    open: Option<OpenJournal>,
+    read_only: bool,
 }
 
 struct OpenJournal {
@@ -453,7 +480,7 @@ impl SessionJournal {
             id: session.id.clone(),
             base_seq: session.journal_seq,
             header: SessionMeta::of(session),
-            open: Mutex::new(None),
+            open: Mutex::new(JournalState::default()),
         });
         LIVE.lock()
             .insert(snapshot_path(dir, &session.id), Arc::downgrade(&journal));
@@ -515,31 +542,35 @@ impl SessionJournal {
     /// owns the history until it finishes.
     pub fn record_meta(&self, session: &ConversationSession) -> anyhow::Result<()> {
         self.with_open(|journal, open| {
-            journal.append(open, vec![Entry::Meta { session: SessionMeta::of(session) }])
+            journal.append(
+                open,
+                vec![Entry::Meta {
+                    session: SessionMeta::of(session),
+                }],
+            )
         })
     }
 
     /// Journal whatever `session` changed, then rewrite its snapshot
     /// atomically with `journal_seq` set to the last entry.
     pub fn checkpoint(&self, session: &mut ConversationSession) -> anyhow::Result<()> {
-        let seq = {
+        self.with_open(|journal, open| {
             let messages: Vec<&Message> = session.messages.iter().collect();
             let compactions = session.compactions.len();
             let meta = SessionMeta::of(session);
-            self.with_open(|journal, open| {
-                let (mut entries, hashes) = history_diff(&open.persisted, &messages);
-                if compactions < open.compactions {
-                    entries.push(Entry::DropCompactions { keep: compactions });
-                    open.compactions = compactions;
-                }
-                entries.push(Entry::Meta { session: meta });
-                journal.append(open, entries)?;
-                open.persisted = hashes;
-                Ok(open.seq)
-            })?
-        };
-        session.journal_seq = seq;
-        self.write_snapshot(session)
+            let (mut entries, hashes) = history_diff(&open.persisted, &messages);
+            if compactions < open.compactions {
+                entries.push(Entry::DropCompactions { keep: compactions });
+            }
+            entries.push(Entry::Meta { session: meta });
+            journal.append(open, entries)?;
+            open.persisted = hashes;
+            open.compactions = compactions;
+            drop(messages);
+            session.journal_seq = open.seq;
+            journal.write_snapshot(session)?;
+            journal.rotate(open, session)
+        })
     }
 
     /// Run `f` on the open journal, opening it (and taking the lock) first.
@@ -549,15 +580,27 @@ impl SessionJournal {
         &self,
         f: impl FnOnce(&Self, &mut OpenJournal) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        let mut slot = self.open.lock();
-        let open = match slot.take() {
-            Some(open) => open,
-            None => self.open_journal()?,
+        let mut state = self.open.lock();
+        if state.read_only {
+            return Err(SessionLocked(self.id.clone()).into());
+        }
+        if state.open.is_none() {
+            match self.open_journal() {
+                Ok(open) => state.open = Some(open),
+                Err(error) => {
+                    // A stale reader must never silently become a writer after
+                    // the owner exits. Reopening requires a fresh loaded session.
+                    state.read_only = error.downcast_ref::<SessionLocked>().is_some();
+                    return Err(error);
+                }
+            }
+        }
+        let Some(open) = state.open.as_mut() else {
+            anyhow::bail!("session journal did not open");
         };
-        let open = slot.insert(open);
         let result = f(self, open);
         if result.is_err() {
-            *slot = None;
+            state.open = None;
         }
         result
     }
@@ -610,7 +653,9 @@ impl SessionJournal {
     fn append(&self, open: &mut OpenJournal, entries: Vec<Entry<'_>>) -> anyhow::Result<()> {
         let header = if open.needs_header {
             vec![
-                Entry::Meta { session: self.header.clone() },
+                Entry::Meta {
+                    session: self.header.clone(),
+                },
                 Entry::Truncate { len: 0 },
             ]
         } else {
@@ -625,7 +670,53 @@ impl SessionJournal {
         }
         open.file.write_all(&buf)?;
         open.file.sync_data()?;
+        if open.needs_header {
+            sync_directory(&self.dir)?;
+        }
         open.seq = seq;
+        open.needs_header = false;
+        Ok(())
+    }
+
+    /// Replace the unbounded delta log only after the snapshot is durable.
+    /// Both old and new logs independently recover the full current session.
+    fn rotate(&self, open: &mut OpenJournal, session: &ConversationSession) -> anyhow::Result<()> {
+        let tmp = self.dir.join(format!(".{}.jsonl.tmp", self.id));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        crate::accounts::set_user_only_perms(&tmp);
+        let entries = [
+            Entry::Meta {
+                session: SessionMeta::of(session),
+            },
+            Entry::Truncate { len: 0 },
+            Entry::Checkpoint {
+                session: Box::new(session.clone()),
+            },
+        ];
+        // Every initialized journal has at least its two header entries plus
+        // the checkpoint's metadata entry. Preserve the accepted sequence.
+        let first = open
+            .seq
+            .checked_sub(2)
+            .ok_or_else(|| anyhow::anyhow!("session journal sequence is too short to rotate"))?;
+        for (offset, entry) in entries.into_iter().enumerate() {
+            serde_json::to_writer(
+                &mut file,
+                &JournalLine {
+                    seq: first + offset as u64,
+                    entry,
+                },
+            )?;
+            file.write_all(b"\n")?;
+        }
+        file.sync_all()?;
+        std::fs::rename(&tmp, journal_path(&self.dir, &self.id))?;
+        sync_directory(&self.dir)?;
+        open.file = file;
         open.needs_header = false;
         Ok(())
     }
@@ -642,8 +733,19 @@ impl SessionJournal {
         file.sync_all()?;
         drop(file);
         std::fs::rename(&tmp, snapshot_path(&self.dir, &self.id))?;
+        sync_directory(&self.dir)?;
         Ok(())
     }
+}
+
+/// Unix directory fsync makes renamed snapshot/base files survive power loss.
+/// Windows retains the existing filesystem rename durability guarantees.
+fn sync_directory(directory: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    File::open(directory)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = directory;
+    Ok(())
 }
 
 impl Drop for SessionJournal {
@@ -655,7 +757,7 @@ impl Drop for SessionJournal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::{apply_compaction, CompactionTrigger};
+    use crate::history::{CompactionTrigger, apply_compaction};
 
     fn texts(messages: &[Message]) -> Vec<String> {
         messages.iter().map(|m| m.get_all_text()).collect()
@@ -890,7 +992,71 @@ mod tests {
     }
 
     #[test]
-    fn a_second_writer_is_locked_out_until_the_first_drops() {
+    fn repeated_checkpoint_rotation_bounds_rewrites_and_preserves_rewind_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = session_with(&["u1", "a1", "u2", "a2"]);
+        let journal = SessionJournal::new(dir.path(), &session);
+        let record = compact(&mut session, 2, "summary");
+        journal
+            .record_compaction(&record, &session.messages)
+            .unwrap();
+        session.compactions.push(record);
+        for i in 0..25 {
+            session.messages[1] = Message::user(format!("rewritten {i}"));
+            journal.checkpoint(&mut session).unwrap();
+            assert_eq!(journal_lines(dir.path(), &session.id).len(), 3);
+        }
+        let expected_timeline: Vec<_> = session
+            .rewind_timeline()
+            .map(|m| m.get_all_text())
+            .collect();
+        std::fs::remove_file(snapshot_path(dir.path(), &session.id)).unwrap();
+        let rebuilt = load(dir.path(), &session.id).unwrap();
+        assert_eq!(
+            rebuilt
+                .session
+                .rewind_timeline()
+                .map(|m| m.get_all_text())
+                .collect::<Vec<_>>(),
+            expected_timeline
+        );
+        assert_eq!(rebuilt.session.journal_seq, session.journal_seq);
+        session.add_message(Message::user("after rotation"));
+        journal.sync_messages(&session.messages).unwrap();
+        drop(journal);
+        let recovered = load(dir.path(), &session.id).unwrap();
+        assert_eq!(texts(&recovered.session.messages), texts(&session.messages));
+        assert_eq!(recovered.session.compactions.len(), 1);
+    }
+
+    #[test]
+    fn failed_snapshot_or_rotation_keeps_an_independent_recoverable_journal() {
+        for fail_snapshot in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut session = session_with(&["u1"]);
+            let journal = SessionJournal::new(dir.path(), &session);
+            journal.sync_messages(&session.messages).unwrap();
+            let blocker = if fail_snapshot {
+                snapshot_path(dir.path(), &session.id)
+            } else {
+                dir.path().join(format!(".{}.jsonl.tmp", session.id))
+            };
+            std::fs::create_dir(&blocker).unwrap();
+            session.add_message(Message::assistant("accepted before failed checkpoint"));
+            assert!(journal.checkpoint(&mut session).is_err());
+            std::fs::remove_dir(&blocker).unwrap();
+            if !fail_snapshot {
+                std::fs::remove_file(snapshot_path(dir.path(), &session.id)).unwrap();
+            }
+            let recovered = load(dir.path(), &session.id).unwrap();
+            assert_eq!(texts(&recovered.session.messages), texts(&session.messages));
+            journal.checkpoint(&mut session).unwrap();
+            assert_eq!(journal_lines(dir.path(), &session.id).len(), 3);
+        }
+    }
+
+    #[test]
+    fn lock_conflict_is_sticky_even_after_the_owner_drops() {
         let dir = tempfile::tempdir().unwrap();
         let mut session = session_with(&["u1"]);
         let first = SessionJournal::new(dir.path(), &session);
@@ -901,12 +1067,30 @@ mod tests {
         assert!(err.downcast_ref::<SessionLocked>().is_some(), "{err}");
         assert!(delete(dir.path(), &session.id).is_err());
 
+        // The owner accepts newer history while the second writer is stale.
+        session.add_message(Message::assistant("owner tail"));
+        first.sync_messages(&session.messages).unwrap();
         drop(first);
-        session.add_message(Message::assistant("a1"));
-        second.sync_messages(&session.messages).unwrap();
+        let mut stale = session.clone();
+        stale.messages.truncate(1);
+        stale.add_message(Message::assistant("stale overwrite"));
+        assert!(
+            second
+                .sync_messages(&stale.messages)
+                .unwrap_err()
+                .is::<SessionLocked>()
+        );
+        assert!(
+            second
+                .checkpoint(&mut stale)
+                .unwrap_err()
+                .is::<SessionLocked>()
+        );
         drop(second);
         let loaded = load(dir.path(), &session.id).unwrap();
-        assert_eq!(texts(&loaded.session.messages), ["u1", "a1"]);
+        assert_eq!(texts(&loaded.session.messages), ["u1", "owner tail"]);
+        let reopened = SessionJournal::new(dir.path(), &loaded.session);
+        reopened.acquire().unwrap();
     }
 
     #[test]
