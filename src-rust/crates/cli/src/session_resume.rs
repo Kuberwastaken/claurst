@@ -87,6 +87,8 @@ pub(crate) fn apply(
     app.config.project_dir = Some(tools.working_dir.clone());
     query.working_directory = Some(tools.working_dir.display().to_string());
     app.current_session_id = Some(session.id.clone());
+    app.session_id = session.id.clone();
+    app.reset_auto_poke_state();
     app.attach_turn_diff_state(tools.file_history.clone(), tools.current_turn.clone());
     claurst_tui::update_terminal_title(session.title.as_deref());
     app.status_message = Some(format!("Resumed session {}.", session.id));
@@ -214,7 +216,12 @@ mod tests {
         let mut b = ConversationSession::new("model-b".into());
         b.messages.push(Message::user("only B"));
         let b_id = b.id.clone();
+        live.app.auto_poke_count = 10;
+        live.app.no_progress_turns = 2;
         live.resume(b, dir.path()).unwrap();
+        assert_eq!(live.app.session_id, b_id);
+        assert_eq!(live.app.auto_poke_count, 0);
+        assert_eq!(live.app.no_progress_turns, 0);
         live.messages
             .push(Message::assistant("B after browser resume"));
         live.query

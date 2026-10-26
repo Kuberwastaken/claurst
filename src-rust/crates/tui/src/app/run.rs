@@ -283,6 +283,10 @@ impl App {
                 self.complete_current_turn_snapshot(stop_reason.contains("abort") || stop_reason.contains("cancel"));
                 self.invalidate_transcript();
                 self.refresh_turn_diff_from_history();
+
+                // Auto-poke: queue a continuation prompt when the model
+                // stopped cleanly with incomplete todos.
+                self.check_auto_poke(&stop_reason);
             }
 
             QueryEvent::Status(msg) => {
@@ -369,6 +373,140 @@ impl App {
 
         // Update token count from tracker.
         self.token_count = self.cost_tracker.total_tokens() as u32;
+    }
+
+    // -------------------------------------------------------------------
+    // Auto-poke
+    // -------------------------------------------------------------------
+
+    /// Reset the per-session auto-poke state. Called when the session
+    /// changes (`/new`, `/resume`, and resuming a `/fork`): the budget and
+    /// no-progress trackers are documented as per-session, so a fresh session
+    /// must start with a clean slate instead of inheriting the counters of
+    /// the session that was swapped out.
+    pub fn reset_auto_poke_state(&mut self) {
+        self.auto_poke_count = 0;
+        self.no_progress_turns = 0;
+        self.last_todo_hash = String::new();
+        self.queued_messages
+            .retain(|message| !claurst_tools::todo_write::is_auto_poke_message(message));
+    }
+
+    /// A synthetic poke continues the same work, so it must retain the
+    /// no-progress counter. Real user input starts a new task.
+    pub fn record_prompt_submission(&mut self, input: &str, automatic: bool) {
+        if automatic && claurst_tools::todo_write::is_auto_poke_message(input) {
+            return;
+        }
+        self.queued_messages
+            .retain(|message| !claurst_tools::todo_write::is_auto_poke_message(message));
+        self.no_progress_turns = 0;
+    }
+
+    /// Whether a `/goal` continuation loop is currently active for this
+    /// session. Auto-poke must stay silent while a goal loop drives its own
+    /// continuations: its TurnComplete events would otherwise queue pokes
+    /// on top of the loop's turns.
+    pub(super) fn goal_active(&self) -> bool {
+        claurst_core::goals_enabled()
+            && claurst_core::GoalStore::open_default()
+                .map(|store| store.get_active_goal(&self.session_id).is_some())
+                .unwrap_or(false)
+    }
+
+    /// Check whether auto-poke should fire after a model turn ended with
+    /// `stop_reason`. When the model stopped cleanly with incomplete todos,
+    /// queue a synthetic continuation message via the existing
+    /// `queued_messages` mechanism (submitted by the main loop).
+    ///
+    /// Opt-in: auto-poke must be enabled in settings (default OFF) — see
+    /// `/poke`. Safety rails:
+    /// - Only fires on a clean `end_turn` stop. Aborts/cancels (Esc),
+    ///   `max_tokens` truncation, `content_filtered` refusals, and unknown
+    ///   stop reasons never poke — the user must stay in control after any
+    ///   abnormal stop.
+    /// - Budget: at most `MAX_AUTO_POKES` pokes per session.
+    /// - No-progress: after `NO_PROGRESS_THRESHOLD` consecutive turns with an
+    ///   unchanged todo-state hash, poking stops.
+    pub(super) fn check_auto_poke(&mut self, stop_reason: &str) {
+        // Opt-in only — default OFF. Read the live config so `/poke` toggles
+        // take effect immediately without a settings reload.
+        if !self.config.auto_poke_enabled {
+            return;
+        }
+
+        // Stop-reason gate: only continue after a clean end-of-turn. An
+        // aborted (Esc) or cancelled turn must never re-poke, and neither
+        // should truncation or provider-side refusals.
+        if stop_reason != "end_turn" {
+            return;
+        }
+
+        // Bridge/remote sessions share handle_query_event, but their turns
+        // come from a remote session URL, not a local query loop; a queued
+        // continuation would never be submitted for them.
+        if self.remote_session_url.is_some() {
+            return;
+        }
+
+        // Never poke while a goal continuation loop is running: TurnComplete
+        // also fires on every in-loop goal continuation, so a poke here would
+        // stack onto the loop's own continuations in queued_messages and
+        // replay after /goal pause or a budget stop.
+        if self.goal_active() {
+            return;
+        }
+
+        // One poke at a time: if a previous poke is still queued (not yet
+        // submitted), do not stack another on top of it.
+        if self
+            .queued_messages
+            .iter()
+            .any(|m| claurst_tools::todo_write::is_auto_poke_message(m))
+        {
+            return;
+        }
+
+        // Poke budget.
+        if self.auto_poke_count >= claurst_tools::todo_write::MAX_AUTO_POKES {
+            self.status_message = Some(format!(
+                "Auto-poke stopped: budget of {} reached.",
+                claurst_tools::todo_write::MAX_AUTO_POKES
+            ));
+            return;
+        }
+
+        // Incomplete todos?
+        let incomplete = claurst_tools::todo_write::count_incomplete_todos(&self.session_id);
+        if incomplete == 0 {
+            return; // All done — no poke needed.
+        }
+
+        // No-progress detection: hash the todo state.
+        let current_hash = claurst_tools::todo_write::todo_state_hash(&self.session_id);
+        if current_hash == self.last_todo_hash {
+            self.no_progress_turns += 1;
+        } else {
+            self.no_progress_turns = 0;
+            self.last_todo_hash = current_hash;
+        }
+
+        if self.no_progress_turns >= claurst_tools::todo_write::NO_PROGRESS_THRESHOLD {
+            self.status_message =
+                Some("Auto-poke stopped: no progress for 3 turns.".to_string());
+            return;
+        }
+
+        // Queue the continuation via the existing queued_messages
+        // infrastructure so the main loop submits it on the next iteration.
+        let poke_msg = claurst_tools::todo_write::build_auto_poke_message(incomplete);
+        self.auto_poke_count += 1;
+        self.status_message = Some(format!(
+            "Auto-poking... ({} incomplete todos)",
+            incomplete
+        ));
+        self.queued_messages.push_back(poke_msg);
+        self.pending_auto_submit = true;
     }
 
     /// Spawn and drain the background session-list loads requested by

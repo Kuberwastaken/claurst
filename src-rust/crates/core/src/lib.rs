@@ -1349,6 +1349,12 @@ pub mod config {
             skip_serializing_if = "Option::is_none"
         )]
         pub auto_memory_enabled: Option<bool>,
+        /// Auto-poke: automatically send a continuation prompt when the model
+        /// stops with incomplete todos. Opt-in — the default is OFF. The
+        /// TUI's `/poke` command toggles it and persists to settings.json
+        /// under `"autoPokeEnabled"`.
+        #[serde(default, rename = "autoPokeEnabled")]
+        pub auto_poke_enabled: bool,
         /// External status line command configuration. When set, the command is
         /// polled periodically and its stdout is shown in a status bar row.
         #[serde(default, rename = "statusLine", alias = "status_line", skip_serializing_if = "Option::is_none")]
@@ -1415,6 +1421,7 @@ pub mod config {
                 bang_commands: Default::default(),
                 memory_extraction_enabled: Default::default(),
                 auto_memory_enabled: Default::default(),
+                auto_poke_enabled: Default::default(),
                 sandbox: Default::default(),
             }
         }
@@ -2639,6 +2646,7 @@ pub mod config {
                 // settings file must not be able to flip this on.
                 bang_commands: base.config.bang_commands.clone(),
                 cursor_blink_enabled: over.config.cursor_blink_enabled || base.config.cursor_blink_enabled,
+                auto_poke_enabled: base.config.auto_poke_enabled,
                 file_autocomplete_limit: if over.config.file_autocomplete_limit != 0 { over.config.file_autocomplete_limit } else { base.config.file_autocomplete_limit },
                 file_autocomplete_show_hidden_files: over.config.file_autocomplete_show_hidden_files || base.config.file_autocomplete_show_hidden_files,
                 file_injection_enabled: over.config.file_injection_enabled || base.config.file_injection_enabled,
@@ -3318,6 +3326,46 @@ pub mod config {
             assert!(
                 !merged.config.bang_commands.enabled,
                 "project settings must not be able to enable bangCommands"
+            );
+        }
+
+        #[test]
+        fn auto_poke_enabled_defaults_off() {
+            // Opt-in: absent key deserializes to false, not true.
+            let settings = Settings::default();
+            assert!(!settings.config.auto_poke_enabled);
+            // Roundtrip through camelCase `autoPokeEnabled` (mirrors
+            // yolo_mode_json_roundtrip above).
+            let mut on = Settings::default();
+            on.config.auto_poke_enabled = true;
+            let serialized = serde_json::to_string(&on).unwrap();
+            assert!(serialized.contains("\"autoPokeEnabled\":true"), "got: {serialized}");
+            let back: Settings = serde_json::from_str(&serialized).unwrap();
+            assert!(back.config.auto_poke_enabled);
+        }
+
+        #[test]
+        fn auto_poke_global_on_wins() {
+            // Global settings can enable; default false everywhere.
+            let mut base = Settings::default();
+            base.config.auto_poke_enabled = true;
+            let over = Settings::default();
+            let merged = Settings::merge(base, over);
+            assert!(merged.config.auto_poke_enabled);
+        }
+
+        #[test]
+        fn auto_poke_is_global_only() {
+            // A project settings file must not be able to enable auto-poke:
+            // it auto-submits turns, which combined with bypassPermissions
+            // would form a self-driving loop the user never opted into.
+            let base = Settings::default();
+            let mut project = Settings::default();
+            project.config.auto_poke_enabled = true;
+            let merged = Settings::merge(base, project);
+            assert!(
+                !merged.config.auto_poke_enabled,
+                "project settings must not be able to enable autoPokeEnabled"
             );
         }
 
