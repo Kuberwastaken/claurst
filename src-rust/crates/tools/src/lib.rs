@@ -35,6 +35,7 @@ pub mod line_endings;
 pub(crate) mod test_support;
 pub mod file_read;
 pub mod file_write;
+mod protected_files;
 pub mod glob_tool;
 pub mod grep_tool;
 pub mod lsp_tool;
@@ -668,6 +669,24 @@ impl ToolContext {
         &self,
         request: PermissionRequest,
     ) -> Result<PermissionGrant, claurst_core::error::ClaudeError> {
+        if !request.is_read_only
+            && matches!(
+                request.tool_name.as_str(),
+                "Write" | "Edit" | "BatchEdit" | "NotebookEdit" | "ApplyPatch"
+            )
+            && request.path.as_deref().is_some_and(|path| {
+                let tokens = std::env::var_os("CLAURST_MCP_TOKENS_DIR").map(PathBuf::from);
+                protected_files::is_protected(
+                    std::path::Path::new(path),
+                    &claurst_core::paths::claurst_home(),
+                    tokens.as_deref(),
+                )
+            })
+        {
+            return Err(claurst_core::error::ClaudeError::PermissionDenied(
+            "File tools cannot modify Claurst settings, permission rules, or credentials. Use the settings or authentication commands.".to_string(),
+        ));
+        }
         let interactive_reason = request.details.clone();
         let decision = self.permission_handler.request_permission(&request);
         match decision {
@@ -1555,4 +1574,22 @@ mod tests {
             .unwrap();
         drop(acquired);
     }
+    #[test]
+    fn file_write_guard_precedes_even_an_allow_all_permission_handler() {
+        let ctx = crate::test_support::allow_all_context(std::env::temp_dir());
+        let settings = claurst_core::paths::claurst_home().join("settings.json");
+        for tool in ["Write", "Edit", "BatchEdit", "NotebookEdit", "ApplyPatch"] {
+            let result = ctx.check_permission_for_path(tool, "attempt", settings.clone(), false);
+            assert!(
+                result.is_err(),
+                "{tool} bypassed global settings protection"
+            );
+        }
+        // Reading configuration and editing unrelated user files remain normal
+        // permission decisions. This test never modifies the real settings file.
+        assert!(ctx
+            .check_permission_for_path("Read", "inspect", settings, true)
+            .is_ok());
+    }
+
 }
