@@ -41,6 +41,13 @@ pub fn variant_ladder(
     model: &str,
     registry: Option<&ModelRegistry>,
 ) -> Vec<EffortLevel> {
+    // Native MiniMax Flash has tunable adaptive thinking even before the
+    // catalog refresh includes it. This is a transport capability, not a
+    // curated model list; keep other providers and custom IDs catalog-driven.
+    if provider == "minimax" && bare_model(model).eq_ignore_ascii_case("MiniMax-M3.1-Flash") {
+        use EffortLevel::*;
+        return vec![Low, Medium, High, XHigh, Max];
+    }
     let facts = ModelFacts::resolve(provider, model, registry);
     crate::variants::variant_efforts(
         &facts.npm,

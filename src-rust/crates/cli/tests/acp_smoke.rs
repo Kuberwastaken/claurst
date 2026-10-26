@@ -15,9 +15,24 @@ fn binary_path() -> String {
     env!("CARGO_BIN_EXE_claurst").to_string()
 }
 
+/// A fresh scratch directory for `CLAURST_HOME`, so the smoke test neither
+/// reads the developer's real settings (yoloMode, saved approvals, …) nor
+/// writes anything into them.
+fn scratch_home() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "claurst-acp-smoke-home-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).expect("create scratch CLAURST_HOME");
+    dir
+}
+
 fn run_with_input(stdin: &str, timeout: Duration) -> (String, String) {
+    let scratch_home = scratch_home();
     let mut child = Command::new(binary_path())
         .arg("acp")
+        .env("CLAURST_HOME", &scratch_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

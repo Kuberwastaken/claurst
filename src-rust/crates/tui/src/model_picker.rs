@@ -1565,6 +1565,20 @@ mod tests {
     }
 
     #[test]
+    fn minimax_picker_projects_upstream_lifecycle_with_flash_first() {
+        let registry = claurst_api::ModelRegistry::new();
+        let models = models_for_provider_from_registry("minimax", &registry);
+        let ids: Vec<_> = models.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(ids, vec!["MiniMax-M3.1-Flash", "MiniMax-M3"]);
+        assert_eq!(picker_variant_ladder("MiniMax-M3.1-Flash"), vec![
+            EffortLevel::Low, EffortLevel::Medium, EffortLevel::High,
+            EffortLevel::XHigh, EffortLevel::Max,
+        ]);
+        assert!(registry.get("minimax", "MiniMax-M2.7").is_some());
+        assert!(provider_uses_catalog_projection("minimax"));
+    }
+
+    #[test]
     fn local_runtime_models_are_authoritative() {
         for pid in [
             "ollama",

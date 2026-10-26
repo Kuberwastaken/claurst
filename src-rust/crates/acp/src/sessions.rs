@@ -57,7 +57,11 @@ impl SessionState {
 
     /// Start a prompt turn with a fresh cancellation token. Returns `None`
     /// when another prompt is already running on this session.
-    pub fn begin_turn(&self) -> Option<ActiveTurn<'_>> {
+    ///
+    /// Takes `&Arc<Self>` so the returned `ActiveTurn` owns the session: the
+    /// reservation is taken in `dispatch` (issue #467) and must outlive the
+    /// borrowed dispatcher state.
+    pub fn begin_turn(self: &Arc<Self>) -> Option<ActiveTurn> {
         let mut slot = self.active_turn.lock();
         if slot.is_some() {
             return None;
@@ -65,7 +69,7 @@ impl SessionState {
         let token = CancellationToken::new();
         *slot = Some(token.clone());
         Some(ActiveTurn {
-            slot: &self.active_turn,
+            session: Arc::clone(self),
             token,
         })
     }
@@ -82,15 +86,16 @@ impl SessionState {
     }
 }
 
-/// A running prompt turn. Dropping it marks the session idle again.
-pub struct ActiveTurn<'a> {
-    slot: &'a parking_lot::Mutex<Option<CancellationToken>>,
+/// A running prompt turn owning its session. Dropping it clears the
+/// session's active-turn slot, marking it idle again.
+pub struct ActiveTurn {
+    session: Arc<SessionState>,
     pub token: CancellationToken,
 }
 
-impl Drop for ActiveTurn<'_> {
+impl Drop for ActiveTurn {
     fn drop(&mut self) {
-        *self.slot.lock() = None;
+        *self.session.active_turn.lock() = None;
     }
 }
 
@@ -115,6 +120,11 @@ impl SessionRegistry {
 
     pub fn remove(&self, id: &acp::SessionId) -> Option<Arc<SessionState>> {
         self.inner.remove(id).map(|(_, v)| v)
+    }
+
+    /// Canonical working directories of all registered sessions.
+    pub fn live_cwds(&self) -> std::collections::HashSet<PathBuf> {
+        self.inner.iter().map(|entry| entry.value().cwd.clone()).collect()
     }
 }
 

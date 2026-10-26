@@ -420,6 +420,7 @@ mod tests {
             false,
             &std::collections::HashSet::new(),
             &McpTrustStore::default(),
+            &std::collections::HashSet::new(),
         );
         let names = |v: &[claurst_core::config::McpServerConfig]| {
             v.iter().map(|s| s.name.clone()).collect::<Vec<_>>()
