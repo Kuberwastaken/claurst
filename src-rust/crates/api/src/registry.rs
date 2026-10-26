@@ -736,11 +736,12 @@ mod tests {
             ProviderId::NEURALWATT,
             ProviderId::LM_STUDIO,
             "lmstudio",
+            "togetherai",
             "custom-openai",
         ] {
             assert!(is_known_provider_id(id), "{id} should be accepted");
         }
-        for id in ["togetherai", "anthropik", "", ProviderId::GOOGLE_VERTEX, ProviderId::GITLAB] {
+        for id in ["anthropik", "", ProviderId::GOOGLE_VERTEX, ProviderId::GITLAB] {
             assert!(!is_known_provider_id(id), "{id} has no backend and should be rejected");
         }
     }

@@ -2747,8 +2747,10 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         }
 
         // 3. Cost — mirrors TS formatCost: 4 decimal places for costs < $0.50, else 2.
-        // Display cost if it's >= 0.0, so free models show $0.00
-        if app.cost_usd >= 0.0 {
+        // Display cost if it's >= 0.0, so free models show $0.00. Subscription
+        // providers (ChatGPT Codex, Claude Pro/Max OAuth) show no dollar
+        // figure at all because usage isn't billed per token (issue #499).
+        if app.cost_usd >= 0.0 && !app.cost_tracker.is_subscription() {
             if !parts.is_empty() {
                 parts.push(Span::raw("  "));
             }

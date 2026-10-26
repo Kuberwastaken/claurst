@@ -906,6 +906,19 @@ async fn main() -> anyhow::Result<()> {
     // from the models.dev cache if available.
     let model_registry = load_cached_model_registry(&config);
 
+    // Cost reporting seed (issue #499): configure the shared tracker for the
+    // active provider/model — zero cost for subscription providers (ChatGPT
+    // Codex, Claude Pro/Max OAuth), catalog pricing for known models, and no
+    // invented default rate for unknown ones. The headless `result` event,
+    // `/cost` and the TUI footer all read this same tracker.
+    claurst_api::apply_session_cost_pricing(
+        &cost_tracker,
+        Some(&model_registry),
+        config.selected_provider_id(),
+        config.effective_model(),
+        use_bearer_auth,
+    );
+
     // Build query config
     let mut query_config = claurst_query::QueryConfig::from_config_with_registry(&config, &model_registry);
     query_config.model_registry = Some(model_registry.clone());
@@ -1037,6 +1050,7 @@ async fn main() -> anyhow::Result<()> {
             bridge_config,
             has_credentials,
             model_registry,
+            use_bearer_auth,
             user_question_rx,
             pending_project_mcp,
             mcp_project_root,
@@ -1470,6 +1484,9 @@ struct RefreshedProviderRuntime {
     provider_registry: Arc<claurst_api::ProviderRegistry>,
     model_registry: Arc<claurst_api::ModelRegistry>,
     auth_store: claurst_core::AuthStore,
+    /// Anthropic auth mode resolved for `config` (Bearer = Claude Pro/Max
+    /// OAuth subscription); feeds the cost tracker (issue #499).
+    use_bearer_auth: bool,
 }
 
 async fn refresh_provider_runtime_state(
@@ -1534,6 +1551,7 @@ async fn refresh_provider_runtime_state(
         provider_registry,
         model_registry,
         auth_store: claurst_core::AuthStore::default(),
+        use_bearer_auth,
     })
 }
 
@@ -1578,6 +1596,7 @@ async fn reload_provider_runtime_state(
         provider_registry,
         model_registry,
         auth_store: claurst_core::AuthStore::default(),
+        use_bearer_auth,
     })
 }
 
@@ -1990,6 +2009,7 @@ async fn run_interactive(
     bridge_config: Option<claurst_bridge::BridgeConfig>,
     has_credentials: bool,
     model_registry: Arc<claurst_api::ModelRegistry>,
+    anthropic_bearer_auth: bool,
     user_question_rx: Option<tokio::sync::mpsc::UnboundedReceiver<claurst_tools::UserQuestionEvent>>,
     pending_project_mcp: Vec<claurst_core::config::McpServerConfig>,
     mcp_project_root: Option<PathBuf>,
@@ -2130,6 +2150,10 @@ async fn run_interactive(
     claurst_tui::spawn_signal_restore_watchers();
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
     app.command_queue = Some(command_queue.clone());
+    // Propagate the startup auth mode into cost reporting: a Claude Pro/Max
+    // OAuth session must report zero cost (issue #499).
+    app.anthropic_bearer_auth = anthropic_bearer_auth;
+    app.sync_cost_pricing();
     // Startup skill discovery runs on the blocking pool so a cold
     // `skills.urls` clone never holds the terminal. When it finishes, the
     // main loop installs the slash commands for autocomplete and every query
@@ -2995,6 +3019,9 @@ async fn run_interactive(
                                                     "Saved provider state cleared. Run /connect to reconnect."
                                                         .to_string(),
                                                 );
+                                                app.anthropic_bearer_auth =
+                                                    refreshed.use_bearer_auth;
+                                                app.sync_cost_pricing();
                                             }
                                             Err(err) => {
                                                 app.status_message = Some(format!(
@@ -4704,6 +4731,10 @@ async fn run_interactive(
                     );
                     app.provider_registry = Some(refreshed.provider_registry);
                     app.has_credentials = true;
+                    // A fresh Claude Pro/Max OAuth login switches usage to
+                    // flat subscription billing — zero reported cost (#499).
+                    app.anthropic_bearer_auth = refreshed.use_bearer_auth;
+                    app.sync_cost_pricing();
                 }
                 Err(err) => {
                     app.status_message =
