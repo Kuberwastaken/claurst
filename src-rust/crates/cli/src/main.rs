@@ -768,6 +768,36 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // One-time warning for saved permission rules in the legacy
+    // `<server>_<tool>` form (issue #471): the exposed names were renamed to
+    // `mcp__<server>__<tool>` (#459), so a saved rule matching a configured
+    // server no longer matches anything. Sees all saved-rule sources:
+    // allowed_tools / disallowed_tools and the persisted permissionRules.
+    {
+        let mut legacy_specs: Vec<String> = config
+            .allowed_tools
+            .iter()
+            .chain(config.disallowed_tools.iter())
+            .cloned()
+            .collect();
+        legacy_specs.extend(
+            settings
+                .permission_rules
+                .iter()
+                .filter_map(|rule| rule.tool_name.clone()),
+        );
+        let legacy_rules =
+            claurst_mcp::legacy_permission_rule_names(&config.mcp_servers, &legacy_specs);
+        if !legacy_rules.is_empty() {
+            warn!(
+                rules = ?legacy_rules,
+                "Saved permission rules use the legacy <server>_<tool> MCP naming and never \
+                 match now; rename them to mcp__<server>__<tool> (or mcp__<server> to cover \
+                 every tool of a server) in allowed_tools / disallowed_tools or permissionRules"
+            );
+        }
+    }
+
     let pending_permissions = Arc::new(ParkingMutex::new(claurst_tools::PendingPermissionStore::default()));
 
     let is_non_interactive = cli.print || cli.prompt.is_some();
@@ -1004,10 +1034,20 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn the background cron scheduler (fires cron tasks at scheduled times).
     // Cancelled automatically when the process exits since we use a shared token.
+    // The scheduler resolves its tool list at fire time (issue #471) through
+    // `cron_manager_cell`, so tasks pick up MCP tools whose servers connect
+    // after startup.
     let cron_cancel = tokio_util::sync::CancellationToken::new();
+    let cron_manager_cell: Arc<parking_lot::RwLock<Option<Arc<claurst_mcp::McpManager>>>> =
+        Arc::new(parking_lot::RwLock::new(mcp_manager_arc.clone()));
+    let cron_tool_list: claurst_query::ToolListProvider = {
+        let manager_cell = Arc::clone(&cron_manager_cell);
+        let snapshot = query_config.clone();
+        Arc::new(move || tools_for_session(manager_cell.read().clone(), &snapshot))
+    };
     claurst_query::start_cron_scheduler(
         client.clone(),
-        tools.clone(),
+        cron_tool_list,
         tool_ctx.clone(),
         query_config.clone(),
         cron_cancel.clone(),
@@ -1058,6 +1098,7 @@ async fn main() -> anyhow::Result<()> {
             pending_project_mcp,
             mcp_project_root,
             skill_discovery,
+            cron_manager_cell,
         )
         .await
     };
@@ -2019,6 +2060,10 @@ async fn run_interactive(
     pending_project_mcp: Vec<claurst_core::config::McpServerConfig>,
     mcp_project_root: Option<PathBuf>,
     skill_discovery: Option<tokio::task::JoinHandle<claurst_core::SkillRegistry>>,
+    // Shared slot for the cron scheduler's session tool list (issue #471):
+    // updated when the MCP runtime is rebuilt so cron tasks resolve fresh
+    // tool lists, including MCP tools from late-connecting servers.
+    cron_manager_cell: Arc<parking_lot::RwLock<Option<Arc<claurst_mcp::McpManager>>>>,
 ) -> anyhow::Result<()> {
     use claurst_commands::{execute_command, CommandContext, CommandResult};
     use claurst_bridge::{BridgeOutbound, TuiBridgeEvent};
@@ -4859,6 +4904,9 @@ async fn run_interactive(
             }
             tool_ctx.mcp_manager = new_mcp_manager.clone();
             app.mcp_manager = new_mcp_manager.clone();
+            // Keep the cron scheduler's tool resolver in sync with the
+            // rebuilt runtime (issue #471).
+            *cron_manager_cell.write() = new_mcp_manager.clone();
             cmd_ctx.mcp_manager = new_mcp_manager.clone();
             app.disabled_mcp_servers = settings.disabled_mcp_servers.clone();
             cmd_ctx.disabled_mcp_servers = settings.disabled_mcp_servers.clone();

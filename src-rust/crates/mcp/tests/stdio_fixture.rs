@@ -331,7 +331,7 @@ async fn server_instructions_reach_the_prompt_section() -> Result<(), String> {
         .instructions_prompt_section(|name| name.starts_with("mcp__"))
         .ok_or("expected an instructions section")?;
     ensure(
-        section.contains("## docs\nSearch before you answer; cite page URLs."),
+        section.contains("## docs\n<server-instructions>\nSearch before you answer; cite page URLs.\n</server-instructions>"),
         || format!("instructions missing from section:\n{section}"),
     )?;
     ensure(!section.contains("## plain"), || {
