@@ -43,6 +43,7 @@ pub(crate) fn is_protected(path: &Path, home: &Path, mcp_tokens: Option<&Path>) 
     let path = resolved(path);
     for name in [
         "settings.json",
+        "mcp_trust.json",
         "auth.json",
         "accounts.json",
         "oauth_tokens.json",
@@ -77,6 +78,7 @@ mod tests {
         std::fs::create_dir(&home).unwrap();
         for name in [
             "settings.json",
+            "mcp_trust.json",
             "auth.json",
             "accounts/codex/profile/codex_tokens.json",
             "projects/project/permissions.json",
@@ -117,6 +119,11 @@ mod tests {
         let home = root.path().join("claurst");
         std::fs::create_dir(&home).unwrap();
         std::fs::write(home.join("settings.json"), "{}").unwrap();
+        std::fs::write(home.join("mcp_trust.json"), "{}").unwrap();
+        assert!(is_protected(&home.join("mcp_trust.json"), &home, None));
+        let trust_alias = root.path().join("trust.txt");
+        std::os::unix::fs::symlink(home.join("mcp_trust.json"), &trust_alias).unwrap();
+        assert!(is_protected(&trust_alias, &home, None));
         let alias = root.path().join("alias");
         std::os::unix::fs::symlink(&home, &alias).unwrap();
         assert!(is_protected(&alias.join("settings.json"), &home, None));
