@@ -664,3 +664,39 @@ mod bang_tests {
         assert!(!app.notifications.is_empty());
     }
 }
+
+#[cfg(test)]
+mod bang_first_output_render_test {
+    #[tokio::test]
+    async fn bang_first_output_replaces_empty_welcome_screen() {
+        let mut config = claurst_core::Config::default();
+        config.bang_commands.enabled = true;
+        let mut app = crate::App::new(config, claurst_core::cost::CostTracker::new());
+        app.execute_bang_command("echo reviewer-smoke".into());
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while app.bang_command_pending.is_some() {
+                app.poll_session_loads();
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(app.messages.is_empty());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::render::render_app(frame, &app))
+            .unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            screen.contains("reviewer-smoke"),
+            "first local output must replace the welcome screen"
+        );
+    }
+}
