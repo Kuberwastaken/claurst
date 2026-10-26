@@ -34,7 +34,7 @@ mod sessions;
 mod e2e_tests;
 
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub use connection::Connection;
 pub use runtime::AgentRuntime;
@@ -75,6 +75,20 @@ pub async fn run_acp_server() -> anyhow::Result<()> {
     let (reader_res, _) = tokio::join!(reader_fut, dispatch_fut);
     if let Err(e) = reader_res {
         error!(?e, "ACP: reader loop failed");
+    }
+
+    // Let turn-end memory extraction tasks finish before shutdown: ACP
+    // clients disconnect right after the last turn response, and the
+    // detached extraction spawn would die with the runtime.
+    {
+        let unfinished =
+            claurst_query::await_pending_extractions(std::time::Duration::from_secs(30)).await;
+        if unfinished > 0 {
+            warn!(
+                count = unfinished,
+                "memory extraction tasks dropped at ACP shutdown"
+            );
+        }
     }
 
     info!("ACP: server shutdown");

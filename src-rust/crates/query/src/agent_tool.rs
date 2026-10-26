@@ -356,6 +356,9 @@ impl Tool for AgentTool {
             system_prompt: Some(system_prompt),
             append_system_prompt: None,
             session_context: None,
+            // Sub-agents build their own first-turn memory from the store
+            // via the loop's per-turn refresh; no seed here.
+            memory_content: String::new(),
             output_style: ctx.config.effective_output_style(),
             output_style_prompt: ctx.config.resolve_output_style_prompt(),
             working_directory: Some(working_dir_str),
