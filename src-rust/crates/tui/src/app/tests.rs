@@ -571,6 +571,25 @@ use crate::session_browser::SessionBrowserMode;
     }
 
     #[test]
+    fn session_browser_honors_user_rebinding_without_prompt_leak() {
+        let mut app = make_app();
+        let bindings = claurst_core::keybindings::UserKeybindings::from_json_str(
+            r#"{"bindings":[
+                {"chord":"a","action":null,"context":"SessionBrowser"},
+                {"chord":"x","action":"toggleSessionPaths","context":"SessionBrowser"}
+            ]}"#,
+        );
+        app.keybindings = claurst_core::keybindings::KeybindingResolver::new(&bindings);
+        app.session_browser.open(vec![]);
+        app.handle_key_event(press_key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(!app.session_browser.show_paths);
+        app.handle_key_event(press_key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.session_browser.show_paths);
+        app.handle_key_event(press_key(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert!(app.prompt_input.text.is_empty());
+    }
+
+    #[test]
     fn test_session_browser_rename_still_inline() {
         let mut app = make_app();
         let entries = vec![crate::session_browser::SessionEntry {

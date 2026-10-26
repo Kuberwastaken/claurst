@@ -416,7 +416,7 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
             // Optional working-directory row under each entry (toggle: `a`).
             if state.show_paths {
                 let path_display = session.working_dir.as_deref().unwrap_or("(no working dir)");
-                let path_cell = truncate_display(path_display, inner_w.saturating_sub(4));
+                let path_cell = truncate_display(path_display, inner_w.saturating_sub(6));
                 let path_style = if is_selected {
                     Style::default().fg(Color::Rgb(140, 160, 180)).bg(row_bg)
                 } else {
@@ -958,6 +958,47 @@ mod tests {
             let area = Rect::new(0, 0, 80, 24);
             let mut buf = Buffer::empty(area);
             render_session_browser(&s, area, &mut buf);
+        }
+    }
+
+    #[test]
+    fn selected_row_stays_visible_with_paths_and_preview() {
+        for paths in [false, true] {
+            for preview in [false, true] {
+                let mut state = SessionBrowserState::new();
+                state.open(
+                    (0..40)
+                        .map(|i| SessionEntry {
+                            id: format!("session-{i}"),
+                            title: format!("Selected {i}"),
+                            last_updated: "now".into(),
+                            message_count: 1,
+                            cost_usd: 0.0,
+                            working_dir: Some(
+                                "/a/very/long/working/directory/path/that/must/not/wrap".into(),
+                            ),
+                        })
+                        .collect(),
+                );
+                state.show_paths = paths;
+                state.show_preview = preview;
+                for selected in 0..40 {
+                    state.selected_idx = selected;
+                    let area = Rect::new(0, 0, 80, 24);
+                    let mut buffer = Buffer::empty(area);
+                    render_session_browser(&state, area, &mut buffer);
+                    let highlighted: String = buffer
+                        .content
+                        .iter()
+                        .filter(|cell| cell.bg == Color::Rgb(40, 60, 80))
+                        .map(|cell| cell.symbol())
+                        .collect();
+                    assert!(
+                        highlighted.contains(&format!("Selected {selected}")),
+                        "selection {selected} hidden with paths={paths}, preview={preview}"
+                    );
+                }
+            }
         }
     }
 

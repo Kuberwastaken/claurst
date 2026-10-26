@@ -15,6 +15,7 @@
 mod oauth_flow;
 mod codex_oauth_flow;
 mod headless;
+mod session_resume;
 mod upgrade;
 
 // ---------------------------------------------------------------------------
@@ -2200,6 +2201,8 @@ async fn run_interactive(
     claurst_tui::spawn_signal_restore_watchers();
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
     app.command_queue = Some(command_queue.clone());
+    app.current_session_id = Some(session.id.clone());
+    app.session_title = session.title.clone();
     // Propagate the startup auth mode into cost reporting: a Claude Pro/Max
     // OAuth session must report zero cost (issue #499).
     app.anthropic_bearer_auth = anthropic_bearer_auth;
@@ -2501,13 +2504,6 @@ async fn run_interactive(
     // Device code / OAuth auth channel — background tasks send events here
     // so the main loop can update the device_auth_dialog state.
     let (device_auth_tx, mut device_auth_rx) = mpsc::channel::<DeviceAuthEvent>(8);
-
-    // Session browser list load: /session and /resume set
-    // `app.session_list_pending`; the loop spawns the disk load here and
-    // delivers entries back through this channel (issue #382 — the browser
-    // used to open empty because the dead App::run loop owned the loader).
-    let (session_list_tx, mut session_list_rx) =
-        mpsc::channel::<Vec<claurst_tui::session_browser::SessionEntry>>(1);
 
     // MCP OAuth auth channel — background tasks send events here so the main
     // loop can update status and trigger a reconnect after browser auth finishes.
@@ -2860,6 +2856,7 @@ async fn run_interactive(
                                     tool_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_title = None;
+                                    app.current_session_id = Some(session.id.clone());
                                     // Reset per-turn diff/turn bookkeeping, as
                                     // ResumeSession does when swapping sessions.
                                     tool_ctx.file_history = Arc::new(ParkingMutex::new(
@@ -2990,57 +2987,20 @@ async fn run_interactive(
                                         Some("Select what to import from ~/.claude.".to_string());
                                 }
                                 Some(CommandResult::ResumeSession(resumed_session)) => {
-                                    session = resumed_session;
-                                    session_journal =
-                                        claurst_core::session_journal::SessionJournal::for_session(
-                                            &session,
-                                        );
-                                    base_query_config.session_journal =
-                                        Some(session_journal.clone());
-                                    if let Err(e) = session_journal.acquire() {
-                                        app.notifications.push(
-                                            NotificationKind::Warning,
-                                            e.to_string(),
-                                            None,
-                                        );
+                                    if let Err(error) = session_resume::apply(
+                                        resumed_session,
+                                        &claurst_core::history::sessions_dir(),
+                                        &mut session,
+                                        &mut session_journal,
+                                        &mut base_query_config,
+                                        &mut messages,
+                                        &mut app,
+                                        &mut cmd_ctx,
+                                        &mut tool_ctx,
+                                    ) {
+                                        app.status_message =
+                                            Some(format!("Could not resume session: {error}"));
                                     }
-                                    messages = session.messages.clone();
-                                    app.replace_messages(messages.clone());
-                                    cmd_ctx.config.model = Some(session.model.clone());
-                                    app.config.model = Some(session.model.clone());
-                                    tool_ctx.config.model = Some(session.model.clone());
-                                    app.model_name = session.model.clone();
-                                    tool_ctx.session_id = session.id.clone();
-                                    tool_ctx.file_history = Arc::new(ParkingMutex::new(
-                                        claurst_core::file_history::FileHistory::new(),
-                                    ));
-                                    tool_ctx.current_turn = Arc::new(
-                                        std::sync::atomic::AtomicUsize::new(0),
-                                    );
-                                    cmd_ctx.session_id = session.id.clone();
-                                    cmd_ctx.session_title = session.title.clone();
-                                    if let Some(saved_dir) = session.working_dir.as_ref() {
-                                        let saved_path =
-                                            std::path::PathBuf::from(saved_dir);
-                                        if saved_path.exists() {
-                                            tool_ctx.working_dir = saved_path.clone();
-                                            cmd_ctx.working_dir = saved_path;
-                                        }
-                                    }
-                                    app.config.project_dir =
-                                        Some(tool_ctx.working_dir.clone());
-                                    app.current_session_id = Some(session.id.clone());
-                                    app.attach_turn_diff_state(
-                                        tool_ctx.file_history.clone(),
-                                        tool_ctx.current_turn.clone(),
-                                    );
-                                    claurst_tui::update_terminal_title(
-                                        session.title.as_deref(),
-                                    );
-                                    app.status_message = Some(format!(
-                                        "Resumed session {}.",
-                                        &session.id[..8]
-                                    ));
                                 }
                                 Some(CommandResult::RenameSession(title)) => {
                                     session.title = Some(title.clone());
@@ -4451,81 +4411,30 @@ async fn run_interactive(
             }
         }
 
-        // ---- Session browser: spawn list load when pending ----------------
-        if app.session_list_pending {
-            app.session_list_pending = false;
-            let tx = session_list_tx.clone();
-            tokio::spawn(async move {
-                let sessions = claurst_core::history::list_sessions().await;
-                let entries: Vec<claurst_tui::session_browser::SessionEntry> = sessions
-                    .into_iter()
-                    .map(|s| {
-                        let age = chrono::Utc::now().signed_duration_since(s.updated_at);
-                        let last_updated = if age.num_minutes() < 1 {
-                            "just now".to_string()
-                        } else if age.num_hours() < 1 {
-                            format!("{}m ago", age.num_minutes())
-                        } else if age.num_hours() < 24 {
-                            format!("{}h ago", age.num_hours())
-                        } else {
-                            format!("{}d ago", age.num_days())
-                        };
-                        claurst_tui::session_browser::SessionEntry {
-                            id: s.id,
-                            title: s.title.unwrap_or_else(|| "(untitled)".to_string()),
-                            last_updated,
-                            message_count: s.messages.len(),
-                            cost_usd: s.total_cost,
-                            working_dir: s.working_dir,
-                        }
-                    })
-                    .collect();
-                let _ = tx.send(entries).await;
-            });
-        }
-        // Deliver loaded entries into the browser (non-blocking).
-        if let Ok(entries) = session_list_rx.try_recv() {
-            app.session_browser.sessions = entries;
-            app.session_browser.selected_idx = 0;
-        }
-
-        // ---- Session browser: resume the selected session -------------------
-        if let Some(resume_id) = app.session_resume_pending.take() {
-            match claurst_core::history::load_session(&resume_id).await {
-                Ok(resumed) => {
-                    session = resumed;
-                    messages = session.messages.clone();
-                    app.replace_messages(messages.clone());
-                    cmd_ctx.config.model = Some(session.model.clone());
-                    app.config.model = Some(session.model.clone());
-                    tool_ctx.config.model = Some(session.model.clone());
-                    app.model_name = session.model.clone();
-                    tool_ctx.session_id = session.id.clone();
-                    cmd_ctx.session_id = session.id.clone();
-                    cmd_ctx.session_title = session.title.clone();
-                    if let Some(saved_dir) = session.working_dir.as_ref() {
-                        let saved_path = std::path::PathBuf::from(saved_dir);
-                        if saved_path.exists() {
-                            tool_ctx.working_dir = saved_path.clone();
-                            cmd_ctx.working_dir = saved_path;
-                            app.config.project_dir = Some(tool_ctx.working_dir.clone());
+        // Browser selection uses the same persistence/session transition as
+        // /resume. Hold the request until the old query has fully drained.
+        if current_query.is_none() && !app.is_streaming {
+            if let Some(resume_id) = app.session_resume_pending.take() {
+                match claurst_core::history::load_session(&resume_id).await {
+                    Ok(resumed) => {
+                        if let Err(error) = session_resume::apply(
+                            resumed,
+                            &claurst_core::history::sessions_dir(),
+                            &mut session,
+                            &mut session_journal,
+                            &mut base_query_config,
+                            &mut messages,
+                            &mut app,
+                            &mut cmd_ctx,
+                            &mut tool_ctx,
+                        ) {
+                            app.status_message = Some(format!("Could not resume session: {error}"));
                         }
                     }
-                    tool_ctx.file_history = Arc::new(ParkingMutex::new(
-                        claurst_core::file_history::FileHistory::new(),
-                    ));
-                    tool_ctx.current_turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                    app.current_session_id = Some(session.id.clone());
-                    app.attach_turn_diff_state(
-                        tool_ctx.file_history.clone(),
-                        tool_ctx.current_turn.clone(),
-                    );
-                    app.status_message =
-                        Some(format!("Resumed session: {}", session.id));
-                }
-                Err(e) => {
-                    app.status_message =
-                        Some(format!("Could not load session {}: {}", resume_id, e));
+                    Err(error) => {
+                        app.status_message =
+                            Some(format!("Could not load session {resume_id}: {error}"));
+                    }
                 }
             }
         }
