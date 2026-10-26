@@ -25,6 +25,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -258,15 +259,20 @@ async fn run_in_background(
                 if let Some(pid) = c.id() {
                     global_registry().set_pid(&task_id_clone, pid);
                 }
-                let mut stdout = c.stdout.take().map(|s| BgLineReader::new(BufReader::new(s)));
-                let mut stderr = c.stderr.take().map(|s| BgLineReader::new(BufReader::new(s)));
-                // Full output for the spill file; the registry keeps only
-                // bounded windows of lines (#442).
-                let mut full = OutputAccumulator::new(
+                // Capture raw pipe chunks before display-line truncation, so
+                // newline-free output remains complete in the spill file.
+                let full = Arc::new(parking_lot::Mutex::new(OutputAccumulator::new(
                     RAW_HEAD_BYTES,
                     RAW_TAIL_BYTES,
                     Some(spill_path.clone()),
-                );
+                )));
+                let mut stdout = c
+                    .stdout
+                    .take()
+                    .map(|s| BgLineReader::new(BufReader::new(s)).capture(full.clone(), b""));
+                let mut stderr = c.stderr.take().map(|s| {
+                    BgLineReader::new(BufReader::new(s)).capture(full.clone(), b"STDERR: ")
+                });
                 // Drain both pipes concurrently until both close. Reading
                 // stdout to EOF first let a child that filled the stderr pipe
                 // block forever (#442).
@@ -305,7 +311,6 @@ async fn run_in_background(
                                     }
                                 },
                             };
-                            full.push(format!("{line}\n").as_bytes());
                             global_registry().append_output(&task_id_clone, &line);
                         }
                     };
@@ -328,7 +333,8 @@ async fn run_in_background(
                     }
                     drifted
                 };
-                let spilled = match full.finish() {
+                let captured = full.lock().finish();
+                let spilled = match captured {
                     Captured::Truncated { tail, spill, .. } => finish_spill(spill, &tail),
                     Captured::Complete(bytes) => {
                         match bound_head_tail(&String::from_utf8_lossy(&bytes)) {
@@ -427,8 +433,8 @@ const MAX_BG_LINE_BYTES: usize = 256 * 1024;
 /// Line reader over a background child's pipe. Reads raw bytes and decodes
 /// lossily, so non-UTF-8 output cannot end the drain early (#465: `Lines`
 /// turned `InvalidData` into EOF), and cuts every line at
-/// [`MAX_BG_LINE_BYTES`], discarding the rest of an over-long line so a
-/// newline-free stream cannot fill memory.
+/// [`MAX_BG_LINE_BYTES`] for display. Every consumed raw byte is captured
+/// separately, so trimming display lines never loses spill-file content.
 struct BgLineReader<R> {
     reader: R,
     /// Bytes scanned from the stream since the last newline but not yet
@@ -436,6 +442,9 @@ struct BgLineReader<R> {
     /// `tokio::select!` may poll and drop this future freely without losing
     /// partial bytes.
     line: Vec<u8>,
+    capture: Option<Arc<parking_lot::Mutex<OutputAccumulator>>>,
+    capture_prefix: &'static [u8],
+    capture_line_start: bool,
 }
 
 impl<R: tokio::io::AsyncBufRead + Unpin> BgLineReader<R> {
@@ -443,7 +452,20 @@ impl<R: tokio::io::AsyncBufRead + Unpin> BgLineReader<R> {
         Self {
             reader,
             line: Vec::new(),
+            capture: None,
+            capture_prefix: b"",
+            capture_line_start: true,
         }
+    }
+
+    fn capture(
+        mut self,
+        capture: Arc<parking_lot::Mutex<OutputAccumulator>>,
+        prefix: &'static [u8],
+    ) -> Self {
+        self.capture = Some(capture);
+        self.capture_prefix = prefix;
+        self
     }
 
     /// Next line without its newline, lossily decoded as UTF-8. `None` at EOF
@@ -469,6 +491,18 @@ impl<R: tokio::io::AsyncBufRead + Unpin> BgLineReader<R> {
                         let room = MAX_BG_LINE_BYTES.saturating_sub(self.line.len());
                         let take = delim.unwrap_or(buf.len()).min(room);
                         self.line.extend_from_slice(&buf[..take]);
+                        // This capture is independent of the display cap. It
+                        // happens before consume, with no await in between,
+                        // so cancelling next_line cannot duplicate or lose it.
+                        if let Some(capture) = &self.capture {
+                            let mut capture = capture.lock();
+                            if self.capture_line_start {
+                                capture.push(self.capture_prefix);
+                            }
+                            let consumed = delim.map_or(buf.len(), |p| p + 1);
+                            capture.push(&buf[..consumed]);
+                            self.capture_line_start = delim.is_some();
+                        }
                         Some(match delim {
                             // Line done: consume it plus the newline.
                             Some(p) => (true, p + 1),
@@ -1032,26 +1066,30 @@ async fn run_windows_fallback(
     // fully into memory first could be starved by the other pipe and grew
     // without bound on a newline-free stream.
     let spill_path = spill_dir.join(format!("{}.txt", uuid::Uuid::new_v4()));
-    let mut full = OutputAccumulator::new(RAW_HEAD_BYTES, RAW_TAIL_BYTES, Some(spill_path.clone()));
+    let full = Arc::new(parking_lot::Mutex::new(OutputAccumulator::new(
+        RAW_HEAD_BYTES,
+        RAW_TAIL_BYTES,
+        Some(spill_path.clone()),
+    )));
     let result = {
         let mut stdout = child
             .stdout
             .take()
-            .map(|s| BgLineReader::new(BufReader::new(s)));
+            .map(|s| BgLineReader::new(BufReader::new(s)).capture(full.clone(), b""));
         let mut stderr = child
             .stderr
             .take()
-            .map(|s| BgLineReader::new(BufReader::new(s)));
+            .map(|s| BgLineReader::new(BufReader::new(s)).capture(full.clone(), b"STDERR: "));
         let drain = async {
             while stdout.is_some() || stderr.is_some() {
-                let line = tokio::select! {
+                tokio::select! {
                     line = async {
                         match stdout.as_mut() {
                             Some(reader) => reader.next_line().await,
                             None => None,
                         }
                     }, if stdout.is_some() => match line {
-                        Some(line) => line,
+                        Some(_) => {},
                         None => {
                             stdout = None;
                             continue;
@@ -1063,14 +1101,13 @@ async fn run_windows_fallback(
                             None => None,
                         }
                     }, if stderr.is_some() => match line {
-                        Some(line) => format!("STDERR: {}", line),
+                        Some(_) => {},
                         None => {
                             stderr = None;
                             continue;
                         }
                     },
                 };
-                full.push(format!("{line}\n").as_bytes());
             }
         };
         tokio::time::timeout(timeout_dur, async {
@@ -1084,7 +1121,8 @@ async fn run_windows_fallback(
         Ok(status) => {
             guard.disarm();
             let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-            let output = match full.finish() {
+            let captured = full.lock().finish();
+            let output = match captured {
                 Captured::Complete(bytes) => {
                     let text = String::from_utf8_lossy(&bytes);
                     match bound_head_tail(&text) {
@@ -2152,6 +2190,29 @@ mod tests {
         .await;
         assert!(!result.is_error, "{}", result.content);
         assert_eq!(result.content, "cat cat cat 0 1 1 1 term");
+    }
+
+    /// The display prefix is bounded, but the spill must include the entire
+    /// physical line, even when it has no final newline.
+    #[tokio::test]
+    async fn background_spills_complete_newline_free_output() {
+        let spill_dir = tempfile::tempdir().unwrap();
+        let task = run_background_to_completion(
+            "head -c 1200000 /dev/zero | tr '\\0' x",
+            spill_dir.path(),
+        )
+        .await;
+        assert_eq!(task.status, claurst_core::tasks::TaskStatus::Completed);
+        let path = task.output_file.as_ref().expect("large output must spill");
+        assert!(task.render_output().contains("Full output:"));
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(bytes.len(), 1_200_000);
+        assert!(bytes.iter().all(|byte| *byte == b'x'));
+        assert!(
+            task.output
+                .iter()
+                .all(|line| line.len() <= MAX_BG_LINE_BYTES)
+        );
     }
 
     #[tokio::test]

@@ -104,14 +104,14 @@ impl OutputAccumulator {
         self.omitted += excess as u64;
     }
 
-    pub(crate) fn finish(self) -> Captured {
-        let Self {
-            mut head,
-            tail,
-            omitted,
-            spill,
-            ..
-        } = self;
+    /// Drain the retained capture, including its spill writer. Taking the
+    /// fields lets pipe readers share an accumulator behind a mutex while
+    /// retaining ownership of their bounded display buffers.
+    pub(crate) fn finish(&mut self) -> Captured {
+        let mut head = std::mem::take(&mut self.head);
+        let tail = std::mem::take(&mut self.tail);
+        let omitted = std::mem::take(&mut self.omitted);
+        let spill = self.spill.take();
         if omitted == 0 {
             head.extend(tail);
             Captured::Complete(head)
