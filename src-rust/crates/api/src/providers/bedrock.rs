@@ -1,4 +1,4 @@
-// providers/bedrock.rs — Amazon Bedrock provider adapter.
+// providers/bedrock.rs: Amazon Bedrock provider adapter.
 //
 // Uses the Bedrock Converse Streaming API which accepts a unified message
 // format similar to Anthropic's, making it straightforward to map from
@@ -157,7 +157,11 @@ impl BedrockProvider {
         });
         let canonical_uri = {
             let p = parsed.path();
-            if p.is_empty() { "/".to_string() } else { p.to_string() }
+            if p.is_empty() {
+                "/".to_string()
+            } else {
+                p.to_string()
+            }
         };
         let canonical_query = parsed.query().unwrap_or("").to_string();
 
@@ -175,8 +179,7 @@ impl BedrockProvider {
             "content-type:{}\nhost:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
             content_type, host, body_hash, datetime_str
         );
-        let mut signed_headers =
-            "content-type;host;x-amz-content-sha256;x-amz-date".to_string();
+        let mut signed_headers = "content-type;host;x-amz-content-sha256;x-amz-date".to_string();
 
         if let Some(ref tok) = self.session_token {
             canonical_headers.push_str(&format!("x-amz-security-token:{}\n", tok));
@@ -186,19 +189,12 @@ impl BedrockProvider {
         // Canonical request.
         let canonical_request = format!(
             "{}\n{}\n{}\n{}\n{}\n{}",
-            method,
-            canonical_uri,
-            canonical_query,
-            canonical_headers,
-            signed_headers,
-            body_hash
+            method, canonical_uri, canonical_query, canonical_headers, signed_headers, body_hash
         );
 
         // String to sign.
-        let credential_scope =
-            format!("{}/{}/{}/aws4_request", date_str, region, service);
-        let canonical_request_hash =
-            hex::encode(Sha256::digest(canonical_request.as_bytes()));
+        let credential_scope = format!("{}/{}/{}/aws4_request", date_str, region, service);
+        let canonical_request_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
         let string_to_sign = format!(
             "AWS4-HMAC-SHA256\n{}\n{}\n{}",
             datetime_str, credential_scope, canonical_request_hash
@@ -207,37 +203,31 @@ impl BedrockProvider {
         // Signing key: HMAC-SHA256 chain.
         let sign_key = {
             let k_date = {
-                let mut mac = HmacSha256::new_from_slice(
-                    format!("AWS4{}", secret_key).as_bytes(),
-                )
-                .expect("HMAC init failed");
+                let mut mac = HmacSha256::new_from_slice(format!("AWS4{}", secret_key).as_bytes())
+                    .expect("HMAC init failed");
                 mac.update(date_str.as_bytes());
                 mac.finalize().into_bytes()
             };
             let k_region = {
-                let mut mac = HmacSha256::new_from_slice(&k_date)
-                    .expect("HMAC init failed");
+                let mut mac = HmacSha256::new_from_slice(&k_date).expect("HMAC init failed");
                 mac.update(region.as_bytes());
                 mac.finalize().into_bytes()
             };
             let k_service = {
-                let mut mac = HmacSha256::new_from_slice(&k_region)
-                    .expect("HMAC init failed");
+                let mut mac = HmacSha256::new_from_slice(&k_region).expect("HMAC init failed");
                 mac.update(service.as_bytes());
                 mac.finalize().into_bytes()
             };
-            
+
             {
-                let mut mac = HmacSha256::new_from_slice(&k_service)
-                    .expect("HMAC init failed");
+                let mut mac = HmacSha256::new_from_slice(&k_service).expect("HMAC init failed");
                 mac.update(b"aws4_request");
                 mac.finalize().into_bytes()
             }
         };
 
         let signature = {
-            let mut mac =
-                HmacSha256::new_from_slice(&sign_key).expect("HMAC init failed");
+            let mut mac = HmacSha256::new_from_slice(&sign_key).expect("HMAC init failed");
             mac.update(string_to_sign.as_bytes());
             hex::encode(mac.finalize().into_bytes())
         };
@@ -288,16 +278,18 @@ impl BedrockProvider {
 
         // Tool definitions.
         if !request.tools.is_empty() {
+            let tools = crate::schema_dialect_map::filter_tools("bedrock", &request.tools);
             let tool_specs: Vec<Value> = request
                 .tools
                 .iter()
+                .zip(tools.iter())
                 .map(|td| {
                     json!({
                         "toolSpec": {
-                            "name": td.name,
-                            "description": td.description,
+                            "name": td.0.name,
+                            "description": td.0.description,
                             "inputSchema": {
-                                "json": td.input_schema
+                                "json": td.1.input_schema
                             }
                         }
                     })
@@ -373,7 +365,9 @@ impl BedrockProvider {
                     None
                 }
             }
-            ContentBlock::ToolUse { id, name, input, .. } => Some(json!({
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => Some(json!({
                 "toolUse": {
                     "toolUseId": id,
                     "name": name,
@@ -460,7 +454,9 @@ impl BedrockProvider {
         if !(200..300).contains(&(status as usize)) {
             let retry_after = crate::retry::retry_after(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            return Err(self.map_http_error(status, &text).with_retry_after(retry_after));
+            return Err(self
+                .map_http_error(status, &text)
+                .with_retry_after(retry_after));
         }
 
         Ok(resp)
@@ -545,9 +541,8 @@ impl BedrockProvider {
                 body: None,
             })?;
 
-        let content_blocks = Self::parse_converse_content(
-            message.get("content").and_then(|c| c.as_array()),
-        );
+        let content_blocks =
+            Self::parse_converse_content(message.get("content").and_then(|c| c.as_array()));
 
         let stop_reason_str = json
             .get("stopReason")
@@ -626,14 +621,8 @@ impl BedrockProvider {
             None => return UsageInfo::default(),
         };
         UsageInfo {
-            input_tokens: u
-                .get("inputTokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            output_tokens: u
-                .get("outputTokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
+            input_tokens: u.get("inputTokens").and_then(|v| v.as_u64()).unwrap_or(0),
+            output_tokens: u.get("outputTokens").and_then(|v| v.as_u64()).unwrap_or(0),
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
         }
@@ -847,7 +836,9 @@ fn parse_bedrock_event(
         } else {
             events.push(Ok(StreamEvent::ContentBlockStart {
                 index,
-                content_block: ContentBlock::Text { text: String::new() },
+                content_block: ContentBlock::Text {
+                    text: String::new(),
+                },
             }));
         }
         return events;
@@ -867,7 +858,9 @@ fn parse_bedrock_event(
             }));
             events.push(Ok(StreamEvent::ContentBlockStart {
                 index: 0,
-                content_block: ContentBlock::Text { text: String::new() },
+                content_block: ContentBlock::Text {
+                    text: String::new(),
+                },
             }));
             *message_started = true;
         }
@@ -1006,8 +999,8 @@ fn parse_bedrock_event(
 /// to `:exception-type` for error frames) and `frame_len == total_length`.
 /// Returns `None` when more bytes are required to complete the current frame.
 ///
-/// We parse strictly by the length declared in the prelude — this is
-/// deterministic and keeps the buffer frame-aligned — and deliberately skip
+/// We parse strictly by the length declared in the prelude. This is
+/// deterministic and keeps the buffer frame-aligned. We deliberately skip
 /// CRC32 validation. `crc32fast` is only present transitively in the workspace
 /// lockfile (not a direct dependency of this crate), and length-based framing is
 /// sufficient because the prelude gives the exact frame boundary.
@@ -1109,7 +1102,7 @@ fn event_type_from_headers(mut headers: &[u8]) -> Option<String> {
                 headers = headers.get(16..)?;
                 None
             }
-            // Unknown value type — alignment can no longer be trusted.
+            // Unknown value type: alignment can no longer be trusted.
             _ => break,
         };
 
@@ -1136,7 +1129,7 @@ fn drain_event_stream_frames(
 
     // Kept as an explicit `loop`: each frame's payload is parsed into an owned
     // value inside the match arm to release the `buf` borrow before we drain the
-    // consumed frame below — a `while let` binding on `buf` would hold that
+    // consumed frame below; a `while let` binding on `buf` would hold that
     // borrow across the mutation and fail to compile.
     #[allow(clippy::while_let_loop)]
     loop {
@@ -1157,7 +1150,7 @@ fn drain_event_stream_frames(
             if let Some(payload_val) = payload_val {
                 // parse_bedrock_event expects the `{ <event-type>: <payload> }`
                 // shape, matching how events nest in the non-stream Converse
-                // response — so we re-wrap the payload under its event type.
+                // response, so we re-wrap the payload under its event type.
                 let mut wrapped = serde_json::Map::new();
                 wrapped.insert(event_type, payload_val);
                 out.extend(parse_bedrock_event(
@@ -1255,7 +1248,7 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         let mut started = false;
 
-        // First chunk: an incomplete frame — nothing emitted, bytes retained.
+        // First chunk: an incomplete frame, nothing emitted, bytes retained.
         buf.extend_from_slice(&frame[..split]);
         assert!(
             parse_event_stream_frame(&buf).is_none(),

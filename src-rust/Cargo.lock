@@ -762,6 +762,7 @@ dependencies = [
  "bytes",
  "chrono",
  "claurst-core",
+ "claurst-schema-dialect",
  "futures",
  "hex",
  "hmac",
@@ -772,6 +773,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -983,6 +985,17 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "claurst-schema-dialect"
+version = "0.2.0"
+dependencies = [
+ "claurst-schema-dialect",
+ "dirs",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

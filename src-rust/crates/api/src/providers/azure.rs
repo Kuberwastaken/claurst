@@ -1,4 +1,4 @@
-// providers/azure.rs — Azure OpenAI provider adapter.
+// providers/azure.rs: Azure OpenAI provider adapter.
 //
 // Azure OpenAI uses the same Chat Completions wire format as OpenAI, but with
 // a different URL structure and auth header.
@@ -64,8 +64,8 @@ impl AzureProvider {
     pub fn from_env() -> Option<Self> {
         let key = std::env::var("AZURE_API_KEY").ok()?;
         let resource = std::env::var("AZURE_RESOURCE_NAME").ok()?;
-        let version = std::env::var("AZURE_API_VERSION")
-            .unwrap_or_else(|_| "2024-08-01-preview".to_string());
+        let version =
+            std::env::var("AZURE_API_VERSION").unwrap_or_else(|_| "2024-08-01-preview".to_string());
         Some(Self::new(resource, key).with_api_version(version))
     }
 
@@ -88,7 +88,7 @@ impl AzureProvider {
             &request.messages,
             request.system_prompt.as_ref(),
         );
-        let tools = OpenAiProvider::to_openai_tools_pub(&request.tools);
+        let tools = OpenAiProvider::to_openai_tools_pub(&self.id, &request.tools);
 
         let mut body = json!({
             "model": request.model,
@@ -158,7 +158,7 @@ impl AzureProvider {
             &request.messages,
             request.system_prompt.as_ref(),
         );
-        let tools = OpenAiProvider::to_openai_tools_pub(&request.tools);
+        let tools = OpenAiProvider::to_openai_tools_pub(&self.id, &request.tools);
 
         let mut body = json!({
             "model": request.model,
@@ -204,7 +204,9 @@ impl AzureProvider {
         if !(200..300).contains(&(status as usize)) {
             let retry_after = crate::retry::retry_after(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            return Err(self.map_http_error(status, &text).with_retry_after(retry_after));
+            return Err(self
+                .map_http_error(status, &text)
+                .with_retry_after(retry_after));
         }
 
         Ok(resp)
