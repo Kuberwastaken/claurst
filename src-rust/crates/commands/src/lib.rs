@@ -66,6 +66,8 @@ pub enum CommandResult {
     /// should reload settings and rebuild the MCP manager + tool list so the
     /// change takes effect in the live session.
     McpServersToggled { server_name: String, enabled: bool },
+    /// Rebuild the MCP roster after plugin discovery changed.
+    ReloadMcpRoster(String),
     /// Clear the conversation.
     ClearConversation,
     /// Replace the conversation with a specific message list (used by /rewind).
