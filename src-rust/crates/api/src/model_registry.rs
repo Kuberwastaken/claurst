@@ -985,6 +985,18 @@ impl ModelRegistry {
             return None;
         }
 
+        // Flash is the native MiniMax default when the authoritative catalog
+        // lists it. Do not synthesize entries or bypass lifecycle visibility;
+        // explicit saved models are handled before default resolution.
+        if provider_id == "minimax" {
+            if let Some(flash) = models.iter().find(|entry| {
+                &*entry.info.id == "MiniMax-M3.1-Flash"
+                    && entry.status.is_listed_by_default()
+            }) {
+                return Some(flash.info.id.to_string());
+            }
+        }
+
         let priority_patterns = flagship_patterns_for(provider_id);
 
         models.sort_by(|a, b| {
@@ -1973,6 +1985,19 @@ mod tests {
             );
         }
 
+        let flash = reg.get("minimax", "MiniMax-M3.1-Flash").expect("Flash must be bundled");
+        assert_eq!(flash.info.context_window, 1_000_000);
+        assert_eq!(flash.info.max_output_tokens, 524_288);
+        assert!(flash.reasoning && flash.tool_calling && flash.vision());
+        assert_eq!(flash.cost_input, Some(0.15));
+        assert_eq!(flash.cost_output, Some(0.6));
+        assert_eq!(flash.cost_cache_read, Some(0.015));
+        assert_eq!(flash.modalities_input, vec![Modality::Text, Modality::Image, Modality::Video]);
+        let mut visible: Vec<_> = reg.list_visible_by_provider("minimax").into_iter()
+            .map(|entry| entry.info.id.to_string()).collect();
+        visible.sort();
+        assert_eq!(visible, vec!["MiniMax-M3", "MiniMax-M3.1-Flash"]);
+
         let m3 = reg
             .get("minimax", "MiniMax-M3")
             .expect("MiniMax-M3 must be bundled");
@@ -2010,8 +2035,21 @@ mod tests {
 
         assert_eq!(
             reg.best_model_for_provider("minimax").as_deref(),
-            Some("MiniMax-M3")
+            Some("MiniMax-M3.1-Flash")
         );
+    }
+
+    #[test]
+    fn minimax_flash_default_respects_catalog_lifecycle() {
+        let mut registry = ModelRegistry::new();
+        merge_json(&mut registry, r#"{"minimax":{"id":"minimax","name":"MiniMax","env":[],"models":{"MiniMax-M3.1-Flash":{"id":"MiniMax-M3.1-Flash","name":"MiniMax-M3.1-Flash","status":"deprecated","limit":{"context":1000000,"output":524288}}}}}"#);
+        assert_eq!(registry.best_model_for_provider("minimax").as_deref(), Some("MiniMax-M3"));
+        let config = claurst_core::config::Config {
+            provider: Some("minimax".to_string()),
+            model: Some("MiniMax-M3.1-Flash".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(effective_model_for_config(&config, &registry), "MiniMax-M3.1-Flash");
     }
 
     // ---- opencode-style model surfacing (issue #180) ----------------------

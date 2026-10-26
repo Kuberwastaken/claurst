@@ -58,6 +58,10 @@ fn main() {
         "structured_content_and_images_are_converted",
         Box::pin(structured_content_and_images_are_converted()),
     );
+    run(
+        "shutdown_closes_client_transports",
+        Box::pin(shutdown_closes_client_transports()),
+    );
 
     if failed > 0 {
         println!("\n{failed} stdio fixture test(s) failed");
@@ -120,6 +124,54 @@ fn is_connected(manager: &Arc<McpManager>, name: &str) -> bool {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Shutdown (issue #418 review: old-manager leak)
+// ---------------------------------------------------------------------------
+
+/// `McpManager::shutdown` must close every transport, so a stdio child
+/// observes stdin EOF and exits. The fake server writes a marker file at
+/// exit; the test waits for it. Statuses must read as disconnected
+/// afterwards, and tools must be unregistered.
+async fn shutdown_closes_client_transports() -> Result<(), String> {
+    let marker_dir = tempfile::tempdir().expect("marker tempdir");
+    let marker = marker_dir.path().join("exited");
+    let server = fake_server(
+        "leaky",
+        "serve_marker",
+        &[("FAKE_MCP_MARKER", marker.to_str().expect("marker path"))],
+    );
+    let manager = McpManager::start(&[server]);
+    manager.wait_until_settled().await;
+    ensure(is_connected(&manager, "leaky"), || {
+        "server should connect first".to_string()
+    })?;
+    ensure(!manager.all_tool_definitions().is_empty(), || {
+        "server should have tools registered before shutdown".to_string()
+    })?;
+
+    manager.shutdown().await;
+
+    ensure(
+        matches!(
+            manager.server_status("leaky"),
+            McpServerStatus::Disconnected { last_error: None }
+        ),
+        || {
+            format!(
+                "status must read disconnected after shutdown, got {:?}",
+                manager.server_status("leaky")
+            )
+        },
+    )?;
+    ensure(manager.all_tool_definitions().is_empty(), || {
+        "tools must be unregistered after shutdown".to_string()
+    })?;
+    let exited = wait_for(Duration::from_secs(5), || marker.exists()).await;
+    ensure(exited, || {
+        "stdio child did not exit within 5s of manager shutdown; transport not closed".to_string()
+    })
+}
 
 async fn hung_server_times_out() -> Result<(), String> {
     let mut config = fake_server("hung", "hang", &[]);
@@ -339,8 +391,12 @@ mod fake_server {
     /// `hang`: read requests and never answer, like a server stuck at startup.
     /// `serve`: a minimal, well-behaved server. `FAKE_MCP_TOOLS` lists its
     /// tools; calling `add_tool` adds `late_tool` and announces the change.
+    /// `serve_marker`: like `serve`, but writes the `FAKE_MCP_MARKER` file
+    /// once the read loop ends (stdin EOF), proving the transport and the
+    /// child were shut down.
     pub fn run(mode: &str) {
         let name = std::env::var("FAKE_MCP_NAME").unwrap_or_else(|_| "fake".to_string());
+        let marker = std::env::var("FAKE_MCP_MARKER").ok();
         let tool_names: Vec<String> = std::env::var("FAKE_MCP_TOOLS")
             .unwrap_or_else(|_| "echo".to_string())
             .split(',')
@@ -430,6 +486,11 @@ mod fake_server {
                 }
             };
             send(&mut stdout, &json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+        }
+        // EOF on stdin: the client closed the transport. Write the marker so
+        // the test can observe the child actually terminating.
+        if let Some(marker) = marker {
+            let _ = std::fs::write(marker, "");
         }
     }
 }
