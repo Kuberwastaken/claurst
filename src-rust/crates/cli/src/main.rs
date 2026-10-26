@@ -4806,6 +4806,9 @@ async fn run_interactive(
         // servers that failed to start.
         if !app.is_streaming && current_query.is_none() {
             if let Some(manager) = tool_ctx.mcp_manager.clone() {
+                // Connections finish asynchronously, including before the
+                // first generation snapshot, so refresh the cheap live count.
+                app.mcp_server_count = manager.server_count();
                 let generation = manager.generation();
                 if mcp_seen_generation != Some(generation) {
                     mcp_seen_generation = Some(generation);
