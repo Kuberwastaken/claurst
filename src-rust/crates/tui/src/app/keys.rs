@@ -203,6 +203,10 @@ impl App {
     /// Process a keyboard event. Returns `true` when the input should be
     /// submitted (Enter pressed with no blocking dialog).
     pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
+        if self.kb_select_mode && self.kb_terminal_width != self.last_terminal_width.get() {
+            self.handle_terminal_resize(self.last_terminal_width.get());
+            return false;
+        }
         // Make Ctrl shortcuts layout-independent before any handler runs: on
         // non-Latin layouts (Ukrainian / Russian, …) a Ctrl combo reports the
         // Cyrillic glyph at the physical key, which would otherwise miss the
@@ -1246,6 +1250,11 @@ impl App {
             self.keybindings.cancel_chord();
         }
 
+        // Selection owns the input until a configurable action handles it.
+        if self.kb_select_mode {
+            return false;
+        }
+
         // Clear any active text selection on key press (except Ctrl+C which copies it).
         let is_copy = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
         if !is_copy && self.selection_anchor.is_some() {
@@ -1747,6 +1756,11 @@ impl App {
     }
 
     pub(super) fn current_key_context(&self) -> KeyContext {
+        // Keyboard selection mode takes priority — all movement/copy/cancel
+        // keys are routed through the Transcript context's keybinding table.
+        if self.kb_select_mode {
+            return KeyContext::Transcript;
+        }
         if self.diff_viewer.visible {
             KeyContext::DiffDialog
         } else if self.agents_menu.visible || self.mcp_view.visible || self.stats_dialog.visible {
@@ -2104,6 +2118,16 @@ impl App {
             // Idle Esc keeps its other meanings (vim, transcript focus). There
             // is no backtrack picker, so Esc-Esc on an idle prompt does nothing.
             "cancelTurn" => self.turn_running(),
+            // Entering kb selection needs rendered transcript content to
+            // select in; keep the key's ordinary meaning when the pane is
+            // empty (welcome screen) or a turn is streaming. The selectable
+            // area falls back to the full frame on the welcome screen, so
+            // total_message_lines is the real "transcript exists" check.
+            "enterSelection" => {
+                !self.is_streaming
+                    && self.total_message_lines.get() > 0
+                    && self.voice_recorder.is_none()
+            }
             _ => true,
         }
     }
@@ -2146,6 +2170,13 @@ impl App {
                 if self.prompt_input.is_empty() {
                     self.should_exit = true;
                 }
+                false
+            }
+            "enterSelection" => {
+                // `ctrl+x v` in Chat context. Gated in
+                // keybinding_action_applies on a non-empty transcript pane,
+                // not streaming, and no voice recorder.
+                self.enter_kb_selection();
                 false
             }
             "redraw" => false,
@@ -2516,8 +2547,188 @@ impl App {
                 }
                 false
             }
+
+            // ========== KEYBOARD TEXT SELECTION (Transcript context) ==========
+            // All cursor state is content-anchored (line indices into the
+            // rendered transcript), so selections survive scrolling and
+            // resizes. Screen coordinates are projected at render time.
+            "selectionUp" => {
+                self.move_kb_cursor(-1);
+                false
+            }
+            "selectionDown" => {
+                self.move_kb_cursor(1);
+                false
+            }
+            "selectionPageUp" => {
+                let step = self.last_msg_area.get().height.max(1) as i32;
+                self.move_kb_cursor(-step);
+                false
+            }
+            "selectionPageDown" => {
+                let step = self.last_msg_area.get().height.max(1) as i32;
+                self.move_kb_cursor(step);
+                false
+            }
+            "selectionGoStart" => {
+                self.kb_cursor_line = 0;
+                self.scroll_kb_cursor_into_view();
+                false
+            }
+            "selectionGoEnd" => {
+                self.kb_cursor_line = self.total_message_lines.get().saturating_sub(1);
+                self.scroll_kb_cursor_into_view();
+                false
+            }
+            "selectionCopy" => {
+                self.copy_kb_selection();
+                self.exit_kb_selection();
+                false
+            }
+            "selectionCancel" => {
+                self.exit_kb_selection();
+                false
+            }
+
             _ => false,
         }
+    }
+
+    // ========== KEYBOARD TEXT SELECTION HELPERS ============================
+    //
+    // The selection cursor is content-anchored: kb_cursor_line and
+    // kb_anchor_line index the rendered transcript lines (0 = topmost),
+    // independent of scroll position and pane geometry. Screen coordinates
+    // are derived at render time (see render.rs), so the selection survives
+    // scrolling. Width changes cancel because they rewrap content lines.
+
+    /// Enter keyboard selection mode.
+    /// Called from the `enterSelection` keybinding action (`ctrl+x v`, gated
+    /// in keybinding_action_applies on a non-empty transcript pane).
+    pub(super) fn enter_kb_selection(&mut self) {
+        let area = self.last_selectable_area.get();
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        self.kb_select_mode = true;
+        self.kb_terminal_width = self.last_terminal_width.get();
+        let total = self.total_message_lines.get();
+        let top = if self.auto_scroll {
+            total.saturating_sub(self.last_msg_area.get().height as usize)
+        } else {
+            self.last_max_scroll.get().saturating_sub(self.scroll_offset)
+        };
+        self.kb_cursor_line = top
+            .saturating_add(self.last_msg_area.get().height as usize)
+            .saturating_sub(1)
+            .min(total.saturating_sub(1));
+        self.kb_anchor_line = self.kb_cursor_line;
+        self.status_message = Some("Selection mode: ↑↓ move · Enter copy · Esc cancel".to_string());
+    }
+
+    /// Width changes rewrap content lines, so retaining their indices could
+    /// silently copy different text. Height-only changes keep the selection.
+    pub fn handle_terminal_resize(&mut self, width: u16) {
+        if self.kb_select_mode && width != self.kb_terminal_width {
+            self.exit_kb_selection();
+            self.status_message = Some("Selection cancelled: terminal width changed".into());
+        }
+    }
+
+    /// Exit keyboard selection mode and clear selection state.
+    pub(super) fn exit_kb_selection(&mut self) {
+        self.kb_select_mode = false;
+        self.clear_selection();
+        // Drop the line cache: it is repopulated every frame while the mode
+        // is active, so a stale cache from a previous session can never be
+        // copied after re-entering on a changed transcript.
+        self.kb_line_text.borrow_mut().clear();
+    }
+
+    /// The text of the current keyboard selection: the flattened lines from
+    /// `kb_anchor_line` to `kb_cursor_line` (inclusive), from the render-time
+    /// line cache. Empty when the cache has not been populated yet.
+    /// Kept separate from the clipboard write so tests can assert the range
+    /// math without a clipboard.
+    pub(crate) fn kb_selection_text(&self) -> String {
+        let start = self.kb_anchor_line.min(self.kb_cursor_line);
+        let end = self.kb_anchor_line.max(self.kb_cursor_line);
+        let lines = self.kb_line_text.borrow();
+        if lines.is_empty() {
+            // No render-time cache yet (entered before first render after
+            // enabling the mode): fall back to the visible-selection text.
+            self.selection_text.borrow().clone()
+        } else {
+            let from = start.min(lines.len().saturating_sub(1));
+            let to = (end + 1).min(lines.len());
+            lines[from..to]
+                .iter()
+                .map(|l| l.trim_end())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
+
+    /// Copy the keyboard selection to the clipboard, if non-empty. The text
+    /// comes from the render-time line cache (kb_line_text), so selections
+    /// that extend past the viewport copy in full. Shared by the configurable selectionCopy bindings
+    /// (Enter and Ctrl+C by default).
+    pub(super) fn copy_kb_selection(&mut self) {
+        let text = self.kb_selection_text();
+        if !text.is_empty() {
+            let copied = crate::image_paste::write_clipboard_text(&text);
+            if copied {
+                self.push_notification(
+                    NotificationKind::Info,
+                    "Copied to clipboard".to_string(),
+                    Some(2),
+                );
+            }
+        }
+    }
+
+    /// Move the keyboard selection cursor by `delta` content lines
+    /// (negative = up). Clamps to the transcript content and scrolls the
+    /// view to keep the cursor visible.
+    pub(super) fn move_kb_cursor(&mut self, delta: i32) {
+        let total = self.total_message_lines.get();
+        if total == 0 {
+            return;
+        }
+        let max_line = total - 1;
+        let new_line = if delta < 0 {
+            self.kb_cursor_line
+                .saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            self.kb_cursor_line.saturating_add(delta as usize)
+        };
+        self.kb_cursor_line = new_line.min(max_line);
+        self.scroll_kb_cursor_into_view();
+    }
+
+    /// Scroll so the kb cursor line is on screen.
+    /// scroll_offset counts lines above the bottom (0 = pinned at bottom);
+    /// the cursor's distance from the bottom line is
+    /// `total - 1 - kb_cursor_line`.
+    pub(super) fn scroll_kb_cursor_into_view(&mut self) {
+        let total = self.total_message_lines.get();
+        if total == 0 {
+            return;
+        }
+        let visible = self.last_msg_area.get().height as usize;
+        if visible == 0 {
+            return;
+        }
+        self.kb_cursor_line = self.kb_cursor_line.min(total - 1);
+        let max_scroll = self.last_max_scroll.get();
+        let mut top = max_scroll.saturating_sub(self.scroll_offset.min(max_scroll));
+        if self.kb_cursor_line < top {
+            top = self.kb_cursor_line;
+        } else if self.kb_cursor_line >= top.saturating_add(visible) {
+            top = self.kb_cursor_line + 1 - visible;
+        }
+        self.scroll_offset = max_scroll.saturating_sub(top);
+        self.auto_scroll = self.scroll_offset == 0;
     }
 
     /// Handle a key event while in legacy history-search mode.

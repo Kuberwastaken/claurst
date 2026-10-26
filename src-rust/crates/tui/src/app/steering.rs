@@ -31,7 +31,50 @@ fn completion_notice_header(text: &str) -> Option<&str> {
     }
 }
 
+pub(super) struct ParkedSessionInput {
+    prompt: crate::prompt_input::PromptInputState,
+    queued: std::collections::VecDeque<String>,
+    auto_submit: bool,
+}
+
 impl App {
+    /// Park drafts and next-turn prompts with their session, then rebuild the
+    /// visible steer dock from the already rebound durable queue.
+    pub fn switch_session_input(
+        &mut self,
+        previous: &str,
+        next: &str,
+        pending: Vec<(u64, String)>,
+    ) {
+        if previous != next {
+            let mut fresh = crate::prompt_input::PromptInputState::new();
+            fresh.vim_enabled = self.prompt_input.vim_enabled;
+            let history = std::mem::take(&mut self.prompt_input.history);
+            let old = ParkedSessionInput {
+                prompt: std::mem::replace(&mut self.prompt_input, fresh),
+                queued: std::mem::take(&mut self.queued_messages),
+                auto_submit: std::mem::take(&mut self.pending_auto_submit),
+            };
+            if !old.prompt.text.is_empty()
+                || !old.prompt.pending_images.is_empty()
+                || !old.queued.is_empty()
+                || old.auto_submit
+            {
+                self.parked_session_inputs.insert(previous.to_owned(), old);
+            }
+            if let Some(parked) = self.parked_session_inputs.remove(next) {
+                self.prompt_input = parked.prompt;
+                self.queued_messages = parked.queued;
+                self.pending_auto_submit = parked.auto_submit;
+            }
+            self.prompt_input.history = history;
+        }
+        self.pending_steers = pending
+            .into_iter()
+            .filter(|(_, text)| completion_notice_header(text).is_none())
+            .collect();
+    }
+
     /// Enter during a turn: deliver `text` to the model at the next step
     /// boundary. Without a command queue it is queued for after the turn.
     pub fn steer(&mut self, text: String) {
@@ -67,9 +110,19 @@ impl App {
             return Some(text);
         }
         let queue = self.command_queue.as_ref()?;
-        while let Some((id, text)) = self.pending_steers.pop() {
-            if queue.remove(id).is_some() {
-                return Some(text);
+        while let Some((id, text)) = self.pending_steers.last().cloned() {
+            match queue.try_remove(id) {
+                Ok(Some(_)) => {
+                    self.pending_steers.pop();
+                    return Some(text);
+                }
+                Ok(None) => {
+                    self.pending_steers.pop();
+                }
+                Err(error) => {
+                    self.status_message = Some(format!("Could not remove queued input: {error}"));
+                    return None;
+                }
             }
         }
         None
@@ -101,14 +154,21 @@ impl App {
     /// them, so the idle wake-up delivers them after the cancel.
     pub fn restore_pending_steers(&mut self) {
         let mut restored: Vec<String> = Vec::new();
+        let mut retained = Vec::new();
         if let Some(ref queue) = self.command_queue {
             for (id, text) in self.pending_steers.drain(..) {
-                if queue.remove(id).is_some() {
-                    restored.push(text);
+                match queue.try_remove(id) {
+                    Ok(Some(_)) => restored.push(text),
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.status_message =
+                            Some(format!("Could not remove queued input: {error}"));
+                        retained.push((id, text));
+                    }
                 }
             }
         }
-        self.pending_steers.clear();
+        self.pending_steers = retained;
         restored.extend(self.queued_messages.drain(..));
         if restored.is_empty() {
             return;
@@ -153,7 +213,55 @@ mod tests {
     }
 
     fn dock(app: &App) -> Vec<(PendingKind, String)> {
-        app.pending_prompts().map(|(kind, text)| (kind, text.to_string())).collect()
+        app.pending_prompts()
+            .map(|(kind, text)| (kind, text.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn session_switch_parks_drafts_and_tab_prompts_without_sending_them_elsewhere() {
+        let (mut app, _) = app_with_queue();
+        app.prompt_input.text = "draft A".into();
+        app.prompt_input
+            .paste_contents
+            .insert(7, "full pasted text".into());
+        app.queued_messages.push_back("next A".into());
+        app.pending_auto_submit = true;
+        app.switch_session_input("A", "B", vec![(2, "steer B".into())]);
+        assert!(app.prompt_input.text.is_empty());
+        assert!(app.queued_messages.is_empty());
+        assert!(!app.pending_auto_submit);
+        assert_eq!(app.pending_steers, vec![(2, "steer B".into())]);
+        app.prompt_input.text = "draft B".into();
+        app.switch_session_input("B", "A", vec![]);
+        assert_eq!(app.prompt_input.text, "draft A");
+        assert_eq!(app.prompt_input.paste_contents[&7], "full pasted text");
+        assert_eq!(app.queued_messages.front().unwrap(), "next A");
+        assert!(app.pending_auto_submit);
+        app.switch_session_input("A", "A", vec![]);
+        assert_eq!(app.prompt_input.text, "draft A");
+    }
+
+    #[test]
+    fn failed_durable_takeback_keeps_the_dock_and_input_visible() {
+        let (mut app, queue) = app_with_queue();
+        let dir = tempfile::tempdir().unwrap();
+        queue.enable_persistence_in(dir.path(), "session").unwrap();
+        app.steer("keep visible".into());
+        let store = dir.path().join("pending-soft-interrupts/session.json");
+        std::fs::write(store, "corrupt pending store").unwrap();
+        app.remove_last_pending();
+        assert_eq!(dock(&app), [(PendingKind::Steer, "keep visible".into())]);
+        assert!(!queue.is_empty());
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("Could not remove")
+        );
+        app.restore_pending_steers();
+        assert_eq!(app.pending_steers.len(), 1);
+        assert!(app.prompt_input.is_empty());
     }
 
     #[test]
@@ -206,7 +314,11 @@ mod tests {
         ]));
         assert_eq!(app.messages.len(), before);
         let note = app.system_annotations.last().expect("annotation");
-        assert!(note.text.contains("<background-shell id=\"t1\""), "{}", note.text);
+        assert!(
+            note.text.contains("<background-shell id=\"t1\""),
+            "{}",
+            note.text
+        );
     }
 
     #[test]
@@ -219,7 +331,10 @@ mod tests {
         app.edit_last_pending();
         assert_eq!(app.prompt_input.text, "queued");
         app.edit_last_pending();
-        assert_eq!(app.prompt_input.text, "queued", "a non-empty prompt is never overwritten");
+        assert_eq!(
+            app.prompt_input.text, "queued",
+            "a non-empty prompt is never overwritten"
+        );
 
         app.set_prompt_text(String::new());
         app.edit_last_pending();
@@ -292,7 +407,10 @@ mod tests {
         app.query_in_flight = true;
         let mode = app.agent_mode.clone();
         app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.agent_mode, mode, "an empty-prompt Tab must not switch agent mode mid-turn");
+        assert_eq!(
+            app.agent_mode, mode,
+            "an empty-prompt Tab must not switch agent mode mid-turn"
+        );
         assert!(!app.agent_mode_changed);
         app.set_prompt_text("next".to_string());
         app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -330,7 +448,10 @@ mod tests {
         app.restore_pending_steers();
         assert_eq!(app.prompt_input.text, "one\ntwo\nlater\ndraft");
         assert!(app.pending_steers.is_empty());
-        assert!(app.queued_messages.is_empty(), "nothing auto-submits after a cancel");
+        assert!(
+            app.queued_messages.is_empty(),
+            "nothing auto-submits after a cancel"
+        );
         let left: Vec<String> = queue
             .drain()
             .into_iter()
