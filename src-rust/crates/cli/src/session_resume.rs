@@ -31,8 +31,9 @@ pub(crate) fn apply(
         SessionJournal::new(sessions_dir, &resumed)
     };
     destination.acquire()?;
-    session.messages = messages.clone();
-    journal.checkpoint(session)?;
+    let mut previous = session.clone();
+    previous.messages = messages.clone();
+    journal.checkpoint(&mut previous)?;
 
     *session = resumed;
     *journal = destination;
@@ -77,10 +78,12 @@ pub(crate) fn rename_current(
     commands: &mut CommandContext,
     app: &mut App,
 ) -> anyhow::Result<()> {
-    session.messages = messages.to_vec();
-    session.title = Some(title.clone());
-    session.updated_at = chrono::Utc::now();
-    journal.checkpoint(session)?;
+    let mut renamed = session.clone();
+    renamed.messages = messages.to_vec();
+    renamed.title = Some(title.clone());
+    renamed.updated_at = chrono::Utc::now();
+    journal.checkpoint(&mut renamed)?;
+    *session = renamed;
     commands.session_title = session.title.clone();
     app.session_title = session.title.clone();
     claurst_tui::update_terminal_title(Some(&title));
@@ -257,6 +260,38 @@ mod tests {
             Some("browser title")
         );
         assert_eq!(live.app.session_title.as_deref(), Some("browser title"));
+    }
+
+    #[test]
+    fn failed_rename_does_not_publish_candidate_metadata_or_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut live = Harness::new(dir.path());
+        // The original writer keeps its lock while a different writer for
+        // the same session injects a realistic checkpoint failure.
+        let held = live.journal.clone();
+        live.journal = SessionJournal::new(dir.path(), &live.session);
+        live.messages
+            .push(Message::user("uncheckpointed idle edit"));
+        let before_title = live.session.title.clone();
+        let before_messages = live.session.messages.len();
+        assert!(
+            rename_current(
+                "must not publish".into(),
+                &live.messages,
+                &mut live.session,
+                &live.journal,
+                &mut live.commands,
+                &mut live.app
+            )
+            .is_err()
+        );
+        assert_eq!(live.session.title, before_title);
+        assert_eq!(live.session.messages.len(), before_messages);
+        assert_eq!(live.commands.session_title, before_title);
+        assert_eq!(live.app.session_title, before_title);
+        let loaded = claurst_core::session_journal::load(dir.path(), &live.session.id).unwrap();
+        assert_eq!(loaded.session.title, before_title);
+        drop(held);
     }
 
     #[test]
