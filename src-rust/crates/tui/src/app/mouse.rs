@@ -344,6 +344,35 @@ impl App {
             return;
         }
 
+        // Keyboard selection mode owns the selection: a mouse click/drag
+        // would fight the content-anchored cursor by writing raw screen
+        // coordinates into selection_anchor/focus. Wheel scrolling still
+        // works (it only adjusts scroll_offset, which the projection at
+        // render time follows), so keep the mouse useful while selecting.
+        if self.kb_select_mode {
+            match mouse_event.kind {
+                MouseEventKind::ScrollUp
+                    if !mouse_event.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    let step = self.scroll_step();
+                    self.scroll_up_by(step);
+                }
+                MouseEventKind::ScrollDown
+                    if !mouse_event.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    let step = self.scroll_step();
+                    let new_off = self.scroll_offset.saturating_sub(step);
+                    self.scroll_offset = new_off;
+                    if new_off == 0 {
+                        self.auto_scroll = true;
+                        self.new_messages_while_scrolled = 0;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Fast-reject mouse-move events — they flood at 60+ Hz and we don't
         // need hover tracking. Exception: context menu needs hover to update
         // the selected item highlight.
