@@ -275,18 +275,29 @@ async fn run_in_background(
                 // the child, and the drain then finishes and spills whatever
                 // the command printed before the deadline onto the task instead
                 // of orphaning that data until the 7-day sweep (#465).
-                let timed_out = {
-                    let mut drain = async {
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+                let mut timed_out = {
+                    let drain = async {
                         while stdout.is_some() || stderr.is_some() {
                             let line = tokio::select! {
-                                line = stdout.as_mut().unwrap().next_line(), if stdout.is_some() => match line {
+                                line = async {
+                                    match stdout.as_mut() {
+                                        Some(reader) => reader.next_line().await,
+                                        None => None,
+                                    }
+                                }, if stdout.is_some() => match line {
                                     Some(line) => line,
                                     None => {
                                         stdout = None;
                                         continue;
                                     }
                                 },
-                                line = stderr.as_mut().unwrap().next_line(), if stderr.is_some() => match line {
+                                line = async {
+                                    match stderr.as_mut() {
+                                        Some(reader) => reader.next_line().await,
+                                        None => None,
+                                    }
+                                }, if stderr.is_some() => match line {
                                     Some(line) => format!("STDERR: {}", line),
                                     None => {
                                         stderr = None;
@@ -298,9 +309,8 @@ async fn run_in_background(
                             global_registry().append_output(&task_id_clone, &line);
                         }
                     };
-                    let drifted = tokio::time::timeout(Duration::from_millis(timeout_ms), &mut drain)
-                        .await
-                        .is_err();
+                    tokio::pin!(drain);
+                    let drifted = tokio::time::timeout_at(deadline, &mut drain).await.is_err();
                     if drifted {
                         // Kill the child so the pipes close and the drain
                         // finishes; a child that leaks its fds elsewhere only
@@ -330,7 +340,17 @@ async fn run_in_background(
                 if let Some(path) = spilled {
                     global_registry().set_output_file(&task_id_clone, path);
                 }
-                let status = c.wait().await;
+                // Pipe EOF does not imply process exit: commands can close
+                // both streams and keep running. Keep the wait on the same
+                // deadline rather than giving it an unbounded second phase.
+                let status = match tokio::time::timeout_at(deadline, c.wait()).await {
+                    Ok(status) => status,
+                    Err(_) => {
+                        timed_out = true;
+                        let _ = c.kill().await;
+                        c.wait().await
+                    }
+                };
                 if timed_out {
                     global_registry().update_status(
                         &task_id_clone,
@@ -431,6 +451,7 @@ impl<R: tokio::io::AsyncBufRead + Unpin> BgLineReader<R> {
     /// final line is still returned, and once a line fills
     /// [`MAX_BG_LINE_BYTES`] the remainder of it is read and dropped.
     async fn next_line(&mut self) -> Option<String> {
+        let mut ended_with_newline = false;
         loop {
             // (`fill_buf` borrows the reader; the slice is only used inside
             // this block, ending the borrow before `consume` below.)
@@ -466,12 +487,13 @@ impl<R: tokio::io::AsyncBufRead + Unpin> BgLineReader<R> {
                         self.reader.consume(n);
                     }
                     if done {
+                        ended_with_newline = true;
                         break;
                     }
                 }
             }
         }
-        if self.line.is_empty() {
+        if self.line.is_empty() && !ended_with_newline {
             None
         } else {
             let out = String::from_utf8_lossy(&self.line).into_owned();
@@ -662,7 +684,7 @@ async fn run_in_pty(
     // reading as soon as the DIRECT child exits rather than waiting for pty EOF,
     // which a detached grandchild would hold open forever (#184).
     let spill_for_thread = spill_path.clone();
-    let read_handle = tokio::task::spawn_blocking(move || {
+    let mut read_handle = tokio::task::spawn_blocking(move || {
         let master_fd = master.as_raw_fd();
         let result = drive_pty_child(child, reader, master_fd, spill_for_thread);
         // Keep the master fd alive until reading + reaping is complete.
@@ -1012,19 +1034,35 @@ async fn run_windows_fallback(
     let spill_path = spill_dir.join(format!("{}.txt", uuid::Uuid::new_v4()));
     let mut full = OutputAccumulator::new(RAW_HEAD_BYTES, RAW_TAIL_BYTES, Some(spill_path.clone()));
     let result = {
-        let mut stdout = child.stdout.take().map(|s| BgLineReader::new(BufReader::new(s)));
-        let mut stderr = child.stderr.take().map(|s| BgLineReader::new(BufReader::new(s)));
-        let mut drain = async {
+        let mut stdout = child
+            .stdout
+            .take()
+            .map(|s| BgLineReader::new(BufReader::new(s)));
+        let mut stderr = child
+            .stderr
+            .take()
+            .map(|s| BgLineReader::new(BufReader::new(s)));
+        let drain = async {
             while stdout.is_some() || stderr.is_some() {
                 let line = tokio::select! {
-                    line = stdout.as_mut().unwrap().next_line(), if stdout.is_some() => match line {
+                    line = async {
+                        match stdout.as_mut() {
+                            Some(reader) => reader.next_line().await,
+                            None => None,
+                        }
+                    }, if stdout.is_some() => match line {
                         Some(line) => line,
                         None => {
                             stdout = None;
                             continue;
                         }
                     },
-                    line = stderr.as_mut().unwrap().next_line(), if stderr.is_some() => match line {
+                    line = async {
+                        match stderr.as_mut() {
+                            Some(reader) => reader.next_line().await,
+                            None => None,
+                        }
+                    }, if stderr.is_some() => match line {
                         Some(line) => format!("STDERR: {}", line),
                         None => {
                             stderr = None;
@@ -1035,13 +1073,16 @@ async fn run_windows_fallback(
                 full.push(format!("{line}\n").as_bytes());
             }
         };
-        tokio::time::timeout(timeout_dur, &mut drain).await
+        tokio::time::timeout(timeout_dur, async {
+            drain.await;
+            child.wait().await
+        })
+        .await
     };
 
     match result {
-        Ok(()) => {
+        Ok(status) => {
             guard.disarm();
-            let status = child.wait().await;
             let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
             let output = match full.finish() {
                 Captured::Complete(bytes) => {
@@ -2113,6 +2154,74 @@ mod tests {
         assert_eq!(result.content, "cat cat cat 0 1 1 1 term");
     }
 
+    #[tokio::test]
+    async fn background_keeps_draining_after_one_pipe_closes() {
+        let spill_dir = tempfile::tempdir().unwrap();
+        for (command, expected) in [
+            ("exec 1>&-; sleep 0.05; echo later >&2", "STDERR: later"),
+            ("exec 2>&-; sleep 0.05; echo later", "later"),
+        ] {
+            let task = run_background_to_completion(command, spill_dir.path()).await;
+            assert_eq!(task.status, claurst_core::tasks::TaskStatus::Completed);
+            assert!(
+                task.output.iter().any(|line| line == expected),
+                "{:?}",
+                task.output
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn background_timeout_includes_wait_after_pipe_eof() {
+        let spill_dir = tempfile::tempdir().unwrap();
+        let started = run_in_background(
+            "exec 1>&- 2>&-; sleep 5".to_string(),
+            std::env::temp_dir(),
+            100,
+            spill_dir.path(),
+            None,
+            None,
+        )
+        .await;
+        let task_id = started
+            .content
+            .lines()
+            .find_map(|line| line.strip_prefix("Task ID: "))
+            .unwrap();
+        let task = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let task = global_registry().get(task_id).unwrap();
+                if !task.is_running() {
+                    break task;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("closed pipes must not bypass the process deadline");
+        assert!(
+            matches!(task.status,
+                claurst_core::tasks::TaskStatus::Failed(ref reason) if reason.contains("timed out")
+            ),
+            "{:?}",
+            task.status
+        );
+    }
+
+    #[tokio::test]
+    async fn bg_reader_preserves_blank_lines() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, mut lines) = bg_reader();
+        tokio::spawn(async move {
+            writer.write_all(b"\nfirst\n\nlast\n").await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+        for expected in ["", "first", "", "last"] {
+            assert_eq!(lines.next_line().await.as_deref(), Some(expected));
+        }
+        assert_eq!(lines.next_line().await, None);
+    }
+
     /// #465: non-UTF-8 output no longer ends the drain (`Lines` surfaced the
     /// read error as EOF), and an unterminated final line is still returned.
     #[tokio::test]
@@ -2188,14 +2297,14 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         let (mut writer, mut lines) = bg_reader();
         tokio::spawn(async move {
-            writer.write_all(b"first\nsect").await.unwrap();
+            writer.write_all(b"first\nsec").await.unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;
             writer.write_all(b"ond\nthird\n").await.unwrap();
             writer.shutdown().await.unwrap();
         });
         assert_eq!(lines.next_line().await, Some("first".to_string()));
         // Drop an in-flight poll several times (nothing readable yet): the
-        // partial "sect" must survive every cancellation.
+        // partial "sec" must survive every cancellation.
         for _ in 0..5 {
             let _ = tokio::time::timeout(Duration::from_millis(5), lines.next_line()).await;
         }

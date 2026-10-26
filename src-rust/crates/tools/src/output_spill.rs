@@ -295,7 +295,7 @@ mod tests {
             format!("out\n\nFull output: {}", path.display())
         );
         assert_eq!(
-            with_output_trailer("out".into(), Some(path), "Partial output"),
+            with_output_trailer("out".into(), Some(path.clone()), "Partial output"),
             format!("out\n\nPartial output: {}", path.display())
         );
     }
