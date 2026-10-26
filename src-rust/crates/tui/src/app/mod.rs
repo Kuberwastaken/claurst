@@ -450,6 +450,7 @@ pub struct App {
     /// When `true`, the main loop will inject a synthetic Enter event on the
     /// next iteration to dequeue and submit the next queued message.
     pub pending_auto_submit: bool,
+    parked_session_inputs: std::collections::HashMap<String, steering::ParkedSessionInput>,
     /// Connect-a-provider dialog (/connect command).
     pub connect_dialog: DialogSelectState,
     /// Import-config source picker (/import-config command).
@@ -805,6 +806,7 @@ impl App {
             command_queue: None,
             pending_steers: Vec::new(),
             pending_auto_submit: false,
+            parked_session_inputs: std::collections::HashMap::new(),
             connect_dialog: DialogSelectState::new("Connect a provider", provider_picker_items()),
             import_config_picker: DialogSelectState::new("Import config", import_config_picker_items()),
             import_config_dialog: ImportConfigDialogState::new(),
