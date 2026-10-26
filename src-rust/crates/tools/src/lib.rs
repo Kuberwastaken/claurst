@@ -309,18 +309,43 @@ impl Drop for FileLock {
     }
 }
 
-/// Lock `paths` for a read-modify-write, keyed by canonical path so aliases
-/// of one file share a lock (a file that does not exist yet is keyed by its
-/// canonical parent plus its name). Keys are taken in sorted order, so two
-/// multi-file tools cannot deadlock. Callers take the lock before opening the
-/// file: a handle opened before another writer's atomic rename would point at
-/// the replaced inode and `write_atomic_bound` would refuse it.
-pub(crate) async fn lock_files<'a>(
-    paths: impl IntoIterator<Item = &'a std::path::Path>,
-) -> Vec<FileLock> {
-    let mut keys: Vec<PathBuf> = paths
-        .into_iter()
-        .map(|path| match std::fs::canonicalize(path) {
+/// Windows canonicalizes a file through an object handle, whose name can
+/// change during replacement. Lock its canonical directory instead. This
+/// deliberately serializes writes to different files in one directory, and
+/// also coalesces case/8.3/trailing-dot aliases without opening the final file.
+#[cfg(any(windows, test))]
+fn file_lock_directory_key(
+    path: &std::path::Path,
+    canonicalize_parent: &impl Fn(&std::path::Path) -> std::io::Result<PathBuf>,
+    depth: u8,
+) -> PathBuf {
+    if depth < 40 {
+        if let Ok(target) = std::fs::read_link(path) {
+            let target = if target.is_absolute() {
+                target
+            } else {
+                path.parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join(target)
+            };
+            return file_lock_directory_key(&target, canonicalize_parent, depth + 1);
+        }
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    canonicalize_parent(parent).unwrap_or_else(|_| parent.to_path_buf())
+}
+
+fn file_lock_key(path: &std::path::Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        file_lock_directory_key(path, &|parent| std::fs::canonicalize(parent), 0)
+    }
+    #[cfg(not(windows))]
+    {
+        match std::fs::canonicalize(path) {
             Ok(real) => real,
             Err(_) => match (path.parent(), path.file_name()) {
                 (Some(parent), Some(name)) => std::fs::canonicalize(parent)
@@ -328,8 +353,21 @@ pub(crate) async fn lock_files<'a>(
                     .unwrap_or_else(|_| path.to_path_buf()),
                 _ => path.to_path_buf(),
             },
-        })
-        .collect();
+        }
+    }
+}
+
+/// Lock `paths` for a read-modify-write, keyed by canonical directory on
+/// Windows and canonical file path elsewhere, so aliases
+/// of one file share a lock (outside Windows, a missing file is keyed by its
+/// canonical parent plus its name). Keys are taken in sorted order, so two
+/// multi-file tools cannot deadlock. Callers take the lock before opening the
+/// file: a handle opened before another writer's atomic rename would point at
+/// the replaced inode and `write_atomic_bound` would refuse it.
+pub(crate) async fn lock_files<'a>(
+    paths: impl IntoIterator<Item = &'a std::path::Path>,
+) -> Vec<FileLock> {
+    let mut keys: Vec<PathBuf> = paths.into_iter().map(file_lock_key).collect();
     keys.sort();
     keys.dedup();
     let mut locks = Vec::with_capacity(keys.len());
@@ -1571,6 +1609,77 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), b"external change");
     }
 
+    #[test]
+    fn directory_lock_key_never_opens_the_replaceable_final_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.txt");
+        let parent = std::fs::canonicalize(dir.path()).unwrap();
+        let resolve = |candidate: &std::path::Path| {
+            assert_eq!(
+                candidate,
+                dir.path(),
+                "final-object canonicalization can observe a moved temp name"
+            );
+            Ok(parent.clone())
+        };
+        let key = file_lock_directory_key(&path, &resolve, 0);
+        std::fs::write(&path, b"present").unwrap();
+        assert_eq!(file_lock_directory_key(&path, &resolve, 0), key);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(file_lock_directory_key(&path, &resolve, 0), key);
+        assert_eq!(
+            file_lock_directory_key(&dir.path().join("SHARED~1.TXT"), &resolve, 0),
+            key
+        );
+        assert_eq!(
+            file_lock_directory_key(&dir.path().join("shared.txt. "), &resolve, 0),
+            key
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_lock_key_resolves_final_symlinks_to_the_target_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = dir.path().join("target");
+        std::fs::create_dir(&target_dir).unwrap();
+        let target = target_dir.join("missing.txt");
+        let alias = dir.path().join("alias.txt");
+        std::os::unix::fs::symlink("target/missing.txt", &alias).unwrap();
+        assert_eq!(
+            file_lock_directory_key(&alias, &|p| std::fs::canonicalize(p), 0),
+            file_lock_directory_key(&target, &|p| std::fs::canonicalize(p), 0)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lock_serializes_read_modify_write_during_atomic_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("counter.txt");
+        std::fs::write(&path, b"0").unwrap();
+        let mut writers = Vec::new();
+        for _ in 0..32 {
+            let path = path.clone();
+            writers.push(tokio::spawn(async move {
+                let _lock = lock_files([path.as_path()]).await;
+                let count: usize = tokio::fs::read_to_string(&path)
+                    .await
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                tokio::task::yield_now().await;
+                write_atomic(&path, (count + 1).to_string().as_bytes())
+                    .await
+                    .unwrap();
+            }));
+        }
+        for writer in writers {
+            writer.await.unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "32");
+        assert_eq!(count_atomic_tmp_files(dir.path()), 0);
+    }
+
     #[tokio::test]
     async fn simultaneous_atomic_writes_own_distinct_temporary_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -1591,6 +1700,32 @@ mod tests {
             .unwrap()
             .starts_with("writer-"));
         assert_eq!(count_atomic_tmp_files(dir.path()), 0);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_existing_missing_and_case_aliases_share_directory_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Shared long filename.txt");
+        let key = file_lock_key(&path);
+        let held = lock_files([path.as_path()]).await;
+        std::fs::write(&path, b"present").unwrap();
+        assert_eq!(file_lock_key(&path), key);
+        let alias = dir.path().join("SHARED LONG FILENAME.TXT");
+        assert_eq!(file_lock_key(&alias), key);
+        let waiting = lock_files([alias.as_path()]);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut waiting)
+                .await
+                .is_err()
+        );
+        drop(held);
+        drop(
+            tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+                .await
+                .unwrap(),
+        );
     }
 
     #[tokio::test]
