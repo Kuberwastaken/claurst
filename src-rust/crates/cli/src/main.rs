@@ -2226,6 +2226,9 @@ async fn run_interactive(
     // OAuth session must report zero cost (issue #499).
     app.anthropic_bearer_auth = anthropic_bearer_auth;
     app.sync_cost_pricing();
+    // Sync the session id at startup so auto-poke reads this session's
+    // todos from the first turn on, not only after /new or a resume.
+    app.session_id = tool_ctx.session_id.clone();
     app.disabled_mcp_servers = settings.disabled_mcp_servers.clone();
     // Startup skill discovery runs on the blocking pool so a cold
     // `skills.urls` clone never holds the terminal. When it finishes, the
@@ -2638,6 +2641,8 @@ async fn run_interactive(
         // Poll for crossterm events (keyboard/mouse) with short timeout
         // unless an auto-submit (queued message) is pending — in which case
         // synthesize an Enter event to dequeue and submit it.
+        let automatic_submission = app.pending_key.is_none()
+            && app.pending_auto_submit && !app.is_streaming;
         let synthetic_event: Option<Event> = if let Some(k) = app.pending_key.take() {
             // A non-character key swallowed by the paste-burst drain — replay
             // it so the keystroke that ended a raw-key paste is not lost.
@@ -2781,6 +2786,8 @@ async fn run_interactive(
                             continue;
                         }
 
+                        app.record_prompt_submission(&input, automatic_submission);
+
                         // Check for slash command
                         if input.starts_with('/') {
                             let (cmd_name, cmd_args) =
@@ -2881,6 +2888,11 @@ async fn run_interactive(
                                     tool_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_title = None;
+                                    // Keep the TUI's session id in sync so
+                                    // auto-poke reads the new session's todos,
+                                    // and reset its per-session counters.
+                                    app.session_id = tool_ctx.session_id.clone();
+                                    app.reset_auto_poke_state();
                                     app.current_session_id = Some(session.id.clone());
                                     // Reset per-turn diff/turn bookkeeping, as
                                     // ResumeSession does when swapping sessions.

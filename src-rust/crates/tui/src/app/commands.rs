@@ -45,6 +45,7 @@ pub(super) const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("new", "Start a fresh session (keeps model, provider & directory)"),
     ("output-style", "Show or switch the output style / persona"),
     ("plugin", "Manage plugins (list/info/enable/disable/reload)"),
+    ("poke", "Toggle or configure auto-poke (on/off/status)"),
     ("providers", "List available AI providers and their status"),
     ("caveman", "Caveman persona output style — save big token"),
     ("rocky", "Rocky persona output style — amaze amaze amaze"),
@@ -56,6 +57,7 @@ pub(super) const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("review", "Review changes (git diff)"),
     ("rewind", "Rewind to an earlier turn"),
     ("session", "Browse and manage sessions"),
+    ("sessions", "Browse sessions, optionally pre-filtered: /sessions <query>"),
     ("settings", "Open settings"),
     ("share", "Upload the current session as a secret gist and get a shareable URL"),
     ("stats", "Open token and cost stats"),
@@ -80,8 +82,8 @@ pub(super) fn help_command_category(name: &str) -> &'static str {
         | "cc-statusline" => {
             "Workspace"
         }
-        "agent" | "agents" | "memory" | "plugin" | "survey" | "turns" => "Tools",
-        "session" | "resume" | "rename" | "fork" | "clear" | "new" | "move" | "compact"
+        "agent" | "agents" | "memory" | "plugin" | "poke" | "survey" | "turns" => "Tools",
+        "session" | "sessions" | "resume" | "rename" | "fork" | "clear" | "new" | "move" | "compact"
         | "quit" | "exit" => "Session",
         _ => "Commands",
     }
@@ -149,9 +151,76 @@ impl App {
         }
     }
 
+    /// Handle `/poke [on|off|status]`. Toggles auto-poke, which sends a
+    /// continuation prompt when the model stops with incomplete todos.
+    /// Opt-in only: the default is OFF. Persists to settings.json.
+    pub fn handle_poke_command(&mut self, args: &str) {
+        let toggled = !self.config.auto_poke_enabled;
+        // Persist first, flip the live flag only when the save succeeded;
+        // otherwise the setting would revert on the next launch while the
+        // status message claims it changed.
+        let mut persist = |flag: bool, enabled_msg: &str| -> String {
+            let result = claurst_core::Settings::load_sync().and_then(|mut settings| {
+                settings.config.auto_poke_enabled = flag;
+                settings.save_sync()
+            });
+            match result {
+                Ok(()) => {
+                    self.config.auto_poke_enabled = flag;
+                    enabled_msg.to_string()
+                }
+                Err(e) => format!("Auto-poke unchanged: could not save settings ({e})."),
+            }
+        };
+        match args.trim() {
+            "on" | "enable" => {
+                self.status_message = Some(persist(true, "Auto-poke enabled."));
+            }
+            "off" | "disable" => {
+                self.status_message = Some(persist(false, "Auto-poke disabled."));
+            }
+            "status" => {
+                let budget_left =
+                    claurst_tools::todo_write::MAX_AUTO_POKES.saturating_sub(self.auto_poke_count);
+                let incomplete =
+                    claurst_tools::todo_write::count_incomplete_todos(&self.session_id);
+                self.status_message = Some(format!(
+                    "Auto-poke: {} | Pokes: {}/{} | Budget left: {} | Incomplete: {}",
+                    if self.config.auto_poke_enabled {
+                        "ON"
+                    } else {
+                        "OFF"
+                    },
+                    self.auto_poke_count,
+                    claurst_tools::todo_write::MAX_AUTO_POKES,
+                    budget_left,
+                    incomplete,
+                ));
+            }
+            "" => {
+                let now_on = toggled;
+                self.status_message = Some(persist(
+                    now_on,
+                    if now_on {
+                        "Auto-poke enabled."
+                    } else {
+                        "Auto-poke disabled."
+                    },
+                ));
+            }
+            _ => {
+                self.status_message =
+                    Some("Usage: /poke [on|off|status] (no arg toggles).".to_string());
+            }
+        }
+    }
     /// Handle slash commands that should open UI screens rather than execute
     /// as normal commands. Returns `true` if the command was intercepted.
     pub fn intercept_slash_command_with_args(&mut self, cmd: &str, args: &str) -> bool {
+        if cmd == "poke" {
+            self.handle_poke_command(args);
+            return true;
+        }
         if cmd == "turns" {
             let args = args.trim();
             if args.is_empty() {
@@ -186,6 +255,19 @@ impl App {
         }
         if cmd == "mcp" && !args.trim().is_empty() {
             return false;
+        }
+        // `/sessions <query>` opens the browser with the filter pre-applied;
+        // a bare `/sessions` behaves like `/session`.
+        if cmd == "sessions" {
+            let query = args.trim();
+            if query.is_empty() {
+                return self.intercept_slash_command("session");
+            }
+            self.close_secondary_views();
+            self.dismiss_error_notifications();
+            self.session_browser.open_with_query(vec![], query);
+            self.session_list_pending = true;
+            return true;
         }
         self.intercept_slash_command(cmd)
     }
@@ -302,6 +384,14 @@ impl App {
                 true
             }
             "session" | "resume" => {
+                self.session_browser.open(vec![]);
+                self.session_list_pending = true;
+                true
+            }
+            // `/sessions <query>` pre-filters the browser (see
+            // `intercept_slash_command_with_args`); reached here only when the
+            // TUI-layer arg dispatch above didn't catch it.
+            "sessions" => {
                 self.session_browser.open(vec![]);
                 self.session_list_pending = true;
                 true

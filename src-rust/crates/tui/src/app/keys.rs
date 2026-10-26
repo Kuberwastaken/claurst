@@ -889,6 +889,22 @@ impl App {
                     }
                     return false;
                 }
+                SessionBrowserMode::Search => {
+                    if let Some(keystroke) = key_event_to_keystroke(&key) {
+                        match self.keybindings.process(keystroke, &KeyContext::SessionFilter) {
+                            KeybindingResult::Action(action) => { self.handle_keybinding_action(&action); }
+                            KeybindingResult::NoMatch => {
+                                if let KeyCode::Char(c) = key.code {
+                                    if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                                        let c = self.shift_normalize(c, key.modifiers);
+                                        self.session_browser.push_filter_char(c);
+                                    }
+                                }
+                            }
+                            KeybindingResult::Pending | KeybindingResult::Unbound => {}
+                        }
+                    }
+                }
                 SessionBrowserMode::Rename => {
                     match key.code {
                         KeyCode::Esc => self.session_browser.cancel(),
@@ -1747,7 +1763,13 @@ impl App {
     }
 
     pub(super) fn current_key_context(&self) -> KeyContext {
-        if self.diff_viewer.visible {
+        if self.session_browser.visible {
+            if self.session_browser.mode == crate::session_browser::SessionBrowserMode::Search {
+                KeyContext::SessionFilter
+            } else {
+                KeyContext::SessionBrowser
+            }
+        } else if self.diff_viewer.visible {
             KeyContext::DiffDialog
         } else if self.agents_menu.visible || self.mcp_view.visible || self.stats_dialog.visible {
             KeyContext::Select
@@ -2150,6 +2172,10 @@ impl App {
             }
             "redraw" => false,
             // ---- Session browser (KeyContext::SessionBrowser) ----
+            "startSessionFilter" => { self.session_browser.start_search(); false }
+            "applySessionFilter" => { self.session_browser.confirm_search(); false }
+            "clearSessionFilter" => { self.session_browser.clear_filter(); false }
+            "eraseSessionFilter" => { self.session_browser.pop_filter_char(); false }
             "prevSession" => {
                 self.session_browser.select_prev();
                 false
@@ -2627,6 +2653,17 @@ impl App {
     /// Otherwise the text goes through the normal `prompt_input.paste()` path
     /// which applies the multi-line summary placeholder for large pastes.
     pub fn handle_paste_data(&mut self, data: String) {
+        if self.session_browser.visible
+            && self.session_browser.mode == crate::session_browser::SessionBrowserMode::Search
+        {
+            for c in data.chars() {
+                let c = if c == '\n' || c == '\r' { ' ' } else { c };
+                if !c.is_control() {
+                    self.session_browser.push_filter_char(c);
+                }
+            }
+            return;
+        }
         use crate::prompt_input::detect_pasted_path;
         use crate::image_paste::PastedImage;
 
