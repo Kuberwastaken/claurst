@@ -959,7 +959,10 @@ pub async fn run_query_loop(
         *messages = sanitize::sanitize_history(std::mem::take(messages));
 
         // Build API request
-        let api_messages: Vec<ApiMessage> = messages.iter().map(ApiMessage::from).collect();
+        let api_messages: Vec<ApiMessage> = claurst_api::normalize_anthropic_messages(messages)
+            .iter()
+            .map(ApiMessage::from)
+            .collect();
         // Max-steps degradation: the final summary turn is dispatched with NO
         // tool definitions so the model can only produce text (issue #230).
         let api_tools: Vec<ApiToolDefinition> = if degradation_turn {
@@ -1344,24 +1347,7 @@ pub async fn run_query_loop(
                     };
 
                     // Accumulators for building the final assistant message.
-                    let mut text_chunks: Vec<String> = Vec::new();
-                    // Accumulate reasoning/thinking content for providers like
-                    // DeepSeek that require reasoning_content to be sent back.
-                    // Keep each thinking block paired with its signature for
-                    // replay on the next MiniMax/Anthropic-compatible turn.
-                    let mut thinking_blocks: std::collections::BTreeMap<usize, (String, String)> =
-                        std::collections::BTreeMap::new();
-                    // Opaque reasoning state (Codex `encrypted_content`)
-                    // that must be replayed on the next request.
-                    let mut redacted_thinking_blocks: Vec<ContentBlock> = Vec::new();
-                    // tool_call_blocks: index → (id, name, accumulated_json, thought_signature)
-                    // thought_signature carries Gemini's opaque per-call signature
-                    // through stream assembly so it survives into the persisted
-                    // ToolUse block and is echoed back next turn (#311).
-                    let mut tool_call_blocks: std::collections::HashMap<
-                        usize,
-                        (String, String, String, Option<String>),
-                    > = std::collections::HashMap::new();
+                    let mut blocks = claurst_api::provider_types::StreamBlockAccumulator::new();
                     let mut usage = UsageInfo::default();
                     let mut stop_str = "end_turn".to_string();
                     let mut msg_id = uuid::Uuid::new_v4().to_string();
@@ -1411,46 +1397,12 @@ pub async fn run_query_loop(
                                             }
                                         }
 
-                                        // Accumulate response data.
+                                        // Preserve block indices and provider-owned reasoning items.
+                                        blocks.on_event(&evt);
                                         match &evt {
                                             claurst_api::StreamEvent::MessageStart { id, usage: u, .. } => {
                                                 msg_id = id.clone();
                                                 merge_provider_stream_usage(&mut usage, u);
-                                            }
-                                            claurst_api::StreamEvent::ContentBlockStart {
-                                                index,
-                                                content_block: ContentBlock::ToolUse { id, name, thought_signature, .. },
-                                            } => {
-                                                tool_call_blocks.insert(*index, (id.clone(), name.clone(), String::new(), thought_signature.clone()));
-                                            }
-                                            claurst_api::StreamEvent::ContentBlockStart {
-                                                content_block: block @ ContentBlock::RedactedThinking { .. },
-                                                ..
-                                            } => {
-                                                redacted_thinking_blocks.push(block.clone());
-                                            }
-                                            claurst_api::StreamEvent::TextDelta { text, .. } => {
-                                                text_chunks.push(text.clone());
-                                            }
-                                            claurst_api::StreamEvent::ContentBlockStart {
-                                                index,
-                                                content_block: ContentBlock::Thinking { thinking, signature },
-                                            } => {
-                                                thinking_blocks.insert(*index, (thinking.clone(), signature.clone()));
-                                            }
-                                            claurst_api::StreamEvent::ThinkingDelta { index, thinking } => {
-                                                thinking_blocks.entry(*index).or_default().0.push_str(thinking);
-                                            }
-                                            claurst_api::StreamEvent::ReasoningDelta { index, reasoning } => {
-                                                thinking_blocks.entry(*index).or_default().0.push_str(reasoning);
-                                            }
-                                            claurst_api::StreamEvent::SignatureDelta { index, signature } => {
-                                                thinking_blocks.entry(*index).or_default().1.push_str(signature);
-                                            }
-                                            claurst_api::StreamEvent::InputJsonDelta { index, partial_json } => {
-                                                if let Some((_, _, buf, _)) = tool_call_blocks.get_mut(index) {
-                                                    buf.push_str(partial_json);
-                                                }
                                             }
                                             claurst_api::StreamEvent::MessageDelta { stop_reason, usage: u } => {
                                                 stop_str = match stop_reason {
@@ -1565,65 +1517,24 @@ pub async fn run_query_loop(
                     retry_attempt = 0;
                     schema_recovery_used = false;
 
-                    // Build the content blocks from accumulated stream data.
-                    let mut content_blocks: Vec<ContentBlock> = Vec::new();
-
-                    // Thinking / reasoning block — must come first so that
-                    // inject_reasoning_for_tool_turns can find it later.
-                    let combined_thinking: String = thinking_blocks.values()
-                        .map(|(thinking, _)| thinking.as_str()).collect();
-                    for (thinking, signature) in thinking_blocks.into_values() {
-                        if !thinking.is_empty() || !signature.is_empty() {
-                            content_blocks.push(ContentBlock::Thinking { thinking, signature });
-                        }
-                    }
-                    content_blocks.append(&mut redacted_thinking_blocks);
-
-                    let combined_text = text_chunks.join("");
-                    if !combined_text.is_empty() {
-                        content_blocks.push(ContentBlock::Text {
-                            text: combined_text.clone(),
-                        });
-                    }
-
-                    // Reconstruct tool-use blocks (sorted by index for determinism).
-                    let mut tc_indices: Vec<usize> = tool_call_blocks.keys().cloned().collect();
-                    tc_indices.sort();
-                    // Tool calls whose accumulated JSON arguments failed to
-                    // parse. We still emit a tool_use block (so the assistant
-                    // message stays well-formed and every tool_use has a
-                    // matching tool_result), but we must NOT execute the tool
-                    // with empty/garbage input — instead we surface a tool
-                    // error to the model so it can retry (issue #215).
-                    let mut malformed_tool_calls: std::collections::HashMap<String, String> =
-                        std::collections::HashMap::new();
-                    for idx in tc_indices {
-                        if let Some((id, name, json_str, thought_signature)) =
-                            tool_call_blocks.remove(&idx)
-                        {
-                            let input = match claurst_api::tool_json::parse_tool_input(&json_str) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    warn!(
-                                        provider = %provider_id_str,
-                                        tool = %name,
-                                        tool_id = %id,
-                                        error = %e,
-                                        "Tool-call arguments failed to parse (truncated/malformed JSON); surfacing a tool error instead of executing with empty args"
-                                    );
-                                    malformed_tool_calls.insert(id.clone(), e.to_string());
-                                    // Placeholder input — this call is never executed.
-                                    serde_json::json!({})
-                                }
-                            };
-                            content_blocks.push(ContentBlock::ToolUse {
-                                id,
-                                name,
-                                input,
-                                thought_signature,
-                            });
-                        }
-                    }
+                    let (content_blocks, malformed_tool_calls) = blocks.finish_with_invalid_tools();
+                    let combined_text: String = content_blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    let combined_thinking: String = content_blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+                            ContentBlock::ResponsesReasoning { summary, .. } => {
+                                Some(summary.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect();
 
                     let mut assistant_msg = Message {
                         role: claurst_core::types::Role::Assistant,
@@ -4047,6 +3958,7 @@ mod tests {
         id: claurst_core::provider_id::ProviderId,
         steps: StdMutex<std::collections::VecDeque<ScriptStep>>,
         calls: Arc<std::sync::atomic::AtomicUsize>,
+        requests: Arc<StdMutex<Vec<claurst_api::ProviderRequest>>>,
     }
 
     fn text_turn(text: &str) -> Vec<Result<claurst_api::StreamEvent, claurst_api::ProviderError>> {
@@ -4088,7 +4000,7 @@ mod tests {
 
         async fn create_message_stream(
             &self,
-            _request: claurst_api::ProviderRequest,
+            request: claurst_api::ProviderRequest,
         ) -> Result<
             std::pin::Pin<
                 Box<
@@ -4099,6 +4011,7 @@ mod tests {
             >,
             claurst_api::ProviderError,
         > {
+            self.requests.lock().unwrap().push(request);
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let step = self.steps.lock().unwrap().pop_front();
             let events = match step {
@@ -4136,6 +4049,7 @@ mod tests {
         calls: usize,
         events: Vec<QueryEvent>,
         messages: Vec<Message>,
+        requests: Vec<claurst_api::ProviderRequest>,
     }
 
     /// Drive `run_query_loop` against a `ScriptedProvider` with a fast retry
@@ -4160,10 +4074,12 @@ mod tests {
         command_queue: Option<CommandQueue>,
     ) -> ScriptedRun {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests = Arc::new(StdMutex::new(Vec::new()));
         let provider = Arc::new(ScriptedProvider {
             id: claurst_core::provider_id::ProviderId::new("scriptprov"),
             steps: StdMutex::new(steps.into()),
             calls: calls.clone(),
+            requests: requests.clone(),
         });
         let mut registry = claurst_api::ProviderRegistry::new();
         registry.register(provider);
@@ -4214,7 +4130,9 @@ mod tests {
         while let Ok(ev) = rx.try_recv() {
             events.push(ev);
         }
+        let requests = requests.lock().unwrap().clone();
         ScriptedRun {
+            requests,
             outcome,
             calls: calls.load(std::sync::atomic::Ordering::SeqCst),
             events,
@@ -4484,6 +4402,115 @@ mod tests {
         assert_eq!(prompts, 1, "summary prompt must appear exactly once");
     }
 
+    /// A completed Responses item replaces its streaming placeholder, while
+    /// distinct reasoning, calls and text remain in wire order through the real
+    /// query loop, the next request, and save/load before replay.
+    #[tokio::test]
+    async fn responses_reasoning_replays_in_order_after_query_and_persistence() {
+        use claurst_api::StreamEvent;
+        use claurst_core::types::ResponsesReasoningProvider;
+        let reasoning = |id: &str, summary: &str, data: &str| ContentBlock::ResponsesReasoning {
+            provider: ResponsesReasoningProvider::Codex,
+            item_id: Some(id.into()),
+            summary: summary.into(),
+            encrypted_content: Some(data.into()),
+        };
+        let events = vec![
+            Ok(StreamEvent::MessageStart {
+                id: "msg_reasoning".into(),
+                model: "mock-model".into(),
+                usage: UsageInfo::default(),
+            }),
+            Ok(StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: ContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: String::new(),
+                },
+            }),
+            Ok(StreamEvent::ThinkingDelta {
+                index: 0,
+                thinking: "first".into(),
+            }),
+            Ok(StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: reasoning("rs_0", "first", "ENC-0"),
+            }),
+            Ok(StreamEvent::ContentBlockStart {
+                index: 1,
+                content_block: ContentBlock::ToolUse {
+                    id: "call-1".into(),
+                    name: "noop_tool".into(),
+                    input: serde_json::json!({}),
+                    thought_signature: None,
+                },
+            }),
+            Ok(StreamEvent::InputJsonDelta {
+                index: 1,
+                partial_json: "{}".into(),
+            }),
+            Ok(StreamEvent::ContentBlockStart {
+                index: 2,
+                content_block: reasoning("rs_2", "second", "ENC-2"),
+            }),
+            Ok(StreamEvent::TextDelta {
+                index: 3,
+                text: "checking".into(),
+            }),
+            Ok(StreamEvent::MessageDelta {
+                stop_reason: Some(claurst_api::StopReason::ToolUse),
+                usage: None,
+            }),
+            Ok(StreamEvent::MessageStop),
+        ];
+        let run = drive_scripted(vec![ScriptStep::Stream(events)], 0, noop_tools()).await;
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(run.requests.len(), 2);
+        let saved: Vec<Message> =
+            serde_json::from_str(&serde_json::to_string(&run.messages).unwrap()).unwrap();
+        let blocks = saved[1].content_blocks();
+        assert_eq!(blocks.len(), 4);
+        assert!(
+            matches!(&blocks[0], ContentBlock::ResponsesReasoning { item_id: Some(id), summary, encrypted_content: Some(data), .. } if id == "rs_0" && summary == "first" && data == "ENC-0")
+        );
+        assert!(matches!(&blocks[1], ContentBlock::ToolUse { id, .. } if id == "call-1"));
+        assert!(
+            matches!(&blocks[2], ContentBlock::ResponsesReasoning { item_id: Some(id), .. } if id == "rs_2")
+        );
+        assert!(matches!(&blocks[3], ContentBlock::Text { text } if text == "checking"));
+        assert_eq!(
+            serde_json::to_value(&run.requests[1].messages[1]).unwrap(),
+            serde_json::to_value(&saved[1]).unwrap()
+        );
+        let mut replay = run.requests[1].clone();
+        replay.messages = saved;
+        replay.system_prompt = None;
+        let input = claurst_api::providers::CopilotProvider::to_responses_input_pub(&replay);
+        let types: Vec<_> = input
+            .iter()
+            .map(|item| item["type"].as_str().or(item["role"].as_str()).unwrap())
+            .collect();
+        assert_eq!(
+            &types[..5],
+            &[
+                "user",
+                "reasoning",
+                "function_call",
+                "reasoning",
+                "assistant"
+            ]
+        );
+        assert_eq!(input[1]["id"], "rs_0");
+        assert_eq!(input[1]["encrypted_content"], "ENC-0");
+        assert_eq!(input[3]["id"], "rs_2");
+        assert_eq!(input[3]["encrypted_content"], "ENC-2");
+        let native = claurst_api::normalize_anthropic_messages(&replay.messages);
+        let native_blocks = native[1].content_blocks();
+        assert_eq!(native_blocks.len(), 2);
+        assert!(matches!(&native_blocks[0], ContentBlock::ToolUse { .. }));
+        assert!(matches!(&native_blocks[1], ContentBlock::Text { .. }));
+    }
+
     // ---- schema-rejection recovery (claurst-schema-dialect) ----------------
 
     /// Serializes tests that mutate process env. The schema-recovery test
@@ -4541,6 +4568,7 @@ mod tests {
             id: claurst_core::provider_id::ProviderId::new("azure"),
             steps: StdMutex::new(steps.into()),
             calls: calls.clone(),
+            requests: Arc::new(StdMutex::new(Vec::new())),
         });
         let mut registry = claurst_api::ProviderRegistry::new();
         registry.register(provider);
@@ -4592,6 +4620,7 @@ mod tests {
             outcome,
             calls: calls.load(std::sync::atomic::Ordering::SeqCst),
             events,
+            requests: Vec::new(),
             messages,
         }
     }

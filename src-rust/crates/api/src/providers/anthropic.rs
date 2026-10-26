@@ -307,6 +307,7 @@ impl LlmProvider for AnthropicProvider {
             stop_reason,
             usage,
             model,
+            rate_limits: None,
         })
     }
 

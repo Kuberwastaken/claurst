@@ -260,6 +260,7 @@ impl CohereProvider {
             stop_reason,
             usage,
             model: request.model.clone(),
+            rate_limits: None,
         })
     }
 

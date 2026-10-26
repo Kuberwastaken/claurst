@@ -512,6 +512,7 @@ impl OpenAiProvider {
             stop_reason,
             usage,
             model,
+            rate_limits: None,
         })
     }
 

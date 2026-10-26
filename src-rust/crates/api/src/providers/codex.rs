@@ -11,11 +11,13 @@
 //   token endpoint with `grant_type=refresh_token` before making the request,
 //   matching the official client's 5-minute proactive refresh window.
 //
-// Model list: static — the Codex endpoint does not expose a /models route,
-//   so we use the `CODEX_MODELS` constant from `claurst-core`.
+// Model list: the live ChatGPT catalog (`GET  .../codex/models?client_version=X`,
+// pinned to `CODEX_CATALOG_CLIENT_VERSION`), filtered to the entries the
+// official picker lists, falling back to the `CODEX_MODELS` constant from
+// `claurst-core` when the fetch fails.
 
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_stream::stream;
@@ -36,8 +38,8 @@ use crate::error_handling::parse_error_response;
 use crate::provider::{LlmProvider, ModelInfo};
 use crate::provider_error::ProviderError;
 use crate::provider_types::{
-    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, StopReason,
-    StreamEvent, SystemPromptStyle,
+    ProviderCapabilities, ProviderRequest, ProviderResponse, ProviderStatus, RateLimitUsage,
+    StopReason, StreamEvent, SystemPromptStyle,
 };
 
 // Re-use Copilot's message translation helpers via the public Copilot type.
@@ -130,6 +132,181 @@ fn custom_tool_name(name: &str) -> String {
 /// client's `CHATGPT_ACCESS_TOKEN_REFRESH_WINDOW_MINUTES` = 5).
 const REFRESH_WINDOW_SECS: u64 = 5 * 60;
 
+/// Client version the live model-catalog query advertises.
+///
+/// The ChatGPT backend (`codex-api/src/endpoint/models.rs`) returns only the
+/// models whose `minimal_client_version` is at or below this value, so the
+/// pinned constant must be the highest codex release whose request shape
+/// claurst fully implements (`0.124.0`, the last one before
+/// `use_responses_lite` entries started being listed). Never send claurst's
+/// own version — `0.1.8` hides every entry — and never a current codex
+/// version, which lists lite models whose request body claurst does not
+/// build. Bump this when claurst implements the lite request shape.
+pub const CODEX_CATALOG_CLIENT_VERSION: &str = "0.124.0";
+
+// ---------------------------------------------------------------------------
+// Live model catalog (codex-rs models-manager)
+// ---------------------------------------------------------------------------
+
+/// One entry of the Codex `/models` catalog response.
+///
+/// Field set intentionally minimal: only what claurst's registry and gating
+/// need, with `serde` defaults so new server fields never break parsing
+/// (mirrors codex-rs `openai_models::Model`).
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+pub struct CodexCatalogModel {
+    /// Model slug, e.g. `gpt-5.5`.
+    #[serde(default)]
+    pub slug: String,
+    /// Display name, e.g. `GPT-5.5 (default)`; falls back to the slug.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Total context window in tokens.
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    /// Catalog ordering priority (higher = preferred default in the
+    /// official client's picker).
+    #[serde(default)]
+    pub priority: Option<u64>,
+    /// Whether the model is callable over the Responses API.
+    #[serde(default)]
+    pub supported_in_api: bool,
+    /// Picker visibility (`"list"` = shown in the official picker).
+    #[serde(default)]
+    pub visibility: Option<String>,
+    /// Whether the model only accepts the "lite" Responses request shape,
+    /// which claurst does not emit yet (see
+    /// [`CODEX_CATALOG_CLIENT_VERSION`]).
+    #[serde(default)]
+    pub use_responses_lite: bool,
+    /// Reasoning efforts the model accepts, ascending (official
+    /// `supported_reasoning_levels`); empty for non-reasoning models.
+    #[serde(default)]
+    pub supported_reasoning_levels: Vec<CodexReasoningLevel>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+pub struct CodexReasoningLevel {
+    #[serde(default)]
+    pub effort: String,
+}
+
+impl CodexCatalogModel {
+    /// Entries the official picker lists: callable, listed, and not
+    /// restricted to the lite request shape.
+    pub fn is_listed(&self) -> bool {
+        self.supported_in_api
+            && self.visibility.as_deref() == Some("list")
+            && !self.use_responses_lite
+    }
+}
+
+/// Parse a canned/live `/models` response, keeping only the entries the
+/// official picker would list ([`CodexCatalogModel::is_listed`]).
+pub fn parse_codex_catalog(json_val: &Value) -> Vec<CodexCatalogModel> {
+    let Some(models) = json_val.get("models").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    models
+        .iter()
+        .filter_map(|model| serde_json::from_value::<CodexCatalogModel>(model.clone()).ok())
+        .filter(CodexCatalogModel::is_listed)
+        .collect()
+}
+
+/// The last successfully fetched live catalog, shared process-wide so a
+/// mid-conversation model switch (or the `include` gating below) consults the
+/// same registry snapshot under `codex`. Hydrated by
+/// [`CodexProvider::fetch_catalog`]; until then the static `CODEX_MODELS`
+/// fallback stands in.
+static LIVE_CATALOG: RwLock<Option<Box<[CodexCatalogModel]>>> = RwLock::new(None);
+
+/// Process-wide one-shot for the lazy catalog hydration: a failed attempt is
+/// cached too, so requests never stall behind a repeatedly failing endpoint
+/// and no request path retries it.
+static CATALOG_HYDRATION: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+/// Publish a parsed catalog to the process-wide registry.
+fn set_live_catalog(models: Vec<CodexCatalogModel>) {
+    let mut guard = LIVE_CATALOG.write().unwrap_or_else(PoisonError::into_inner);
+    *guard = Some(models.into_boxed_slice());
+}
+
+/// Look `model` up in the live catalog (accepting a `provider/` prefix the
+/// way `uses_freeform_apply_patch` does). `None` while no live catalog has
+/// been fetched — callers fall back to the model-id heuristics.
+pub fn codex_catalog_lookup(model: &str) -> Option<CodexCatalogModel> {
+    let slug = model.rsplit('/').next().unwrap_or(model);
+    let guard = LIVE_CATALOG.read().unwrap_or_else(PoisonError::into_inner);
+    guard
+        .as_deref()
+        .and_then(|catalog| catalog.iter().find(|m| m.slug == slug))
+        .cloned()
+}
+
+/// Base URL for the catalog endpoint, derived from the Responses URL so the
+/// two can never drift (`https://chatgpt.com/backend-api/codex/models`).
+fn codex_models_url(endpoint: &str) -> String {
+    let base = endpoint.trim_end_matches("responses").trim_end_matches('/');
+    format!("{base}/models?client_version={CODEX_CATALOG_CLIENT_VERSION}")
+}
+
+/// One fetch attempt of the live catalog. Failure is swallowed by the caller;
+/// the static builtin list remains the fallback.
+async fn fetch_catalog_raw(
+    provider_id: &ProviderId,
+    http_client: &reqwest::Client,
+    endpoint: &str,
+    token: &str,
+    account_id: Option<&str>,
+) -> Result<Vec<CodexCatalogModel>, ProviderError> {
+    let builder = http_client
+        .get(codex_models_url(endpoint))
+        .header("Accept", "application/json");
+    let builder = CodexProvider::codex_headers(builder, token, account_id, &json!({}));
+    let resp = builder.send().await.map_err(|e| ProviderError::Other {
+        provider: provider_id.clone(),
+        message: format!("Codex model catalog request failed: {}", e),
+        status: None,
+        body: None,
+    })?;
+
+    let status = resp.status().as_u16();
+    let text = resp.text().await.map_err(|e| ProviderError::Other {
+        provider: provider_id.clone(),
+        message: format!("Failed to read Codex model catalog response: {}", e),
+        status: Some(status),
+        body: None,
+    })?;
+
+    if !(200..300).contains(&(status as usize)) {
+        return Err(ProviderError::Other {
+            provider: provider_id.clone(),
+            message: format!("Codex model catalog request failed (HTTP {})", status),
+            status: Some(status),
+            body: Some(text),
+        });
+    }
+
+    let json_val: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Other {
+        provider: provider_id.clone(),
+        message: format!("Failed to parse Codex model catalog JSON: {}", e),
+        status: Some(status),
+        body: Some(text.clone()),
+    })?;
+
+    let models = parse_codex_catalog(&json_val);
+    if models.is_empty() {
+        return Err(ProviderError::Other {
+            provider: provider_id.clone(),
+            message: "Codex model catalog listed no usable models".to_string(),
+            status: Some(status),
+            body: Some(text),
+        });
+    }
+    Ok(models)
+}
+
 /// Process-wide refresh guard (the official client's `AuthManager.refresh_lock`).
 /// Refresh tokens are single-use and the query path builds a fresh
 /// `CodexProvider` per request, so the lock cannot live on the instance.
@@ -167,6 +344,8 @@ fn unix_now() -> u64 {
 pub struct CodexProvider {
     id: ProviderId,
     http_client: reqwest::Client,
+    api_endpoint: String,
+    token_endpoint: String,
     /// Mutable token cache: updated in-place when a refresh succeeds.
     tokens: Arc<Mutex<CodexTokens>>,
 }
@@ -186,6 +365,8 @@ impl CodexProvider {
         Self {
             id: ProviderId::new(ProviderId::CODEX),
             http_client,
+            api_endpoint: CODEX_API_ENDPOINT.to_owned(),
+            token_endpoint: CODEX_TOKEN_URL.to_owned(),
             tokens: Arc::new(Mutex::new(tokens)),
         }
     }
@@ -271,7 +452,7 @@ impl CodexProvider {
 
         let resp = self
             .http_client
-            .post(CODEX_TOKEN_URL)
+            .post(&self.token_endpoint)
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
@@ -380,7 +561,6 @@ impl CodexProvider {
     /// `session-id` header: ChatGPT derives prompt-cache affinity from it, and
     /// the official client sets it to the same value as `prompt_cache_key`.
     fn codex_headers(
-        &self,
         builder: reqwest::RequestBuilder,
         token: &str,
         account_id: Option<&str>,
@@ -401,7 +581,7 @@ impl CodexProvider {
 
     /// Parse the `x-codex-{primary,secondary}-used-percent` headers (official
     /// `codex-api/src/rate_limits.rs`). `None` when neither is present.
-    fn parse_rate_limits(headers: &reqwest::header::HeaderMap) -> Option<StreamEvent> {
+    fn parse_rate_limits(headers: &reqwest::header::HeaderMap) -> Option<RateLimitUsage> {
         let used = |name: &str| {
             headers
                 .get(name)
@@ -414,7 +594,7 @@ impl CodexProvider {
         if primary_used_percent.is_none() && secondary_used_percent.is_none() {
             return None;
         }
-        Some(StreamEvent::RateLimits {
+        Some(RateLimitUsage {
             primary_used_percent,
             secondary_used_percent,
         })
@@ -422,6 +602,48 @@ impl CodexProvider {
 
     fn account_id(&self) -> Option<String> {
         self.tokens.lock().unwrap_or_else(PoisonError::into_inner).account_id.clone()
+    }
+
+    /// Fetch the live model catalog with fresh credentials (used by
+    /// `discover_models`, which must not hit a stale one-shot guard).
+    async fn fetch_catalog(&self) -> Result<Vec<CodexCatalogModel>, ProviderError> {
+        let token = self.access_token().await?;
+        let account_id = self.account_id();
+        let models = fetch_catalog_raw(
+            &self.id,
+            &self.http_client,
+            &self.api_endpoint,
+            &token,
+            account_id.as_deref(),
+        )
+        .await?;
+        set_live_catalog(models.clone());
+        Ok(models)
+    }
+
+    /// Hydrate the shared catalog once per process, before the request body is
+    /// built, so the `include: reasoning.encrypted_content` gate and any later
+    /// model switch consult real capabilities instead of a model-id heuristic.
+    /// Best-effort: failures leave the static fallback in place.
+    async fn ensure_catalog(&self, token: &str, account_id: Option<&str>) {
+        let _ = CATALOG_HYDRATION
+            .get_or_try_init(|| async {
+                if let Ok(models) = fetch_catalog_raw(
+                    &self.id,
+                    &self.http_client,
+                    &self.api_endpoint,
+                    token,
+                    account_id,
+                )
+                .await
+                {
+                    set_live_catalog(models);
+                }
+                // Failure is cached too: one attempt per process, never a
+                // retry storm against the catalog endpoint.
+                Ok::<(), ProviderError>(())
+            })
+            .await;
     }
 
     /// Build the Responses-API request body for Codex.
@@ -494,6 +716,25 @@ impl CodexProvider {
         // at the server default. Mirrors opencode's gpt-5 reasoning defaults.
         CopilotProvider::apply_responses_provider_options_pub(&mut body, &request.provider_options);
 
+        // The query layer's `include` option rides a gpt-5*/o* model-id
+        // heuristic, which fires for every gpt-5 slug — including ones the
+        // live catalog knows have no reasoning levels. A model that produces
+        // no encrypted reasoning state must not request it (the endpoint
+        // rejects the include). Catalog-unknown models keep the heuristic
+        // fallback since nothing else discriminates.
+        if codex_catalog_lookup(&request.model)
+            .is_some_and(|entry| entry.supported_reasoning_levels.is_empty())
+        {
+            if let Some(object) = body.as_object_mut() {
+                if let Some(Value::Array(items)) = object.get_mut("include") {
+                    items.retain(|item| item.as_str() != Some("reasoning.encrypted_content"));
+                    if items.is_empty() {
+                        object.remove("include");
+                    }
+                }
+            }
+        }
+
         body
     }
 
@@ -523,92 +764,185 @@ impl CodexProvider {
         &self,
         request: &ProviderRequest,
     ) -> Result<ProviderResponse, ProviderError> {
-        let token = self.access_token().await?;
-        let account_id = self.account_id();
+        let mut token = self.access_token().await?;
+        let mut account_id = self.account_id();
+
+        // Best-effort one-shot: real capabilities (item 5's include gate) need
+        // the live catalog before the body is built.
+        self.ensure_catalog(&token, account_id.as_deref()).await;
 
         let body = Self::build_responses_body(request);
 
-        let builder = self
-            .http_client
-            .post(CODEX_API_ENDPOINT)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json");
-        let builder = self.codex_headers(builder, &token, account_id.as_deref(), &body);
+        let mut retried_auth = false;
+        loop {
+            let builder = self
+                .http_client
+                .post(&self.api_endpoint)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json");
+            let builder = Self::codex_headers(builder, &token, account_id.as_deref(), &body);
 
-        let resp = builder
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("HTTP request failed: {}", e),
-                status: None,
-                body: None,
-            })?;
+            let resp = builder
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| ProviderError::Other {
+                    provider: self.id.clone(),
+                    message: format!("HTTP request failed: {}", e),
+                    status: None,
+                    body: None,
+                })?;
 
-        let status = resp.status().as_u16();
-        let text = resp.text().await.map_err(|e| ProviderError::Other {
-            provider: self.id.clone(),
-            message: format!("Failed to read response body: {}", e),
-            status: Some(status),
-            body: None,
-        })?;
+            let status = resp.status().as_u16();
+            // A 401 means the bearer token was rejected even though the
+            // 5-minute proactive refresh window said it was fine (server-side
+            // revocation, expired JWT, adoption race). Refresh once and retry,
+            // like the official client does before surfacing the error.
+            if status == 401 && !retried_auth {
+                retried_auth = true;
+                if let Ok(refreshed) = self.refresh_after_auth_failure(&token).await {
+                    debug!("Codex request hit a 401 — token refreshed, retrying once");
+                    token = refreshed;
+                    account_id = self.account_id();
+                    continue;
+                }
+            }
 
-        if !(200..300).contains(&(status as usize)) {
-            return Err(parse_error_response(status, &text, &self.id));
-        }
+            // The non-streaming path must parse the x-codex-* usage headers
+            // too — the streaming path gets them via `sse_events`.
+            let rate_limits = Self::parse_rate_limits(resp.headers());
 
-        let json_val: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Other {
-            provider: self.id.clone(),
-            message: format!("Failed to parse response JSON: {}", e),
-            status: Some(status),
-            body: Some(text.clone()),
-        })?;
-
-        Self::parse_responses_response(&self.id, &json_val)
-    }
-
-    async fn send_responses_streaming_request(
-        &self,
-        request: &ProviderRequest,
-    ) -> Result<reqwest::Response, ProviderError> {
-        let token = self.access_token().await?;
-        let account_id = self.account_id();
-
-        let mut body = Self::build_responses_body(request);
-        body["stream"] = json!(true);
-
-        let builder = self
-            .http_client
-            .post(CODEX_API_ENDPOINT)
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream");
-        let builder = self.codex_headers(builder, &token, account_id.as_deref(), &body);
-
-        let resp = builder
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Other {
-                provider: self.id.clone(),
-                message: format!("HTTP request failed: {}", e),
-                status: None,
-                body: None,
-            })?;
-
-        let status = resp.status().as_u16();
-        if !(200..300).contains(&(status as usize)) {
-            let retry_after = crate::retry::retry_after(resp.headers());
             let text = resp.text().await.map_err(|e| ProviderError::Other {
                 provider: self.id.clone(),
                 message: format!("Failed to read response body: {}", e),
                 status: Some(status),
                 body: None,
             })?;
-            return Err(parse_error_response(status, &text, &self.id).with_retry_after(retry_after));
+
+            if !(200..300).contains(&(status as usize)) {
+                return Err(parse_error_response(status, &text, &self.id));
+            }
+
+            let json_val: Value = serde_json::from_str(&text).map_err(|e| ProviderError::Other {
+                provider: self.id.clone(),
+                message: format!("Failed to parse response JSON: {}", e),
+                status: Some(status),
+                body: Some(text.clone()),
+            })?;
+
+            let mut response = Self::parse_responses_response(&self.id, &json_val)?;
+            response.rate_limits = rate_limits;
+            return Ok(response);
+        }
+    }
+
+    async fn send_responses_streaming_request(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let mut token = self.access_token().await?;
+        let mut account_id = self.account_id();
+
+        // Same one-shot as the non-streaming path, before body building.
+        self.ensure_catalog(&token, account_id.as_deref()).await;
+
+        let mut body = Self::build_responses_body(request);
+        body["stream"] = json!(true);
+
+        let mut retried_auth = false;
+        loop {
+            let builder = self
+                .http_client
+                .post(&self.api_endpoint)
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream");
+            let builder = Self::codex_headers(builder, &token, account_id.as_deref(), &body);
+
+            let resp = builder
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| ProviderError::Other {
+                    provider: self.id.clone(),
+                    message: format!("HTTP request failed: {}", e),
+                    status: None,
+                    body: None,
+                })?;
+
+            let status = resp.status().as_u16();
+            if !(200..300).contains(&(status as usize)) {
+                // Same refresh-once-and-retry contract as the non-streaming
+                // request (only a pre-stream rejection can be replayed; a
+                // mid-stream failure is terminal).
+                if status == 401 && !retried_auth {
+                    retried_auth = true;
+                    if let Ok(refreshed) = self.refresh_after_auth_failure(&token).await {
+                        debug!("Codex stream hit a 401 — token refreshed, retrying once");
+                        token = refreshed;
+                        account_id = self.account_id();
+                        continue;
+                    }
+                }
+                let retry_after = crate::retry::retry_after(resp.headers());
+                let text = resp.text().await.map_err(|e| ProviderError::Other {
+                    provider: self.id.clone(),
+                    message: format!("Failed to read response body: {}", e),
+                    status: Some(status),
+                    body: None,
+                })?;
+                return Err(
+                    parse_error_response(status, &text, &self.id).with_retry_after(retry_after)
+                );
+            }
+
+            return Ok(resp);
+        }
+    }
+
+    /// Recover from a 401 by obtaining a usable token (official client's
+    /// `reload-or-refresh` before surfacing the error):
+    ///
+    ///   1. adopt fresher tokens saved to disk by another provider instance —
+    ///      the single-use refresh token may already have been spent there;
+    ///   2. else force a refresh, bypassing the 5-minute proactive window that
+    ///      produced the stale-bearer 401.
+    ///
+    /// Returns `Err` (propagating the refresh failure's own taxonomy) when no
+    /// usable token can be produced; the caller then surfaces the original
+    /// 401.
+    async fn refresh_after_auth_failure(&self, stale_token: &str) -> Result<String, ProviderError> {
+        // Refresh tokens are single-use: serialize against other instances.
+        let _refresh_guard = REFRESH_LOCK.lock().await;
+        if let Some(stored) = get_codex_tokens() {
+            if stored.access_token != stale_token
+                && !stored.access_token.is_empty()
+                && !Self::is_expired(&stored, unix_now())
+            {
+                let fresh = stored.access_token.clone();
+                let mut guard = self.tokens.lock().unwrap_or_else(PoisonError::into_inner);
+                *guard = stored;
+                if guard.account_id.is_none() {
+                    guard.account_id = jwt_identity(&guard.access_token).account_id;
+                }
+                return Ok(fresh);
+            }
         }
 
-        Ok(resp)
+        let refresh = self
+            .tokens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .refresh_token
+            .clone();
+        let Some(refresh) = refresh else {
+            return Err(ProviderError::AuthFailed {
+                provider: self.id.clone(),
+                message: "Codex access token was rejected and no refresh token is available — \
+                          run /connect to sign in again"
+                    .to_string(),
+            });
+        };
+        self.refresh_token(&refresh).await
     }
 
     // -----------------------------------------------------------------------
@@ -666,28 +1000,10 @@ impl CodexProvider {
                     }
                 }
                 Some("reasoning") => {
-                    if let Some(summaries) = item.get("summary").and_then(|v| v.as_array()) {
-                        let reasoning: String = summaries
-                            .iter()
-                            .filter_map(|s| s.get("text").and_then(|t| t.as_str()))
-                            .collect::<Vec<_>>()
-                            .join("");
-                        if !reasoning.is_empty() {
-                            content.push(ContentBlock::Thinking {
-                                thinking: reasoning,
-                                signature: String::new(),
-                            });
-                        }
-                    }
-                    if let Some(data) = item
-                        .get("encrypted_content")
-                        .and_then(|v| v.as_str())
-                        .filter(|data| !data.is_empty())
-                    {
-                        content.push(ContentBlock::RedactedThinking {
-                            data: data.to_string(),
-                        });
-                    }
+                    content.push(crate::provider_types::responses_reasoning_block(
+                        item,
+                        claurst_core::types::ResponsesReasoningProvider::Codex,
+                    ))
                 }
                 Some("function_call") => {
                     has_tool_call = true;
@@ -764,6 +1080,7 @@ impl CodexProvider {
             stop_reason,
             usage,
             model,
+            rate_limits: None,
         })
     }
 
@@ -793,6 +1110,14 @@ impl CodexProvider {
             let mut open_blocks: std::collections::HashSet<usize> = std::collections::HashSet::new();
             // Freeform tool input streamed so far, by output index.
             let mut custom_inputs: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+            // Reasoning items whose summary deltas were streamed into an open
+            // block, by output index. Each output_index is one reasoning item,
+            // so its Thinking block must be started and stopped as a unit and
+            // the item's encrypted state attached to that same index when the
+            // item completes — keeping the (summary, encrypted_content) pair
+            // and the ordering relative to function calls.
+            let mut reasoning_items: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            let mut reasoning_summaries: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
@@ -1040,6 +1365,16 @@ impl CodexProvider {
                                         .get("output_index")
                                         .and_then(|value| value.as_u64())
                                         .unwrap_or(0) as usize;
+                                    if reasoning_items.insert(output_index) {
+                                        yield Ok(StreamEvent::ContentBlockStart {
+                                            index: output_index,
+                                            content_block: claurst_core::types::ContentBlock::Thinking {
+                                                thinking: String::new(),
+                                                signature: String::new(),
+                                            },
+                                        });
+                                    }
+                                    reasoning_summaries.entry(output_index).or_default().push_str("\n\n");
                                     yield Ok(StreamEvent::ThinkingDelta {
                                         index: output_index,
                                         thinking: "\n\n".to_string(),
@@ -1063,7 +1398,19 @@ impl CodexProvider {
                                     });
                                     message_started = true;
                                 }
+                                // Each reasoning item's summary streams into
+                                // its own block: open it on the first delta.
+                                if reasoning_items.insert(output_index) {
+                                    yield Ok(StreamEvent::ContentBlockStart {
+                                        index: output_index,
+                                        content_block: claurst_core::types::ContentBlock::Thinking {
+                                            thinking: String::new(),
+                                            signature: String::new(),
+                                        },
+                                    });
+                                }
                                 if !delta.is_empty() {
+                                    reasoning_summaries.entry(output_index).or_default().push_str(delta);
                                     yield Ok(StreamEvent::ThinkingDelta {
                                         index: output_index,
                                         thinking: delta.to_string(),
@@ -1089,22 +1436,26 @@ impl CodexProvider {
                                 if open_blocks.remove(&output_index) {
                                     yield Ok(StreamEvent::ContentBlockStop { index: output_index });
                                 }
-                                // Carry the reasoning item's encrypted state so
-                                // the next (stateless, store:false) request can
-                                // replay it and the model keeps its chain.
-                                if let Some(data) = json_val
-                                    .get("item")
-                                    .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("reasoning"))
-                                    .and_then(|item| item.get("encrypted_content"))
-                                    .and_then(|value| value.as_str())
-                                    .filter(|data| !data.is_empty())
+                                // A reasoning item's summary block closes first,
+                                // keeping the (summary, encrypted_content) pair
+                                // adjacent on the same output index.
+                                if json_val.pointer("/item/type").and_then(Value::as_str) == Some("reasoning")
+                                    && reasoning_items.remove(&output_index)
                                 {
-                                    yield Ok(StreamEvent::ContentBlockStart {
-                                        index: output_index,
-                                        content_block: claurst_core::types::ContentBlock::RedactedThinking {
-                                            data: data.to_string(),
-                                        },
-                                    });
+                                    yield Ok(StreamEvent::ContentBlockStop { index: output_index });
+                                }
+                                if let Some(item) = json_val.get("item")
+                                    .filter(|item| item["type"].as_str() == Some("reasoning"))
+                                {
+                                    let mut block = crate::provider_types::responses_reasoning_block(
+                                        item, claurst_core::types::ResponsesReasoningProvider::Codex,
+                                    );
+                                    if let claurst_core::types::ContentBlock::ResponsesReasoning { summary, .. } = &mut block {
+                                        if summary.is_empty() {
+                                            *summary = reasoning_summaries.remove(&output_index).unwrap_or_default();
+                                        }
+                                    }
+                                    yield Ok(StreamEvent::ContentBlockStart { index: output_index, content_block: block });
                                     yield Ok(StreamEvent::ContentBlockStop { index: output_index });
                                 }
                             }
@@ -1126,6 +1477,33 @@ impl CodexProvider {
                                         // No reassignment: this branch is the
                                         // stream-completion handler — execution
                                         // never re-enters the guard below.
+                                    }
+
+                                    if let Some(items) = response.get("output").and_then(Value::as_array) {
+                                        for (index, item) in items.iter().enumerate() {
+                                            if item["type"].as_str() == Some("reasoning") {
+                                                let mut block = crate::provider_types::responses_reasoning_block(
+                                                    item, claurst_core::types::ResponsesReasoningProvider::Codex,
+                                                );
+                                                if let claurst_core::types::ContentBlock::ResponsesReasoning { summary, .. } = &mut block {
+                                                    if summary.is_empty() {
+                                                        *summary = reasoning_summaries.get(&index).cloned().unwrap_or_default();
+                                                    }
+                                                }
+                                                yield Ok(StreamEvent::ContentBlockStart { index, content_block: block });
+                                            }
+                                        }
+                                    }
+
+                                    // Reasoning blocks whose item never saw
+                                    // `output_item.done` (defensive: a
+                                    // truncated done event) still need a
+                                    // closing stop event.
+                                    let mut reasoning_left: Vec<usize> =
+                                        reasoning_items.drain().collect();
+                                    reasoning_left.sort_unstable();
+                                    for index in reasoning_left {
+                                        yield Ok(StreamEvent::ContentBlockStop { index });
                                     }
 
                                     let mut remaining: Vec<usize> = open_blocks.drain().collect();
@@ -1237,7 +1615,7 @@ impl LlmProvider for CodexProvider {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>, ProviderError>
     {
         let resp = self.send_responses_streaming_request(&request).await?;
-        let rate_limits = Self::parse_rate_limits(resp.headers());
+        let rate_limits = Self::parse_rate_limits(resp.headers()).map(StreamEvent::from);
         Ok(Box::pin(Self::sse_events(
             resp.bytes_stream(),
             self.id.clone(),
@@ -1247,6 +1625,43 @@ impl LlmProvider for CodexProvider {
 
     async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         use claurst_core::codex_oauth::codex_limit_override;
+
+        // Live catalog first (issue #462 item 1): the ChatGPT backend filters
+        // by the pinned client version, and `context_window` /
+        // `supported_reasoning_levels` / `priority` come straight from the
+        // response. Fall back to the static builtin list when the fetch
+        // fails or yields nothing usable — the picker must never go empty.
+        let live = match self.fetch_catalog().await {
+            Ok(models) => Some(models),
+            Err(err) => {
+                debug!(error = %err, "Codex live model catalog unavailable — using the builtin list");
+                None
+            }
+        };
+
+        if let Some(models) = live {
+            return Ok(models
+                .iter()
+                .map(|entry| {
+                    let context_window = entry.context_window.map(|c| c as u32).unwrap_or(400_000);
+                    let max_output_tokens = codex_limit_override(&entry.slug)
+                        .map(|(_, _, out)| out)
+                        .unwrap_or(128_000);
+                    ModelInfo {
+                        id: ModelId::new(entry.slug.clone()),
+                        provider_id: self.id.clone(),
+                        name: entry
+                            .display_name
+                            .clone()
+                            .unwrap_or_else(|| entry.slug.clone()),
+                        context_window,
+                        max_output_tokens,
+                        ..Default::default()
+                    }
+                })
+                .collect());
+        }
+
         let models = CODEX_MODELS
             .iter()
             .map(|(id, name)| {
@@ -1303,6 +1718,93 @@ impl LlmProvider for CodexProvider {
 mod tests {
     use super::*;
     use base64::Engine as _;
+
+    fn sse_line(event: &str, payload: &Value) -> String {
+        format!("event: {event}\ndata: {payload}\n\n")
+    }
+
+    /// Two reasoning items interleaved with a function call must stream as
+    /// well-formed per-item blocks — (summary, encrypted_content) pair per
+    /// `output_index`, in wire order relative to the function call — instead
+    /// of one joined Thinking blob followed by detached redacted blocks.
+    #[tokio::test]
+    async fn sse_reasoning_items_stay_paired_per_output_index() {
+        use claurst_core::types::ContentBlock;
+
+        let events = [
+            sse_line("response.created", &json!({"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}})),
+            sse_line("response.reasoning_summary_text.delta", &json!({"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"first item"})),
+            sse_line("response.output_item.done", &json!({"type":"response.output_item.done","output_index":0,"item":{"id":"rs_0","type":"reasoning","encrypted_content":"ENC-1"}})),
+            sse_line("response.output_item.added", &json!({"type":"response.output_item.added","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Bash"}})),
+            sse_line("response.function_call_arguments.delta", &json!({"type":"response.function_call_arguments.delta","output_index":1,"delta":r#"{"command":"ls"}"#})),
+            sse_line("response.output_item.done", &json!({"type":"response.output_item.done","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Bash","arguments":r#"{"command":"ls"}"#}})),
+            sse_line("response.reasoning_summary_text.delta", &json!({"type":"response.reasoning_summary_text.delta","output_index":2,"delta":"second item"})),
+            sse_line("response.output_item.done", &json!({"type":"response.output_item.done","output_index":2,"item":{"id":"rs_2","type":"reasoning","encrypted_content":"ENC-2"}})),
+            sse_line("response.completed", &json!({"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.5","usage":{"input_tokens":10,"output_tokens":5}}})),
+        ]
+        .join("");
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> = vec![Ok(events.into_bytes())];
+        let events: Vec<StreamEvent> = CodexProvider::sse_events(
+            futures::stream::iter(chunks),
+            ProviderId::new(ProviderId::CODEX),
+            None,
+        )
+        .map(|event| event.expect("stream has no errors"))
+        .collect()
+        .await;
+
+        // The per-item pairing: for each reasoning item, Thinking start →
+        // ThinkingDelta → Thinking stop → encrypted RedactedThinking, all at
+        // the item's output index.
+        let position = |probe: &dyn Fn(&StreamEvent) -> bool| -> Option<usize> {
+            events.iter().position(probe)
+        };
+        for (index, delta_text, encrypted) in [
+            (0usize, "first item", "ENC-1"),
+            (2usize, "second item", "ENC-2"),
+        ] {
+            let probe = |event: &StreamEvent| matches!(event,
+                StreamEvent::ContentBlockStart { index: i, content_block: ContentBlock::Thinking { .. } } if *i == index);
+            let start = position(&probe).unwrap_or_else(|| panic!("item {index}: Thinking block must start"));
+            let delta = events[start..]
+                .iter()
+                .position(|event| matches!(event, StreamEvent::ThinkingDelta { index: i, thinking } if *i == index && thinking == delta_text))
+                .map(|p| start + p)
+                .expect("item deltas after the block start");
+            let stop = events[delta..]
+                .iter()
+                .position(|event| matches!(event, StreamEvent::ContentBlockStop { index: i } if *i == index))
+                .map(|p| delta + p)
+                .expect("item summary block must stop before the encrypted state");
+            let redacted_start = events[stop..]
+                .iter()
+                .position(|event| matches!(event,
+                    StreamEvent::ContentBlockStart { index: i, content_block: ContentBlock::ResponsesReasoning { encrypted_content: Some(data), .. } }
+                    if *i == index && data == encrypted))
+                .map(|p| stop + p)
+                .expect("item's encrypted state must pair with its summary");
+            assert!(matches!(
+                &events[redacted_start + 1],
+                StreamEvent::ContentBlockStop { index: i } if *i == index,
+            ));
+        }
+
+        // Wire order relative to the function call: item 0's encrypted state
+        // precedes the tool call; item 2's summary block opens after it.
+        let tool_start = events
+            .iter()
+            .position(|event| matches!(event,
+                StreamEvent::ContentBlockStart { index: 1, content_block: ContentBlock::ToolUse { .. } }))
+            .expect("function call block must start");
+        let enc1 = events.iter().position(|event| matches!(event,
+            StreamEvent::ContentBlockStart { content_block: ContentBlock::ResponsesReasoning { encrypted_content: Some(data), .. }, .. } if data == "ENC-1"))
+            .expect("item 0 encrypted state present");
+        assert!(enc1 < tool_start, "item 0's pair must complete before the tool call");
+        let thinking2 = events.iter().position(|event| matches!(event,
+            StreamEvent::ContentBlockStart { index: 2, content_block: ContentBlock::Thinking { .. } }))
+            .expect("item 2 Thinking start present");
+        assert!(thinking2 > tool_start, "item 2 must stream after the tool call");
+    }
 
     fn jwt(payload: Value) -> String {
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string());
@@ -1387,7 +1889,11 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 StreamEvent::ContentBlockStart {
-                    content_block: ContentBlock::RedactedThinking { data },
+                    content_block:
+                        ContentBlock::ResponsesReasoning {
+                            encrypted_content: Some(data),
+                            ..
+                        },
                     ..
                 } => Some(data.as_str()),
                 _ => None,
@@ -1429,12 +1935,11 @@ mod tests {
         req.messages = vec![
             Message::user("list files"),
             Message::assistant_blocks(vec![
-                ContentBlock::Thinking {
-                    thinking: "Listing files first.".into(),
-                    signature: String::new(),
-                },
-                ContentBlock::RedactedThinking {
-                    data: "ENC-1".into(),
+                ContentBlock::ResponsesReasoning {
+                    provider: claurst_core::types::ResponsesReasoningProvider::Codex,
+                    item_id: Some("rs_42".into()),
+                    summary: "Listing files first.".into(),
+                    encrypted_content: Some("ENC-1".into()),
                 },
                 ContentBlock::ToolUse {
                     id: "call_42".into(),
@@ -1464,12 +1969,156 @@ mod tests {
             .iter()
             .map(|item| item["type"].as_str().or(item["role"].as_str()).unwrap_or(""))
             .collect();
-        assert_eq!(
-            types,
-            ["user", "reasoning", "function_call", "function_call_output", "assistant"]
-        );
+        assert_eq!(types, ["user", "reasoning", "function_call", "function_call_output", "assistant"]);
         assert_eq!(input[1]["encrypted_content"], "ENC-1");
+        assert_eq!(input[1]["id"], "rs_42");
         assert_eq!(input[1]["summary"][0]["text"], "Listing files first.");
+    }
+
+    #[test]
+    fn codex_models_url_pins_the_catalog_client_version() {
+        let url = codex_models_url(CODEX_API_ENDPOINT);
+        assert_eq!(
+            url,
+            format!(
+                "https://chatgpt.com/backend-api/codex/models?client_version={CODEX_CATALOG_CLIENT_VERSION}"
+            )
+        );
+        assert_eq!(CODEX_CATALOG_CLIENT_VERSION, "0.124.0");
+    }
+
+    /// The live catalog (`GET .../codex/models?client_version=X`, canned
+    /// response): entries the official picker lists (supported_in_api,
+    /// visibility == "list", not `use_responses_lite`) survive, and the
+    /// registry-relevant fields (context window, reasoning levels, priority)
+    /// come straight from the response.
+    #[test]
+    fn catalog_filter_and_field_mapping_match_the_canned_response() {
+        use claurst_core::codex_oauth::codex_limit_override;
+
+        let json_val: Value =
+            serde_json::from_str(include_str!("fixtures/codex_catalog.json")).unwrap();
+        let models = parse_codex_catalog(&json_val);
+
+        let slugs: Vec<&str> = models.iter().map(|m| m.slug.as_str()).collect();
+        assert_eq!(
+            slugs,
+            ["gpt-5.5", "gpt-5.3-codex-spark"],
+            "lite / non-listed / non-API models must be filtered out"
+        );
+
+        let gpt55 = &models[0];
+        assert_eq!(gpt55.display_name.as_deref(), Some("GPT-5.5 (default)"));
+        // Context window and the gpt-5.5 output override come from the
+        // catalog / limit table, not the (missing) models.dev row.
+        assert_eq!(gpt55.context_window, Some(400_000));
+        assert_eq!(
+            codex_limit_override("gpt-5.5").map(|(_, _, out)| out),
+            Some(128_000)
+        );
+        assert_eq!(gpt55.priority, Some(3));
+        let efforts: Vec<&str> =
+            gpt55.supported_reasoning_levels.iter().map(|l| l.effort.as_str()).collect();
+        assert_eq!(efforts, ["minimal", "low", "medium", "high", "xhigh"]);
+    }
+
+    /// Serializes tests that swap the process-wide `LIVE_CATALOG` registry:
+    /// the registry is shared state and the suite may run multi-threaded.
+    static CATALOG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Snapshot/restore helper for `CATALOG_TEST_LOCK` holders: swaps the
+    /// process-wide catalog for `models`, restoring the previous contents
+    /// when the returned guard is dropped.
+    fn with_live_catalog(models: Vec<CodexCatalogModel>) -> impl Drop {
+        struct Restore(Option<Vec<CodexCatalogModel>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let restore = self.0.take();
+                set_live_catalog(restore.unwrap_or_default());
+            }
+        }
+        let saved = LIVE_CATALOG
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_deref()
+            .map(|catalog| catalog.to_vec());
+        set_live_catalog(models);
+        Restore(saved)
+    }
+
+    #[test]
+    fn catalog_lookup_accepts_prefixed_ids_and_misses_unknown_models() {
+        let _guard = CATALOG_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _catalog = with_live_catalog(parse_codex_catalog(
+            &serde_json::from_str(include_str!("fixtures/codex_catalog.json")).unwrap(),
+        ));
+        assert!(codex_catalog_lookup("gpt-5.5").is_some());
+        assert!(codex_catalog_lookup("codex/gpt-5.5").is_some());
+        assert!(codex_catalog_lookup("gpt-6-lens").is_none());
+    }
+
+    /// The `include: reasoning.encrypted_content` option the query layer adds
+    /// on a gpt-5* id-heuristic must not reach the wire for models the live
+    /// catalog lists with no reasoning levels; models the catalog does not
+    /// list keep the heuristic fallback.
+    #[test]
+    fn include_gate_reads_catalog_reasoning_levels() {
+        let _guard = CATALOG_TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+
+        let options = |model: &str| -> ProviderRequest {
+            let mut req = request(None);
+            req.model = model.to_string();
+            req.provider_options = json!({
+                "reasoningEffort": "medium",
+                "reasoningSummary": "auto",
+                "include": ["reasoning.encrypted_content"],
+            });
+            req
+        };
+
+        let _catalog = with_live_catalog(vec![
+            CodexCatalogModel {
+                slug: "gpt-5-no-effort".to_string(),
+                visibility: Some("list".to_string()),
+                supported_in_api: true,
+                ..CodexCatalogModel::default()
+            }, // The reasoning-bearing listed entry keeps its include gate.
+            CodexCatalogModel {
+                slug: "gpt-5-with-effort".to_string(),
+                visibility: Some("list".to_string()),
+                supported_in_api: true,
+                supported_reasoning_levels: vec![CodexReasoningLevel {
+                    effort: "high".to_string(),
+                }],
+                ..CodexCatalogModel::default()
+            },
+        ]);
+
+        let body = CodexProvider::build_responses_body(&options("gpt-5-no-effort"));
+        assert_eq!(body["model"], "gpt-5-no-effort");
+        assert!(body.get("include").is_none(), "non-reasoning model must not request encrypted reasoning: {body}");
+        // Reasoning options themselves are untouched.
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert_eq!(body["reasoning"]["effort"], "medium");
+
+        let body = CodexProvider::build_responses_body(&options("gpt-5-with-effort"));
+        assert_eq!(
+            body["include"],
+            json!(["reasoning.encrypted_content"]),
+            "reasoning-capable catalog entries keep the include"
+        );
+
+        // Not in the catalog: heuristic fallback keeps the include.
+        let body = CodexProvider::build_responses_body(&options("gpt-99-unknown"));
+        assert_eq!(
+            body["include"],
+            json!(["reasoning.encrypted_content"]),
+            "catalog-unknown models fall back to the id heuristic"
+        );
+
+        // A `provider/`-prefixed id resolves through the catalog too.
+        let body = CodexProvider::build_responses_body(&options("openai/gpt-5-no-effort"));
+        assert!(body.get("include").is_none());
     }
 
     fn tool(name: &str) -> claurst_core::types::ToolDefinition {
@@ -1612,16 +2261,18 @@ mod tests {
         headers.insert("x-codex-primary-used-percent", HeaderValue::from_static("12.5"));
         headers.insert("x-codex-primary-window-minutes", HeaderValue::from_static("300"));
         headers.insert("x-codex-secondary-used-percent", HeaderValue::from_static("71"));
-        match CodexProvider::parse_rate_limits(&headers) {
-            Some(StreamEvent::RateLimits {
+        let usage = CodexProvider::parse_rate_limits(&headers).expect("both headers present");
+        assert_eq!(usage.primary_used_percent, Some(12.5));
+        assert_eq!(usage.secondary_used_percent, Some(71.0));
+        // The usage converts to the stream event the streaming path emits.
+        assert!(matches!(
+            StreamEvent::from(usage.clone()),
+            StreamEvent::RateLimits {
                 primary_used_percent,
                 secondary_used_percent,
-            }) => {
-                assert_eq!(primary_used_percent, Some(12.5));
-                assert_eq!(secondary_used_percent, Some(71.0));
             }
-            other => panic!("unexpected {other:?}"),
-        }
+            if primary_used_percent == Some(12.5) && secondary_used_percent == Some(71.0)
+        ));
 
         let mut partial = HeaderMap::new();
         partial.insert("x-codex-secondary-used-percent", HeaderValue::from_static("garbage"));
@@ -1640,11 +2291,130 @@ mod tests {
         assert_eq!(provider.account_id().as_deref(), Some("ws_123"));
     }
 
+    static AUTH_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct TestHome {
+        previous: Option<std::ffi::OsString>,
+        directory: std::path::PathBuf,
+    }
+
+    impl TestHome {
+        fn new() -> Self {
+            let directory =
+                std::env::temp_dir().join(format!("claurst-codex-auth-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let previous = std::env::var_os("CLAURST_HOME");
+            std::env::set_var("CLAURST_HOME", &directory);
+            Self {
+                previous,
+                directory,
+            }
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+            match self.previous.take() {
+                Some(previous) => std::env::set_var("CLAURST_HOME", previous),
+                None => std::env::remove_var("CLAURST_HOME"),
+            }
+        }
+    }
+
+    /// Both HTTP paths must retry a rejected bearer exactly once using the
+    /// refreshed token/account, and preserve response usage headers. All URLs
+    /// point at loopback, including catalog hydration and token exchange.
+    #[test]
+    fn auth_401_retries_with_refreshed_token_and_account_on_both_paths() {
+        let _catalog_lock = CATALOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let _catalog = with_live_catalog(Vec::new());
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _serial = AUTH_HOME_LOCK.lock().await;
+        for (streaming, reject_again) in [(false, false), (true, false), (false, true), (true, true)] {
+            let _home = TestHome::new();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let id_token = jwt(json!({"https://api.openai.com/auth":{"chatgpt_account_id":"new-account"}}));
+            let server = tokio::spawn(async move {
+                let mut response_headers = Vec::new();
+                let mut refreshes = 0;
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0; 4096];
+                    let headers = loop {
+                        let n = socket.read(&mut buffer).await.unwrap();
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&buffer[..n]);
+                        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&bytes[..end]).into_owned();
+                            let length: usize = headers.lines().find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
+                            }).unwrap_or(0);
+                            if bytes.len() >= end + 4 + length { break headers; }
+                        }
+                    };
+                    let path = headers.lines().next().unwrap().split_whitespace().nth(1).unwrap();
+                    let mut done = false;
+                    let (status, body) = if path.starts_with("/models?") {
+                        (200, json!({"models":[{"slug":"test-model","visibility":"list","supported_in_api":true}]}))
+                    } else if path == "/token" {
+                        refreshes += 1;
+                        (200, json!({"access_token":"fresh-token","refresh_token":"fresh-refresh","expires_in":3600,"id_token":id_token}))
+                    } else {
+                        assert_eq!(path, "/responses");
+                        let lower = headers.to_ascii_lowercase();
+                        response_headers.push(lower.clone());
+                        if lower.contains("authorization: bearer stale-token") {
+                            (401, json!({"error":{"message":"expired token"}}))
+                        } else {
+                            assert!(lower.contains("authorization: bearer fresh-token"));
+                            assert!(lower.contains("chatgpt-account-id: new-account"));
+                            done = true;
+                            (if reject_again { 401 } else { 200 }, json!({"id":"resp_test","model":"test-model","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{}}))
+                        }
+                    };
+                    let body = body.to_string();
+                    socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nx-codex-primary-used-percent: 12.5\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                    if done { return (response_headers, refreshes); }
+                }
+            });
+            let mut provider = CodexProvider::new(CodexTokens {
+                access_token: "stale-token".into(),
+                refresh_token: Some("stale-refresh".into()),
+                account_id: Some("old-account".into()),
+                ..Default::default()
+            });
+            provider.api_endpoint = format!("http://{address}/responses");
+            provider.token_endpoint = format!("http://{address}/token");
+            if streaming {
+                let response = provider.send_responses_streaming_request(&request(None)).await;
+                if reject_again { assert!(response.is_err()); } else {
+                    assert_eq!(CodexProvider::parse_rate_limits(response.unwrap().headers()).unwrap().primary_used_percent, Some(12.5));
+                }
+            } else {
+                let response = provider.send_responses_request(&request(None)).await;
+                if reject_again { assert!(response.is_err()); } else {
+                    assert_eq!(response.unwrap().rate_limits.unwrap().primary_used_percent, Some(12.5));
+                }
+            }
+            let (requests, refreshes) = server.await.unwrap();
+            assert_eq!(requests.len(), 2, "401 must cause one replay only");
+            assert_eq!(refreshes, 1);
+            assert!(requests[0].contains("chatgpt-account-id: old-account"));
+        }
+        });
+    }
+
     #[tokio::test]
     async fn access_token_adopts_fresh_tokens_refreshed_by_another_instance() {
-        let home = std::env::temp_dir().join(format!("claurst-codex-{}", uuid::Uuid::new_v4()));
-        let prev_home = std::env::var_os("CLAURST_HOME");
-        std::env::set_var("CLAURST_HOME", &home);
+        let _serial = AUTH_HOME_LOCK.lock().await;
+        let _home = TestHome::new();
 
         let stale = CodexProvider::new(CodexTokens {
             access_token: jwt(json!({ "exp": 1 })),
@@ -1663,12 +2433,6 @@ mod tests {
         // No network: the expired in-memory token must be replaced by the
         // one on disk without POSTing the spent refresh token.
         let token = stale.access_token().await;
-
-        match prev_home {
-            Some(v) => std::env::set_var("CLAURST_HOME", v),
-            None => std::env::remove_var("CLAURST_HOME"),
-        }
-        let _ = std::fs::remove_dir_all(&home);
 
         saved.unwrap();
         assert_eq!(token.unwrap(), fresh_access);

@@ -96,6 +96,7 @@ pub use providers::AnthropicProvider;
 pub use providers::GoogleProvider;
 pub use providers::MinimaxProvider;
 pub use providers::OpenAiProvider;
+pub use providers::message_normalization::normalize_anthropic_messages;
 
 // Phase 3 re-exports: model registry.
 pub use effort_support::{

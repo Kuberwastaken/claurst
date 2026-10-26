@@ -187,8 +187,10 @@ impl GoogleProvider {
                 Some(part)
             }
 
-            // Thinking blocks are not supported by Gemini, drop silently.
-            ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => None,
+            // Thinking blocks are not supported by Gemini — drop silently.
+            ContentBlock::Thinking { .. }
+            | ContentBlock::RedactedThinking { .. }
+            | ContentBlock::ResponsesReasoning { .. } => None,
 
             // Document blocks: treat as file data when URL is available,
             // otherwise as inline base64.
@@ -580,6 +582,7 @@ impl GoogleProvider {
             stop_reason,
             usage,
             model: model.to_string(),
+            rate_limits: None,
         })
     }
 
