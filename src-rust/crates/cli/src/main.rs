@@ -2172,10 +2172,12 @@ async fn run_interactive(
                 }),
                 None => claurst_core::SkillRegistry::default(),
             };
+            // Publish listings before notifying the UI: command receipt also
+            // reads the watch value to populate the skill count.
+            let _ = skill_listings_tx.send(Some(registry.listings()));
             let _ = skill_cmds_tx
                 .send(claurst_commands::skill_command_entries(&registry))
                 .await;
-            let _ = skill_listings_tx.send(Some(registry.listings()));
         });
     }
     // Populate the MCP server indicator cheaply from the already-started
