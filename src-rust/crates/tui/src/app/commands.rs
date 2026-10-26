@@ -190,6 +190,42 @@ impl App {
         self.intercept_slash_command(cmd)
     }
 
+    /// Execute a `!` bang command in a spawned subprocess with a timeout
+    /// and output cap. The command uses the Bash tool's shell runtime (bash on
+    /// Unix, cmd on Windows) and the result is pushed into the transcript
+    /// as a system message when the spawned task completes. Only one bang
+    /// command may run at a time.
+    pub fn execute_bang_command(&mut self, command: String) {
+        if !self.config.bang_commands.enabled {
+            self.status_message = Some("Bang commands are disabled.".to_string());
+            return;
+        }
+        // Block in plan mode.
+        if self.plan_mode || self.config.permission_mode == claurst_core::PermissionMode::Plan {
+            self.push_notification(
+                crate::notifications::NotificationKind::Warning,
+                "Bang commands disabled in plan mode.".to_string(),
+                None,
+            );
+            return;
+        }
+
+        if self.bang_command_pending.is_some() {
+            self.status_message = Some("A bang command is already running.".to_string());
+            return;
+        }
+
+        let working_dir = self.project_root();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        self.bang_command_pending = Some(rx);
+
+        tokio::spawn(async move {
+            let output = run_shell_command(&command, &working_dir).await;
+            let _ = tx.send((command, output)).await;
+        });
+    }
+
     pub fn intercept_slash_command(&mut self, cmd: &str) -> bool {
         self.close_secondary_views();
         self.dismiss_error_notifications();
@@ -483,4 +519,126 @@ impl App {
         }
     }
 
+}
+
+
+/// Use the common shell runtime so pipe lifetime, timeouts and descendant
+/// cleanup stay consistent with Bash. Output keeps bounded head/tail windows
+/// and a complete spill path rather than closing a chatty child's pipes.
+async fn run_shell_command(command: &str, working_dir: &std::path::Path) -> String {
+    claurst_tools::pty_bash::run_user_shell(
+        command,
+        working_dir,
+        std::time::Duration::from_secs(60),
+        &claurst_core::paths::tool_output_dir(),
+    ).await.content
+}
+
+#[cfg(test)]
+mod bang_tests {
+    use super::*;
+    use crate::App;
+
+    fn test_app() -> App {
+        // Same construction path as make_app in tests.rs, kept local so this
+        // module stays independent of the shared fixture.
+        let config = claurst_core::Config::default();
+        let cost_tracker = claurst_core::cost::CostTracker::new();
+        App::new(config, cost_tracker)
+    }
+
+    #[tokio::test]
+    async fn bang_output_combines_stdout_and_stderr() {
+        let dir = std::env::temp_dir();
+        let out = run_shell_command("echo out; echo err 1>&2", &dir).await;
+        assert!(out.contains("out"));
+        assert!(out.contains("err"));
+    }
+
+    #[tokio::test]
+    async fn bang_output_reports_nonzero_exit_code() {
+        let dir = std::env::temp_dir();
+        let out = run_shell_command("exit 3", &dir).await;
+        assert!(out.contains("code 3"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn bang_missing_working_dir_is_reported() {
+        // A directory as the working dir fails spawn on all platforms.
+        let dir = std::env::temp_dir().join("claurst-bang-no-such-dir");
+        let out = run_shell_command("echo hi", &dir).await;
+        assert!(
+            out.contains("Failed to spawn") || out.contains("No such file or directory"),
+            "missing working directory must be reported, got: {out}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bang_descendant_pipe_does_not_hold_the_prompt() {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_shell_command("sleep 3 & echo prompt-returned", &std::env::temp_dir()),
+        ).await.expect("an inherited descendant pipe must not hang bang completion");
+        assert!(result.contains("prompt-returned"), "{result}");
+    }
+
+    #[test]
+    fn bang_command_requires_global_opt_in_even_for_direct_dispatch() {
+        let mut app = test_app();
+        app.execute_bang_command("echo disabled".into());
+        assert!(app.bang_command_pending.is_none());
+    }
+
+    #[tokio::test]
+    async fn second_bang_command_is_rejected_while_one_runs() {
+        let mut app = test_app();
+        app.config.bang_commands.enabled = true;
+        app.execute_bang_command("sleep 1".to_string());
+        assert!(app.bang_command_pending.is_some());
+
+        app.execute_bang_command("echo second".to_string());
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("A bang command is already running.")
+        );
+
+        // Drain both so the spawned task and channel shut down cleanly.
+        for _ in 0..200 {
+            app.poll_session_loads();
+            if app.bang_command_pending.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(app.bang_command_pending.is_none());
+    }
+
+    #[tokio::test]
+    async fn bang_command_result_lands_in_transcript() {
+        let mut app = test_app();
+        app.config.bang_commands.enabled = true;
+        app.execute_bang_command("echo bang-ok".to_string());
+
+        for _ in 0..200 {
+            app.poll_session_loads();
+            if app.system_annotations.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(app.system_annotations.len(), 1);
+        assert!(app.system_annotations[0].text.contains("bang-ok"));
+    }
+
+    #[tokio::test]
+    async fn bang_command_blocked_in_plan_mode() {
+        let mut app = test_app();
+        app.config.bang_commands.enabled = true;
+        app.config.permission_mode = claurst_core::PermissionMode::Plan;
+        app.execute_bang_command("echo no".to_string());
+        assert!(app.bang_command_pending.is_none());
+        assert!(!app.notifications.is_empty());
+    }
 }

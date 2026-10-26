@@ -2663,25 +2663,12 @@ impl App {
         }
     }
 
-    /// Returns `true` when the app is in a state where the prompt can accept
-    /// regular text input — used to gate paste-burst detection.
-    pub(super) fn prompt_is_accepting_text(&self) -> bool {
-        !self.is_streaming
-            && self.permission_request.is_none()
-            && !self.ask_user_dialog.visible
-            && !self.history_search_overlay.visible
-            && self.history_search.is_none()
-            && !self.settings_screen.visible
-            && !self.theme_screen.visible
-            && self.prompt_input.vim_mode == crate::prompt_input::VimMode::Insert
-    }
-
     /// Gate for paste-burst detection in the live CLI event loop: keystrokes
     /// are currently flowing into the prompt (no modal is capturing input and
-    /// vim is in insert mode). Unlike `prompt_is_accepting_text`, streaming
-    /// does NOT disable it — the prompt stays editable during a turn for
-    /// queued composition, and a raw-key paste flood must be captured there
-    /// too instead of submitting on every pasted newline.
+    /// vim is in insert mode). Streaming does NOT disable it — the prompt
+    /// stays editable during a turn for queued composition, and a raw-key
+    /// paste flood must be captured there too instead of submitting on every
+    /// pasted newline.
     pub fn paste_burst_allowed(&self) -> bool {
         !self.any_modal_open()
             && self.prompt_input.vim_mode == crate::prompt_input::VimMode::Insert
