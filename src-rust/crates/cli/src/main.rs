@@ -15,6 +15,7 @@
 mod oauth_flow;
 mod codex_oauth_flow;
 mod headless;
+mod prompt_dispatch;
 mod upgrade;
 
 // ---------------------------------------------------------------------------
@@ -2717,6 +2718,9 @@ async fn run_interactive(
                         // model, so they wait for the turn to end (issue #149).
                         // Both show in the queued-prompt dock until delivered.
                         let input = app.take_input();
+                        if prompt_dispatch::try_bang(&mut app, &input) {
+                            continue;
+                        }
                         if input.starts_with('/') {
                             app.queued_messages.push_back(input);
                         } else if !input.is_empty() {
@@ -2750,6 +2754,9 @@ async fn run_interactive(
 
                         let input = app.take_input();
                         if input.is_empty() {
+                            continue;
+                        }
+                        if prompt_dispatch::try_bang(&mut app, &input) {
                             continue;
                         }
 
