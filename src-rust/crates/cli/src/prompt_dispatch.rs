@@ -31,7 +31,7 @@ mod tests {
     #[tokio::test]
     async fn live_prompt_route_executes_bang_without_a_provider() {
         let mut app = app(true);
-        assert!(try_bang(&mut app, "!printf reviewer-smoke"));
+        assert!(try_bang(&mut app, "!echo reviewer-smoke"));
         assert!(app.bang_command_pending.is_some());
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {
