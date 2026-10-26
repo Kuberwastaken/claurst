@@ -15,8 +15,8 @@
 mod codex_oauth_flow;
 mod headless;
 mod oauth_flow;
-mod session_resume;
 mod prompt_dispatch;
+mod session_resume;
 mod upgrade;
 
 // ---------------------------------------------------------------------------
