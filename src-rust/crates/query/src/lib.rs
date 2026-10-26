@@ -33,7 +33,7 @@ pub use command_queue::{CommandPriority, CommandQueue, QueuedCommand, drain_comm
 pub use continuation::{
     ContinuationDecision, ContinuationMode, ContinuationPolicy, StopPolicy, TurnEndContext,
 };
-pub use cron_scheduler::start_cron_scheduler;
+pub use cron_scheduler::{start_cron_scheduler, ToolListProvider};
 pub use goal_loop::{
     GoalContinuation, StopReason, check_and_continue_goal, decide_goal_continuation,
     mark_goal_complete,
@@ -254,6 +254,52 @@ fn persist_step(config: &QueryConfig, messages: &[Message]) {
         if let Err(e) = journal.sync_messages(messages) {
             warn!(error = %e, "Session journal write failed");
         }
+    }
+}
+
+/// Answer vetoed tool calls before returning so the journal and UI retain a
+/// complete tool-use/result sequence without executing any tools or tool hooks.
+fn reject_model_turn_tools(
+    assistant: &Message,
+    reason: &str,
+    messages: &mut Vec<Message>,
+    config: &QueryConfig,
+    event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
+) {
+    let mut results = Vec::new();
+    for block in assistant.get_tool_use_blocks() {
+        if let ContentBlock::ToolUse {
+            id, name, input, ..
+        } = block
+        {
+            let error = format!("Blocked by PostModelTurn hook: {reason}");
+            if let Some(tx) = event_tx {
+                let _ = tx.send(QueryEvent::ToolStart {
+                    tool_name: name.clone(),
+                    tool_id: id.clone(),
+                    input_json: input.to_string(),
+                });
+                let _ = tx.send(QueryEvent::ToolEnd {
+                    tool_name: name.clone(),
+                    tool_id: id.clone(),
+                    result: error.clone(),
+                    is_error: true,
+                });
+            }
+            results.push(ContentBlock::ToolResult {
+                tool_use_id: id.clone(),
+                content: ToolResultContent::Text(error),
+                is_error: Some(true),
+            });
+        }
+    }
+    if !results.is_empty() {
+        let message = Message::user_blocks(results);
+        if let Some(tx) = event_tx {
+            let _ = tx.send(QueryEvent::MessageCommitted(message.clone()));
+        }
+        messages.push(message);
+        persist_step(config, messages);
     }
 }
 
@@ -1220,7 +1266,10 @@ pub async fn run_query_loop(
                     let mut text_chunks: Vec<String> = Vec::new();
                     // Accumulate reasoning/thinking content for providers like
                     // DeepSeek that require reasoning_content to be sent back.
-                    let mut thinking_chunks: Vec<String> = Vec::new();
+                    // Keep each thinking block paired with its signature for
+                    // replay on the next MiniMax/Anthropic-compatible turn.
+                    let mut thinking_blocks: std::collections::BTreeMap<usize, (String, String)> =
+                        std::collections::BTreeMap::new();
                     // Opaque reasoning state (Codex `encrypted_content`)
                     // that must be replayed on the next request.
                     let mut redacted_thinking_blocks: Vec<ContentBlock> = Vec::new();
@@ -1300,11 +1349,20 @@ pub async fn run_query_loop(
                                             claurst_api::StreamEvent::TextDelta { text, .. } => {
                                                 text_chunks.push(text.clone());
                                             }
-                                            claurst_api::StreamEvent::ThinkingDelta { thinking, .. } => {
-                                                thinking_chunks.push(thinking.clone());
+                                            claurst_api::StreamEvent::ContentBlockStart {
+                                                index,
+                                                content_block: ContentBlock::Thinking { thinking, signature },
+                                            } => {
+                                                thinking_blocks.insert(*index, (thinking.clone(), signature.clone()));
                                             }
-                                            claurst_api::StreamEvent::ReasoningDelta { reasoning, .. } => {
-                                                thinking_chunks.push(reasoning.clone());
+                                            claurst_api::StreamEvent::ThinkingDelta { index, thinking } => {
+                                                thinking_blocks.entry(*index).or_default().0.push_str(thinking);
+                                            }
+                                            claurst_api::StreamEvent::ReasoningDelta { index, reasoning } => {
+                                                thinking_blocks.entry(*index).or_default().0.push_str(reasoning);
+                                            }
+                                            claurst_api::StreamEvent::SignatureDelta { index, signature } => {
+                                                thinking_blocks.entry(*index).or_default().1.push_str(signature);
                                             }
                                             claurst_api::StreamEvent::InputJsonDelta { index, partial_json } => {
                                                 if let Some((_, _, buf, _)) = tool_call_blocks.get_mut(index) {
@@ -1430,12 +1488,12 @@ pub async fn run_query_loop(
 
                     // Thinking / reasoning block — must come first so that
                     // inject_reasoning_for_tool_turns can find it later.
-                    let combined_thinking = thinking_chunks.join("");
-                    if !combined_thinking.is_empty() {
-                        content_blocks.push(ContentBlock::Thinking {
-                            thinking: combined_thinking.clone(),
-                            signature: String::new(),
-                        });
+                    let combined_thinking: String = thinking_blocks.values()
+                        .map(|(thinking, _)| thinking.as_str()).collect();
+                    for (thinking, signature) in thinking_blocks.into_values() {
+                        if !thinking.is_empty() || !signature.is_empty() {
+                            content_blocks.push(ContentBlock::Thinking { thinking, signature });
+                        }
                     }
                     content_blocks.append(&mut redacted_thinking_blocks);
 
@@ -1509,7 +1567,17 @@ pub async fn run_query_loop(
                                 model_turn_hooks.reason_or_default()
                             )));
                         }
-                        return QueryOutcome::EndTurn { message: assistant_msg, usage };
+                        reject_model_turn_tools(
+                            &assistant_msg,
+                            model_turn_hooks.reason_or_default(),
+                            messages,
+                            config,
+                            event_tx.as_ref(),
+                        );
+                        return QueryOutcome::EndTurn {
+                            message: assistant_msg,
+                            usage,
+                        };
                     }
 
                     // Handle tool-use turn: execute tools and loop.
@@ -1920,7 +1988,17 @@ pub async fn run_query_loop(
                     model_turn_hooks.reason_or_default()
                 )));
             }
-            return QueryOutcome::EndTurn { message: assistant_msg, usage };
+            reject_model_turn_tools(
+                &assistant_msg,
+                model_turn_hooks.reason_or_default(),
+                messages,
+                config,
+                event_tx.as_ref(),
+            );
+            return QueryOutcome::EndTurn {
+                message: assistant_msg,
+                usage,
+            };
         }
 
         if let Some(ref tx) = event_tx {
@@ -3214,6 +3292,9 @@ mod tests {
             }
         }
     }
+
+    #[path = "minimax_tests.rs"]
+    mod minimax_tests;
 
     fn noop_tools() -> Vec<Box<dyn Tool>> {
         vec![Box::new(MockTool {
@@ -5008,6 +5089,9 @@ mod hook_loop_tests {
         history: String,
         tool_inputs: Vec<Value>,
         requests: usize,
+        messages: Vec<Message>,
+        persisted: Vec<Message>,
+        events: Vec<QueryEvent>,
     }
 
     async fn drive(hooks: HookMap, steps: Vec<Step>, permission: PermissionDecision, is_subagent: bool) -> Run {
@@ -5021,6 +5105,18 @@ mod hook_loop_tests {
         is_subagent: bool,
         nested: Option<&'static str>,
     ) -> Run {
+        drive_with_client(hooks, steps, permission, is_subagent, nested, None).await
+    }
+
+    async fn drive_with_client(
+        hooks: HookMap,
+        steps: Vec<Step>,
+        permission: PermissionDecision,
+        is_subagent: bool,
+        nested: Option<&'static str>,
+        raw_client: Option<claurst_api::AnthropicClient>,
+    ) -> Run {
+        let raw_anthropic = raw_client.is_some();
         let requests = Arc::new(StdMutex::new(0));
         let provider = Arc::new(ScriptedProvider {
             id: claurst_core::provider_id::ProviderId::new("mockprov"),
@@ -5030,13 +5126,19 @@ mod hook_loop_tests {
         let mut registry = claurst_api::ProviderRegistry::new();
         registry.register(provider);
 
-        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
-            api_key: "test-key".to_string(),
-            ..Default::default()
-        })
-        .expect("build test client");
+        let client = raw_client.unwrap_or_else(|| {
+            claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+                api_key: "test-key".to_string(),
+                ..Default::default()
+            })
+            .expect("build test client")
+        });
 
-        let config = Config { provider: Some("mockprov".to_string()), hooks, ..Default::default() };
+        let config = Config {
+            provider: (!raw_anthropic).then(|| "mockprov".to_string()),
+            hooks,
+            ..Default::default()
+        };
         let ctx = ToolContext {
             working_dir: std::env::temp_dir(),
             permission_mode: claurst_core::config::PermissionMode::Default,
@@ -5057,10 +5159,16 @@ mod hook_loop_tests {
             batch_rejection: Default::default(),
         };
 
+        let dir = tempfile::tempdir().unwrap();
+        let session = claurst_core::history::ConversationSession::new("mock-model".to_string());
         let query_config = QueryConfig {
             model: "mock-model".to_string(),
             max_turns: 6,
-            provider_registry: Some(Arc::new(registry)),
+            provider_registry: (!raw_anthropic).then(|| Arc::new(registry)),
+            session_journal: Some(claurst_core::session_journal::SessionJournal::new(
+                dir.path(),
+                &session,
+            )),
             is_subagent,
             ..Default::default()
         };
@@ -5068,6 +5176,7 @@ mod hook_loop_tests {
         let inputs = Arc::new(StdMutex::new(Vec::new()));
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(RecTool { inputs: inputs.clone(), nested })];
         let mut messages = vec![Message::user("start")];
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             run_query_loop(
@@ -5077,7 +5186,7 @@ mod hook_loop_tests {
                 &ctx,
                 &query_config,
                 claurst_core::cost::CostTracker::new(),
-                None,
+                Some(tx),
                 tokio_util::sync::CancellationToken::new(),
                 None,
             ),
@@ -5087,7 +5196,23 @@ mod hook_loop_tests {
 
         let tool_inputs = inputs.lock().unwrap().clone();
         let requests = *requests.lock().unwrap();
-        Run { outcome, history: serde_json::to_string(&messages).unwrap(), tool_inputs, requests }
+        let persisted = claurst_core::session_journal::load(dir.path(), &session.id)
+            .unwrap()
+            .session
+            .messages;
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        Run {
+            outcome,
+            history: serde_json::to_string(&messages).unwrap(),
+            tool_inputs,
+            requests,
+            messages,
+            persisted,
+            events,
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5259,5 +5384,130 @@ mod hook_loop_tests {
         assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
         assert!(run.tool_inputs.is_empty());
         assert_eq!(run.requests, 1);
+        assert_vetoed_tools_answered(&run, 1);
+    }
+
+    fn assert_vetoed_tools_answered(run: &Run, count: usize) {
+        let tool_ids: Vec<_> = run
+            .messages
+            .iter()
+            .flat_map(Message::get_tool_use_blocks)
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_ids.len(), count);
+        let results = run.messages.last().unwrap().get_tool_result_blocks();
+        assert_eq!(results.len(), count);
+        for (block, id) in results.iter().zip(tool_ids) {
+            assert!(matches!(block,
+                ContentBlock::ToolResult { tool_use_id, content: ToolResultContent::Text(text), is_error: Some(true) }
+                    if tool_use_id == id && text.contains("Blocked by PostModelTurn hook: budget")));
+        }
+        assert_eq!(
+            serde_json::to_value(&run.messages).unwrap(),
+            serde_json::to_value(&run.persisted).unwrap()
+        );
+        let committed: Vec<_> = run
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                QueryEvent::MessageCommitted(message) => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            committed.len(),
+            2,
+            "assistant and rejected results must both reach the UI"
+        );
+        assert_eq!(committed[1].get_tool_result_blocks().len(), count);
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(|event| matches!(event,
+            QueryEvent::ToolEnd { is_error: true, result, .. } if result.contains("budget")))
+                .count(),
+            count
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn post_model_turn_deny_answers_raw_anthropic_tool_calls() {
+        use serde_json::json;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let n = socket.read(&mut buffer).await.unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buffer[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let mut events = vec![
+                json!({"type":"message_start","message":{"id":"msg_veto","type":"message","role":"assistant","model":"mock-model","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}),
+            ];
+            for index in 0..2 {
+                events.push(json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":format!("tool_{index}"),"name":"rec_tool","input":{}}}));
+                events.push(json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":"{}"}}));
+                events.push(json!({"type":"content_block_stop","index":index}));
+            }
+            events.push(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}));
+            events.push(json!({"type":"message_stop"}));
+            let body: String = events
+                .iter()
+                .map(|event| {
+                    format!(
+                        "event: {}\ndata: {event}\n\n",
+                        event["type"].as_str().unwrap()
+                    )
+                })
+                .collect();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+            api_key: "test-key".into(),
+            api_base: format!("http://{address}"),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut hooks = HookMap::new();
+        on(
+            &mut hooks,
+            HookEvent::PostModelTurn,
+            None,
+            "echo 'budget' >&2; exit 2".into(),
+        );
+        let run = drive_with_client(
+            hooks,
+            Vec::new(),
+            PermissionDecision::Allow,
+            false,
+            None,
+            Some(client),
+        )
+        .await;
+        server.await.unwrap();
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert!(run.tool_inputs.is_empty());
+        assert_vetoed_tools_answered(&run, 2);
     }
 }

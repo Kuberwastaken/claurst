@@ -941,6 +941,10 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     apply_selection_highlight(frame, app);
     cache_selectable_row_text(frame, app);
     render_context_menu(frame, app);
+
+    // Apply the active theme palette last, over everything rendered above,
+    // so overlays and widgets are remapped consistently in a single pass.
+    crate::theme::apply_theme_pass(frame.buffer_mut());
 }
 
 /// Snapshot the rendered text of every row inside the selectable area into
@@ -3026,6 +3030,25 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 format!("Tokens: {}/{} ({}%)", used, max, pct),
                 Style::default().fg(color),
             ));
+        }
+
+        // Skills + MCP count indicator: render only the non-zero halves so a
+        // user with skills but no MCP servers doesn't see "0 mcp".
+        if app.skill_count > 0 || app.mcp_server_count > 0 {
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+            let mut label = String::new();
+            if app.skill_count > 0 {
+                label.push_str(&format!("{} skill{}", app.skill_count, if app.skill_count == 1 { "" } else { "s" }));
+            }
+            if app.mcp_server_count > 0 {
+                if !label.is_empty() {
+                    label.push_str(" \u{00b7} ");
+                }
+                label.push_str(&format!("{} mcp", app.mcp_server_count));
+            }
+            parts.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
         }
 
         // 4. Rate limits

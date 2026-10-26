@@ -92,10 +92,18 @@ impl SlashCommand for ConfigCommand {
         match key {
             "theme" => {
                 let Some(theme) = parse_theme(value) else {
-                    return CommandResult::Error(
-                        "Theme must be one of: default, dark, light".to_string(),
-                    );
+                    return CommandResult::Error("Theme name cannot be empty".to_string());
                 };
+                // Validate the theme loads before persisting, same as /theme.
+                let name = theme.name().to_string();
+                let themes_dir = claurst_tui::themes_dir();
+                if let Err(err) = claurst_tui::theme::load_theme(&name, Some(&themes_dir)) {
+                    let available = claurst_tui::theme::available_theme_names(Some(&themes_dir)).join(", ");
+                    return CommandResult::Error(format!(
+                        "Unknown theme '{}': {}. Available themes: {}",
+                        name, err, available
+                    ));
+                }
                 let mut new_config = ctx.config.clone();
                 new_config.theme = theme.clone();
                 if let Err(err) =
@@ -105,7 +113,7 @@ impl SlashCommand for ConfigCommand {
                 }
                 CommandResult::ConfigChangeMessage(
                     new_config,
-                    format!("Theme set to {}.", value.trim().to_lowercase()),
+                    format!("Theme set to {}.", value.trim()),
                 )
             }
             "output-style" | "output_style" => {
