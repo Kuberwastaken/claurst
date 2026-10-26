@@ -892,13 +892,29 @@ pub async fn run_query_loop(
             }
         }
 
+        // Durable steering (soft interrupts): for the interactive session's
+        // queue — journaled (#449) and not a sub-agent — push, remove and
+        // drain mirror into the soft-interrupt store, and interrupts a
+        // previous run persisted are restored here, before the first drain.
+        // Sub-agents and headless runs persist nothing.
+        if let Some(queue) = config.command_queue.as_ref() {
+            if config.session_journal.is_some() && !config.is_subagent {
+                if let Err(error) = queue.enable_persistence(&tool_ctx.session_id) {
+                    return QueryOutcome::Error(error);
+                }
+            }
+        }
+
         // Step boundary (#444): deliver queued input — steers typed while the
         // turn ran and background-task completion notices — before the next
         // model request. They are appended after the last tool results, in
         // queue order, and reported so the UI can show them where they landed.
         if let Some(ref cq) = config.command_queue {
             if !cq.is_empty() {
-                let injected = drain_command_queue(cq);
+                let injected = match command_queue::deliver_command_queue(cq, messages, config.session_journal.as_deref()) {
+                    Ok(injected) => injected,
+                    Err(error) => return QueryOutcome::Error(error),
+                };
                 if !injected.is_empty() {
                     debug!(count = injected.len(), "Injecting command-queue messages");
                     if let Some(ref tx) = event_tx {
@@ -906,7 +922,6 @@ pub async fn run_query_loop(
                             injected.iter().map(Message::get_all_text).collect(),
                         ));
                     }
-                    messages.extend(injected);
                 }
             }
         }
@@ -3420,6 +3435,47 @@ mod tests {
 
     #[path = "minimax_tests.rs"]
     mod minimax_tests;
+
+    #[tokio::test]
+    async fn durable_queue_is_journaled_and_acknowledged_before_model_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = CommandQueue::new();
+        queue.enable_persistence_in(dir.path(), "durable-loop").unwrap();
+        queue.push(QueuedCommand::InjectUserMessage("durable steer".into()), CommandPriority::High);
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let mut registry = claurst_api::ProviderRegistry::new();
+        registry.register(Arc::new(RecordingProvider {
+            id: claurst_core::provider_id::ProviderId::new("mockprov"),
+            tools_empty_per_request: requests.clone(),
+            systems_per_request: Arc::new(StdMutex::new(Vec::new())),
+            always_end_turn: true,
+        }));
+        let mut session = claurst_core::history::ConversationSession::new("mock-model".into());
+        session.id = "durable-loop".into();
+        let journal_dir = dir.path().join("sessions");
+        let journal = claurst_core::session_journal::SessionJournal::new(&journal_dir, &session);
+        let mut config = make_config(None, None);
+        config.model = "mock-model".into();
+        config.provider_registry = Some(Arc::new(registry));
+        config.command_queue = Some(queue.clone());
+        config.session_journal = Some(journal);
+        let mut context = deny_all_context();
+        context.session_id = session.id.clone();
+        context.config.provider = Some("mockprov".into());
+        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+            api_key: "unused-fixture-key".into(), ..Default::default()
+        }).unwrap();
+        let mut messages = vec![Message::user("start")];
+        let outcome = run_query_loop(&client, &mut messages, &[], &context, &config,
+            claurst_core::cost::CostTracker::new(), None, tokio_util::sync::CancellationToken::new(), None).await;
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(queue.is_empty());
+        assert!(claurst_core::soft_interrupt_store::load_in(dir.path(), "durable-loop").unwrap().is_empty());
+        let loaded = claurst_core::session_journal::load(&journal_dir, &session.id).unwrap().session;
+        assert_eq!(loaded.messages.iter().filter(|message| message.get_all_text() == "durable steer").count(), 1);
+        assert!(loaded.messages.iter().find(|message| message.get_all_text() == "durable steer").unwrap().uuid.is_some());
+    }
 
     fn noop_tools() -> Vec<Box<dyn Tool>> {
         vec![Box::new(MockTool {

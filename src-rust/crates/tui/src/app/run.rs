@@ -609,6 +609,7 @@ impl App {
                         self.handle_paste_data(data);
                         self.refresh_prompt_input();
                     }
+                    Event::Resize(width, _) => self.handle_terminal_resize(width),
                     Event::Mouse(mouse_event) => {
                         self.handle_mouse_event(mouse_event);
                     }
