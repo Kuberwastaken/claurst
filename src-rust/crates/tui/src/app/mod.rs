@@ -409,6 +409,17 @@ pub struct App {
     /// When `true`, the main event loop should spawn an async task to load
     /// the session list from disk and populate the session browser.
     pub session_list_pending: bool,
+    /// Session id selected for resume in the session browser. Set by the
+    /// `resumeSession` keybinding action; drained by the main loop, which
+    /// performs the same session swap as the /resume command.
+    pub session_resume_pending: Option<String>,
+    /// Browser rename request, persisted by the idle main loop so a live
+    /// session's in-memory title and journal cannot diverge.
+    pub session_rename_pending: Option<(String, String)>,
+    /// Id of the session the live REPL is currently continuing. The browser's
+    /// rename flow uses it to update the live title only when the renamed
+    /// entry IS the current session.
+    pub current_session_id: Option<String>,
     /// Receiver for background session-list results.
     pub session_list_rx:
         Option<tokio::sync::mpsc::Receiver<Vec<crate::session_browser::SessionEntry>>>,
@@ -598,6 +609,13 @@ pub struct App {
     /// Timestamp of the last scroll event (for burst detection).
     scroll_last_time: Option<std::time::Instant>,
 
+    // ---- Bash prefix allowlist -------------------------------------------
+    /// Command prefixes that have been permanently allowed this session via
+    /// the "Allow commands starting with X" option in the bash permission dialog.
+    /// Before showing the dialog for a bash command, the first whitespace-delimited
+    /// word is checked against this set; a match silently auto-approves the request.
+    pub bash_prefix_allowlist: std::collections::HashSet<String>,
+
     // ---- Auto-update notification ----------------------------------------
     /// If a newer version was found during background update check, this holds
     /// the latest version string (e.g. "0.1.0"). Shown in the footer status bar.
@@ -771,6 +789,9 @@ impl App {
             model_picker_fetch_pending: false,
             model_picker_provider_id: None,
             session_list_pending: false,
+            session_resume_pending: None,
+            session_rename_pending: None,
+            current_session_id: None,
             session_list_rx: None,
             recent_sessions: Vec::new(),
             // Load recent activity once, lazily, on the first run-loop iteration.
@@ -882,6 +903,7 @@ impl App {
             context_menu_state: None,
             scroll_accel: 3.0,
             scroll_last_time: None,
+            bash_prefix_allowlist: std::collections::HashSet::new(),
             update_available: None,
             managed_agent_cost_breakdown: None,
             managed_agents_active: false,

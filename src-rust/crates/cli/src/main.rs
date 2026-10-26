@@ -15,6 +15,7 @@
 mod codex_oauth_flow;
 mod headless;
 mod oauth_flow;
+mod session_resume;
 mod upgrade;
 
 // ---------------------------------------------------------------------------
@@ -2218,6 +2219,8 @@ async fn run_interactive(
     claurst_tui::spawn_signal_restore_watchers();
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
     app.command_queue = Some(command_queue.clone());
+    app.current_session_id = Some(session.id.clone());
+    app.session_title = session.title.clone();
     // Propagate the startup auth mode into cost reporting: a Claude Pro/Max
     // OAuth session must report zero cost (issue #499).
     app.anthropic_bearer_auth = anthropic_bearer_auth;
@@ -2871,6 +2874,7 @@ async fn run_interactive(
                                     tool_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_title = None;
+                                    app.current_session_id = Some(session.id.clone());
                                     // Reset per-turn diff/turn bookkeeping, as
                                     // ResumeSession does when swapping sessions.
                                     tool_ctx.file_history = Arc::new(ParkingMutex::new(
@@ -3001,71 +3005,27 @@ async fn run_interactive(
                                         Some("Select what to import from ~/.claude.".to_string());
                                 }
                                 Some(CommandResult::ResumeSession(resumed_session)) => {
-                                    session = resumed_session;
-                                    session_journal =
-                                        claurst_core::session_journal::SessionJournal::for_session(
-                                            &session,
-                                        );
-                                    base_query_config.session_journal =
-                                        Some(session_journal.clone());
-                                    if let Err(e) = session_journal.acquire() {
-                                        app.notifications.push(
-                                            NotificationKind::Warning,
-                                            e.to_string(),
-                                            None,
-                                        );
+                                    if let Err(error) = session_resume::apply(
+                                        resumed_session,
+                                        &claurst_core::history::sessions_dir(),
+                                        &mut session,
+                                        &mut session_journal,
+                                        &mut base_query_config,
+                                        &mut messages,
+                                        &mut app,
+                                        &mut cmd_ctx,
+                                        &mut tool_ctx,
+                                    ) {
+                                        app.status_message =
+                                            Some(format!("Could not resume session: {error}"));
                                     }
-                                    messages = session.messages.clone();
-                                    app.replace_messages(messages.clone());
-                                    cmd_ctx.config.model = Some(session.model.clone());
-                                    app.config.model = Some(session.model.clone());
-                                    tool_ctx.config.model = Some(session.model.clone());
-                                    app.model_name = session.model.clone();
-                                    tool_ctx.session_id = session.id.clone();
-                                    tool_ctx.file_history = Arc::new(ParkingMutex::new(
-                                        claurst_core::file_history::FileHistory::new(),
-                                    ));
-                                    tool_ctx.current_turn = Arc::new(
-                                        std::sync::atomic::AtomicUsize::new(0)
-                                    );
-                                    cmd_ctx.session_id = session.id.clone();
-                                    cmd_ctx.session_title = session.title.clone();
-                                    if let Some(saved_dir) = session.working_dir.as_ref() {
-                                        let saved_path =
-                                            std::path::PathBuf::from(saved_dir);
-                                        if saved_path.exists() {
-                                            tool_ctx.working_dir = saved_path.clone();
-                                            cmd_ctx.working_dir = saved_path;
-                                        }
-                                    }
-                                    app.config.project_dir =
-                                        Some(tool_ctx.working_dir.clone());
-                                    app.attach_turn_diff_state(
-                                        tool_ctx.file_history.clone(),
-                                        tool_ctx.current_turn.clone(),
-                                    );
-                                    claurst_tui::update_terminal_title(
-                                        session.title.as_deref()
-                                    );
-                                    app.status_message = Some(format!(
-                                        "Resumed session {}.",
-                                        &session.id[..8]
-                                    ));
                                 }
                                 Some(CommandResult::RenameSession(title)) => {
-                                    session.title = Some(title.clone());
-                                    session.updated_at = chrono::Utc::now();
-                                    cmd_ctx.session_title = session.title.clone();
-                                    persist_live_session(
-                                        &session_journal,
-                                        &mut session,
-                                        current_query.is_some(),
-                                    );
-                                    claurst_tui::update_terminal_title(Some(&title));
-                                    app.status_message = Some(format!(
-                                        "Session renamed to \"{}\".",
-                                        title
-                                    ));
+                                    if let Err(error) = session_resume::rename_current(
+                                        title, &messages, &mut session, &session_journal, &mut cmd_ctx, &mut app,
+                                    ) {
+                                        app.status_message = Some(format!("Could not rename session: {error}"));
+                                    }
                                 }
                                 Some(CommandResult::RefreshProviderState) => {
                                     if app.is_streaming || current_query.is_some() {
@@ -4459,6 +4419,50 @@ async fn run_interactive(
         if app.update_available.is_none() {
             if let Ok(Some(version)) = update_rx.try_recv() {
                 app.update_available = Some(version);
+            }
+        }
+
+        if current_query.is_none() && !app.is_streaming {
+            if let Some((id, title)) = app.session_rename_pending.take() {
+                let result = if id == session.id {
+                    session_resume::rename_current(
+                        title, &messages, &mut session, &session_journal, &mut cmd_ctx, &mut app,
+                    )
+                } else {
+                    claurst_core::history::rename_session(&id, &title).await
+                        .map(|()| app.status_message = Some(format!("Renamed to: {title}")))
+                };
+                if let Err(error) = result {
+                    app.status_message = Some(format!("Could not rename session: {error}"));
+                }
+            }
+        }
+
+        // Browser selection uses the same persistence/session transition as
+        // /resume. Hold the request until the old query has fully drained.
+        if current_query.is_none() && !app.is_streaming {
+            if let Some(resume_id) = app.session_resume_pending.take() {
+                match claurst_core::history::load_session(&resume_id).await {
+                    Ok(resumed) => {
+                        if let Err(error) = session_resume::apply(
+                            resumed,
+                            &claurst_core::history::sessions_dir(),
+                            &mut session,
+                            &mut session_journal,
+                            &mut base_query_config,
+                            &mut messages,
+                            &mut app,
+                            &mut cmd_ctx,
+                            &mut tool_ctx,
+                        ) {
+                            app.status_message = Some(format!("Could not resume session: {error}"));
+                        }
+                    }
+                    Err(error) => {
+                        app.status_message =
+                            Some(format!("Could not load session {resume_id}: {error}"));
+                    }
+                }
             }
         }
 
