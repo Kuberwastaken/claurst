@@ -2619,7 +2619,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_failed_remote_server_is_retried_periodically() {
-        let mgr = McpManager::start(&[http_fail_config("remote")]);
+        // Windows can spend seconds rejecting a closed TCP port. Respond with
+        // an immediate HTTP error instead, so this tests our retry scheduling
+        // rather than the platform's connection-refusal timeout.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = http_fail_config("remote");
+        config.url = Some(format!("http://{}/mcp", listener.local_addr().unwrap()));
+        let mgr = McpManager::start(&[config]);
+        let cancellation = mgr.state.read().connection_attempts["remote"].clone();
+        let server = tokio::spawn(async move {
+            tokio::select! {
+                _ = cancellation.cancelled() => {}
+                _ = async {
+                    loop {
+                        let Ok((mut stream, _)) = listener.accept().await else { return };
+                        let mut request = [0; 4096];
+                        let _ = stream.read(&mut request).await;
+                        let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    }
+                } => {}
+            }
+        });
         // Set this before startup settles: the runtime sleep is armed as soon
         // as the final startup failure is published.
         use std::sync::atomic::Ordering;
@@ -2643,6 +2664,8 @@ mod tests {
                 changes.changed().await.unwrap();
             }
         }).await.expect("failed remote server should keep retrying");
+        drop(mgr);
+        tokio::time::timeout(Duration::from_secs(1), server).await.unwrap().unwrap();
     }
 
     #[tokio::test]
