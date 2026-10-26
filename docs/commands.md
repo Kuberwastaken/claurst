@@ -155,6 +155,28 @@ In the TUI, `/session` opens the session browser. The text form shows the curren
 /session list
 ```
 
+The browser overlay lists saved sessions across projects with their
+title, last-updated time, message count, and cost. In the overlay:
+
+- `↑`/`↓` navigate, `Enter` resumes the selected session, `r` renames it, `Esc` closes.
+- `PageUp`/`PageDown` move eight sessions and stop at the ends.
+- `a` toggles each session's working-directory path under its row. Paths are
+  shown for the sessions already listed — it does not reveal sessions from
+  other projects.
+- `p` toggles the preview panel under the list (selected session's title,
+  stats, and working directory).
+
+---
+
+### /sessions
+
+Open the session browser overlay with an optional pre-applied filter. While the browser is open, press `/` to type a filter live, `Ctrl+U` to clear it, and `Esc` to close. Matching is case-insensitive against the session title and id.
+
+```
+/sessions
+/sessions <query>
+```
+
 ---
 
 ### /fork
@@ -465,7 +487,11 @@ Inspect MCP servers. In the TUI, `/mcp` without arguments opens the MCP panel. S
 /mcp resources [server]                  — resources from connected servers
 /mcp prompts [server]                    — prompt templates from connected servers
 /mcp get-prompt <server> <prompt> [key=value ...]
+/mcp enable <name>                       — re-enable a disabled server and rebuild connections live
+/mcp disable <name>                      — persist the toggle under disabledMcpServers in global settings
 ```
+
+`/mcp disable <name>` persists the toggle under `disabledMcpServers` in the global settings: the server is not connected, its tools are not registered, and it is skipped at startup. `/mcp enable <name>` reverts it and rebuilds the connections live. Project-level settings files cannot re-enable a server disabled globally.
 
 ---
 
@@ -483,14 +509,20 @@ Show or switch the output style (the response persona added to the system prompt
 
 ### /theme
 
-Without arguments, opens the theme picker (Default, Dark, Light, Solarized, Nord, Dracula, Monokai, Deuteranopia). `/theme <name>` sets the theme and saves it to settings.
+Without arguments, opens the theme picker (Default, Dark, Light, Solarized, Nord, Dracula, Monokai, Deuteranopia). `/theme <name>` sets the theme and saves it to settings; the name can also be a custom theme loaded from `~/.claurst/themes/<name>.toml`.
 
 ```
-/theme
+/theme              # open the picker
 /theme dark
 /theme light
 /theme solarized
+/theme my-palette   # custom theme from ~/.claurst/themes/my-palette.toml
 ```
+
+Built-in themes: `default`, `dark`, `light`, `deuteranopia`, `solarized`, `nord`,
+`dracula`, `monokai`. Custom themes are TOML files under `~/.claurst/themes/`
+(see the configuration reference for the file format). Unknown names fail with a
+list of available themes and change nothing.
 
 ---
 

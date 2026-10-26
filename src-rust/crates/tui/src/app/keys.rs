@@ -859,37 +859,59 @@ impl App {
             return false;
         }
 
-        // Session browser intercepts navigation and Esc
+        // Session browser: Rename and Confirm modes intercept raw character
+        // input here. Browse mode routes every key through the keybinding
+        // resolver in SessionBrowser context: matched keys run their action,
+        // unmatched keys are swallowed so they never leak into the prompt
+        // editor (issue #407 review).
         if self.session_browser.visible {
             use crate::session_browser::SessionBrowserMode;
             match self.session_browser.mode {
                 SessionBrowserMode::Browse => {
-                    match key.code {
-                        KeyCode::Esc => self.session_browser.close(),
-                        KeyCode::Enter => {
-                            // Hand the pick to the CLI's `/resume <id>` path,
-                            // which owns session swapping (issue #382).
-                            if let Some(id) =
-                                self.session_browser.selected_session().map(|s| s.id.clone())
-                            {
-                                self.session_browser.close();
-                                self.set_prompt_text(format!("/resume {}", id));
-                                self.pending_auto_submit = true;
+                    // The generic resolver at the bottom of this function
+                    // never runs while an overlay owns the screen, so resolve
+                    // here, in this overlay's context. Chord state stays
+                    // coherent because both call sites share one resolver.
+                    if let Some(keystroke) = key_event_to_keystroke(&key) {
+                        match self
+                            .keybindings
+                            .process(keystroke, &KeyContext::SessionBrowser)
+                        {
+                            KeybindingResult::Action(action) => {
+                                self.handle_keybinding_action(&action);
                             }
+                            KeybindingResult::Pending
+                            | KeybindingResult::NoMatch
+                            | KeybindingResult::Unbound => {}
                         }
-                        KeyCode::Up => self.session_browser.select_prev(),
-                        KeyCode::Down => self.session_browser.select_next(),
-                        KeyCode::Char('r') => self.session_browser.start_rename(),
-                        _ => {}
+                    } else {
+                        self.keybindings.cancel_chord();
+                    }
+                    return false;
+                }
+                SessionBrowserMode::Search => {
+                    if let Some(keystroke) = key_event_to_keystroke(&key) {
+                        match self.keybindings.process(keystroke, &KeyContext::SessionFilter) {
+                            KeybindingResult::Action(action) => { self.handle_keybinding_action(&action); }
+                            KeybindingResult::NoMatch => {
+                                if let KeyCode::Char(c) = key.code {
+                                    if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                                        let c = self.shift_normalize(c, key.modifiers);
+                                        self.session_browser.push_filter_char(c);
+                                    }
+                                }
+                            }
+                            KeybindingResult::Pending | KeybindingResult::Unbound => {}
+                        }
                     }
                 }
                 SessionBrowserMode::Rename => {
                     match key.code {
                         KeyCode::Esc => self.session_browser.cancel(),
                         KeyCode::Enter => {
-                            if let Some((_id, name)) = self.session_browser.confirm_rename() {
-                                self.session_title = Some(name.clone());
-                                self.status_message = Some(format!("Renamed to: {}", name));
+                            if let Some((id, name)) = self.session_browser.confirm_rename() {
+                                self.session_rename_pending = Some((id, name));
+                                self.status_message = Some("Saving session name...".to_string());
                             }
                         }
                         KeyCode::Backspace => self.session_browser.pop_rename_char(),
@@ -1741,7 +1763,13 @@ impl App {
     }
 
     pub(super) fn current_key_context(&self) -> KeyContext {
-        if self.diff_viewer.visible {
+        if self.session_browser.visible {
+            if self.session_browser.mode == crate::session_browser::SessionBrowserMode::Search {
+                KeyContext::SessionFilter
+            } else {
+                KeyContext::SessionBrowser
+            }
+        } else if self.diff_viewer.visible {
             KeyContext::DiffDialog
         } else if self.agents_menu.visible || self.mcp_view.visible || self.stats_dialog.visible {
             KeyContext::Select
@@ -2143,6 +2171,62 @@ impl App {
                 false
             }
             "redraw" => false,
+            // ---- Session browser (KeyContext::SessionBrowser) ----
+            "startSessionFilter" => { self.session_browser.start_search(); false }
+            "applySessionFilter" => { self.session_browser.confirm_search(); false }
+            "clearSessionFilter" => { self.session_browser.clear_filter(); false }
+            "eraseSessionFilter" => { self.session_browser.pop_filter_char(); false }
+            "prevSession" => {
+                self.session_browser.select_prev();
+                false
+            }
+            "nextSession" => {
+                self.session_browser.select_next();
+                false
+            }
+            "prevSessionPage" => {
+                self.session_browser.select_prev_page();
+                false
+            }
+            "nextSessionPage" => {
+                self.session_browser.select_next_page();
+                false
+            }
+            "closeSessionBrowser" => {
+                self.session_browser.close();
+                false
+            }
+            "renameSession" => {
+                self.session_browser.start_rename();
+                false
+            }
+            "resumeSession" => {
+                // Signal the main loop to swap in the selected session. The
+                // loop drains `session_resume_pending` and performs the same
+                // swap as the /resume command (load, replace messages, reset
+                // file history and turn bookkeeping).
+                if let Some(session) = self.session_browser.selected_session() {
+                    self.session_resume_pending = Some(session.id.clone());
+                    self.session_browser.close();
+                }
+                false
+            }
+            "toggleSessionPaths" => {
+                self.session_browser.toggle_show_paths();
+                self.status_message = Some(format!(
+                    "Session paths {}.",
+                    if self.session_browser.show_paths {
+                        "shown"
+                    } else {
+                        "hidden"
+                    }
+                ));
+                false
+            }
+            "toggleSessionPreview" => {
+                self.session_browser.toggle_show_preview();
+                false
+            }
             "historySearch" => {
                 let overlay = HistorySearchOverlay::open(&self.prompt_input.history);
                 self.history_search_overlay = overlay;
@@ -2569,6 +2653,17 @@ impl App {
     /// Otherwise the text goes through the normal `prompt_input.paste()` path
     /// which applies the multi-line summary placeholder for large pastes.
     pub fn handle_paste_data(&mut self, data: String) {
+        if self.session_browser.visible
+            && self.session_browser.mode == crate::session_browser::SessionBrowserMode::Search
+        {
+            for c in data.chars() {
+                let c = if c == '\n' || c == '\r' { ' ' } else { c };
+                if !c.is_control() {
+                    self.session_browser.push_filter_char(c);
+                }
+            }
+            return;
+        }
         use crate::prompt_input::detect_pasted_path;
         use crate::image_paste::PastedImage;
 

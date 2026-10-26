@@ -5,7 +5,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::overlays::centered_rect;
@@ -19,6 +19,8 @@ use crate::overlays::centered_rect;
 pub enum SessionBrowserMode {
     /// Default: list sessions, navigate with arrow keys.
     Browse,
+    /// Editing the visible session filter.
+    Search,
     /// User is typing a new name for the selected session.
     Rename,
     /// Waiting for the user to confirm a destructive action (delete / export).
@@ -35,6 +37,10 @@ pub struct SessionEntry {
     pub message_count: usize,
     /// Estimated USD cost for the session.
     pub cost_usd: f64,
+    /// Working directory recorded for the session, shown when path display
+    /// is toggled on (`a`). `None` for sessions saved before the field
+    /// existed.
+    pub working_dir: Option<String>,
 }
 
 /// State for the session browser overlay.
@@ -45,6 +51,14 @@ pub struct SessionBrowserState {
     pub mode: SessionBrowserMode,
     /// Input buffer used while in `Rename` mode.
     pub rename_input: String,
+    /// Persistent case-insensitive title/id filter.
+    pub filter_input: String,
+    /// Whether each session's working-directory path is shown in the list
+    /// (toggled with `a`). Off by default to keep rows compact.
+    pub show_paths: bool,
+    /// Whether a preview of the selected session is shown below the list
+    /// (toggled with `p`). On by default.
+    pub show_preview: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -60,6 +74,9 @@ impl SessionBrowserState {
             sessions: Vec::new(),
             mode: SessionBrowserMode::Browse,
             rename_input: String::new(),
+            filter_input: String::new(),
+            show_paths: false,
+            show_preview: true,
         }
     }
 
@@ -72,6 +89,64 @@ impl SessionBrowserState {
         self.visible = true;
     }
 
+    /// Open the browser with a pre-applied filter query. The list is populated
+    /// later by the async loader (which assigns `sessions` directly), so the
+    /// query only needs to live in `filter_input`; the visible rows recompute
+    /// from it on every render.
+    pub fn open_with_query(&mut self, sessions: Vec<SessionEntry>, query: &str) {
+        self.open(sessions);
+        self.filter_input = query.trim().to_string();
+    }
+
+    /// Sessions matching the current filter: case-insensitive substring match
+    /// against the title or the session id. An empty filter shows everything.
+    pub fn visible_sessions(&self) -> Vec<&SessionEntry> {
+        let query = self.filter_input.trim().to_lowercase();
+        if query.is_empty() {
+            return self.sessions.iter().collect();
+        }
+        self.sessions
+            .iter()
+            .filter(|s| {
+                s.title.to_lowercase().contains(&query) || s.id.to_lowercase().contains(&query)
+            })
+            .collect()
+    }
+
+    /// Enter search mode, keeping any existing filter so it can be edited.
+    pub fn start_search(&mut self) {
+        self.mode = SessionBrowserMode::Search;
+    }
+
+    /// Append a character to the filter input and reset the selection to the
+    /// first visible row so the highlight never points past the narrowed list.
+    pub fn push_filter_char(&mut self, c: char) {
+        if self.mode == SessionBrowserMode::Search {
+            self.filter_input.push(c);
+            self.selected_idx = 0;
+        }
+    }
+
+    /// Remove the last character from the filter input.
+    pub fn pop_filter_char(&mut self) {
+        if self.mode == SessionBrowserMode::Search {
+            self.filter_input.pop();
+            self.selected_idx = 0;
+        }
+    }
+
+    /// Leave search mode, keeping the filter applied. Returns to `Browse` so
+    /// navigation and resume/rename work against the narrowed list.
+    pub fn confirm_search(&mut self) {
+        self.mode = SessionBrowserMode::Browse;
+    }
+
+    /// Clear the filter entirely.
+    pub fn clear_filter(&mut self) {
+        self.filter_input.clear();
+        self.selected_idx = 0;
+    }
+
     /// Close the browser entirely.
     pub fn close(&mut self) {
         self.visible = false;
@@ -81,7 +156,7 @@ impl SessionBrowserState {
 
     /// Move selection up one row, wrapping to the end.
     pub fn select_prev(&mut self) {
-        let count = self.sessions.len();
+        let count = self.visible_sessions().len();
         if count == 0 {
             return;
         }
@@ -94,22 +169,55 @@ impl SessionBrowserState {
 
     /// Move selection down one row, wrapping to the start.
     pub fn select_next(&mut self) {
-        let count = self.sessions.len();
+        let count = self.visible_sessions().len();
         if count == 0 {
             return;
         }
         self.selected_idx = (self.selected_idx + 1) % count;
     }
 
-    /// Return a reference to the currently selected session, if any.
-    pub fn selected_session(&self) -> Option<&SessionEntry> {
-        self.sessions.get(self.selected_idx)
+    /// How many entries one PageUp/PageDown press jumps.
+    pub const PAGE_STEP: usize = 8;
+
+    /// Move selection up one page, clamping at the first entry (no wrap).
+    pub fn select_prev_page(&mut self) {
+        self.selected_idx = self.selected_idx.saturating_sub(Self::PAGE_STEP);
     }
 
-    /// Switch to rename mode, pre-populating the input with the current title.
+    /// Move selection down one page, clamping at the last entry (no wrap).
+    pub fn select_next_page(&mut self) {
+        let count = self.visible_sessions().len();
+        if count == 0 {
+            return;
+        }
+        self.selected_idx = (self.selected_idx + Self::PAGE_STEP).min(count - 1);
+    }
+
+    /// Toggle whether each session's working-directory path is shown.
+    pub fn toggle_show_paths(&mut self) {
+        self.show_paths = !self.show_paths;
+    }
+
+    /// Toggle whether the selected session's preview is shown.
+    pub fn toggle_show_preview(&mut self) {
+        self.show_preview = !self.show_preview;
+    }
+
+    /// Return a reference to the currently selected session, if any.
+    pub fn selected_session(&self) -> Option<&SessionEntry> {
+        self.visible_sessions().get(self.selected_idx).copied()
+    }
+
+    /// Switch to rename mode. A real title pre-populates the input; a
+    /// placeholder like "(untitled)" must not, or it would be baked into the
+    /// saved name.
     pub fn start_rename(&mut self) {
-        if let Some(session) = self.sessions.get(self.selected_idx) {
-            self.rename_input = session.title.clone();
+        if let Some(session) = self.selected_session() {
+            self.rename_input = if session.title == "(untitled)" {
+                String::new()
+            } else {
+                session.title.clone()
+            };
             self.mode = SessionBrowserMode::Rename;
         }
     }
@@ -138,11 +246,9 @@ impl SessionBrowserState {
         if new_name.is_empty() {
             return None;
         }
-        let session_id = self.sessions.get(self.selected_idx)?.id.clone();
-        // Apply the rename in the local list immediately for UI consistency.
-        if let Some(session) = self.sessions.get_mut(self.selected_idx) {
-            session.title = new_name.clone();
-        }
+        let session_id = self.selected_session()?.id.clone();
+        let session = self.sessions.iter_mut().find(|session| session.id == session_id)?;
+        session.title = new_name.clone();
         self.mode = SessionBrowserMode::Browse;
         self.rename_input.clear();
         Some((session_id, new_name))
@@ -154,7 +260,7 @@ impl SessionBrowserState {
     pub fn cancel(&mut self) {
         match self.mode {
             SessionBrowserMode::Browse => self.close(),
-            SessionBrowserMode::Rename | SessionBrowserMode::Confirm => {
+            SessionBrowserMode::Search | SessionBrowserMode::Rename | SessionBrowserMode::Confirm => {
                 self.mode = SessionBrowserMode::Browse;
                 self.rename_input.clear();
             }
@@ -205,18 +311,18 @@ fn truncate_display(s: &str, max_width: usize) -> String {
 
 /// Render the session browser overlay directly into `buf`.
 ///
-/// Draws a centred modal (≈70 wide × ≈20 tall) with:
-/// - A scrollable list of sessions (id, title, date, messages, cost)
-/// - Selection highlight on the focused row
-/// - Mode-sensitive hint bar at the bottom
-/// - A rename input field shown when in `Rename` mode
+/// Layout is fixed so every region stays reachable regardless of session
+/// count: list (windowed around the selection), preview panel (when enabled),
+/// and a mode-sensitive hint bar at the bottom. Windowing keeps the selection
+/// visible past ~14 sessions instead of letting the list push the preview and
+/// hints off the modal.
 pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut Buffer) {
     if !state.visible {
         return;
     }
 
     const MODAL_W: u16 = 70;
-    const MODAL_H: u16 = 20;
+    const MODAL_H: u16 = 24;
 
     let dialog_area = centered_rect(
         MODAL_W.min(area.width.saturating_sub(2)),
@@ -233,40 +339,101 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
         }
     }
 
-    let inner_w = dialog_area.width.saturating_sub(2) as usize;
-    let mut lines: Vec<Line> = Vec::new();
+    // --- Layout: list area, preview area, hint area ------------------------
+    // Borders consume 2 rows; the hint bar gets 2 lines (hint + spacer).
+    // Every region is clamped to `inner` so short terminals degrade instead
+    // of panicking on out-of-bounds renders.
+    let inner = Rect {
+        x: dialog_area.x + 1,
+        y: dialog_area.y + 1,
+        width: dialog_area.width.saturating_sub(2),
+        height: dialog_area.height.saturating_sub(2),
+    };
+    let hint_h: u16 = inner.height.min(2);
+    let preview_h: u16 = if state.show_preview {
+        inner.height.saturating_sub(hint_h).min(6)
+    } else {
+        0
+    };
+    let list_h = inner.height.saturating_sub(hint_h + preview_h);
+    let preview_area = Rect {
+        y: inner.y + list_h,
+        height: preview_h,
+        ..inner
+    };
+    let hint_area = Rect {
+        y: inner.y + list_h + preview_h,
+        height: hint_h,
+        ..inner
+    };
 
-    // --- Session list -----------------------------------------------------
-    if state.sessions.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![Span::styled(
-            "  No sessions found.",
+    let inner_w = inner.width as usize;
+
+    // --- Session list (windowed around the selection) -----------------------
+    let mut list_lines: Vec<Line> = Vec::new();
+    let visible = state.visible_sessions();
+    let filter_rows = usize::from(!state.filter_input.is_empty() || state.mode == SessionBrowserMode::Search);
+    if filter_rows > 0 {
+        let cursor = if state.mode == SessionBrowserMode::Search { "\u{2588}" } else { "" };
+        let label = format!("  Filter: {}{} ({}/{})", state.filter_input, cursor,
+            visible.len(), state.sessions.len());
+        list_lines.push(Line::styled(truncate_display(&label, inner_w),
+            Style::default().fg(Color::Yellow)));
+    }
+    if visible.is_empty() {
+        list_lines.push(Line::from(""));
+        list_lines.push(Line::from(vec![Span::styled(
+            if state.filter_input.is_empty() { "  No sessions found." } else { "  No matching sessions." },
             Style::default().fg(Color::DarkGray),
         )]));
     } else {
         // Column widths (approximate):
-        //   title: ~40 chars  |  date: ~14 chars  |  msgs: 5  |  cost: 9
+        //   title: flexible  |  date: ~14 chars  |  msgs: 5  |  cost: 9
         let date_w: usize = 14;
         let msgs_w: usize = 5;
         let cost_w: usize = 9;
-        let fixed = date_w + msgs_w + cost_w + 6; // separators & padding
+        // 8 separator columns: 2 leading indent + 3 double spaces between
+        // the four cells. The rows must fit `inner_w` exactly or the Paragraph
+        // wraps them and each entry consumes two lines.
+        let fixed = date_w + msgs_w + cost_w + 8; // separators & padding
         let title_w = inner_w.saturating_sub(fixed).max(10);
 
         // Header row
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {:<title_w$}  {:<date_w$}  {:>msgs_w$}  {:>cost_w$}",
-                    "Title", "Last Updated", "Msgs", "Cost",
-                    title_w = title_w, date_w = date_w,
-                    msgs_w = msgs_w, cost_w = cost_w),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::UNDERLINED),
+        list_lines.push(Line::from(vec![Span::styled(
+            format!(
+                "  {:<title_w$}  {:<date_w$}  {:>msgs_w$}  {:>cost_w$}",
+                "Title",
+                "Last Updated",
+                "Msgs",
+                "Cost",
+                title_w = title_w,
+                date_w = date_w,
+                msgs_w = msgs_w,
+                cost_w = cost_w
             ),
-        ]));
-        lines.push(Line::from(""));
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::UNDERLINED),
+        )]));
+        list_lines.push(Line::from(""));
 
-        for (i, session) in state.sessions.iter().enumerate() {
+        // Visible-row window: show at most list_h-2 rows (header + blank),
+        // keeping the selection inside the window. The budget is in LINES,
+        // so entries with a working-dir row (show_paths) count twice.
+        let list_rows = (list_h.saturating_sub(2) as usize).saturating_sub(filter_rows);
+        let (window_start, window_end) = list_window(
+            state.selected_idx,
+            visible.len(),
+            list_rows,
+            state.show_paths,
+        );
+
+        let mut lines_used = 0usize;
+        for (i, session) in visible.iter().enumerate().take(window_end).skip(window_start) {
+            if lines_used >= list_rows {
+                break;
+            }
+            lines_used += if state.show_paths { 2 } else { 1 };
             let is_selected = i == state.selected_idx;
 
             let title_cell = truncate_display(&session.title, title_w);
@@ -298,78 +465,170 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
 
             let prefix_style = Style::default().bg(row_bg);
 
-            lines.push(Line::from(vec![
+            list_lines.push(Line::from(vec![
                 Span::styled("  ", prefix_style),
-                Span::styled(format!("{:<title_w$}", title_cell, title_w = title_w), title_style),
+                Span::styled(
+                    format!("{:<title_w$}", title_cell, title_w = title_w),
+                    title_style,
+                ),
                 Span::styled("  ", meta_style),
-                Span::styled(format!("{:<date_w$}", date_cell, date_w = date_w), meta_style),
+                Span::styled(
+                    format!("{:<date_w$}", date_cell, date_w = date_w),
+                    meta_style,
+                ),
                 Span::styled("  ", meta_style),
                 Span::styled(msgs_cell, meta_style),
                 Span::styled("  ", meta_style),
                 Span::styled(cost_cell, meta_style),
             ]));
+
+            // Optional working-directory row under each entry (toggle: `a`).
+            if state.show_paths {
+                let path_display = session.working_dir.as_deref().unwrap_or("(no working dir)");
+                let path_cell = truncate_display(path_display, inner_w.saturating_sub(6));
+                let path_style = if is_selected {
+                    Style::default().fg(Color::Rgb(140, 160, 180)).bg(row_bg)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                list_lines.push(Line::from(vec![
+                    Span::styled("      ", prefix_style),
+                    Span::styled(path_cell, path_style),
+                ]));
+            }
         }
     }
 
-    lines.push(Line::from(""));
+    // --- Preview panel (toggle: `p`) ---------------------------------------
+    let mut preview_lines: Vec<Line> = Vec::new();
+    if state.show_preview {
+        preview_lines.push(Line::from(vec![Span::styled(
+            " Preview",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        match state.selected_session() {
+            Some(session) => {
+                preview_lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(&session.title, Style::default().fg(Color::White)),
+                ]));
+                preview_lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        format!(
+                            "{} messages · {} · {}",
+                            session.message_count,
+                            session.last_updated,
+                            fmt_cost(session.cost_usd)
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+                if let Some(dir) = session.working_dir.as_deref() {
+                    preview_lines.push(Line::from(vec![
+                        Span::styled("  ", Style::default()),
+                        Span::styled(dir, Style::default().fg(Color::DarkGray)),
+                    ]));
+                }
+            }
+            None => preview_lines.push(Line::from(vec![Span::styled(
+                "  (no session selected)",
+                Style::default().fg(Color::DarkGray),
+            )])),
+        }
+    }
 
-    // --- Mode-sensitive bottom section -----------------------------------
-    match &state.mode {
-        SessionBrowserMode::Browse => {
-            lines.push(Line::from(vec![
+    // --- Mode-sensitive hint bar -------------------------------------------
+    let hint_lines: Vec<Line> = match &state.mode {
+        SessionBrowserMode::Browse => vec![
+            Line::styled("  /=filter  Ctrl+U=clear", Style::default().fg(Color::DarkGray)),
+            Line::from(vec![
                 Span::styled("  ", Style::default()),
                 Span::styled(
                     "\u{2191}\u{2193}",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(" navigate  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "Enter",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=resume  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "r",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=rename  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
+                    "a",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("=paths  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "p",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("=preview  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
                     "Esc",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=close", Style::default().fg(Color::DarkGray)),
-            ]));
-        }
-        SessionBrowserMode::Rename => {
-            // Show rename input field.
-            let label = "  Rename: ";
-            let cursor = "\u{2588}"; // block cursor
-            let input_display = format!("{}{}", state.rename_input, cursor);
-            lines.push(Line::from(vec![
-                Span::styled(label, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            ]),
+        ],
+        SessionBrowserMode::Search => vec![
+            Line::from("  Type to filter sessions by title or id"),
+            Line::from("  Enter/Esc=apply  Ctrl+U=clear"),
+        ],
+        SessionBrowserMode::Rename => vec![
+            Line::from(vec![
                 Span::styled(
-                    input_display,
+                    "  Rename: ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{}\u{2588}", state.rename_input),
                     Style::default()
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
                 ),
-            ]));
-            lines.push(Line::from(vec![
+            ]),
+            Line::from(vec![
                 Span::styled("  ", Style::default()),
                 Span::styled(
                     "Enter",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=confirm  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "Esc",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=cancel", Style::default().fg(Color::DarkGray)),
-            ]));
-        }
-        SessionBrowserMode::Confirm => {
-            lines.push(Line::from(vec![
+            ]),
+        ],
+        SessionBrowserMode::Confirm => vec![
+            Line::from(vec![
                 Span::styled(
                     "  Confirm? ",
                     Style::default()
@@ -378,7 +637,9 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
                 ),
                 Span::styled(
                     "Enter",
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=yes  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
@@ -386,9 +647,10 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=no", Style::default().fg(Color::DarkGray)),
-            ]));
-        }
-    }
+            ]),
+            Line::from(""),
+        ],
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -396,13 +658,46 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
         .title_alignment(Alignment::Center)
         .border_style(Style::default().fg(Color::Cyan));
 
-    let para = Paragraph::new(lines)
+    Paragraph::new(list_lines)
         .block(block)
         .alignment(Alignment::Left)
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .render(dialog_area, buf);
 
-    use ratatui::widgets::Widget;
-    para.render(dialog_area, buf);
+    if state.show_preview {
+        Paragraph::new(preview_lines)
+            .block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            )
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: false })
+            .render(preview_area, buf);
+    }
+
+    Paragraph::new(hint_lines)
+        .alignment(Alignment::Left)
+        .wrap(Wrap { trim: false })
+        .render(hint_area, buf);
+}
+
+/// Compute the `[start, end)` window of entries to render so the selection
+/// stays visible. `rows` is a budget in LINES: with `show_paths` each entry
+/// renders two lines, so the number of entries that fit is halved. Scrolls
+/// the window only when the selection would leave it.
+fn list_window(selected: usize, total: usize, rows: usize, show_paths: bool) -> (usize, usize) {
+    let lines_per_entry = if show_paths { 2 } else { 1 };
+    let capacity = rows.checked_div(lines_per_entry).unwrap_or(0);
+    if total == 0 || capacity == 0 {
+        return (0, 0);
+    }
+    let capacity = capacity.min(total);
+    if selected < capacity {
+        return (0, capacity);
+    }
+    let start = (selected + 1).saturating_sub(capacity);
+    (start, start + capacity)
 }
 
 // ---------------------------------------------------------------------------
@@ -421,6 +716,7 @@ mod tests {
                 last_updated: "2 hours ago".to_string(),
                 message_count: 34,
                 cost_usd: 0.0124,
+                working_dir: Some("/home/user/project-a".to_string()),
             },
             SessionEntry {
                 id: "sess-002".to_string(),
@@ -428,6 +724,7 @@ mod tests {
                 last_updated: "yesterday".to_string(),
                 message_count: 12,
                 cost_usd: 0.0045,
+                working_dir: Some("/home/user/project-b".to_string()),
             },
             SessionEntry {
                 id: "sess-003".to_string(),
@@ -435,6 +732,7 @@ mod tests {
                 last_updated: "3 days ago".to_string(),
                 message_count: 57,
                 cost_usd: 0.0289,
+                working_dir: None,
             },
         ]
     }
@@ -481,6 +779,50 @@ mod tests {
         assert_eq!(s.selected_idx, 2);
     }
 
+    // 4b. Page moves jump PAGE_STEP entries and clamp at both ends
+    // (no wrap), with an empty list staying put.
+    #[test]
+    fn select_page_clamps_and_steps() {
+        let mut s = SessionBrowserState::new();
+        let sessions: Vec<SessionEntry> = (0..20)
+            .map(|i| SessionEntry {
+                id: format!("sess-{:03}", i),
+                title: format!("Session {}", i),
+                last_updated: "1h ago".to_string(),
+                message_count: i,
+                cost_usd: 0.0,
+                working_dir: None,
+            })
+            .collect();
+        s.open(sessions);
+        assert_eq!(s.selected_idx, 0);
+
+        // Down from index 0: exactly PAGE_STEP forward, no wrap.
+        s.select_next_page();
+        assert_eq!(s.selected_idx, SessionBrowserState::PAGE_STEP);
+
+        // Up from PAGE_STEP: exactly PAGE_STEP back to the first entry.
+        s.select_prev_page();
+        assert_eq!(s.selected_idx, 0);
+
+        // Up at the top clamps at 0 instead of wrapping.
+        s.select_prev_page();
+        assert_eq!(s.selected_idx, 0);
+
+        // Down past the end clamps at the last entry.
+        for _ in 0..4 {
+            s.select_next_page();
+        }
+        assert_eq!(s.selected_idx, 19);
+
+        // Empty list: both directions are no-ops.
+        let mut empty = SessionBrowserState::new();
+        empty.open(vec![]);
+        empty.select_next_page();
+        empty.select_prev_page();
+        assert_eq!(empty.selected_idx, 0);
+    }
+
     // 5. selected_session() returns correct entry.
     #[test]
     fn selected_session_correct() {
@@ -500,6 +842,20 @@ mod tests {
         s.start_rename();
         assert_eq!(s.mode, SessionBrowserMode::Rename);
         assert_eq!(s.rename_input, "Refactor auth module");
+    }
+
+    // 6b. Renaming an untitled session starts from an empty input; the
+    // placeholder must not leak into the saved name.
+    #[test]
+    fn start_rename_untitled_starts_empty() {
+        let mut s = SessionBrowserState::new();
+        let mut sessions = sample_sessions();
+        sessions[0].title = "(untitled)".to_string();
+        s.open(sessions);
+        s.selected_idx = 0;
+        s.start_rename();
+        assert_eq!(s.mode, SessionBrowserMode::Rename);
+        assert_eq!(s.rename_input, "");
     }
 
     // 7. push_rename_char / pop_rename_char edit the input buffer.
@@ -525,7 +881,10 @@ mod tests {
         s.start_rename();
         s.rename_input = "  New Title  ".to_string(); // intentional whitespace
         let result = s.confirm_rename();
-        assert_eq!(result, Some(("sess-001".to_string(), "New Title".to_string())));
+        assert_eq!(
+            result,
+            Some(("sess-001".to_string(), "New Title".to_string()))
+        );
         assert_eq!(s.mode, SessionBrowserMode::Browse);
         assert!(s.rename_input.is_empty());
         // Also check local title was updated
@@ -551,7 +910,10 @@ mod tests {
         s.start_rename();
         s.cancel();
         assert_eq!(s.mode, SessionBrowserMode::Browse);
-        assert!(s.visible, "overlay should remain visible after cancel-from-rename");
+        assert!(
+            s.visible,
+            "overlay should remain visible after cancel-from-rename"
+        );
     }
 
     // 11. cancel() in Browse mode closes the overlay.
@@ -582,7 +944,11 @@ mod tests {
         let mut buf = Buffer::empty(area);
         render_session_browser(&s, area, &mut buf);
         for cell in buf.content() {
-            assert_eq!(cell.symbol(), " ", "buffer should be empty when browser is hidden");
+            assert_eq!(
+                cell.symbol(),
+                " ",
+                "buffer should be empty when browser is hidden"
+            );
         }
     }
 
@@ -595,11 +961,384 @@ mod tests {
     }
 
     // 15. truncate_display trims long strings.
+    // Toggle defaults: paths off, preview on.
+    #[test]
+    fn toggle_defaults() {
+        let s = SessionBrowserState::new();
+        assert!(!s.show_paths);
+        assert!(s.show_preview);
+    }
+
+    // Toggling flips the flags.
+    #[test]
+    fn toggles_flip_flags() {
+        let mut s = SessionBrowserState::new();
+        s.toggle_show_paths();
+        assert!(s.show_paths);
+        s.toggle_show_preview();
+        assert!(!s.show_preview);
+    }
+
+    // Windowing: selection visible even far down a long list.
+    #[test]
+    fn list_window_keeps_selection_visible() {
+        // Early selection: window starts at 0.
+        assert_eq!(list_window(2, 50, 10, false), (0, 10));
+        // Selection past the first page: window scrolls to keep it.
+        assert_eq!(list_window(15, 50, 10, false), (6, 16));
+        // Selection at the end.
+        assert_eq!(list_window(49, 50, 10, false), (40, 50));
+        // Degenerate inputs.
+        assert_eq!(list_window(0, 0, 10, false), (0, 0));
+        assert_eq!(list_window(0, 5, 0, false), (0, 0));
+        // Rows larger than total: everything fits.
+        assert_eq!(list_window(3, 5, 10, false), (0, 5));
+        // With paths shown, each entry takes two lines, halving capacity.
+        assert_eq!(list_window(2, 50, 10, true), (0, 5));
+        assert_eq!(list_window(15, 50, 10, true), (11, 16));
+        assert_eq!(list_window(49, 50, 10, true), (45, 50));
+    }
+
+    // Rendering with paths and preview shown must not panic.
+    #[test]
+    fn render_with_paths_and_preview_does_not_panic() {
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        s.toggle_show_paths();
+        let area = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(area);
+        render_session_browser(&s, area, &mut buf);
+    }
+
+    // Rendering a long list keeps the selection row on screen.
+    #[test]
+    fn render_long_list_does_not_panic() {
+        let mut s = SessionBrowserState::new();
+        let sessions: Vec<SessionEntry> = (0..40)
+            .map(|i| SessionEntry {
+                id: format!("sess-{:03}", i),
+                title: format!("Session number {}", i),
+                last_updated: "1h ago".to_string(),
+                message_count: i,
+                cost_usd: 0.001 * (i as f64),
+                working_dir: Some(format!("/home/user/proj-{}", i % 3)),
+            })
+            .collect();
+        s.open(sessions);
+        // Walk the selection through the whole list.
+        for _ in 0..40 {
+            s.select_next();
+            let area = Rect::new(0, 0, 80, 24);
+            let mut buf = Buffer::empty(area);
+            render_session_browser(&s, area, &mut buf);
+        }
+    }
+
+    #[test]
+    fn selected_row_stays_visible_with_paths_and_preview() {
+        for paths in [false, true] {
+            for preview in [false, true] {
+                let mut state = SessionBrowserState::new();
+                state.open(
+                    (0..40)
+                        .map(|i| SessionEntry {
+                            id: format!("session-{i}"),
+                            title: format!("Selected {i}"),
+                            last_updated: "now".into(),
+                            message_count: 1,
+                            cost_usd: 0.0,
+                            working_dir: Some(
+                                "/a/very/long/working/directory/path/that/must/not/wrap".into(),
+                            ),
+                        })
+                        .collect(),
+                );
+                state.show_paths = paths;
+                state.show_preview = preview;
+                for selected in 0..40 {
+                    state.selected_idx = selected;
+                    let area = Rect::new(0, 0, 80, 24);
+                    let mut buffer = Buffer::empty(area);
+                    render_session_browser(&state, area, &mut buffer);
+                    let highlighted: String = buffer
+                        .content
+                        .iter()
+                        .filter(|cell| cell.bg == Color::Rgb(40, 60, 80))
+                        .map(|cell| cell.symbol())
+                        .collect();
+                    assert!(
+                        highlighted.contains(&format!("Selected {selected}")),
+                        "selection {selected} hidden with paths={paths}, preview={preview}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn filtered_window_keeps_its_selected_row_visible() {
+        let mut state = SessionBrowserState::new();
+        state.open((0..40).map(|i| SessionEntry {
+            id: format!("id-{i}"),
+            title: format!("{} item {i}", if i % 2 == 0 { "Beta" } else { "Alpha" }),
+            last_updated: "now".into(), message_count: 1, cost_usd: 0.0,
+            working_dir: Some("/some/project".into()),
+        }).collect());
+        state.show_paths = true;
+        state.filter_input = "beta".into();
+        state.mode = SessionBrowserMode::Search;
+        for selected in 0..20 {
+            state.selected_idx = selected;
+            let area = Rect::new(0, 0, 80, 24);
+            let mut buffer = Buffer::empty(area);
+            render_session_browser(&state, area, &mut buffer);
+            let highlighted: String = buffer.content.iter()
+                .filter(|cell| cell.bg == Color::Rgb(40, 60, 80))
+                .map(|cell| cell.symbol()).collect();
+            assert!(highlighted.contains(&format!("Beta item {}", selected * 2)), "{highlighted}");
+        }
+    }
+
+    // Rows must fit the dialog width exactly: if a rendered row is wider
+    // than `inner`, the wrapping Paragraph spills it onto a second line and
+    // every entry silently consumes two rows. Title and cost of each visible
+    // entry must share one buffer row.
+    #[test]
+    fn render_rows_do_not_wrap() {
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        render_session_browser(&s, area, &mut buf);
+
+        // Collect each buffer row as a trimmed string.
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            })
+            .collect();
+
+        for (title, cost) in [
+            ("Refactor auth module", "$0.0124"),
+            ("Write unit tests", "$0.0045"),
+            ("Debug memory leak", "$0.0289"),
+        ] {
+            let row = rows
+                .iter()
+                .find(|r| r.contains(title))
+                .unwrap_or_else(|| panic!("title {:?} not found in any row", title));
+            assert!(
+                row.contains(cost),
+                "row for {:?} misses cost {:?} (wrapped?): {:?}",
+                title,
+                cost,
+                row
+            );
+        }
+    }
+
+    // Degenerate terminals: the geometry clamps every region to `inner`, so
+    // tiny areas must degrade to a sliver (or nothing) instead of panicking.
+    #[test]
+    fn render_tiny_areas_do_not_panic() {
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        s.toggle_show_paths(); // two-line entries: worst case for the budget
+        for (w, h) in [(0, 0), (1, 1), (10, 2), (30, 4), (70, 6), (20, 1)] {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            render_session_browser(&s, area, &mut buf);
+        }
+    }
+
     #[test]
     fn truncate_display_trims() {
         let long = "abcdefghij"; // 10 chars
         let result = truncate_display(long, 5);
-        assert!(result.width() <= 6, "truncated string should fit within budget");
+        assert!(
+            result.width() <= 6,
+            "truncated string should fit within budget"
+        );
         assert!(result.ends_with('…'));
+    }
+    // 16. Empty filter shows all sessions.
+    #[test]
+    fn empty_filter_shows_all() {
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        assert_eq!(s.visible_sessions().len(), 3);
+    }
+
+    // 17. Filter narrows by title, case-insensitively.
+    #[test]
+    fn filter_narrows_by_title_case_insensitive() {
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        s.filter_input = "AUTH".to_string();
+        let visible = s.visible_sessions();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, "sess-001");
+    }
+
+    // 18. Filter also matches the session id.
+    #[test]
+    fn filter_matches_session_id() {
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        s.filter_input = "sess-003".to_string();
+        let visible = s.visible_sessions();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, "sess-003");
+    }
+
+    // 19. Non-matching filter yields an empty visible list but keeps sessions.
+    #[test]
+    fn filter_no_match_keeps_underlying_list() {
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        s.filter_input = "nope".to_string();
+        assert!(s.visible_sessions().is_empty());
+        assert_eq!(s.sessions.len(), 3);
+    }
+
+    // 20. open_with_query pre-applies the filter.
+    #[test]
+    fn open_with_query_prefilters() {
+        let mut s = SessionBrowserState::new();
+        s.open_with_query(sample_sessions(), "  tests  ");
+        assert!(s.visible);
+        assert_eq!(s.filter_input, "tests");
+        let visible = s.visible_sessions();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, "sess-002");
+    }
+
+    // 21. Typing in Search mode edits the filter and resets selection.
+    #[test]
+    fn search_mode_typing_edits_filter() {
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        s.start_search();
+        s.selected_idx = 2;
+        s.push_filter_char('t');
+        s.push_filter_char('e');
+        s.push_filter_char('s');
+        s.push_filter_char('t');
+        assert_eq!(s.filter_input, "test");
+        assert_eq!(s.selected_idx, 0);
+        s.pop_filter_char();
+        assert_eq!(s.filter_input, "tes");
+        s.pop_filter_char();
+        assert_eq!(s.filter_input, "te");
+    }
+
+    // 22. Filter chars are ignored outside Search mode.
+    #[test]
+    fn filter_chars_ignored_outside_search_mode() {
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        s.push_filter_char('x');
+        assert!(s.filter_input.is_empty());
+    }
+
+    // 23. confirm_search returns to Browse and keeps the filter applied.
+    #[test]
+    fn confirm_search_keeps_filter() {
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        s.start_search();
+        s.push_filter_char('a');
+        s.push_filter_char('u');
+        s.confirm_search();
+        assert_eq!(s.mode, SessionBrowserMode::Browse);
+        assert_eq!(s.visible_sessions().len(), 1);
+    }
+
+    // 24. clear_filter empties the filter and resets selection.
+    #[test]
+    fn clear_filter_resets() {
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        s.filter_input = "auth".to_string();
+        s.selected_idx = 0;
+        s.clear_filter();
+        assert!(s.filter_input.is_empty());
+        assert_eq!(s.visible_sessions().len(), 3);
+    }
+
+    // 25. Selection navigates the filtered view, not the raw list.
+    #[test]
+    fn selection_indexes_filtered_view() {
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        s.filter_input = "e".to_string(); // matches all three titles
+        s.select_next();
+        assert_eq!(s.selected_session().map(|x| x.id.as_str()), Some("sess-002"));
+        // Narrow further without going through push_filter_char: the stale
+        // index can point past the visible rows, in which case there is no
+        // selection until the next navigation keypress clamps it back in.
+        s.filter_input = "leak".to_string();
+        assert_eq!(s.visible_sessions().len(), 1);
+        assert!(s.selected_session().is_none());
+        s.select_next();
+        assert_eq!(s.selected_session().map(|x| x.id.as_str()), Some("sess-003"));
+    }
+
+    // 26. Rename applies to the underlying entry selected through the filter.
+    #[test]
+    fn rename_through_filter_updates_underlying_entry() {
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        s.filter_input = "leak".to_string(); // only sess-003 visible
+        s.start_rename();
+        assert_eq!(s.mode, SessionBrowserMode::Rename);
+        s.rename_input = "Fixed the leak".to_string();
+        let result = s.confirm_rename();
+        assert_eq!(
+            result,
+            Some(("sess-003".to_string(), "Fixed the leak".to_string()))
+        );
+        // The underlying entry was renamed even though it is not at index 0 of
+        // the raw list.
+        assert_eq!(s.sessions[2].title, "Fixed the leak");
+    }
+
+    // 27. close() keeps the filter for the next open.
+    #[test]
+    fn close_keeps_filter_for_reopen() {
+        let mut s = SessionBrowserState::new();
+        s.open_with_query(sample_sessions(), "auth");
+        s.close();
+        assert!(!s.visible);
+        assert_eq!(s.filter_input, "auth");
+        // Reopening without a query still shows the previous filter applied.
+        s.open(sample_sessions());
+        assert_eq!(s.visible_sessions().len(), 1);
+    }
+
+    // 28. Rendering with an active filter and no matches does not panic.
+    #[test]
+    fn render_no_match_does_not_panic() {
+        let mut s = SessionBrowserState::new();
+        s.open_with_query(sample_sessions(), "zzz");
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(area);
+        render_session_browser(&s, area, &mut buf);
+    }
+
+    // 29. Rendering while typing in Search mode does not panic.
+    #[test]
+    fn render_search_mode_does_not_panic() {
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        s.start_search();
+        s.push_filter_char('a');
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        render_session_browser(&s, area, &mut buf);
     }
 }

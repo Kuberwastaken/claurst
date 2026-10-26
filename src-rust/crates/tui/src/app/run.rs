@@ -40,6 +40,7 @@ pub(super) async fn load_session_entries() -> Vec<SessionEntry> {
                 title: s.title.unwrap_or_else(|| "(untitled)".to_string()),
                 last_updated,
                 cost_usd: s.total_cost,
+                working_dir: s.working_dir,
             }
         })
         .collect()
@@ -393,6 +394,19 @@ impl App {
         self.auto_poke_count = 0;
         self.no_progress_turns = 0;
         self.last_todo_hash = String::new();
+        self.queued_messages
+            .retain(|message| !claurst_tools::todo_write::is_auto_poke_message(message));
+    }
+
+    /// A synthetic poke continues the same work, so it must retain the
+    /// no-progress counter. Real user input starts a new task.
+    pub fn record_prompt_submission(&mut self, input: &str, automatic: bool) {
+        if automatic && claurst_tools::todo_write::is_auto_poke_message(input) {
+            return;
+        }
+        self.queued_messages
+            .retain(|message| !claurst_tools::todo_write::is_auto_poke_message(message));
+        self.no_progress_turns = 0;
     }
 
     /// Whether a `/goal` continuation loop is currently active for this

@@ -27,6 +27,8 @@ pub enum KeyContext {
     ModelPicker,
     Select,
     Plugin,
+    SessionBrowser,
+    SessionFilter,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -348,6 +350,29 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("space", "toggle", KeyContext::Attachments),
         ("a", "addAttachment", KeyContext::Attachments),
         ("r", "removeAttachment", KeyContext::Attachments),
+
+        // ========== SESSION BROWSER ==========
+        ("/", "startSessionFilter", KeyContext::SessionBrowser),
+        ("ctrl+u", "clearSessionFilter", KeyContext::SessionBrowser),
+        ("enter", "applySessionFilter", KeyContext::SessionFilter),
+        ("escape", "applySessionFilter", KeyContext::SessionFilter),
+        ("ctrl+u", "clearSessionFilter", KeyContext::SessionFilter),
+        ("backspace", "eraseSessionFilter", KeyContext::SessionFilter),
+        ("up", "prevSession", KeyContext::SessionFilter),
+        ("down", "nextSession", KeyContext::SessionFilter),
+        ("pageup", "prevSessionPage", KeyContext::SessionFilter),
+        ("pagedown", "nextSessionPage", KeyContext::SessionFilter),
+        ("up", "prevSession", KeyContext::SessionBrowser),
+        ("down", "nextSession", KeyContext::SessionBrowser),
+        ("k", "prevSession", KeyContext::SessionBrowser),
+        ("j", "nextSession", KeyContext::SessionBrowser),
+        ("pageup", "prevSessionPage", KeyContext::SessionBrowser),
+        ("pagedown", "nextSessionPage", KeyContext::SessionBrowser),
+        ("enter", "resumeSession", KeyContext::SessionBrowser),
+        ("escape", "closeSessionBrowser", KeyContext::SessionBrowser),
+        ("r", "renameSession", KeyContext::SessionBrowser),
+        ("a", "toggleSessionPaths", KeyContext::SessionBrowser),
+        ("p", "toggleSessionPreview", KeyContext::SessionBrowser),
     ];
 
     defaults
@@ -662,6 +687,42 @@ pub enum KeybindingResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_default_bindings_cover_session_browser_context() {
+        // Pins the session-browser default bindings (arrows + vim-style j/k,
+        // paging, resume/rename/toggles). These were silently dropped once by
+        // a recovery that only re-applied a partial patch; the defaults table
+        // has no other coverage, so this test is the guard.
+        let bindings = default_bindings();
+        let has = |key: &str, action: &str| {
+            bindings.iter().any(|b| {
+                b.chord.len() == 1
+                    && !b.chord[0].ctrl
+                    && !b.chord[0].alt
+                    && !b.chord[0].shift
+                    && b.chord[0].key == key
+                    && b.action.as_deref() == Some(action)
+                    && b.context == KeyContext::SessionBrowser
+            })
+        };
+        for (key, action) in [
+            ("up", "prevSession"),
+            ("k", "prevSession"),
+            ("down", "nextSession"),
+            ("j", "nextSession"),
+            ("pageup", "prevSessionPage"),
+            ("pagedown", "nextSessionPage"),
+            ("enter", "resumeSession"),
+            ("escape", "closeSessionBrowser"),
+            ("r", "renameSession"),
+            ("a", "toggleSessionPaths"),
+            ("p", "toggleSessionPreview"),
+        ] {
+            assert!(has(key, action), "missing default binding {key}={action}");
+        }
+    }
+
 
     #[test]
     fn test_parse_keystroke_simple() {

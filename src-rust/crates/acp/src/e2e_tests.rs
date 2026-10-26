@@ -222,6 +222,9 @@ pub(crate) struct Client {
     pub hold_permissions: AtomicBool,
     /// Every `session/update` notification the agent sent.
     pub updates: Arc<parking_lot::Mutex<Vec<Value>>>,
+    /// The agent behind the pipe, exposed so tests can inspect the runtime
+    /// cache and registry directly.
+    pub server: Arc<AgentServer>,
 }
 
 impl Client {
@@ -239,9 +242,10 @@ impl Client {
             .insert(runtime.working_dir.clone(), Arc::new(runtime));
         let (tx, mut rx) = mpsc::unbounded_channel();
         tokio::spawn(connection::run_reader(connection, server_read, tx));
+        let dispatch_server = server.clone();
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
-                server.dispatch(msg);
+                dispatch_server.dispatch(msg);
             }
         });
 
@@ -253,6 +257,7 @@ impl Client {
             permission_answers: Arc::new(parking_lot::Mutex::new(VecDeque::new())),
             hold_permissions: AtomicBool::new(false),
             updates: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            server: server.clone(),
         });
         tokio::spawn(Self::read_loop(client.clone(), client_read));
         client
@@ -314,6 +319,26 @@ impl Client {
         let params = serde_json::to_value(params).expect("serialize params");
         self.write(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
             .await;
+    }
+
+    /// Queue a prompt task without yielding, so current-thread tests control
+    /// the exact ordering of dispatch and handler execution.
+    fn dispatch_prompt(&self, session_id: &acp::SessionId) -> oneshot::Receiver<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.responses.insert(id, tx);
+        self.server.dispatch(connection::Inbound::Request {
+            id: serde_json::from_value(json!(id)).unwrap(),
+            method: "session/prompt".into(),
+            params: Some(
+                serde_json::to_value(acp::PromptRequest::new(
+                    session_id.clone(),
+                    vec![acp::ContentBlock::Text(acp::TextContent::new("hello"))],
+                ))
+                .unwrap(),
+            ),
+        });
+        rx
     }
 
     pub async fn new_session(&self, cwd: &Path) -> acp::SessionId {
@@ -399,6 +424,139 @@ async fn prompt_after_cancel_runs_normally() {
         acp::StopReason::EndTurn,
         "a cancel must not poison later prompts"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_directory_via_different_spellings_shares_one_runtime() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("canonical");
+    let client = Client::start(scripted_runtime(&cwd, ScriptedProvider::new(vec![Step::Text("ok")])));
+    let first = client.new_session(&cwd).await;
+    let second = client.new_session(&cwd.join(".")).await;
+    assert_ne!(first, second, "each session/new must return a fresh session id");
+
+    let runtimes = client.server.runtimes.lock().await;
+    let keys: Vec<&std::path::PathBuf> = runtimes.keys().collect();
+    assert_eq!(keys, vec![&cwd], "one runtime per directory, not per spelling: {keys:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn runtimes_without_sessions_are_evicted() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("evict");
+    let unused = scratch_dir("evict-unused");
+    let client = Client::start(scripted_runtime(&cwd, ScriptedProvider::new(vec![Step::Text("ok")])));
+    let _session_id = client.new_session(&cwd).await;
+
+    // Build a second directory's runtime without ever creating a session in
+    // it: its cache entry is garbage and must go on the next pass.
+    client
+        .server
+        .runtime_for(&unused)
+        .await
+        .expect("build runtime for the unused directory");
+    assert!(
+        client.server.runtimes.lock().await.contains_key(&unused),
+        "the runtime exists after an explicit build"
+    );
+
+    client.new_session(&cwd).await; // triggers an eviction pass
+    let runtimes = client.server.runtimes.lock().await;
+    let keys: Vec<&std::path::PathBuf> = runtimes.keys().collect();
+    assert_eq!(
+        keys,
+        vec![&cwd],
+        "the unused directory's runtime is evicted, the one with a session stays: {keys:?}"
+    );
+}
+
+#[tokio::test]
+async fn cancel_before_the_prompt_task_starts_cancels_the_turn() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("cancel-race");
+    // `Step::Hang` never answers: if the cancel were dropped because it
+    // arrived before the prompt task reached its turn reservation, this
+    // prompt could never finish and `Client::prompt` would time out.
+    let provider = ScriptedProvider::new(vec![Step::Hang]);
+    let client = Client::start(scripted_runtime(&cwd, provider.clone()));
+    let session_id = client.new_session(&cwd).await;
+
+    // No await between these dispatches: on this current-thread runtime the
+    // prompt handler cannot start before cancellation has been dispatched.
+    let prompt = client.dispatch_prompt(&session_id);
+    client.server.dispatch(connection::Inbound::Notification {
+        method: "session/cancel".into(),
+        params: Some(serde_json::to_value(acp::CancelNotification::new(session_id)).unwrap()),
+    });
+    assert!(provider.requests.lock().is_empty());
+    let response = tokio::time::timeout(Duration::from_secs(2), prompt)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stop_reason(&response), acp::StopReason::Cancelled);
+    assert!(
+        provider.requests.lock().is_empty(),
+        "pre-start cancellation must skip inference"
+    );
+}
+
+#[tokio::test]
+async fn session_survives_an_independently_evicted_runtime_cache_entry() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("cache-session");
+    let other = scratch_dir("cache-other");
+    let provider = ScriptedProvider::new(vec![Step::Text("still live")]);
+    let client = Client::start(scripted_runtime(&cwd, provider));
+    let session_id = client.new_session(&cwd).await;
+    // Reproduce a cache snapshot that lacks a concurrently created session's
+    // cwd. The session still owns its runtime even when the cache does not.
+    client.server.runtimes.lock().await.remove(&cwd);
+    client.server.runtime_for(&other).await.unwrap();
+    assert!(client.server.sessions.get(&session_id).is_some());
+    let response = client.prompt(&session_id, "continue").await;
+    assert_eq!(stop_reason(&response), acp::StopReason::EndTurn);
+}
+
+#[tokio::test]
+async fn idle_cancel_does_not_cancel_a_later_reserved_prompt() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("idle-cancel");
+    let provider = ScriptedProvider::new(vec![Step::Text("next answer")]);
+    let client = Client::start(scripted_runtime(&cwd, provider.clone()));
+    let session_id = client.new_session(&cwd).await;
+    client.server.dispatch(connection::Inbound::Notification {
+        method: "session/cancel".into(),
+        params: Some(
+            serde_json::to_value(acp::CancelNotification::new(session_id.clone())).unwrap(),
+        ),
+    });
+    let prompt = client.dispatch_prompt(&session_id);
+    let response = tokio::time::timeout(Duration::from_secs(2), prompt)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stop_reason(&response), acp::StopReason::EndTurn);
+    assert_eq!(provider.requests.lock().len(), 1);
+}
+
+#[tokio::test]
+async fn busy_at_dispatch_stays_rejected_after_the_active_turn_finishes() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("busy-dispatch");
+    let provider = ScriptedProvider::new(vec![Step::Text("must not run")]);
+    let client = Client::start(scripted_runtime(&cwd, provider.clone()));
+    let session_id = client.new_session(&cwd).await;
+    let session = client.server.sessions.get(&session_id).unwrap();
+    let active = session.begin_turn().unwrap();
+    let prompt = client.dispatch_prompt(&session_id);
+    drop(active); // the response task has not run yet
+    let response = tokio::time::timeout(Duration::from_secs(2), prompt)
+        .await
+        .unwrap()
+        .unwrap();
+    let error: acp::Error = serde_json::from_value(response["error"].clone()).unwrap();
+    assert_eq!(error.code, acp::ErrorCode::InvalidRequest);
+    assert!(provider.requests.lock().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -699,6 +857,69 @@ async fn prompt_images_reach_a_provider_that_accepts_them() {
         matches!(block, ContentBlock::Image { source } if source.data.as_deref() == Some("aGVsbG8="))
     });
     assert!(has_image, "the image must be passed to the provider: {user:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn global_yolo_mode_bypasses_permissions_in_acp_like_the_cli() {
+    let _home = isolated_home().await;
+    let mut settings = claurst_core::config::Settings::default();
+    settings.config.yolo_mode = true;
+    std::fs::write(
+        claurst_core::config::Settings::global_settings_path(),
+        serde_json::to_string(&settings).expect("serialize global settings"),
+    )
+    .expect("write global settings");
+
+    let runtime = AgentRuntime::build(scratch_dir("yolo"))
+        .await
+        .expect("runtime builds");
+    assert_eq!(
+        runtime.config.permission_mode,
+        claurst_core::PermissionMode::BypassPermissions,
+        "yoloMode must bypass permissions in ACP exactly like the CLI"
+    );
+    assert!(runtime.config.yolo_mode);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn runtime_prompt_wiring_matches_the_cli() {
+    let _home = isolated_home().await;
+
+    // Without a custom prompt: `system_prompt` stays None so the query loop
+    // emits the full default prompt layers — the previous wiring stuffed the
+    // git context into `system_prompt`, flipping every ACP session into
+    // custom-prompt mode.
+    let plain = AgentRuntime::build(scratch_dir("prompt-plain"))
+        .await
+        .expect("runtime builds");
+    assert_eq!(plain.query_config.system_prompt, None);
+    assert_eq!(plain.query_config.append_system_prompt, None);
+    assert!(
+        plain.query_config.session_context.is_some(),
+        "the git/IDE context must ride the dynamic block via session_context"
+    );
+
+    // Custom and append prompts combine into `system_prompt` exactly like the
+    // CLI's stable block, and the append field is left empty for the loop's
+    // own per-turn addenda.
+    let cwd = scratch_dir("prompt-custom");
+    std::fs::create_dir_all(cwd.join(".claurst")).expect("create .claurst");
+    let mut project = claurst_core::config::Settings::default();
+    project.config.custom_system_prompt = Some("ACP-CUSTOM-PROMPT".to_string());
+    project.config.append_system_prompt = Some("ACP-APPEND-PROMPT".to_string());
+    std::fs::write(
+        cwd.join(".claurst").join("settings.json"),
+        serde_json::to_string(&project).expect("serialize project settings"),
+    )
+    .expect("write project settings");
+
+    let custom = AgentRuntime::build(cwd.clone()).await.expect("runtime builds");
+    assert_eq!(
+        custom.query_config.system_prompt.as_deref(),
+        Some("ACP-CUSTOM-PROMPT\n\nACP-APPEND-PROMPT"),
+    );
+    assert_eq!(custom.query_config.append_system_prompt, None);
+    assert_eq!(custom.query_config.working_directory, Some(cwd.display().to_string()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
