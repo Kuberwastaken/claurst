@@ -344,17 +344,33 @@ pub(crate) async fn lock_files<'a>(
 /// Write `contents` to `path` atomically: write to a temp file in the same
 /// directory, then rename over the destination. A crash or disk-full mid-write
 /// can never leave the destination truncated or half-written.
-pub(crate) async fn write_atomic(
-    path: &std::path::Path,
-    contents: &[u8],
-) -> std::io::Result<()> {
+pub(crate) async fn write_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".to_string());
-    let tmp = path.with_file_name(format!(".{}.claurst-tmp-{}", file_name, std::process::id()));
-
-    tokio::fs::write(&tmp, contents).await?;
+    use tokio::io::AsyncWriteExt;
+    let tmp = path.with_file_name(format!(
+        ".{}.claurst-tmp-{}",
+        file_name,
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .await?;
+    let written = async {
+        file.write_all(contents).await?;
+        file.flush().await
+    }
+    .await;
+    if let Err(error) = written {
+        drop(file);
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(error);
+    }
+    drop(file);
     // Preserve the original file's permissions (e.g. the executable bit on
     // Unix), which a fresh temp file would otherwise reset.
     if let Ok(meta) = tokio::fs::metadata(path).await {
@@ -1553,6 +1569,28 @@ mod tests {
             .await
             .is_err());
         assert_eq!(std::fs::read(path).unwrap(), b"external change");
+    }
+
+    #[tokio::test]
+    async fn simultaneous_atomic_writes_own_distinct_temporary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.txt");
+        let mut writers = Vec::new();
+        for index in 0..16 {
+            let path = path.clone();
+            writers.push(tokio::spawn(async move {
+                write_atomic(&path, format!("writer-{index}").as_bytes())
+                    .await
+                    .unwrap();
+            }));
+        }
+        for writer in writers {
+            writer.await.unwrap();
+        }
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .starts_with("writer-"));
+        assert_eq!(count_atomic_tmp_files(dir.path()), 0);
     }
 
     #[tokio::test]
