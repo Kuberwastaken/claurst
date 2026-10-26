@@ -1,6 +1,6 @@
 {
   "name": "claurst",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Open-source, multi-provider terminal coding agent built in Rust",
   "license": "GPL-3.0-only",
   "repository": {
