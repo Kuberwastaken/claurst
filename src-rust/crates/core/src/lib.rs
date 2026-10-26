@@ -6136,6 +6136,11 @@ pub mod tasks {
         /// Update the status of a task.  No-op if the ID is unknown.
         pub fn update_status(&self, id: &str, status: TaskStatus) {
             if let Some(mut entry) = self.tasks.get_mut(id) {
+                // A cancelled worker may finish draining after the user stop.
+                // Its late completion must not revive the task or notify.
+                if entry.status == TaskStatus::Cancelled {
+                    return;
+                }
                 let is_terminal = !matches!(status, TaskStatus::Running);
                 entry.status = status;
                 if is_terminal && entry.completed_at.is_none() {
@@ -6259,6 +6264,16 @@ pub mod tasks {
             registry.set_output_file(&id, std::path::PathBuf::from("/spill/x.txt"), false);
             let rendered = registry.get(&id).unwrap().render_output();
             assert!(rendered.ends_with("line 99999\n\nFull output: /spill/x.txt"));
+        }
+
+        #[test]
+        fn late_worker_completion_does_not_overwrite_user_cancel() {
+            let registry = TaskRegistry::new();
+            let id = registry.register(BackgroundTask::new("cancelled"));
+            registry.cancel(&id);
+            registry.complete(&id);
+            registry.update_status(&id, TaskStatus::Failed("late exit".into()));
+            assert_eq!(registry.get(&id).unwrap().status, TaskStatus::Cancelled);
         }
 
         #[test]

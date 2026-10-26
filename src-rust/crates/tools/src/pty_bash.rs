@@ -210,6 +210,8 @@ async fn run_in_background(
     let task_name = format!("bg: {}", &command[..command.floor_char_boundary(60)]);
     let mut task = BackgroundTask::new(&task_name);
     task.pid = None;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    task.cancel_token = Some(cancel.clone());
     let task_id = global_registry().register(task);
     let task_id_clone = task_id.clone();
     let command_clone = command.clone();
@@ -218,6 +220,9 @@ async fn run_in_background(
     let term = std::env::var_os("TERM").unwrap_or_else(|| DEFAULT_TERM.into());
 
     tokio::spawn(async move {
+        if cancel.is_cancelled() {
+            return;
+        }
         // kill_on_drop: should this task ever be dropped mid-future (stop via
         // the monitor tool), the child must die with it, not leak (#220). The
         // in-command timeout below kills it explicitly (#465).
@@ -242,6 +247,8 @@ async fn run_in_background(
                 }
                 None => Command::new("bash"),
             };
+            #[cfg(unix)]
+            bash.process_group(0);
             bash.arg("-c")
                 .arg(&command_clone)
                 .current_dir(&cwd)
@@ -256,6 +263,10 @@ async fn run_in_background(
 
         match child {
             Ok(mut c) => {
+                #[cfg(unix)]
+                let mut group_guard = UnixProcessGroupGuard::new(c.id());
+                #[cfg(windows)]
+                let mut group_guard = WindowsProcessTreeGuard::new(c.id());
                 if let Some(pid) = c.id() {
                     global_registry().set_pid(&task_id_clone, pid);
                 }
@@ -315,11 +326,16 @@ async fn run_in_background(
                         }
                     };
                     tokio::pin!(drain);
-                    let drifted = tokio::time::timeout_at(deadline, &mut drain).await.is_err();
+                    let drifted = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => true,
+                        result = tokio::time::timeout_at(deadline, &mut drain) => result.is_err(),
+                    };
                     if drifted {
                         // Kill the child so the pipes close and the drain
                         // finishes; a child that leaks its fds elsewhere only
                         // costs the grace window below.
+                        group_guard.kill_now();
                         let _ = c.kill().await;
                         if tokio::time::timeout(BG_DRAIN_GRACE, &mut drain)
                             .await
@@ -336,14 +352,23 @@ async fn run_in_background(
                 // Pipe EOF does not imply process exit: commands can close
                 // both streams and keep running. Keep the wait on the same
                 // deadline rather than giving it an unbounded second phase.
-                let status = match tokio::time::timeout_at(deadline, c.wait()).await {
-                    Ok(status) => status,
-                    Err(_) => {
+                let wait = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => None,
+                    result = tokio::time::timeout_at(deadline, c.wait()) => Some(result),
+                };
+                let status = match wait {
+                    Some(Ok(status)) => status,
+                    _ => {
                         timed_out = true;
+                        group_guard.kill_now();
                         let _ = c.kill().await;
                         c.wait().await
                     }
                 };
+                if status.is_ok() && !timed_out {
+                    group_guard.disarm();
+                }
                 let captured = full.lock().finish();
                 let spilled = match captured {
                     Captured::Truncated { tail, spill, .. } => finish_spill(spill, &tail),
@@ -361,7 +386,10 @@ async fn run_in_background(
                 if let Some(path) = spilled {
                     global_registry().set_output_file(&task_id_clone, path, timed_out);
                 }
-                if timed_out {
+                if cancel.is_cancelled() {
+                    global_registry()
+                        .update_status(&task_id_clone, claurst_core::tasks::TaskStatus::Cancelled);
+                } else if timed_out {
                     global_registry().update_status(
                         &task_id_clone,
                         claurst_core::tasks::TaskStatus::Failed(format!(
@@ -405,11 +433,17 @@ async fn run_in_background(
         // tool was stopped on purpose and does not report back.
         if let Some(notifier) = notifier {
             if let Some(task) = global_registry().get(&task_id_clone) {
-                if task.status != claurst_core::tasks::TaskStatus::Cancelled {
+                if !cancel.is_cancelled()
+                    && task.status != claurst_core::tasks::TaskStatus::Cancelled
+                {
                     let state = task.status.to_string();
                     notifier.notify(crate::completion_notice(
                         "background-shell",
-                        &[("id", &task.id), ("state", &state), ("command", &command_clone)],
+                        &[
+                            ("id", &task.id),
+                            ("state", &state),
+                            ("command", &command_clone),
+                        ],
                         &task.render_output(),
                     ));
                 }
@@ -613,6 +647,45 @@ enum PtyOutcome {
     Failed(String),
 }
 
+/// Owns a dedicated Unix process group created by process_group(0) or the
+/// PTY session's setsid(). A negative PID targets that group, never ours.
+#[cfg(unix)]
+struct UnixProcessGroupGuard {
+    pgid: Arc<parking_lot::Mutex<Option<libc::pid_t>>>,
+}
+
+#[cfg(unix)]
+impl UnixProcessGroupGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self {
+            pgid: Arc::new(parking_lot::Mutex::new(
+                pid.and_then(|pid| libc::pid_t::try_from(pid).ok())
+                    .filter(|pid| *pid > 0),
+            )),
+        }
+    }
+
+    fn disarm(&mut self) {
+        *self.pgid.lock() = None;
+    }
+
+    fn kill_now(&mut self) {
+        let mut owned = self.pgid.lock();
+        if let Some(pgid) = owned.take() {
+            // SAFETY: pgid is positive and names the isolated group created
+            // for this child. Negating it signals only that owned group.
+            let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixProcessGroupGuard {
+    fn drop(&mut self) {
+        self.kill_now();
+    }
+}
+
 /// Guard that guarantees the PTY child is killed if the running future is
 /// dropped before the command completes — e.g. the turn is cancelled or the
 /// task is aborted mid-command. This is the PTY analogue of tokio's
@@ -624,23 +697,37 @@ enum PtyOutcome {
 struct PtyKillGuard {
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     armed: bool,
+    group: UnixProcessGroupGuard,
+    has_group: bool,
 }
 
 #[cfg(unix)]
 impl PtyKillGuard {
-    fn new(killer: Box<dyn portable_pty::ChildKiller + Send + Sync>) -> Self {
-        Self { killer, armed: true }
+    fn new(killer: Box<dyn portable_pty::ChildKiller + Send + Sync>, pid: Option<u32>) -> Self {
+        Self {
+            killer,
+            armed: true,
+            group: UnixProcessGroupGuard::new(pid),
+            has_group: pid.is_some(),
+        }
     }
 
     /// The command finished on its own — there is nothing left to kill.
     fn disarm(&mut self) {
         self.armed = false;
+        self.group.disarm();
     }
 
     /// Kill the child now (timeout path) and disarm so `Drop` is a no-op.
     fn kill_now(&mut self) {
         if self.armed {
-            let _ = self.killer.kill();
+            if self.has_group {
+                self.group.kill_now();
+            } else {
+                // Native Unix PTYs have a PID; retain the trait fallback only
+                // for an implementation that cannot expose its group.
+                let _ = self.killer.kill();
+            }
             self.armed = false;
         }
     }
@@ -650,8 +737,8 @@ impl PtyKillGuard {
 impl Drop for PtyKillGuard {
     fn drop(&mut self) {
         if self.armed {
-            // Future dropped before completion (cancel / abort): don't leak the child.
-            let _ = self.killer.kill();
+            // Future dropped before completion: kill the owned process group.
+            self.kill_now();
         }
     }
 }
@@ -695,21 +782,28 @@ async fn run_in_pty(
     // Restored shell vars go through the child's ENVIRONMENT, never its argv (#211).
     apply_child_env(&mut cmd, env_vars);
 
-    let child = match pair.slave.spawn_command(cmd) {
+    let mut child = match pair.slave.spawn_command(cmd) {
         Ok(c) => c,
         Err(e) => return PtyOutcome::Failed(format!("Failed to spawn in PTY: {}", e)),
-    };
-
-    // Grab the reader *before* dropping slave so the fd stays valid.
-    let reader = match pair.master.try_clone_reader() {
-        Ok(r) => r,
-        Err(e) => return PtyOutcome::Failed(format!("Failed to clone PTY reader: {}", e)),
     };
 
     // A killer handle cloned from the child. This is how a timed-out or
     // cancelled command is explicitly KILLED (portable_pty does not kill on
     // drop, so without this the child would orphan) (#220).
     let killer = child.clone_killer();
+    let child_pid = child.process_id();
+
+    let mut guard = PtyKillGuard::new(killer, child_pid);
+
+    // Grab the reader *before* dropping slave so the fd stays valid.
+    let reader = match pair.master.try_clone_reader() {
+        Ok(r) => r,
+        Err(e) => {
+            guard.kill_now();
+            let _ = tokio::task::spawn_blocking(move || child.wait()).await;
+            return PtyOutcome::Failed(format!("Failed to clone PTY reader: {}", e));
+        }
+    };
 
     // Drop slave after spawn — once the child's controlling terminal is gone,
     // the master side will see EOF when the child exits.
@@ -722,9 +816,10 @@ async fn run_in_pty(
     // reading as soon as the DIRECT child exits rather than waiting for pty EOF,
     // which a detached grandchild would hold open forever (#184).
     let spill_for_thread = spill_path.clone();
+    let group_ownership = guard.group.pgid.clone();
     let mut read_handle = tokio::task::spawn_blocking(move || {
         let master_fd = master.as_raw_fd();
-        let result = drive_pty_child(child, reader, master_fd, spill_for_thread);
+        let result = drive_pty_child(child, reader, master_fd, spill_for_thread, group_ownership);
         // Keep the master fd alive until reading + reaping is complete.
         drop(master);
         result
@@ -732,8 +827,6 @@ async fn run_in_pty(
 
     // Kill-on-drop guard: if this future is dropped mid-command (turn cancelled)
     // the guard fires and kills the child instead of leaking it (#220).
-    let mut guard = PtyKillGuard::new(killer);
-
     match tokio::time::timeout(timeout, &mut read_handle).await {
         Ok(Ok((captured, exit_code))) => {
             guard.disarm();
@@ -821,6 +914,7 @@ fn drive_pty_child(
     mut reader: Box<dyn std::io::Read + Send>,
     master_fd: Option<std::os::unix::io::RawFd>,
     spill_path: PathBuf,
+    group_ownership: Arc<parking_lot::Mutex<Option<libc::pid_t>>>,
 ) -> (Captured, i32) {
     use std::io::Read;
 
@@ -858,20 +952,41 @@ fn drive_pty_child(
             // of hanging on a detached grandchild still holding it open (#184).
             break;
         }
+        // Reaping and signalling share this lock: once try_wait reaps the
+        // leader, the timeout guard must never signal a recycled group ID.
+        let mut owned = group_ownership.lock();
         match child.try_wait() {
             Ok(Some(_)) => {
+                *owned = None;
                 // Direct child is done. Loop once more to drain any final buffered
                 // bytes; the `child_exited` guard above then breaks us out.
                 child_exited = true;
             }
             Ok(None) => {}   // still running
-            Err(_) => break, // can't observe the child — bail rather than spin
+            Err(_) => {
+                *owned = None;
+                break; // child identity is no longer observable; never signal it
+            }
         }
     }
 
-    let exit_code = match child.wait() {
-        Ok(status) => status.exit_code() as i32,
-        Err(_) => -1,
+    let exit_code = loop {
+        let mut owned = group_ownership.lock();
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                *owned = None;
+                break status.exit_code() as i32;
+            }
+            Err(_) => {
+                *owned = None;
+                break -1;
+            }
+            Ok(None) => {}
+        }
+        drop(owned);
+        // EOF can precede exit; never hold the ownership lock across a
+        // blocking wait, or the timeout guard could not kill the child.
+        std::thread::sleep(Duration::from_millis(PTY_POLL_INTERVAL_MS as u64));
     };
     (output.finish(), exit_code)
 }
@@ -1932,8 +2047,13 @@ mod tests {
     async fn timeout_surfaces_partial_output() {
         let state = parking_lot::Mutex::new(ShellState::new());
         let spill_dir = tempfile::tempdir().unwrap();
+        let pid_file = spill_dir.path().join("child.pid");
+        let command = format!(
+            "sleep 30 & child=$!; printf '%s' \"$child\" > '{}'; echo before-timeout; wait \"$child\"",
+            pid_file.display()
+        );
         let result = run_pty_foreground(
-            "echo before-timeout && sleep 29991",
+            &command,
             &state,
             &std::env::temp_dir(),
             Duration::from_millis(800),
@@ -1958,18 +2078,29 @@ mod tests {
             "a timed-out run must not touch the shell state"
         );
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        if let Ok(out) = std::process::Command::new("pgrep")
-            .arg("-f")
-            .arg("sleep 29991")
-            .output()
-        {
-            let pids = String::from_utf8_lossy(&out.stdout);
-            let lingering: Vec<&str> = pids.split_whitespace().collect();
+        let pid: u32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
+        assert_process_stopped(pid).await;
+    }
+
+    /// Check this fixture's actual child, never a global command-line marker
+    /// shared by other concurrently running tests. Zombies are already dead.
+    async fn assert_process_stopped(pid: u32) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let output = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            let state = String::from_utf8_lossy(&output.stdout);
+            let state = state.trim();
+            if state.is_empty() || state.starts_with('Z') {
+                return;
+            }
             assert!(
-                lingering.is_empty(),
-                "timed-out command's sleep left running (pids: {lingering:?})"
+                std::time::Instant::now() < deadline,
+                "fixture child {pid} survived timeout (state {state})"
             );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -2011,8 +2142,13 @@ mod tests {
     #[tokio::test]
     async fn background_timeout_still_spills_partial_output() {
         let spill_dir = tempfile::tempdir().unwrap();
+        let pid_file = spill_dir.path().join("child.pid");
+        let command = format!(
+            "yes | head -c 1200000; sleep 30 & child=$!; printf '%s' \"$child\" > '{}'; wait \"$child\"",
+            pid_file.display()
+        );
         let started = run_in_background(
-            "yes | head -c 1200000; sleep 29991".to_string(),
+            command,
             std::env::temp_dir(),
             1500,
             spill_dir.path(),
@@ -2061,6 +2197,8 @@ mod tests {
             "lossy tail: {:?}",
             &spilled[..spilled.len().min(16)]
         );
+        let pid: u32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
+        assert_process_stopped(pid).await;
     }
 
     /// #442: 10 MB of output used to hit the reader's 2 MB head-only cap, after
@@ -2134,9 +2272,74 @@ mod tests {
             if !task.is_running() {
                 return task;
             }
-            assert!(std::time::Instant::now() < deadline, "background task never finished");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background task never finished"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn monitor_cancel_kills_background_group_without_completion_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("cancel-child.pid");
+        let command = format!(
+            "sleep 30 & child=$!; printf '%s' \"$child\" > '{}'; echo ready; wait \"$child\"",
+            pid_file.display()
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let notifier = CompletionNotifier::new(move |message| {
+            let _ = tx.send(message);
+        });
+        let started = run_in_background(
+            command,
+            std::env::temp_dir(),
+            60_000,
+            dir.path(),
+            None,
+            Some(notifier),
+        )
+        .await;
+        let task_id = started
+            .content
+            .lines()
+            .find_map(|line| line.strip_prefix("Task ID: "))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !pid_file.exists()
+                || !global_registry()
+                    .get(task_id)
+                    .unwrap()
+                    .output
+                    .iter()
+                    .any(|line| line == "ready")
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background fixture must be ready");
+        let pid: u32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
+        let result = crate::MonitorTool
+            .execute(
+                json!({ "action": "cancel", "task_id": task_id }),
+                &allow_all_context(),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .expect("cancelled worker must exit promptly")
+                .is_none(),
+            "user cancellation must not send a completion notice"
+        );
+        assert_eq!(
+            global_registry().get(task_id).unwrap().status,
+            claurst_core::tasks::TaskStatus::Cancelled
+        );
+        assert_process_stopped(pid).await;
     }
 
     /// #444: a background command started with a notifier reports back with
@@ -2228,12 +2431,12 @@ mod tests {
     #[tokio::test]
     async fn background_timeout_spills_small_unterminated_output() {
         let spill_dir = tempfile::tempdir().unwrap();
-        // The descendant keeps the pipe open after bash dies, so the line
-        // reader cannot deliver its pending display line within the grace.
+        // The output has no newline; it must survive when the process group
+        // is killed and the reader delivers its pending bounded prefix.
         let started = run_in_background(
-            "printf short; sleep 3 & wait".to_string(),
+            "printf short; { sleep 10 & }; wait".to_string(),
             std::env::temp_dir(),
-            100,
+            500,
             spill_dir.path(),
             None,
             None,
