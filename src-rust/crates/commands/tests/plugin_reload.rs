@@ -113,7 +113,13 @@ async fn reload_fixture_child() {
     // The import/rebuild path re-reads hierarchical settings rather than
     // projecting from a global-only config that lost its project entries.
     let project_settings = project.join(".claurst/settings.json");
-    std::fs::write(project_settings, json!({"config":{"mcp_servers":[{"name":"project-settings","command":"never-executed","args":[],"env":{},"server_type":"stdio"}]}}).to_string()).unwrap();
+    let mut project_config = Settings::default();
+    project_config.config.mcp_servers = vec![serde_json::from_value(json!({"name":"project-settings","command":"never-executed","args":[],"env":{},"server_type":"stdio"})).unwrap()];
+    std::fs::write(
+        project_settings,
+        serde_json::to_vec(&project_config).unwrap(),
+    )
+    .unwrap();
     settings.config.mcp_servers = vec![serde_json::from_value(json!({"name":"imported-global","command":"never-executed","args":[],"env":{},"server_type":"stdio"})).unwrap()];
     settings.save_sync().unwrap();
     let configured = Settings::load_hierarchical(&project)
