@@ -28,6 +28,7 @@ pub enum KeyContext {
     Select,
     Plugin,
     SessionBrowser,
+    SessionFilter,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -360,6 +361,16 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("r", "removeAttachment", KeyContext::Attachments),
 
         // ========== SESSION BROWSER ==========
+        ("/", "startSessionFilter", KeyContext::SessionBrowser),
+        ("ctrl+u", "clearSessionFilter", KeyContext::SessionBrowser),
+        ("enter", "applySessionFilter", KeyContext::SessionFilter),
+        ("escape", "applySessionFilter", KeyContext::SessionFilter),
+        ("ctrl+u", "clearSessionFilter", KeyContext::SessionFilter),
+        ("backspace", "eraseSessionFilter", KeyContext::SessionFilter),
+        ("up", "prevSession", KeyContext::SessionFilter),
+        ("down", "nextSession", KeyContext::SessionFilter),
+        ("pageup", "prevSessionPage", KeyContext::SessionFilter),
+        ("pagedown", "nextSessionPage", KeyContext::SessionFilter),
         ("up", "prevSession", KeyContext::SessionBrowser),
         ("down", "nextSession", KeyContext::SessionBrowser),
         ("k", "prevSession", KeyContext::SessionBrowser),
