@@ -43,9 +43,9 @@ The context window has a finite size. Auto-compaction automatically summarises t
 
 ### How it works
 
-Before every model request, including the one after each batch of tool results, Claurst estimates the prompt size: the prompt tokens the provider last reported plus an estimate of what was appended since. When that reaches the threshold, the head of the conversation is summarised through the active provider and replaced by the summary; the most recent messages (about 16,000 tokens) are kept verbatim.
+Before every model request, including the one after each batch of tool results, Claurst estimates the prompt size: the prompt tokens the provider last reported plus an estimate of what was appended since. When that reaches the threshold, the head of the conversation is summarised through the active provider and replaced by the summary; the most recent messages are kept verbatim (up to 16,000 tokens, capped at a quarter of the resolved context window).
 
-The threshold is the lower of 90% of the context window and the window minus the response reserve (`max_tokens`, capped at a quarter of the window). For a 200,000-token window and `max_tokens` 32,000 that is 168,000 tokens.
+The threshold is the lower of the configured fraction of the context window (90% by default) and the window minus the response reserve (`max_tokens`, capped at a quarter of the window). For a 200,000-token window and `max_tokens` 32,000 that is 168,000 tokens.
 
 If the provider still rejects a request as too long, Claurst compacts once and retries the request. A second overflow on the same request is reported as an error.
 
@@ -57,7 +57,9 @@ The `PreCompact` hook fires before compaction, with `trigger` set to `auto` or `
 claurst --no-auto-compact
 ```
 
-`--no-auto-compact` turns off both the threshold check and the overflow retry for the session; `/compact` still works. It is the only switch: the `auto_compact` and `compact_threshold` keys in `config` and the top-level `autoCompact` key are not read by the query loop.
+`--no-auto-compact` turns off both the threshold check and the overflow retry for the session; `/compact` still works. The `config.auto_compact` and top-level `autoCompact` settings also control automatic compaction (default `true`). A `false` in either setting or any settings layer disables it; an omitted/default layer cannot re-enable it. The CLI flag always disables it for that session.
+
+Set `config.compact_threshold` to a fraction strictly between 0 and 1 (default `0.9`). Invalid values use the default. Automatic compaction bounds summary output by both the response limit and an eighth of the resolved window, and bounds verbatim user excerpts to fit small windows. Summary requests retry a transient failure once at most, respecting `config.maxRetries` and the shared capped backoff/Retry-After policy; authentication, quota and invalid-request failures are returned immediately.
 
 ### Manual compaction
 

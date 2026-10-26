@@ -343,6 +343,7 @@ impl QueryConfig {
             effort_level: cfg.effective_effort_level(),
             degradation_enabled: cfg.degradation_summary_enabled_or_default(),
             retry: claurst_api::RetryConfig::with_max_retries(cfg.max_retries),
+            auto_compact: cfg.auto_compact,
             ..Default::default()
         }
     }
@@ -365,6 +366,7 @@ impl QueryConfig {
             effort_level: cfg.effective_effort_level(),
             degradation_enabled: cfg.degradation_summary_enabled_or_default(),
             retry: claurst_api::RetryConfig::with_max_retries(cfg.max_retries),
+            auto_compact: cfg.auto_compact,
             ..Default::default()
         }
     }
@@ -597,6 +599,7 @@ pub async fn run_query_loop(
     let mut max_tokens_recovery_count: u32 = 0;
     // Active model — may switch to fallback on overloaded errors.
     // Agent model override takes priority over the session model when set.
+    let auto_compact_enabled = config.auto_compact && tool_ctx.config.auto_compact;
     let mut effective_model = if let Some(ref agent) = config.agent_definition {
         agent.model.clone().unwrap_or_else(|| config.model.clone())
     } else {
@@ -964,7 +967,7 @@ pub async fn run_query_loop(
             }
         }
 
-        if config.auto_compact
+        if auto_compact_enabled
             && compact_before_request(
                 messages,
                 route.as_ref(),
@@ -973,6 +976,7 @@ pub async fn run_query_loop(
                 context_tokens,
                 context_window,
                 config.max_tokens,
+                &config.retry,
                 &mut compact_state,
                 config.session_journal.as_deref(),
                 event_tx.as_ref(),
@@ -1366,7 +1370,7 @@ pub async fn run_query_loop(
                         Err(e) => {
                             // Context-window error: compact once and retry,
                             // before the transient-retry policy (#441, #439).
-                            if config.auto_compact
+                            if auto_compact_enabled
                                 && !overflow_recovery_used
                                 && provider_error_is_overflow(&e)
                             {
@@ -1376,6 +1380,8 @@ pub async fn run_query_loop(
                                     provider.as_ref(),
                                     &model_id_str,
                                     config.max_tokens,
+                                    context_window,
+                                    &config.retry,
                                     config.session_journal.as_deref(),
                                     event_tx.as_ref(),
                                     tool_ctx,
@@ -1521,7 +1527,7 @@ pub async fn run_query_loop(
                     // once and retries; other failures follow the shared
                     // retry policy, else surface a QueryOutcome::Error.
                     if let Some((err, decision)) = provider_stream_error {
-                        if config.auto_compact
+                        if auto_compact_enabled
                             && !overflow_recovery_used
                             && provider_error_is_overflow(&err)
                         {
@@ -1531,6 +1537,8 @@ pub async fn run_query_loop(
                                 provider.as_ref(),
                                 &model_id_str,
                                 config.max_tokens,
+                                context_window,
+                                &config.retry,
                                 config.session_journal.as_deref(),
                                 event_tx.as_ref(),
                                 tool_ctx,
@@ -1851,7 +1859,7 @@ pub async fn run_query_loop(
             Err(e) => {
                 // Context-window error: compact once and retry, before the
                 // transient-retry policy (#441, #439).
-                if config.auto_compact && !overflow_recovery_used && claude_error_is_overflow(&e) {
+                if auto_compact_enabled && !overflow_recovery_used && claude_error_is_overflow(&e) {
                     overflow_recovery_used = true;
                     let summariser = anthropic_summariser(client);
                     if compact_after_overflow(
@@ -1859,6 +1867,8 @@ pub async fn run_query_loop(
                         &summariser,
                         &effective_model,
                         config.max_tokens,
+                        context_window,
+                        &config.retry,
                         config.session_journal.as_deref(),
                         event_tx.as_ref(),
                         tool_ctx,
@@ -1978,7 +1988,7 @@ pub async fn run_query_loop(
         // the transient-retry policy); if that is not possible, surface it
         // rather than a partial turn.
         if stream_overflow {
-            if config.auto_compact && !overflow_recovery_used {
+            if auto_compact_enabled && !overflow_recovery_used {
                 overflow_recovery_used = true;
                 let summariser = anthropic_summariser(client);
                 if compact_after_overflow(
@@ -1986,6 +1996,8 @@ pub async fn run_query_loop(
                     &summariser,
                     &effective_model,
                     config.max_tokens,
+                    context_window,
+                    &config.retry,
                     config.session_journal.as_deref(),
                     event_tx.as_ref(),
                     tool_ctx,
@@ -5405,7 +5417,7 @@ mod tests {
         script: Vec<MainStep>,
         auto_compact: bool,
     ) -> (QueryOutcome, Vec<String>, Vec<Message>) {
-        drive_journaled_compaction_loop(history, script, auto_compact, None).await
+        drive_journaled_compaction_loop(history, script, auto_compact, None, None).await
     }
 
     /// [`drive_compaction_loop`] with a session journal attached.
@@ -5414,6 +5426,7 @@ mod tests {
         script: Vec<MainStep>,
         auto_compact: bool,
         journal: Option<Arc<claurst_core::session_journal::SessionJournal>>,
+        settings: Option<Config>,
     ) -> (QueryOutcome, Vec<String>, Vec<Message>) {
         let log = Arc::new(StdMutex::new(Vec::new()));
         let provider = Arc::new(CompactionProvider {
@@ -5431,6 +5444,7 @@ mod tests {
         .expect("build test client");
 
         let mut ctx = deny_all_context();
+        ctx.config = settings.unwrap_or_default();
         ctx.session_id = "compaction-test".to_string();
         ctx.config.provider = Some("mockprov".to_string());
 
@@ -5495,6 +5509,45 @@ mod tests {
             drive_compaction_loop(long_history(11, 30_000), vec![MainStep::Reply], false).await;
         assert_eq!(log, vec!["main:plain"]);
         assert_eq!(msgs.len(), 12, "history untouched plus the reply");
+    }
+
+    #[tokio::test]
+    async fn saved_settings_control_threshold_and_disable_overflow_recovery() {
+        let settings = Config {
+            compact_threshold: 0.4,
+            ..Default::default()
+        };
+        let (_, log, _) = drive_journaled_compaction_loop(
+            long_history(7, 20_000),
+            vec![MainStep::Reply],
+            true,
+            None,
+            Some(settings),
+        )
+        .await;
+        assert_eq!(
+            log,
+            ["summary", "main:compacted"],
+            "configured threshold must reach the real query loop"
+        );
+        let settings = Config {
+            auto_compact: false,
+            ..Default::default()
+        };
+        let (outcome, log, _) = drive_journaled_compaction_loop(
+            long_history(11, 30_000),
+            vec![MainStep::Overflow],
+            true,
+            None,
+            Some(settings),
+        )
+        .await;
+        assert!(matches!(outcome, QueryOutcome::Error(_)));
+        assert_eq!(
+            log,
+            ["main:plain"],
+            "saved disable must defeat the default QueryConfig and overflow path"
+        );
     }
 
     /// A context-window error compacts once and retries the request.
@@ -5718,9 +5771,14 @@ mod tests {
         let history = long_history(11, 30_000);
         let first = history[0].get_all_text();
 
-        let (outcome, log, msgs) =
-            drive_journaled_compaction_loop(history, vec![MainStep::Reply], true, Some(journal))
-                .await;
+        let (outcome, log, msgs) = drive_journaled_compaction_loop(
+            history,
+            vec![MainStep::Reply],
+            true,
+            Some(journal),
+            None,
+        )
+        .await;
         assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
         assert_eq!(log, vec!["summary", "main:compacted"]);
 

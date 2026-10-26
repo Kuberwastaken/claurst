@@ -189,8 +189,8 @@ See [Permission Modes](#permission-modes) for a full description of each value.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `auto_compact` | boolean | — | Not read by the query loop: auto-compaction is on unless `--no-auto-compact` is passed. The top-level `autoCompact` key is not read either. |
-| `compact_threshold` | float | — | Not used: the trigger point is fixed. |
+| `auto_compact` | boolean | `true` | Enable automatic threshold compaction and overflow recovery. A `false` here, in top-level `autoCompact`, in another settings layer, or `--no-auto-compact` disables it. Manual `/compact` remains available. |
+| `compact_threshold` | float | `0.9` | Fraction of the resolved context window at which automatic compaction starts, subject to the response reserve. Must be strictly between 0 and 1; invalid values use the default. |
 
 See [Auto-compaction](advanced.md#auto-compaction) for when compaction runs.
 
