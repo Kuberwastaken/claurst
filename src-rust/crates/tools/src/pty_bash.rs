@@ -333,19 +333,6 @@ async fn run_in_background(
                     }
                     drifted
                 };
-                let captured = full.lock().finish();
-                let spilled = match captured {
-                    Captured::Truncated { tail, spill, .. } => finish_spill(spill, &tail),
-                    Captured::Complete(bytes) => {
-                        match bound_head_tail(&String::from_utf8_lossy(&bytes)) {
-                            Some(_) => spill_bytes(&spill_path, &bytes),
-                            None => None,
-                        }
-                    }
-                };
-                if let Some(path) = spilled {
-                    global_registry().set_output_file(&task_id_clone, path);
-                }
                 // Pipe EOF does not imply process exit: commands can close
                 // both streams and keep running. Keep the wait on the same
                 // deadline rather than giving it an unbounded second phase.
@@ -357,6 +344,23 @@ async fn run_in_background(
                         c.wait().await
                     }
                 };
+                let captured = full.lock().finish();
+                let spilled = match captured {
+                    Captured::Truncated { tail, spill, .. } => finish_spill(spill, &tail),
+                    Captured::Complete(bytes) => {
+                        if !bytes.is_empty()
+                            && (timed_out
+                                || bound_head_tail(&String::from_utf8_lossy(&bytes)).is_some())
+                        {
+                            spill_bytes(&spill_path, &bytes)
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(path) = spilled {
+                    global_registry().set_output_file(&task_id_clone, path, timed_out);
+                }
                 if timed_out {
                     global_registry().update_status(
                         &task_id_clone,
@@ -1122,43 +1126,7 @@ async fn run_windows_fallback(
             guard.disarm();
             let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
             let captured = full.lock().finish();
-            let output = match captured {
-                Captured::Complete(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    match bound_head_tail(&text) {
-                        Some(bounded) => with_output_trailer(
-                            bounded,
-                            spill_bytes(&spill_path, &bytes),
-                            "Full output",
-                        ),
-                        None => text.into_owned(),
-                    }
-                }
-                Captured::Truncated {
-                    head,
-                    tail,
-                    omitted,
-                    spill,
-                } => {
-                    // The stream overflowed the windows: the spill file holds
-                    // the head plus the dropped middle; finish it with the tail.
-                    let spilled = finish_spill(spill, &tail);
-                    // The rolling tail starts mid-line: begin at the next full
-                    // line so no half line opens the output.
-                    let tail = match tail.iter().position(|&b| b == b'\n') {
-                        Some(i) => &tail[i + 1..],
-                        None => &tail[..],
-                    };
-                    let head_text = String::from_utf8_lossy(&head);
-                    let tail_text = String::from_utf8_lossy(tail);
-                    let head = head_window(&head_text, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES);
-                    let tail = tail_window(&tail_text, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES);
-                    let omitted = omitted
-                        + (head_text.len() - head.len() + tail_text.len() - tail.len()) as u64;
-                    let output = join_head_tail(head, tail, &format!("about {omitted} bytes"));
-                    with_output_trailer(output, spilled, "Full output")
-                }
-            };
+            let output = render_captured_pipe(captured, &spill_path, false);
             let output = if output.is_empty() {
                 "(no output)".to_string()
             } else {
@@ -1171,7 +1139,62 @@ async fn run_windows_fallback(
             // as a fallback should taskkill be unavailable, and reaps the child.
             guard.kill_now();
             let _ = child.kill().await;
-            ToolResult::error(format!("Command timed out after {}ms", timeout_ms))
+            let captured = full.lock().finish();
+            let partial = render_captured_pipe(captured, &spill_path, true);
+            let mut message = format!("Command timed out after {}ms", timeout_ms);
+            if !partial.is_empty() {
+                message.push_str("\n\n");
+                message.push_str(&partial);
+            }
+            ToolResult::error(message)
+        }
+    }
+}
+
+/// Render retained pipe bytes, attaching even a small capture after a timeout.
+#[cfg(any(windows, test))]
+fn render_captured_pipe(captured: Captured, spill_path: &Path, is_partial: bool) -> String {
+    let label = if is_partial {
+        "Partial output"
+    } else {
+        "Full output"
+    };
+    match captured {
+        Captured::Complete(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            match bound_head_tail(&text) {
+                Some(bounded) => {
+                    with_output_trailer(bounded, spill_bytes(spill_path, &bytes), label)
+                }
+                None if is_partial && !bytes.is_empty() => {
+                    with_output_trailer(text.into_owned(), spill_bytes(spill_path, &bytes), label)
+                }
+                None => text.into_owned(),
+            }
+        }
+        Captured::Truncated {
+            head,
+            tail,
+            omitted,
+            spill,
+        } => {
+            // The stream overflowed the windows: the spill file holds
+            // the head plus the dropped middle; finish it with the tail.
+            let spilled = finish_spill(spill, &tail);
+            // The rolling tail starts mid-line: begin at the next full
+            // line so no half line opens the output.
+            let tail = match tail.iter().position(|&b| b == b'\n') {
+                Some(i) => &tail[i + 1..],
+                None => &tail[..],
+            };
+            let head_text = String::from_utf8_lossy(&head);
+            let tail_text = String::from_utf8_lossy(tail);
+            let head = head_window(&head_text, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES);
+            let tail = tail_window(&tail_text, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES);
+            let omitted =
+                omitted + (head_text.len() - head.len() + tail_text.len() - tail.len()) as u64;
+            let output = join_head_tail(head, tail, &format!("about {omitted} bytes"));
+            with_output_trailer(output, spilled, label)
         }
     }
 }
@@ -2023,11 +2046,21 @@ mod tests {
             "{:?}",
             task.status
         );
+        assert!(task.output_is_partial);
+        assert!(task.render_output().contains("Partial output:"));
         let path = task.output_file.clone().unwrap();
         assert_eq!(path.parent(), Some(spill_dir.path()));
         let spilled = std::fs::read(&path).unwrap();
-        assert!(spilled.len() >= 1_000_000, "spilled: {} bytes", spilled.len());
-        assert!(spilled.ends_with(b"y\n"), "lossy tail: {:?}", &spilled[..spilled.len().min(16)]);
+        assert!(
+            spilled.len() >= 1_000_000,
+            "spilled: {} bytes",
+            spilled.len()
+        );
+        assert!(
+            spilled.ends_with(b"y\n"),
+            "lossy tail: {:?}",
+            &spilled[..spilled.len().min(16)]
+        );
     }
 
     /// #442: 10 MB of output used to hit the reader's 2 MB head-only cap, after
@@ -2190,6 +2223,61 @@ mod tests {
         .await;
         assert!(!result.is_error, "{}", result.content);
         assert_eq!(result.content, "cat cat cat 0 1 1 1 term");
+    }
+
+    #[tokio::test]
+    async fn background_timeout_spills_small_unterminated_output() {
+        let spill_dir = tempfile::tempdir().unwrap();
+        // The descendant keeps the pipe open after bash dies, so the line
+        // reader cannot deliver its pending display line within the grace.
+        let started = run_in_background(
+            "printf short; sleep 3 & wait".to_string(),
+            std::env::temp_dir(),
+            100,
+            spill_dir.path(),
+            None,
+            None,
+        )
+        .await;
+        let task_id = started
+            .content
+            .lines()
+            .find_map(|line| line.strip_prefix("Task ID: "))
+            .unwrap();
+        let task = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let task = global_registry().get(task_id).unwrap();
+                if !task.is_running() {
+                    break task;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timeout must finish after the drain grace");
+        assert!(task.output_is_partial);
+        assert!(task.render_output().contains("Partial output:"));
+        let path = task
+            .output_file
+            .expect("even a small timeout capture must spill");
+        assert_eq!(std::fs::read(path).unwrap(), b"short");
+    }
+
+    /// Exercise the renderer used by the Windows timeout branch on every
+    /// platform: both small captures and spilled tails must survive.
+    #[test]
+    fn pipe_timeout_renderer_preserves_small_and_large_captures() {
+        let spill_dir = tempfile::tempdir().unwrap();
+        for size in [5, RAW_HEAD_BYTES + RAW_TAIL_BYTES + 100] {
+            let path = spill_dir.path().join(format!("{size}.txt"));
+            let expected = vec![b'x'; size];
+            let mut capture =
+                OutputAccumulator::new(RAW_HEAD_BYTES, RAW_TAIL_BYTES, Some(path.clone()));
+            capture.push(&expected);
+            let rendered = render_captured_pipe(capture.finish(), &path, true);
+            assert!(rendered.contains("Partial output:"));
+            assert_eq!(std::fs::read(path).unwrap(), expected);
+        }
     }
 
     /// The display prefix is bounded, but the spill must include the entire

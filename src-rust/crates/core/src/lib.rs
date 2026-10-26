@@ -6032,6 +6032,9 @@ pub mod tasks {
         /// windows (#442).
         #[serde(default)]
         pub output_file: Option<std::path::PathBuf>,
+        /// The capture ended at a timeout, so the attached file is partial.
+        #[serde(default)]
+        pub output_is_partial: bool,
         /// OS process ID, if applicable.
         pub pid: Option<u32>,
         /// Cancellation token for the task's in-process work loop. Signalling it
@@ -6053,6 +6056,7 @@ pub mod tasks {
                 output: Vec::new(),
                 omitted_output_lines: 0,
                 output_file: None,
+                output_is_partial: false,
                 pid: None,
                 cancel_token: None,
             }
@@ -6085,7 +6089,12 @@ pub mod tasks {
                 join_head_tail(head_cut, tail_cut, &format!("{omitted} lines"))
             };
             if let Some(path) = &self.output_file {
-                text.push_str(&format!("\n\nFull output: {}", path.display()));
+                let label = if self.output_is_partial {
+                    "Partial output"
+                } else {
+                    "Full output"
+                };
+                text.push_str(&format!("\n\n{label}: {}", path.display()));
             }
             text
         }
@@ -6191,10 +6200,12 @@ pub mod tasks {
             self.update_status(id, TaskStatus::Cancelled);
         }
 
-        /// Record the file holding a task's full output.  No-op if unknown.
-        pub fn set_output_file(&self, id: &str, path: std::path::PathBuf) {
+        /// Record a task's captured output file and whether it ended early.
+        /// No-op if the task is unknown.
+        pub fn set_output_file(&self, id: &str, path: std::path::PathBuf, is_partial: bool) {
             if let Some(mut entry) = self.tasks.get_mut(id) {
                 entry.output_file = Some(path);
+                entry.output_is_partial = is_partial;
             }
         }
 
@@ -6245,9 +6256,24 @@ pub mod tasks {
             assert!(rendered.contains("lines omitted"));
             assert!(rendered.len() <= 2 * OUTPUT_WINDOW_BYTES + 100);
 
-            registry.set_output_file(&id, std::path::PathBuf::from("/spill/x.txt"));
+            registry.set_output_file(&id, std::path::PathBuf::from("/spill/x.txt"), false);
             let rendered = registry.get(&id).unwrap().render_output();
             assert!(rendered.ends_with("line 99999\n\nFull output: /spill/x.txt"));
+        }
+
+        #[test]
+        fn timeout_file_is_labelled_partial() {
+            let registry = TaskRegistry::new();
+            let id = registry.register(BackgroundTask::new("timeout"));
+            registry.set_output_file(
+                &id,
+                std::path::PathBuf::from("/spill/partial.txt"),
+                true,
+            );
+            assert!(
+                registry.get(&id).unwrap().render_output()
+                    .ends_with("Partial output: /spill/partial.txt")
+            );
         }
 
         #[test]
