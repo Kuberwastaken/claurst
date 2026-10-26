@@ -320,6 +320,14 @@ pub async fn write_transcript_entry(
         .await?;
 
     file.write_all(line.as_bytes()).await?;
+    // tokio::fs::File buffers writes userspace-side and returns from
+    // write_all before the blocking-pool task performs the actual write(2)
+    // (File::poll_write spawns the task and returns Ready immediately; Drop
+    // cannot wait for it). A follow-up read could therefore miss the entry,
+    // or two rapid appends could land out of order on a loaded runner.
+    // flush().await joins the in-flight blocking task, so the syscall has
+    // completed before we return and the entry is visible to any read.
+    file.flush().await?;
     // Transcripts may contain secrets read into context; keep them
     // owner-only (issue #212).
     crate::accounts::set_user_only_perms(path);
