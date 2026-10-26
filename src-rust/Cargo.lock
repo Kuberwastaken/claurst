@@ -739,6 +739,7 @@ dependencies = [
  "dashmap",
  "dirs",
  "futures",
+ "nix 0.29.0",
  "parking_lot",
  "serde",
  "serde_json",
@@ -1056,6 +1057,7 @@ dependencies = [
  "syntect",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "unicode-width 0.2.0",
 ]
