@@ -370,6 +370,8 @@ pub(crate) async fn write_atomic(
 
 /// Like [`write_atomic`], but bound to an already-open file instead of a path
 /// (#415): `real` is the location `opened_file_location` reported for `file`.
+/// Returns the newly installed file handle, so rollback can remain bound to
+/// exactly the file this write created rather than reopening a mutable path.
 ///
 /// On Unix the directory is opened once, confirmed to hold `file` under its
 /// name (same `(dev, ino)`, final component not followed), and the temp file
@@ -381,7 +383,7 @@ pub(crate) async fn write_atomic_bound(
     file: &std::fs::File,
     real: &std::path::Path,
     contents: &[u8],
-) -> std::io::Result<()> {
+) -> std::io::Result<std::fs::File> {
     use std::ffi::CString;
     use std::io::Write;
     use std::os::unix::ffi::OsStrExt;
@@ -450,7 +452,7 @@ pub(crate) async fn write_atomic_bound(
         // SAFETY: `tmp_c` is NUL-terminated and relative to the open `dir_fd`.
         unsafe { libc::unlinkat(dir_fd, tmp_c.as_ptr(), 0) };
     }
-    written
+    written.map(|()| tmp)
 }
 
 /// Non-Unix fallback for [`write_atomic_bound`]: std exposes no
@@ -460,8 +462,9 @@ pub(crate) async fn write_atomic_bound(
     _file: &std::fs::File,
     real: &std::path::Path,
     contents: &[u8],
-) -> std::io::Result<()> {
-    write_atomic(real, contents).await
+) -> std::io::Result<std::fs::File> {
+    write_atomic(real, contents).await?;
+    open_regular_file(real)
 }
 
 /// Open `path` for reading and require a regular file (#415).
@@ -1506,5 +1509,50 @@ mod tests {
             assert!(notice.contains("&amp;lt;spoof&amp;gt;"));
             assert!(notice.contains("\n日本語\n"));
         }
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bound_write_returns_the_installed_inode_for_safe_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::fs::canonicalize(dir.path()).unwrap().join("file.txt");
+        std::fs::write(&path, b"before").unwrap();
+        let original = open_regular_file(&path).unwrap();
+        let installed = write_atomic_bound(&original, &path, b"after")
+            .await
+            .unwrap();
+        assert!(write_atomic_bound(&original, &path, b"stale")
+            .await
+            .is_err());
+        let restored = write_atomic_bound(&installed, &path, b"before")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"before");
+        let external = path.with_file_name("external.txt");
+        std::fs::write(&external, b"external change").unwrap();
+        std::fs::rename(&external, &path).unwrap();
+        assert!(write_atomic_bound(&restored, &path, b"rollback")
+            .await
+            .is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"external change");
+    }
+
+    #[tokio::test]
+    async fn newly_created_file_uses_the_same_lock_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.txt");
+        let held = lock_files([path.as_path()]).await;
+        std::fs::write(&path, b"created").unwrap();
+        let waiting = lock_files([path.as_path()]);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut waiting)
+                .await
+                .is_err()
+        );
+        drop(held);
+        let acquired = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+            .await
+            .unwrap();
+        drop(acquired);
     }
 }

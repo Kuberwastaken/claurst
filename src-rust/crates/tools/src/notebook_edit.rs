@@ -102,23 +102,35 @@ impl Tool for NotebookEditTool {
         }
 
         // Permission check
-        if let Err(e) = ctx.check_permission_for_path(
+        let grant = match ctx.check_permission_for_path(
             self.name(),
             &format!("Edit notebook {}", path.display()),
             path.clone(),
             false,
         ) {
-            return ToolResult::error(e.to_string());
-        }
+            Ok(grant) => grant,
+            Err(e) => return ToolResult::error(e.to_string()),
+        };
 
         // Serialise with other tools changing this file (#443).
         let _lock = crate::lock_files([path.as_path()]).await;
 
-        // Read notebook
-        let content = match tokio::fs::read_to_string(&path).await {
-            Ok(c) => c,
+        // Read and write the same permission-verified object, even if a path
+        // component is replaced between the permission check and the open.
+        let file = match crate::open_regular_file(&path) {
+            Ok(file) => file,
             Err(e) => return ToolResult::error(format!("Failed to read notebook: {}", e)),
         };
+        let real =
+            match ctx.confirm_opened_path(self.name(), "Edit notebook", &path, &file, grant, false)
+            {
+                Ok(real) => real,
+                Err(e) => return ToolResult::error(e),
+            };
+        let mut content = String::new();
+        if let Err(e) = std::io::Read::read_to_string(&mut &file, &mut content) {
+            return ToolResult::error(format!("Failed to read notebook: {}", e));
+        }
 
         let mut notebook: Value = match serde_json::from_str(&content) {
             Ok(v) => v,
@@ -163,7 +175,7 @@ impl Tool for NotebookEditTool {
                     Ok(s) => s,
                     Err(e) => return ToolResult::error(format!("Failed to serialize notebook: {}", e)),
                 };
-                if let Err(e) = crate::write_atomic(&path, updated.as_bytes()).await {
+                if let Err(e) = crate::write_atomic_bound(&file, &real, updated.as_bytes()).await {
                     return ToolResult::error(format!("Failed to write notebook: {}", e));
                 }
                 ctx.record_file_change(
