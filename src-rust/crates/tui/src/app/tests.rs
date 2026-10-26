@@ -10,6 +10,7 @@ use super::keys::{
     normalize_layout_shortcut_key,
 };
 use super::types::{ContextMenuItem, ContextMenuState};
+use crate::session_browser::SessionBrowserMode;
 
     
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
@@ -546,6 +547,70 @@ use super::types::{ContextMenuItem, ContextMenuState};
         assert!(app.intercept_slash_command_with_args("yolo", ""));
         assert!(app.bypass_permissions_dialog.visible);
         assert!(app.yolo_pending);
+    }
+
+    #[test]
+    fn test_session_browser_toggles_route_through_keybindings() {
+        let mut app = make_app();
+        app.session_browser.open(vec![]);
+        assert!(app.session_browser.visible);
+
+        // 'a' toggles paths (KeyContext::SessionBrowser action).
+        assert!(!app.session_browser.show_paths);
+        app.handle_key_event(press_key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(app.session_browser.show_paths);
+
+        // 'p' toggles preview.
+        assert!(app.session_browser.show_preview);
+        app.handle_key_event(press_key(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert!(!app.session_browser.show_preview);
+
+        // Esc closes via the resolver.
+        app.handle_key_event(press_key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.session_browser.visible);
+    }
+
+    #[test]
+    fn session_browser_honors_user_rebinding_without_prompt_leak() {
+        let mut app = make_app();
+        let bindings = claurst_core::keybindings::UserKeybindings::from_json_str(
+            r#"{"bindings":[
+                {"chord":"a","action":null,"context":"SessionBrowser"},
+                {"chord":"x","action":"toggleSessionPaths","context":"SessionBrowser"}
+            ]}"#,
+        );
+        app.keybindings = claurst_core::keybindings::KeybindingResolver::new(&bindings);
+        app.session_browser.open(vec![]);
+        app.handle_key_event(press_key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(!app.session_browser.show_paths);
+        app.handle_key_event(press_key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.session_browser.show_paths);
+        app.handle_key_event(press_key(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert!(app.prompt_input.text.is_empty());
+    }
+
+    #[test]
+    fn test_session_browser_rename_still_inline() {
+        let mut app = make_app();
+        let entries = vec![crate::session_browser::SessionEntry {
+            id: "s1".to_string(),
+            title: "hello".to_string(),
+            last_updated: "now".to_string(),
+            message_count: 1,
+            cost_usd: 0.0,
+            working_dir: None,
+        }];
+        app.session_browser.open(entries);
+        // 'r' enters rename mode via the resolver action.
+        app.handle_key_event(press_key(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(app.session_browser.mode, SessionBrowserMode::Rename);
+        // Typing goes to the rename buffer (inline handling).
+        app.handle_key_event(press_key(KeyCode::Char('!'), KeyModifiers::NONE));
+        assert_eq!(app.session_browser.rename_input, "hello!");
+        // Esc cancels rename back to Browse; the browser stays open.
+        app.handle_key_event(press_key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.session_browser.mode, SessionBrowserMode::Browse);
+        assert!(app.session_browser.visible);
     }
 
     #[test]
@@ -1116,11 +1181,30 @@ use super::types::{ContextMenuItem, ContextMenuState};
             last_updated: "just now".to_string(),
             message_count: 1,
             cost_usd: 0.0,
+            working_dir: None,
         }]);
         app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(!app.session_browser.visible);
-        assert_eq!(app.prompt_input.text, "/resume abc-123");
-        assert!(app.pending_auto_submit);
+        // Enter routes through the keybinding resolver: the resume is
+        // signalled to the main loop, not typed into the prompt.
+        assert_eq!(app.session_resume_pending.as_deref(), Some("abc-123"));
+        assert!(app.prompt_input.text.is_empty());
+    }
+
+    #[test]
+    fn browser_rename_queues_persistence_without_replacing_live_title() {
+        let mut app = make_app();
+        app.current_session_id = Some("current".into());
+        app.session_title = Some("old".into());
+        app.session_browser.open(vec![crate::session_browser::SessionEntry {
+            id: "current".into(), title: "old".into(), last_updated: "now".into(),
+            message_count: 0, cost_usd: 0.0, working_dir: None,
+        }]);
+        app.handle_key_event(press_key(KeyCode::Char('r'), KeyModifiers::NONE));
+        app.session_browser.rename_input = "new".into();
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.session_rename_pending, Some(("current".into(), "new".into())));
+        assert_eq!(app.session_title.as_deref(), Some("old"));
     }
 
     // ---- free-mode context window (issues #393, #394) ----
