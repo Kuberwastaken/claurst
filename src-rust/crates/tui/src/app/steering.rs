@@ -47,6 +47,16 @@ impl App {
         pending: Vec<(u64, String)>,
     ) {
         if previous != next {
+            // Generated continuations belong to the outgoing task, not a
+            // draft to replay when this session is opened again.
+            self.queued_messages
+                .retain(|text| !claurst_tools::todo_write::is_auto_poke_message(text));
+            if self.pending_auto_submit
+                && claurst_tools::todo_write::is_auto_poke_message(&self.prompt_input.text)
+            {
+                self.prompt_input.clear();
+                self.pending_auto_submit = false;
+            }
             let mut fresh = crate::prompt_input::PromptInputState::new();
             fresh.vim_enabled = self.prompt_input.vim_enabled;
             let history = std::mem::take(&mut self.prompt_input.history);
@@ -66,6 +76,14 @@ impl App {
                 self.prompt_input = parked.prompt;
                 self.queued_messages = parked.queued;
                 self.pending_auto_submit = parked.auto_submit;
+            }
+            self.queued_messages
+                .retain(|text| !claurst_tools::todo_write::is_auto_poke_message(text));
+            if self.pending_auto_submit
+                && claurst_tools::todo_write::is_auto_poke_message(&self.prompt_input.text)
+            {
+                self.prompt_input.clear();
+                self.pending_auto_submit = false;
             }
             self.prompt_input.history = history;
         }
@@ -216,6 +234,25 @@ mod tests {
         app.pending_prompts()
             .map(|(kind, text)| (kind, text.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn session_switch_does_not_replay_generated_continuations() {
+        let (mut app, _) = app_with_queue();
+        let poke = claurst_tools::todo_write::build_auto_poke_message(1);
+        app.set_prompt_text(poke.clone());
+        app.pending_auto_submit = true;
+        app.queued_messages.push_back(poke);
+        app.queued_messages.push_back("user next task".into());
+        app.switch_session_input("A", "B", vec![]);
+        app.set_prompt_text("B draft".into());
+        app.switch_session_input("B", "A", vec![]);
+        assert!(app.prompt_input.is_empty());
+        assert!(!app.pending_auto_submit);
+        assert_eq!(app.queued_messages, ["user next task"]);
+        app.switch_session_input("A", "B", vec![]);
+        assert_eq!(app.prompt_input.text, "B draft");
+        assert!(!app.pending_auto_submit);
     }
 
     #[test]
