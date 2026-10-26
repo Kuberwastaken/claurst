@@ -894,24 +894,8 @@ impl App {
                         KeyCode::Esc => self.session_browser.cancel(),
                         KeyCode::Enter => {
                             if let Some((id, name)) = self.session_browser.confirm_rename() {
-                                // Persist the rename for the selected session
-                                // (any entry, not just the live one) in the
-                                // background so the key handler stays sync.
-                                let persisted_id = id.clone();
-                                let persisted_name = name.clone();
-                                tokio::spawn(async move {
-                                    let _ = claurst_core::history::rename_session(
-                                        &persisted_id,
-                                        &persisted_name,
-                                    )
-                                    .await;
-                                });
-                                // The live-session title only changes when the
-                                // renamed entry IS the current session.
-                                if Some(id.as_str()) == self.current_session_id.as_deref() {
-                                    self.session_title = Some(name.clone());
-                                }
-                                self.status_message = Some(format!("Renamed to: {}", name));
+                                self.session_rename_pending = Some((id, name));
+                                self.status_message = Some("Saving session name...".to_string());
                             }
                         }
                         KeyCode::Backspace => self.session_browser.pop_rename_char(),

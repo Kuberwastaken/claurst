@@ -1191,6 +1191,22 @@ use crate::session_browser::SessionBrowserMode;
         assert!(app.prompt_input.text.is_empty());
     }
 
+    #[test]
+    fn browser_rename_queues_persistence_without_replacing_live_title() {
+        let mut app = make_app();
+        app.current_session_id = Some("current".into());
+        app.session_title = Some("old".into());
+        app.session_browser.open(vec![crate::session_browser::SessionEntry {
+            id: "current".into(), title: "old".into(), last_updated: "now".into(),
+            message_count: 0, cost_usd: 0.0, working_dir: None,
+        }]);
+        app.handle_key_event(press_key(KeyCode::Char('r'), KeyModifiers::NONE));
+        app.session_browser.rename_input = "new".into();
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.session_rename_pending, Some(("current".into(), "new".into())));
+        assert_eq!(app.session_title.as_deref(), Some("old"));
+    }
+
     // ---- free-mode context window (issues #393, #394) ----
 
     #[tokio::test]

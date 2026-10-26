@@ -3003,19 +3003,11 @@ async fn run_interactive(
                                     }
                                 }
                                 Some(CommandResult::RenameSession(title)) => {
-                                    session.title = Some(title.clone());
-                                    session.updated_at = chrono::Utc::now();
-                                    cmd_ctx.session_title = session.title.clone();
-                                    persist_live_session(
-                                        &session_journal,
-                                        &mut session,
-                                        current_query.is_some(),
-                                    );
-                                    claurst_tui::update_terminal_title(Some(&title));
-                                    app.status_message = Some(format!(
-                                        "Session renamed to \"{}\".",
-                                        title
-                                    ));
+                                    if let Err(error) = session_resume::rename_current(
+                                        title, &messages, &mut session, &session_journal, &mut cmd_ctx, &mut app,
+                                    ) {
+                                        app.status_message = Some(format!("Could not rename session: {error}"));
+                                    }
                                 }
                                 Some(CommandResult::RefreshProviderState) => {
                                     if app.is_streaming || current_query.is_some() {
@@ -4408,6 +4400,22 @@ async fn run_interactive(
         if app.update_available.is_none() {
             if let Ok(Some(version)) = update_rx.try_recv() {
                 app.update_available = Some(version);
+            }
+        }
+
+        if current_query.is_none() && !app.is_streaming {
+            if let Some((id, title)) = app.session_rename_pending.take() {
+                let result = if id == session.id {
+                    session_resume::rename_current(
+                        title, &messages, &mut session, &session_journal, &mut cmd_ctx, &mut app,
+                    )
+                } else {
+                    claurst_core::history::rename_session(&id, &title).await
+                        .map(|()| app.status_message = Some(format!("Renamed to: {title}")))
+                };
+                if let Err(error) = result {
+                    app.status_message = Some(format!("Could not rename session: {error}"));
+                }
             }
         }
 

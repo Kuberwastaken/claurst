@@ -31,6 +31,7 @@ pub(crate) fn apply(
         SessionJournal::new(sessions_dir, &resumed)
     };
     destination.acquire()?;
+    session.messages = messages.clone();
     journal.checkpoint(session)?;
 
     *session = resumed;
@@ -63,6 +64,27 @@ pub(crate) fn apply(
     app.attach_turn_diff_state(tools.file_history.clone(), tools.current_turn.clone());
     claurst_tui::update_terminal_title(session.title.as_deref());
     app.status_message = Some(format!("Resumed session {}.", session.id));
+    Ok(())
+}
+
+/// Persist a live rename through its owning journal before reporting success.
+/// Used for both `/rename` and a browser rename of the current session.
+pub(crate) fn rename_current(
+    title: String,
+    messages: &[Message],
+    session: &mut ConversationSession,
+    journal: &Arc<SessionJournal>,
+    commands: &mut CommandContext,
+    app: &mut App,
+) -> anyhow::Result<()> {
+    session.messages = messages.to_vec();
+    session.title = Some(title.clone());
+    session.updated_at = chrono::Utc::now();
+    journal.checkpoint(session)?;
+    commands.session_title = session.title.clone();
+    app.session_title = session.title.clone();
+    claurst_tui::update_terminal_title(Some(&title));
+    app.status_message = Some(format!("Session renamed to \"{title}\"."));
     Ok(())
 }
 
@@ -200,6 +222,41 @@ mod tests {
         let existing = live.journal.clone();
         live.resume(live.session.clone(), dir.path()).unwrap();
         assert!(Arc::ptr_eq(&live.journal, &existing));
+    }
+
+    #[test]
+    fn switching_checkpoints_idle_message_edits_before_leaving_a() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut live = Harness::new(dir.path());
+        let a = live.session.id.clone();
+        live.messages.push(Message::user("idle edit"));
+        live.resume(ConversationSession::new("model-b".into()), dir.path())
+            .unwrap();
+        let loaded = claurst_core::session_journal::load(dir.path(), &a).unwrap();
+        assert_eq!(loaded.session.messages.len(), 2);
+    }
+
+    #[test]
+    fn browser_rename_survives_the_next_live_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut live = Harness::new(dir.path());
+        rename_current(
+            "browser title".into(),
+            &live.messages,
+            &mut live.session,
+            &live.journal,
+            &mut live.commands,
+            &mut live.app,
+        )
+        .unwrap();
+        live.journal.checkpoint(&mut live.session).unwrap();
+        let loaded = claurst_core::session_journal::load(dir.path(), &live.session.id).unwrap();
+        assert_eq!(loaded.session.title.as_deref(), Some("browser title"));
+        assert_eq!(
+            live.commands.session_title.as_deref(),
+            Some("browser title")
+        );
+        assert_eq!(live.app.session_title.as_deref(), Some("browser title"));
     }
 
     #[test]

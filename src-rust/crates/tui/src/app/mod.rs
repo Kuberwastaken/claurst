@@ -413,6 +413,9 @@ pub struct App {
     /// `resumeSession` keybinding action; drained by the main loop, which
     /// performs the same session swap as the /resume command.
     pub session_resume_pending: Option<String>,
+    /// Browser rename request, persisted by the idle main loop so a live
+    /// session's in-memory title and journal cannot diverge.
+    pub session_rename_pending: Option<(String, String)>,
     /// Id of the session the live REPL is currently continuing. The browser's
     /// rename flow uses it to update the live title only when the renamed
     /// entry IS the current session.
@@ -787,6 +790,7 @@ impl App {
             model_picker_provider_id: None,
             session_list_pending: false,
             session_resume_pending: None,
+            session_rename_pending: None,
             current_session_id: None,
             session_list_rx: None,
             recent_sessions: Vec::new(),
