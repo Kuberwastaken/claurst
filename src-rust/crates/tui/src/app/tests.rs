@@ -1411,3 +1411,65 @@ use super::types::{ContextMenuItem, ContextMenuState};
             assert!(app.global_search.visible, "{action} must open project search");
         }
     }
+
+    // ---- MCP view without a manager (issue #418 review: fallback status) ----
+
+    /// With no live manager, `refresh_mcp_view` falls back to the configured
+    /// servers. A server the user disabled via `/mcp disable` must read as
+    /// `Disabled`, not `Disconnected`; otherwise the panel claims a disabled
+    /// server merely lost its connection.
+    #[test]
+    fn mcp_view_without_manager_marks_disabled_servers() {
+        let mut app = make_app();
+        app.config.mcp_servers.push(claurst_core::config::McpServerConfig {
+            name: "srv-a".to_string(),
+            command: Some("echo".to_string()),
+            args: vec![],
+            env: Default::default(),
+            url: None,
+            server_type: "stdio".to_string(),
+            headers: Default::default(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
+            origin: Default::default(),
+        });
+        app.config.mcp_servers.push(claurst_core::config::McpServerConfig {
+            name: "srv-b".to_string(),
+            command: Some("echo".to_string()),
+            args: vec![],
+            env: Default::default(),
+            url: None,
+            server_type: "stdio".to_string(),
+            headers: Default::default(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
+            origin: Default::default(),
+        });
+        app.disabled_mcp_servers.insert("srv-a".to_string());
+        assert!(app.mcp_manager.is_none(), "fixture must have no manager attached");
+
+        app.refresh_mcp_view();
+
+        let srv_a = app
+            .mcp_view
+            .servers
+            .iter()
+            .find(|s| s.name == "srv-a")
+            .expect("disabled server listed");
+        assert_eq!(
+            srv_a.status,
+            crate::mcp_view::McpViewStatus::Disabled,
+            "a user-disabled server must not show as merely disconnected"
+        );
+        let srv_b = app
+            .mcp_view
+            .servers
+            .iter()
+            .find(|s| s.name == "srv-b")
+            .expect("configured server listed");
+        assert_eq!(
+            srv_b.status,
+            crate::mcp_view::McpViewStatus::Disconnected,
+            "a configured-but-never-connected server still reads as disconnected"
+        );
+    }

@@ -21,8 +21,11 @@ impl SlashCommand for McpCommand {
            /mcp                        — list configured servers with live status\n\
            /mcp list                   — same as above\n\
            /mcp status                 — detailed connection status for all servers\n\
+           /mcp enable <server>        — re-enable a disabled server\n\
+           /mcp disable <server>     — disconnect a server and skip it at startup\n\
            /mcp auth <server>          — show OAuth auth instructions for a server\n\
            /mcp connect <server>       — reconnect a disconnected server\n\
+           /mcp tools [server]         — list tools (optionally for one server)\n\
            /mcp logs <server>          — show recent errors/logs for a server\n\
            /mcp resources [server]     — list resources from connected servers\n\
            /mcp prompts [server]       — list prompt templates from connected servers\n\
@@ -62,6 +65,18 @@ impl SlashCommand for McpCommand {
             let rest = sub["tools".len()..].trim();
             let server_filter = if rest.is_empty() { None } else { Some(rest) };
             return McpCommand::handle_tools(server_filter, ctx);
+        }
+
+        // /mcp enable <server-name> | /mcp disable <server-name>
+        if matches!(first_word, "enable" | "disable") {
+            let server_name = sub[first_word.len()..].trim();
+            if server_name.is_empty() {
+                return CommandResult::Error(format!(
+                    "Usage: /mcp {} <server-name>",
+                    first_word
+                ));
+            }
+            return McpCommand::handle_toggle(server_name, first_word == "enable", ctx);
         }
 
         // /mcp connect <server-name>
@@ -119,6 +134,16 @@ impl SlashCommand for McpCommand {
                     .or(srv.command.as_deref())
                     .unwrap_or("(unknown)");
 
+                if ctx.disabled_mcp_servers.contains(&srv.name) {
+                    output.push_str(&format!(
+                        "  {name:20} [{kind:10}] disabled by user\n    endpoint: {endpoint}\n",
+                        name = srv.name,
+                        kind = kind,
+                        endpoint = endpoint,
+                    ));
+                    continue;
+                }
+
                 // Fetch live status from the manager if available.
                 let live_status = ctx
                     .mcp_manager
@@ -164,9 +189,13 @@ impl SlashCommand for McpCommand {
                 "(no command)".to_string()
             };
 
-            let status_str = manager
-                .map(|m| m.server_status(&srv.name).display())
-                .unwrap_or_else(|| "not running".to_string());
+            let status_str = if ctx.disabled_mcp_servers.contains(&srv.name) {
+                "disabled".to_string()
+            } else {
+                manager
+                    .map(|m| m.server_status(&srv.name).display())
+                    .unwrap_or_else(|| "not running".to_string())
+            };
 
             output.push_str(&format!(
                 "  {name}  [{status}]\n    type: {type_}  |  {cmd}\n",
@@ -357,6 +386,61 @@ impl McpCommand {
             ));
         }
         CommandResult::Message(out)
+    }
+
+    /// Handle `/mcp enable|disable <server>`: persist the toggle in global
+    /// settings (`disabledMcpServers`) and ask the runtime to rebuild the MCP
+    /// manager so the change applies live (tools registered/unregistered,
+    /// server connected/disconnected). The name is validated against the
+    /// merged config in `ctx.config`, so project-level servers toggle too;
+    /// only the disabled flag itself lives in global settings.
+    fn handle_toggle(server_name: &str, enable: bool, ctx: &mut CommandContext) -> CommandResult {
+        // The server must exist in the current config (user or approved project).
+        if !ctx.config.mcp_servers.iter().any(|s| s.name == server_name) {
+            let names: Vec<&str> = ctx
+                .config
+                .mcp_servers
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect();
+            return CommandResult::Error(format!(
+                "No MCP server named '{}' is configured.\n\
+                 Configured servers: {}",
+                server_name,
+                if names.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    names.join(", ")
+                }
+            ));
+        }
+
+        let save = save_settings_mutation(|settings| {
+            if enable {
+                settings.disabled_mcp_servers.remove(server_name);
+            } else {
+                settings.disabled_mcp_servers.insert(server_name.to_string());
+            }
+        });
+        match save {
+            Ok(()) => {
+                // Keep the session view in sync without re-reading the settings
+                // file; the runtime refreshes the set again after the rebuild.
+                if enable {
+                    ctx.disabled_mcp_servers.remove(server_name);
+                } else {
+                    ctx.disabled_mcp_servers.insert(server_name.to_string());
+                }
+                CommandResult::McpServersToggled {
+                    server_name: server_name.to_string(),
+                    enabled: enable,
+                }
+            }
+            Err(e) => CommandResult::Error(format!(
+                "Failed to save settings while toggling MCP server '{}': {}",
+                server_name, e
+            )),
+        }
     }
 
     /// Handle `/mcp connect <server>` — attempt to reconnect a server.
@@ -592,6 +676,220 @@ impl McpCommand {
                 }
             }
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_mcp_ctx() -> CommandContext {
+        CommandContext {
+            config: claurst_core::config::Config::default(),
+            cost_tracker: claurst_core::cost::CostTracker::new(),
+            messages: vec![],
+            working_dir: std::path::PathBuf::from("."),
+            session_id: "test-session".to_string(),
+            session_title: None,
+            remote_session_url: None,
+            mcp_manager: None,
+            mcp_auth_runner: None,
+            permission_manager: None,
+            disabled_mcp_servers: std::collections::HashSet::new(),
+        }
+    }
+
+    fn configured_server(name: &str) -> claurst_core::config::McpServerConfig {
+        claurst_core::config::McpServerConfig {
+            name: name.to_string(),
+            command: Some("echo".to_string()),
+            args: vec![],
+            env: Default::default(),
+            url: None,
+            server_type: "stdio".to_string(),
+            headers: Default::default(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
+            origin: Default::default(),
+        }
+    }
+
+    /// Serializes tests that mutate process-global `CLAURST_HOME`. Async-aware
+    /// mutex: the guarded tests hold it across `.await` points.
+    static SETTINGS_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct TestSettingsHome {
+        // Held for its lifetime: dropping it removes the temp settings dir.
+        _dir: tempfile::TempDir,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl TestSettingsHome {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let saved = std::env::var_os("CLAURST_HOME");
+            std::env::set_var("CLAURST_HOME", dir.path());
+            Self { _dir: dir, saved }
+        }
+    }
+
+    impl Drop for TestSettingsHome {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var("CLAURST_HOME", v),
+                None => std::env::remove_var("CLAURST_HOME"),
+            }
+        }
+    }
+
+    /// `/mcp disable` must persist to global settings, update the session
+    /// view, and report the toggle. `/mcp enable` reverses it.
+    #[tokio::test]
+    async fn toggle_persists_and_updates_session_state() {
+        let _lock = SETTINGS_HOME_LOCK.lock().await;
+        let _home = TestSettingsHome::new();
+        let mut ctx = make_mcp_ctx();
+        ctx.config
+            .mcp_servers
+            .push(configured_server("proj-server"));
+
+        let cmd = McpCommand;
+        let result = cmd.execute("disable proj-server", &mut ctx).await;
+        match result {
+            CommandResult::McpServersToggled {
+                server_name,
+                enabled,
+            } => {
+                assert_eq!(server_name, "proj-server");
+                assert!(!enabled);
+            }
+            other => panic!("expected McpServersToggled, got {:?}", other),
+        }
+        assert!(ctx.disabled_mcp_servers.contains("proj-server"));
+        assert!(
+            claurst_core::config::Settings::load_sync()
+                .unwrap()
+                .disabled_mcp_servers
+                .contains("proj-server"),
+            "toggle must persist to global settings"
+        );
+
+        let result = cmd.execute("enable proj-server", &mut ctx).await;
+        match result {
+            CommandResult::McpServersToggled {
+                server_name,
+                enabled,
+            } => {
+                assert_eq!(server_name, "proj-server");
+                assert!(enabled);
+            }
+            other => panic!("expected McpServersToggled, got {:?}", other),
+        }
+        assert!(!ctx.disabled_mcp_servers.contains("proj-server"));
+        assert!(
+            !claurst_core::config::Settings::load_sync()
+                .unwrap()
+                .disabled_mcp_servers
+                .contains("proj-server"),
+            "enable must remove the server from global settings"
+        );
+    }
+
+    /// The server name is validated against the merged config, so a typo or
+    /// unconfigured name is rejected with the configured names listed.
+    #[tokio::test]
+    async fn toggle_rejects_unknown_server() {
+        let _lock = SETTINGS_HOME_LOCK.lock().await;
+        let _home = TestSettingsHome::new();
+        let mut ctx = make_mcp_ctx();
+        ctx.config.mcp_servers.push(configured_server("known"));
+
+        let result = McpCommand.execute("disable nope", &mut ctx).await;
+        match result {
+            CommandResult::Error(msg) => {
+                assert!(msg.contains("nope"));
+                assert!(msg.contains("known"), "error must list configured servers");
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+        assert!(ctx.disabled_mcp_servers.is_empty());
+        assert!(
+            claurst_core::config::Settings::load_sync()
+                .unwrap()
+                .disabled_mcp_servers
+                .is_empty(),
+            "a rejected toggle must not touch settings"
+        );
+    }
+
+    /// `/mcp enable|disable <name>` with no name shows usage.
+    #[tokio::test]
+    async fn toggle_without_server_name_shows_usage() {
+        let mut ctx = make_mcp_ctx();
+        let result = McpCommand.execute("enable", &mut ctx).await;
+        match result {
+            CommandResult::Error(msg) => assert!(msg.contains("Usage")),
+            other => panic!("expected Error, got {:?}", other),
+        }
+        let result = McpCommand.execute("disable", &mut ctx).await;
+        match result {
+            CommandResult::Error(msg) => assert!(msg.contains("Usage")),
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    /// `/mcp status` reads the disabled set from the command context, so a
+    /// disabled server shows as user-disabled without a live manager and
+    /// without re-reading the settings file.
+    #[tokio::test]
+    async fn status_marks_disabled_servers_from_context() {
+        let mut ctx = make_mcp_ctx();
+        ctx.config.mcp_servers.push(configured_server("srv-a"));
+        ctx.config.mcp_servers.push(configured_server("srv-b"));
+        ctx.disabled_mcp_servers.insert("srv-a".to_string());
+
+        let result = McpCommand.execute("status", &mut ctx).await;
+        match result {
+            CommandResult::Message(msg) => {
+                let srv_a_line = msg
+                    .lines()
+                    .find(|l| l.contains("srv-a"))
+                    .expect("status lists srv-a");
+                assert!(
+                    srv_a_line.contains("disabled by user"),
+                    "disabled server must be marked, got: {srv_a_line}"
+                );
+                let srv_b_line = msg
+                    .lines()
+                    .find(|l| l.contains("srv-b"))
+                    .expect("status lists srv-b");
+                assert!(
+                    srv_b_line.contains("unknown (manager not active)"),
+                    "enabled server without manager must show unknown, got: {srv_b_line}"
+                );
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
+
+    /// Plain `/mcp` marks disabled servers in the live list too.
+    #[tokio::test]
+    async fn list_marks_disabled_servers_from_context() {
+        let mut ctx = make_mcp_ctx();
+        ctx.config.mcp_servers.push(configured_server("srv-a"));
+
+        ctx.disabled_mcp_servers.insert("srv-a".to_string());
+
+        let result = McpCommand.execute("", &mut ctx).await;
+        match result {
+            CommandResult::Message(msg) => {
+                assert!(
+                    msg.contains("[disabled]"),
+                    "disabled server must show as disabled in the list"
+                );
+            }
+            other => panic!("expected Message, got {:?}", other),
         }
     }
 }
