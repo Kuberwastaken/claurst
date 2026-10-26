@@ -273,10 +273,13 @@ impl CopilotProvider {
         }
     }
 
-    /// Public re-export so other providers (e.g. `CodexProvider`) can reuse
-    /// the same Responses-API message translation without duplicating the logic.
+    /// Shared Responses input translation for Codex. Only reasoning explicitly
+    /// issued by Codex is replayed to its stateless endpoint.
     pub fn to_responses_input_pub(request: &ProviderRequest) -> Vec<Value> {
-        Self::to_responses_input(request)
+        Self::to_responses_input_with(
+            request,
+            claurst_core::types::ResponsesReasoningProvider::Codex,
+        )
     }
 
     /// Public re-export of the Responses-API provider-option mapping
@@ -287,7 +290,14 @@ impl CopilotProvider {
         Self::apply_responses_provider_options(body, provider_options)
     }
 
-    fn to_responses_input(request: &ProviderRequest) -> Vec<Value> {
+    /// Translate claurst messages into Responses-API input items.
+    ///
+    /// Replay opaque reasoning only to its issuing provider. Native Anthropic
+    /// thinking retains its own wire shape and is omitted from Responses input.
+    fn to_responses_input_with(
+        request: &ProviderRequest,
+        provider: claurst_core::types::ResponsesReasoningProvider,
+    ) -> Vec<Value> {
         let mut input = Vec::new();
 
         if let Some(system_text) = Self::system_prompt_to_text(request) {
@@ -361,8 +371,7 @@ impl CopilotProvider {
                                     }));
                                 }
                             };
-                        let mut blocks = blocks.iter().peekable();
-                        while let Some(block) = blocks.next() {
+                        for block in blocks {
                             match block {
                                 ContentBlock::Text { text } => message_parts.push(json!({
                                     "type": "output_text",
@@ -383,34 +392,28 @@ impl CopilotProvider {
                                             .unwrap_or_else(|_| "{}".to_string()),
                                     }));
                                 }
-                                ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                                ContentBlock::ResponsesReasoning {
+                                    provider: origin,
+                                    item_id,
+                                    summary,
+                                    encrypted_content,
+                                } if *origin == provider => {
                                     flush_assistant_content(&mut input, &mut message_parts);
-                                    let mut item = json!({
-                                        "type": "reasoning",
-                                        "summary": [{
-                                            "type": "summary_text",
-                                            "text": thinking,
-                                        }],
-                                    });
-                                    // A summary followed by its encrypted state
-                                    // (Codex stores them as Thinking +
-                                    // RedactedThinking) is one reasoning item.
-                                    if let Some(ContentBlock::RedactedThinking { data }) = blocks.peek() {
-                                        if !data.is_empty() {
-                                            item["encrypted_content"] = json!(data);
-                                            blocks.next();
-                                        }
+                                    let mut item = json!({ "type": "reasoning", "summary": [] });
+                                    if !summary.is_empty() {
+                                        item["summary"] =
+                                            json!([{ "type": "summary_text", "text": summary }]);
+                                    }
+                                    if let Some(id) = item_id {
+                                        item["id"] = json!(id);
+                                    }
+                                    if let Some(data) = encrypted_content {
+                                        item["encrypted_content"] = json!(data);
                                     }
                                     input.push(item);
                                 }
-                                ContentBlock::RedactedThinking { data } if !data.is_empty() => {
-                                    flush_assistant_content(&mut input, &mut message_parts);
-                                    input.push(json!({
-                                        "type": "reasoning",
-                                        "encrypted_content": data,
-                                        "summary": [],
-                                    }));
-                                }
+                                // Native Anthropic state and foreign Responses items are
+                                // never replayed as reasoning to a different backend.
                                 _ => {}
                             }
                         }
@@ -529,21 +532,10 @@ impl CopilotProvider {
                     }
                 }
                 Some("reasoning") => {
-                    // Extract reasoning summary text from the Responses API.
-                    // Format: { "type": "reasoning", "summary": [{ "type": "summary_text", "text": "..." }] }
-                    if let Some(summaries) = item.get("summary").and_then(|v| v.as_array()) {
-                        let reasoning: String = summaries
-                            .iter()
-                            .filter_map(|s| s.get("text").and_then(|t| t.as_str()))
-                            .collect::<Vec<_>>()
-                            .join("");
-                        if !reasoning.is_empty() {
-                            content.push(ContentBlock::Thinking {
-                                thinking: reasoning,
-                                signature: String::new(),
-                            });
-                        }
-                    }
+                    content.push(crate::provider_types::responses_reasoning_block(
+                        item,
+                        claurst_core::types::ResponsesReasoningProvider::Copilot,
+                    ))
                 }
                 Some("function_call") => {
                     has_tool_call = true;
@@ -589,6 +581,7 @@ impl CopilotProvider {
             stop_reason,
             usage,
             model,
+            rate_limits: None,
         })
     }
 
@@ -612,7 +605,7 @@ impl CopilotProvider {
 
         let mut body = json!({
             "model": request.model,
-            "input": Self::to_responses_input(request),
+            "input": Self::to_responses_input_with(request, claurst_core::types::ResponsesReasoningProvider::Copilot),
             "max_output_tokens": request.max_tokens,
             "store": false,
         });
@@ -1277,5 +1270,93 @@ impl LlmProvider for CopilotProvider {
             structured_output: true,
             system_prompt_style: SystemPromptStyle::SystemMessage,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claurst_core::types::{ContentBlock, Message};
+
+    fn replay_request(messages: Vec<Message>) -> ProviderRequest {
+        ProviderRequest {
+            model: "gpt-5.5".to_string(),
+            messages,
+            system_prompt: None,
+            tools: Vec::new(),
+            max_tokens: 1024,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: Vec::new(),
+            thinking: None,
+            provider_options: json!({}),
+        }
+    }
+
+    fn reasoning_history() -> Vec<Message> {
+        vec![
+            Message::user("go"),
+            Message::assistant_blocks(vec![
+                ContentBlock::ResponsesReasoning {
+                    provider: claurst_core::types::ResponsesReasoningProvider::Codex,
+                    item_id: Some("rs_1".into()),
+                    summary: "step one".into(),
+                    encrypted_content: Some("ENC-1".into()),
+                },
+                ContentBlock::Text {
+                    text: "done".to_string(),
+                },
+            ]),
+        ]
+    }
+
+    /// Ciphertext provenance: replaying to the issuing provider pairs the
+    /// summary with its encrypted_content; translating for any other provider
+    /// must keep only summaries — foreign ciphertext is undecryptable there.
+    #[test]
+    fn response_input_replay_gate_controls_encrypted_content() {
+        let with_replay = CopilotProvider::to_responses_input_with(
+            &replay_request(reasoning_history()),
+            claurst_core::types::ResponsesReasoningProvider::Codex,
+        );
+        assert_eq!(with_replay.len(), 3);
+        assert_eq!(with_replay[1]["type"], "reasoning");
+        assert_eq!(with_replay[1]["summary"][0]["text"], "step one");
+        assert_eq!(with_replay[1]["encrypted_content"], "ENC-1");
+        assert_eq!(with_replay[1]["id"], "rs_1");
+        let mut copilot_history = reasoning_history();
+        if let MessageContent::Blocks(blocks) = &mut copilot_history[1].content {
+            if let ContentBlock::ResponsesReasoning { provider, .. } = &mut blocks[0] {
+                *provider = claurst_core::types::ResponsesReasoningProvider::Copilot;
+            }
+        }
+        let native_copilot = CopilotProvider::to_responses_input_with(
+            &replay_request(copilot_history),
+            claurst_core::types::ResponsesReasoningProvider::Copilot,
+        );
+        assert_eq!(native_copilot[1]["encrypted_content"], "ENC-1");
+
+        let without_replay = CopilotProvider::to_responses_input_with(
+            &replay_request(reasoning_history()),
+            claurst_core::types::ResponsesReasoningProvider::Copilot,
+        );
+        let types: Vec<&str> = without_replay
+            .iter()
+            .map(|item| {
+                item["type"].as_str()
+                    .or_else(|| item["role"].as_str())
+                    .unwrap_or("")
+            })
+            .collect();
+        assert_eq!(types, ["user", "assistant"]);
+        assert!(without_replay
+            .iter()
+            .all(|item| item.get("encrypted_content").is_none()));
+
+        // The Codex reuse path replays ciphertext (stateless store:false).
+        let public_path =
+            CopilotProvider::to_responses_input_pub(&replay_request(reasoning_history()));
+        assert_eq!(public_path[1]["encrypted_content"], "ENC-1");
     }
 }

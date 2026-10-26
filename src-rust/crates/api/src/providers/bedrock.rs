@@ -567,6 +567,7 @@ impl BedrockProvider {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
+            rate_limits: None,
         })
     }
 
