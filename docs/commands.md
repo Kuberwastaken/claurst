@@ -168,6 +168,17 @@ title, last-updated time, message count, and cost. In the overlay:
 
 ---
 
+### /sessions
+
+Open the session browser overlay with an optional pre-applied filter. While the browser is open, press `/` to type a filter live, `Ctrl+U` to clear it, and `Esc` to close. Matching is case-insensitive against the session title and id.
+
+```
+/sessions
+/sessions <query>
+```
+
+---
+
 ### /fork
 
 Save the conversation up to message index N (default: all of it) as a new session titled "Fork of ...", with the current session as its parent. The current session stays active; switch with `/resume <id>`.

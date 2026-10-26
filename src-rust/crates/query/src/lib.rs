@@ -50,7 +50,8 @@ pub use goal_loop::{
 pub use runner::*;
 pub use sanitize::sanitize_history;
 pub use session_memory::{
-    ExtractedMemory, MemoryCategory, SessionMemoryExtractor, SessionMemoryState,
+    await_pending_extractions, build_transcript, extract_and_store, extraction_allowed,
+    parse_extraction_response, spawn_extraction, ExtractionCursor, ExtractionRoute,
 };
 
 use claurst_api::{
@@ -109,6 +110,11 @@ pub struct QueryConfig {
     /// Session context gathered at startup (git status, IDE context).
     /// Sent in the dynamic system block, after the cached stable block.
     pub session_context: Option<String>,
+    /// Memory index content injected into the dynamic system block
+    /// (`<memory>` section) when auto-memory is enabled. Refreshed by the
+    /// query loop each turn from the memdir store so extracted facts
+    /// surface on the next turn. Empty: no memory section.
+    pub memory_content: String,
     pub output_style: claurst_core::system_prompt::OutputStyle,
     pub output_style_prompt: Option<String>,
     pub working_directory: Option<String>,
@@ -220,6 +226,7 @@ impl Default for QueryConfig {
             system_prompt: None,
             append_system_prompt: None,
             session_context: None,
+            memory_content: String::new(),
             output_style: claurst_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             working_directory: None,
@@ -257,6 +264,23 @@ fn persist_step(config: &QueryConfig, messages: &[Message]) {
         if let Err(e) = journal.sync_messages(messages) {
             warn!(error = %e, "Session journal write failed");
         }
+    }
+}
+
+/// Load the memory index content for a config, or an empty string when
+/// auto-memory is disabled or the project dir is unknown. Used to seed
+/// `QueryConfig::memory_content` at construction; the query loop refreshes
+/// it every turn so turn-end extraction surfaces on the next request.
+fn memory_content_for_config(cfg: &Config) -> String {
+    if !claurst_core::memdir::is_auto_memory_enabled(cfg.auto_memory_enabled) {
+        return String::new();
+    }
+    match &cfg.project_dir {
+        Some(dir) => {
+            let store_dir = claurst_core::memdir::memory_store_dir(dir);
+            claurst_core::memdir::build_memory_prompt_content(&store_dir)
+        }
+        None => String::new(),
     }
 }
 
@@ -314,6 +338,7 @@ impl QueryConfig {
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
             working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
+            memory_content: memory_content_for_config(cfg),
             managed_agents: cfg.managed_agents.clone(),
             effort_level: cfg.effective_effort_level(),
             degradation_enabled: cfg.degradation_summary_enabled_or_default(),
@@ -335,6 +360,7 @@ impl QueryConfig {
             output_style: cfg.effective_output_style(),
             output_style_prompt: cfg.resolve_output_style_prompt(),
             working_directory: cfg.project_dir.as_ref().map(|p| p.display().to_string()),
+            memory_content: memory_content_for_config(cfg),
             managed_agents: cfg.managed_agents.clone(),
             effort_level: cfg.effective_effort_level(),
             degradation_enabled: cfg.degradation_summary_enabled_or_default(),
@@ -909,6 +935,17 @@ pub async fn run_query_loop(
         let route = config.provider_registry.as_deref().map(|registry| {
             resolve_provider_route(registry, config, tool_ctx, &effective_model, client)
         });
+        // Stash for the turn-end memory extraction hook: the provider Arc is
+        // cheap to clone and `route` is moved into the dispatch block below.
+        let extraction_provider = route.as_ref().and_then(|r| r.provider.clone());
+        let extraction_provider_id = route
+            .as_ref()
+            .map(|r| r.provider_id.clone())
+            .unwrap_or_else(|| "anthropic".to_string());
+        let extraction_model_id = route
+            .as_ref()
+            .map(|r| r.model_id.clone())
+            .unwrap_or_else(|| effective_model.clone());
 
         // Pre-request compaction check point (issue #441). It runs before
         // every request, including the one that follows each tool batch, so
@@ -1030,6 +1067,21 @@ pub async fn run_query_loop(
             }
             patched.sandbox_state =
                 claurst_core::sandbox::render_sandbox_state(&tool_ctx.config.sandbox);
+
+            // Memory index injection: when the auto-memory switches allow it,
+            // load the store's MEMORY.md index and inject it into the
+            // dynamic system block. The store dir is the same hash-keyed dir
+            // the turn-end extractor writes to (`memory_store_dir`), so
+            // facts extracted at the end of turn N surface in turn N+1's
+            // prompt. Read fresh each turn (the index is small, capped at
+            // 200 lines / 25 KiB) and routed through `memory_content`, which
+            // `build_system_prompt` places after the dynamic boundary so the
+            // cached stable block stays byte-identical across turns.
+            if claurst_core::memdir::is_auto_memory_enabled(tool_ctx.config.auto_memory_enabled) {
+                let store_dir = claurst_core::memdir::memory_store_dir(&tool_ctx.working_dir);
+                patched.memory_content =
+                    claurst_core::memdir::build_memory_prompt_content(&store_dir);
+            }
 
             // Apply agent system-prompt prefix: prepend before the main system prompt.
             if let Some(ref agent) = config.agent_definition {
@@ -1739,6 +1791,37 @@ pub async fn run_query_loop(
                         }
                     }
 
+                    // Turn-end memory extraction (same hook as the legacy
+                    // client path below): one extra request through the ACTIVE
+                    // provider/model, results written into the memdir store.
+                    // Off unless `memoryExtractionEnabled` is set globally and
+                    // the auto-memory switches allow it; subagents never
+                    // extract. Tracked detached task so embedders that exit
+                    // right after the loop can await it.
+                    if session_memory::extraction_allowed(&tool_ctx.config, config.is_subagent) {
+                        let route = session_memory::ExtractionRoute {
+                            session_id: tool_ctx.session_id.clone(),
+                            snapshot_sequence: session_memory::next_extraction_sequence(),
+                            provider_id: provider_id_str.to_string(),
+                            model_id: model_id_str.to_string(),
+                            provider: Some(provider.clone()),
+                            anthropic_client: client.clone(),
+                            store_dir: claurst_core::memdir::memory_store_dir(
+                                &tool_ctx.working_dir,
+                            ),
+                        };
+                        let messages_clone = messages.clone();
+                        let working_dir_clone = tool_ctx.working_dir.clone();
+                        session_memory::spawn_extraction(async move {
+                            session_memory::extract_and_store(
+                                &route,
+                                &messages_clone,
+                                &working_dir_clone,
+                            )
+                            .await
+                        });
+                    }
+
                     fire_stop_hooks!(assistant_msg);
                     continue_or_end!(assistant_msg, usage);
                 } else if provider_id_str != "anthropic" {
@@ -2046,59 +2129,31 @@ pub async fn run_query_loop(
             "end_turn" => {
                 fire_stop_hooks!(assistant_msg);
 
-                // Asynchronously extract and persist session memories if warranted.
-                // Runs in a detached Tokio task so it doesn't block the query loop.
-                if session_memory::SessionMemoryExtractor::should_extract(messages) {
-                    let model_clone = config.model.clone();
+                // Turn-end memory extraction: one extra request through the
+                // session's ACTIVE provider/model, results written into the
+                // memdir store. Off unless `memoryExtractionEnabled` is set
+                // globally and the auto-memory switches allow it; subagents
+                // and every other detached loop never extract. Detached task;
+                // failures are debug-logged and never affect the turn.
+                if session_memory::extraction_allowed(&tool_ctx.config, config.is_subagent) {
+                    let route = session_memory::ExtractionRoute {
+                            session_id: tool_ctx.session_id.clone(),
+                            snapshot_sequence: session_memory::next_extraction_sequence(),
+                        provider_id: extraction_provider_id.clone(),
+                        model_id: extraction_model_id.clone(),
+                        provider: extraction_provider.clone(),
+                        anthropic_client: client.clone(),
+                        store_dir: claurst_core::memdir::memory_store_dir(&tool_ctx.working_dir),
+                    };
                     let messages_clone = messages.clone();
                     let working_dir_clone = tool_ctx.working_dir.clone();
-
-                    // Build a fresh client using the same API key.  This avoids
-                    // requiring an Arc in the existing run_query_loop signature.
-                    if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-                        if !api_key.is_empty() {
-                            if let Ok(sm_client) = claurst_api::AnthropicClient::new(
-                                claurst_api::client::ClientConfig {
-                                    api_key,
-                                    ..Default::default()
-                                },
-                            ) {
-                                let sm_client = std::sync::Arc::new(sm_client);
-                                tokio::spawn(async move {
-                                    let extractor =
-                                        session_memory::SessionMemoryExtractor::new(&model_clone);
-                                    match extractor
-                                        .extract(&messages_clone, &working_dir_clone, &sm_client)
+                    // Tracked detached task: embedders that exit right after
+                    // the loop (headless --print) await it via
+                    // `await_pending_extractions` instead of losing the work.
+                    session_memory::spawn_extraction(async move {
+                                        session_memory::extract_and_store(&route,&messages_clone, &working_dir_clone,)
                                         .await
-                                    {
-                                        Ok(memories) if !memories.is_empty() => {
-                                            let target = working_dir_clone
-                                                .join(".claurst")
-                                                .join("AGENTS.md");
-                                            if let Err(e) =
-                                                session_memory::SessionMemoryExtractor::persist(
-                                                    &memories, &target,
-                                                )
-                                                .await
-                                            {
-                                                tracing::warn!(
-                                                    error = %e,
-                                                    "Failed to persist session memories"
-                                                );
-                                            }
-                                        }
-                                        Ok(_) => {} // no memories extracted
-                                        Err(e) => {
-                                            tracing::debug!(
-                                                error = %e,
-                                                "Session memory extraction failed (non-fatal)"
-                                            );
-                                        }
-                                    }
                                 });
-                            }
-                        }
-                    }
                 }
 
                 // Trigger AutoDream consolidation check (non-blocking, best-effort).
@@ -2471,6 +2526,7 @@ mod tests {
             system_prompt: sys.map(String::from),
             append_system_prompt: append.map(String::from),
             session_context: None,
+            memory_content: String::new(),
             output_style: claurst_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             working_directory: None,
@@ -2870,6 +2926,7 @@ mod tests {
     //      execute() runs even though the handler would deny;
     //  (c) a ReadOnly / None tool is never gated centrally.
 
+    use std::sync::atomic::AtomicUsize as StdAtomicUsize;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
     /// Permission handler that denies everything (returns `Ask`, which in a
@@ -3429,6 +3486,221 @@ mod tests {
         })]
     }
 
+    /// Provider that serves the main loop from a scripted stream (always
+    /// `end_turn`) and counts non-stream `create_message` calls — the only
+    /// such calls in these tests are turn-end memory-extraction requests.
+    struct ExtractionProbeProvider {
+        id: claurst_core::provider_id::ProviderId,
+        nonstream_calls: Arc<StdAtomicUsize>,
+        /// System prompts seen by non-stream requests (the extraction route).
+        nonstream_systems: Arc<StdMutex<Vec<Option<SystemPrompt>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl claurst_api::LlmProvider for ExtractionProbeProvider {
+        fn id(&self) -> &claurst_core::provider_id::ProviderId {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            "extraction-probe"
+        }
+
+        async fn create_message(
+            &self,
+            request: claurst_api::ProviderRequest,
+        ) -> Result<claurst_api::ProviderResponse, claurst_api::ProviderError> {
+            self.nonstream_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.nonstream_systems
+                .lock()
+                .unwrap()
+                .push(request.system_prompt.clone());
+            Ok(claurst_api::ProviderResponse {
+                id: uuid::Uuid::new_v4().to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "MEMORY: project_fact | 8 | probe hit".to_string(),
+                }],
+                stop_reason: claurst_api::provider_types::StopReason::EndTurn,
+                usage: UsageInfo::default(),
+                model: "mock-model".to_string(),
+                rate_limits: None,
+            })
+        }
+
+        async fn create_message_stream(
+            &self,
+            request: claurst_api::ProviderRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<claurst_api::StreamEvent, claurst_api::ProviderError>,
+                        > + Send,
+                >,
+            >,
+            claurst_api::ProviderError,
+        > {
+            // Main-loop turns ride this route; record their system prompt so
+            // read-path tests can assert on the prompt the model actually
+            // sees (the non-stream vec above stays extraction-only).
+            self.nonstream_systems
+                .lock()
+                .unwrap()
+                .push(request.system_prompt.clone());
+            use claurst_api::provider_types::StopReason;
+            use claurst_api::StreamEvent;
+
+            let msg_id = uuid::Uuid::new_v4().to_string();
+            let events: Vec<Result<StreamEvent, claurst_api::ProviderError>> = vec![
+                Ok(StreamEvent::MessageStart {
+                    id: msg_id,
+                    model: "mock-model".to_string(),
+                    usage: UsageInfo::default(),
+                }),
+                Ok(StreamEvent::TextDelta {
+                    index: 0,
+                    text: "Done.".to_string(),
+                }),
+                Ok(StreamEvent::MessageDelta {
+                    stop_reason: Some(StopReason::EndTurn),
+                    usage: Some(UsageInfo::default()),
+                }),
+                Ok(StreamEvent::MessageStop),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+
+        async fn health_check(
+            &self,
+        ) -> Result<claurst_api::ProviderStatus, claurst_api::ProviderError> {
+            Ok(claurst_api::ProviderStatus::Healthy)
+        }
+
+        fn capabilities(&self) -> claurst_api::ProviderCapabilities {
+            claurst_api::ProviderCapabilities {
+                streaming: true,
+                tool_calling: true,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: claurst_api::SystemPromptStyle::TopLevel,
+            }
+        }
+    }
+
+    fn extraction_fixture(
+        dir: &std::path::Path,
+        session: &str,
+        calls: Arc<StdAtomicUsize>,
+    ) -> session_memory::ExtractionRoute {
+        session_memory::ExtractionRoute {
+            provider_id: "mockprov".to_string(),
+            model_id: "mock-model".to_string(),
+            provider: Some(Arc::new(ExtractionProbeProvider {
+                id: claurst_core::provider_id::ProviderId::new("mockprov"),
+                nonstream_calls: calls,
+                nonstream_systems: Arc::new(StdMutex::new(Vec::new())),
+            })),
+            anthropic_client: claurst_api::AnthropicClient::new(
+                claurst_api::client::ClientConfig {
+                    api_key: "unused-fixture-key".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+            store_dir: dir.to_path_buf(),
+            session_id: session.to_string(),
+            snapshot_sequence: session_memory::next_extraction_sequence(),
+        }
+    }
+
+    fn extraction_messages(prefix: &str, count: usize) -> Vec<Message> {
+        (0..count)
+            .map(|index| {
+                let mut message = Message::user(format!("useful fact {index}"));
+                message.uuid = Some(format!("{prefix}-{index}"));
+                message
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn extraction_progress_is_session_scoped_and_rewritten_history_is_eligible() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(StdAtomicUsize::new(0));
+        let first = extraction_fixture(dir.path(), "first", calls.clone());
+        session_memory::extract_and_store(&first, &extraction_messages("long", 100), dir.path())
+            .await;
+        let second = extraction_fixture(dir.path(), "second", calls.clone());
+        session_memory::extract_and_store(&second, &extraction_messages("short", 20), dir.path())
+            .await;
+        let rewritten = extraction_fixture(dir.path(), "first", calls.clone());
+        session_memory::extract_and_store(
+            &rewritten,
+            &extraction_messages("rewritten", 20),
+            dir.path(),
+        )
+        .await;
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 3);
+        let first_cursor = claurst_core::memdir::extraction_cursor_path(dir.path(), "first");
+        let second_cursor = claurst_core::memdir::extraction_cursor_path(dir.path(), "second");
+        assert_ne!(first_cursor, second_cursor);
+        assert!(first_cursor.is_file() && second_cursor.is_file());
+    }
+
+    #[tokio::test]
+    async fn concurrent_extractions_recheck_cursor_and_stale_snapshots_cannot_rewind_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let calls = Arc::new(StdAtomicUsize::new(0));
+        let older = extraction_fixture(dir.path(), "session", calls.clone());
+        let newer = extraction_fixture(dir.path(), "session", calls.clone());
+        let messages = extraction_messages("history", 30);
+        tokio::join!(
+            session_memory::extract_and_store(&newer, &messages, dir.path()),
+            session_memory::extract_and_store(&newer, &messages, dir.path()),
+        );
+        session_memory::extract_and_store(&older, &messages[..20], dir.path()).await;
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            1,
+            "one request covers the same window"
+        );
+        let cursor: session_memory::ExtractionCursor = serde_json::from_slice(
+            &std::fs::read(claurst_core::memdir::extraction_cursor_path(
+                dir.path(),
+                "session",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cursor.message_count, 30);
+        assert_eq!(cursor.last_uuid.as_deref(), Some("history-29"));
+    }
+
+    #[tokio::test]
+    async fn extraction_storage_failure_retains_window_for_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auto"), "blocks the memory directory").unwrap();
+        let calls = Arc::new(StdAtomicUsize::new(0));
+        let route = extraction_fixture(dir.path(), "session", calls.clone());
+        let messages = extraction_messages("history", 20);
+        assert_eq!(
+            session_memory::extract_and_store(&route, &messages, dir.path()).await,
+            0
+        );
+        assert!(!claurst_core::memdir::extraction_cursor_path(dir.path(), "session").exists());
+        std::fs::remove_file(dir.path().join("auto")).unwrap();
+        assert_eq!(
+            session_memory::extract_and_store(&route, &messages, dir.path()).await,
+            1
+        );
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 2);
+        assert!(claurst_core::memdir::extraction_cursor_path(dir.path(), "session").is_file());
+    }
+
     /// Drive `run_query_loop` against the recording provider. Returns the
     /// outcome, the per-request "tools were empty" record, and the final
     /// message history.
@@ -3521,6 +3793,277 @@ mod tests {
 
         let recorded = recorded.lock().unwrap().clone();
         (outcome, recorded, messages)
+    }
+
+    /// Drive the loop against `ExtractionProbeProvider` with memory extraction
+    /// enabled and a history long enough to pass `MIN_MESSAGES_TO_EXTRACT`.
+    /// Returns (outcome, non-stream call count, systems seen by those calls).
+    ///
+    /// The registry guard is deliberately held across the awaits below: the
+    /// test must own the process-global spawn registry AND the
+    /// `CLAURST_REMOTE_MEMORY_DIR` env var for its full body, or a sibling
+    /// test's cleanup unsets the env var mid-loop and the store dir silently
+    /// falls back to the real `~/.claurst`.
+    #[allow(clippy::await_holding_lock)]
+    async fn drive_extraction_loop(
+        messages: Vec<Message>,
+        tool_config: claurst_core::config::Config,
+    ) -> (QueryOutcome, usize, Vec<Option<SystemPrompt>>) {
+        drive_extraction_loop_with(messages, tool_config, None).await
+    }
+
+    /// Same as [`Self::drive_extraction_loop`], but lets the caller pass an
+    /// already-held registry guard so tests that need the store seeded before
+    /// the loop starts (or must keep the env override alive across both the
+    /// seeding and the run) do not re-acquire the non-reentrant mutex.
+    #[allow(clippy::await_holding_lock)]
+    async fn drive_extraction_loop_with(
+        messages: Vec<Message>,
+        tool_config: claurst_core::config::Config,
+        mut registry_guard: Option<session_memory::TestRegistryGuard>,
+    ) -> (QueryOutcome, usize, Vec<Option<SystemPrompt>>) {
+        // Serialize against every other test that touches the process-global
+        // spawn registry, or this `await` can drain another test's handles
+        // (and vice versa). When the caller already holds the lock, reuse
+        // their guard; they keep owning the env override and store root.
+        let caller_owns_store = registry_guard.is_some();
+        let _registry = match registry_guard.take() {
+            Some(guard) => guard,
+            None => session_memory::test_registry_lock(),
+        };
+        // The store dir resolves through CLAURST_REMOTE_MEMORY_DIR; isolate
+        // it per test so no cursor or entry ever lands in the real ~/.claurst
+        // and no stale cursor from a previous run suppresses extraction. The
+        // guard also owns the tempdir and restores the previous value on
+        // drop, so a panic inside the loop below cannot leak the override
+        // into later tests.
+        //
+        // When the caller passed a registry guard they already own an env
+        // override (and possibly a pre-seeded store); replacing it here would
+        // hide their seeded entries, so keep theirs.
+        let _env_guard = if caller_owns_store {
+            None
+        } else {
+            let store_root = tempfile::tempdir().expect("temp store root");
+            Some(RemoteMemoryDirOverride::set(store_root))
+        };
+        let nonstream_calls = Arc::new(StdAtomicUsize::new(0));
+        let nonstream_systems = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(ExtractionProbeProvider {
+            id: claurst_core::provider_id::ProviderId::new("mockprov"),
+            nonstream_calls: nonstream_calls.clone(),
+            nonstream_systems: nonstream_systems.clone(),
+        });
+        let mut registry = claurst_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+
+        let mut ctx = deny_all_context();
+        ctx.session_id = "extraction-test".to_string();
+        ctx.config = tool_config;
+        ctx.config.provider = Some("mockprov".to_string());
+
+        let mut config = make_config(None, None);
+        config.model = "mock-model".to_string();
+        config.provider_registry = Some(Arc::new(registry));
+
+        let cost = claurst_core::cost::CostTracker::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut messages = messages;
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &[],
+                &ctx,
+                &config,
+                cost,
+                None,
+                cancel,
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        // The spawn is tracked; drain it so the extraction completes before
+        // the assertions read the probe counters.
+        let unfinished =
+            session_memory::await_pending_extractions(std::time::Duration::from_secs(5)).await;
+        assert_eq!(unfinished, 0, "extraction task must finish within budget");
+
+        let calls = nonstream_calls.load(AtomicOrdering::SeqCst);
+        let systems = nonstream_systems.lock().unwrap().clone();
+        (outcome, calls, systems)
+    }
+
+    /// Points `CLAURST_REMOTE_MEMORY_DIR` at `dir` for its lifetime and
+    /// restores the previous value on drop, so a failing test cannot leak
+    /// the override into the rest of the process. Tests using this must
+    /// hold `session_memory::test_registry_lock()` first: the env var is
+    /// process-global and the lock serializes its readers in this binary.
+    struct RemoteMemoryDirOverride {
+        saved: Option<std::ffi::OsString>,
+        // Owned so the tempdir outlives every store write that resolves
+        // through the override, including detached extraction tasks that
+        // are still draining when the test body ends.
+        _dir: tempfile::TempDir,
+    }
+
+    impl RemoteMemoryDirOverride {
+        fn set(_dir: tempfile::TempDir) -> Self {
+            let saved = std::env::var_os("CLAURST_REMOTE_MEMORY_DIR");
+            std::env::set_var("CLAURST_REMOTE_MEMORY_DIR", _dir.path());
+            Self { saved, _dir }
+        }
+    }
+
+    impl Drop for RemoteMemoryDirOverride {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var("CLAURST_REMOTE_MEMORY_DIR", v),
+                None => std::env::remove_var("CLAURST_REMOTE_MEMORY_DIR"),
+            }
+        }
+    }
+
+    /// (extraction) Provider-dispatch end-turn fires exactly one extraction
+    /// request through the ACTIVE provider, carrying the extraction system
+    /// prompt. Regression for the bug where the hook was legacy-path-only.
+    #[tokio::test]
+    async fn provider_dispatch_end_turn_fires_memory_extraction() {
+        // 25 messages: above MIN_MESSAGES_TO_EXTRACT (20).
+        let mut messages = vec![Message::user("start")];
+        for i in 0..24 {
+            messages.push(if i % 2 == 0 {
+                Message::user(format!("turn {i}"))
+            } else {
+                Message::assistant(format!("reply {i}"))
+            });
+        }
+        let tool_config = claurst_core::config::Config {
+            memory_extraction_enabled: true,
+            ..Default::default()
+        };
+
+        let (outcome, calls, systems) = drive_extraction_loop(messages, tool_config).await;
+
+        assert!(
+            matches!(outcome, QueryOutcome::EndTurn { .. }),
+            "loop must end normally"
+        );
+        assert_eq!(
+            calls, 1,
+            "exactly one extraction request must fire at end_turn"
+        );
+        // Two recorded prompts now: the main-loop turn (stream route) plus
+        // the extraction request (non-stream route). The extraction prompt
+        // is the last one recorded.
+        assert_eq!(systems.len(), 2);
+        match systems.last() {
+            Some(Some(SystemPrompt::Text(text))) => {
+                assert!(
+                    text.contains("memory extraction assistant"),
+                    "extraction request must carry the extraction system prompt"
+                );
+            }
+            other => panic!("expected extraction system prompt, got {other:?}"),
+        }
+    }
+
+    /// (read path) The memory index written to the store by extraction (or a
+    /// prior session) reaches the next turn's system prompt: the loop
+    /// refreshes `memory_content` from `memory_store_dir` every turn and
+    /// `build_system_prompt` places it in the dynamic `<memory>` block.
+    /// Regression for the period where the read path had zero callers and
+    /// extracted facts could never surface in a prompt.
+    #[tokio::test]
+    async fn stored_memory_index_reaches_system_prompt() {
+        // Serialize against every other test that touches the process-global
+        // spawn registry or the CLAURST_REMOTE_MEMORY_DIR override. The guard
+        // is handed to the loop driver below: re-acquiring it there would
+        // self-deadlock (the mutex is not reentrant and the runtime is
+        // current-thread).
+        let registry_guard = session_memory::test_registry_lock();
+        let store_root = tempfile::tempdir().expect("temp store root");
+        let _env_guard = RemoteMemoryDirOverride::set(store_root);
+
+        // Pre-seed the store exactly as `append_auto_memories` would: an
+        // `auto/` topic file plus a MEMORY.md index line for it.
+        let tool_config = claurst_core::config::Config::default();
+        // `deny_all_context` pins working_dir to `/workspace`, so the loop
+        // resolves the store through the same `memory_store_dir` call this
+        // seeding uses; the hash key makes the path deterministic.
+        let store_dir = claurst_core::memdir::memory_store_dir(std::path::Path::new("/workspace"));
+        let entry = claurst_core::memdir::AutoMemoryEntry {
+            name: "build command".to_string(),
+            description: "how to build the workspace".to_string(),
+            content: "cargo build --workspace from src-rust".to_string(),
+            memory_type: claurst_core::memdir::MemoryType::Project,
+        };
+        let written = claurst_core::memdir::append_auto_memories(&store_dir, &[entry]).expect("store memory");
+        assert_eq!(written.len(), 1, "seed entry must land in the store");
+
+        // Drive one turn through the provider-dispatch path with auto-memory
+        // enabled (default) and assert the request's system prompt carries the
+        // index line inside the <memory> block.
+        let messages = vec![Message::user("what is the build command?")];
+        let mut tool_config = tool_config;
+        tool_config.provider = Some("mockprov".to_string());
+        let (outcome, calls, systems) =
+            drive_extraction_loop_with(messages, tool_config, Some(registry_guard)).await;
+
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(calls, 0, "history below threshold: no extraction request");
+        assert_eq!(systems.len(), 1);
+        match &systems[0] {
+            Some(SystemPrompt::Blocks(blocks)) => {
+                let dynamic = blocks
+                    .iter()
+                    .map(|b| b.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    dynamic.contains("<memory>"),
+                    "dynamic block must carry the memory section"
+                );
+                assert!(
+                    dynamic.contains("Memory Index (MEMORY.md)"),
+                    "dynamic block must carry the index heading"
+                );
+                assert!(
+                    dynamic.contains("build command") || dynamic.contains("build-command"),
+                    "index line for the seeded entry must reach the prompt"
+                );
+            }
+            other => panic!("expected block system prompt, got {other:?}"),
+        }
+    }
+
+    /// (extraction) The gate stays closed when `memoryExtractionEnabled` is
+    /// unset: no second request, even with a long history.
+    #[tokio::test]
+    async fn provider_dispatch_extraction_off_by_default() {
+        let mut messages = vec![Message::user("start")];
+        for i in 0..24 {
+            messages.push(if i % 2 == 0 {
+                Message::user(format!("turn {i}"))
+            } else {
+                Message::assistant(format!("reply {i}"))
+            });
+        }
+        let (outcome, calls, _systems) =
+            drive_extraction_loop(messages, claurst_core::config::Config::default()).await;
+
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(calls, 0, "no extraction request when the gate is off");
     }
 
     /// Issue #440: across a scripted multi-turn run the stable system block is
