@@ -246,10 +246,8 @@ pub fn codex_catalog_lookup(model: &str) -> Option<CodexCatalogModel> {
 
 /// Base URL for the catalog endpoint, derived from the Responses URL so the
 /// two can never drift (`https://chatgpt.com/backend-api/codex/models`).
-fn codex_models_url() -> String {
-    let base = CODEX_API_ENDPOINT
-        .trim_end_matches("responses")
-        .trim_end_matches('/');
+fn codex_models_url(endpoint: &str) -> String {
+    let base = endpoint.trim_end_matches("responses").trim_end_matches('/');
     format!("{base}/models?client_version={CODEX_CATALOG_CLIENT_VERSION}")
 }
 
@@ -258,10 +256,13 @@ fn codex_models_url() -> String {
 async fn fetch_catalog_raw(
     provider_id: &ProviderId,
     http_client: &reqwest::Client,
+    endpoint: &str,
     token: &str,
     account_id: Option<&str>,
 ) -> Result<Vec<CodexCatalogModel>, ProviderError> {
-    let builder = http_client.get(codex_models_url()).header("Accept", "application/json");
+    let builder = http_client
+        .get(codex_models_url(endpoint))
+        .header("Accept", "application/json");
     let builder = CodexProvider::codex_headers(builder, token, account_id, &json!({}));
     let resp = builder.send().await.map_err(|e| ProviderError::Other {
         provider: provider_id.clone(),
@@ -343,6 +344,8 @@ fn unix_now() -> u64 {
 pub struct CodexProvider {
     id: ProviderId,
     http_client: reqwest::Client,
+    api_endpoint: String,
+    token_endpoint: String,
     /// Mutable token cache: updated in-place when a refresh succeeds.
     tokens: Arc<Mutex<CodexTokens>>,
 }
@@ -362,6 +365,8 @@ impl CodexProvider {
         Self {
             id: ProviderId::new(ProviderId::CODEX),
             http_client,
+            api_endpoint: CODEX_API_ENDPOINT.to_owned(),
+            token_endpoint: CODEX_TOKEN_URL.to_owned(),
             tokens: Arc::new(Mutex::new(tokens)),
         }
     }
@@ -447,7 +452,7 @@ impl CodexProvider {
 
         let resp = self
             .http_client
-            .post(CODEX_TOKEN_URL)
+            .post(&self.token_endpoint)
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
@@ -604,7 +609,14 @@ impl CodexProvider {
     async fn fetch_catalog(&self) -> Result<Vec<CodexCatalogModel>, ProviderError> {
         let token = self.access_token().await?;
         let account_id = self.account_id();
-        let models = fetch_catalog_raw(&self.id, &self.http_client, &token, account_id.as_deref()).await?;
+        let models = fetch_catalog_raw(
+            &self.id,
+            &self.http_client,
+            &self.api_endpoint,
+            &token,
+            account_id.as_deref(),
+        )
+        .await?;
         set_live_catalog(models.clone());
         Ok(models)
     }
@@ -616,8 +628,14 @@ impl CodexProvider {
     async fn ensure_catalog(&self, token: &str, account_id: Option<&str>) {
         let _ = CATALOG_HYDRATION
             .get_or_try_init(|| async {
-                if let Ok(models) =
-                    fetch_catalog_raw(&self.id, &self.http_client, token, account_id).await
+                if let Ok(models) = fetch_catalog_raw(
+                    &self.id,
+                    &self.http_client,
+                    &self.api_endpoint,
+                    token,
+                    account_id,
+                )
+                .await
                 {
                     set_live_catalog(models);
                 }
@@ -747,7 +765,7 @@ impl CodexProvider {
         request: &ProviderRequest,
     ) -> Result<ProviderResponse, ProviderError> {
         let mut token = self.access_token().await?;
-        let account_id = self.account_id();
+        let mut account_id = self.account_id();
 
         // Best-effort one-shot: real capabilities (item 5's include gate) need
         // the live catalog before the body is built.
@@ -759,7 +777,7 @@ impl CodexProvider {
         loop {
             let builder = self
                 .http_client
-                .post(CODEX_API_ENDPOINT)
+                .post(&self.api_endpoint)
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json");
             let builder = Self::codex_headers(builder, &token, account_id.as_deref(), &body);
@@ -785,6 +803,7 @@ impl CodexProvider {
                 if let Ok(refreshed) = self.refresh_after_auth_failure(&token).await {
                     debug!("Codex request hit a 401 — token refreshed, retrying once");
                     token = refreshed;
+                    account_id = self.account_id();
                     continue;
                 }
             }
@@ -822,7 +841,7 @@ impl CodexProvider {
         request: &ProviderRequest,
     ) -> Result<reqwest::Response, ProviderError> {
         let mut token = self.access_token().await?;
-        let account_id = self.account_id();
+        let mut account_id = self.account_id();
 
         // Same one-shot as the non-streaming path, before body building.
         self.ensure_catalog(&token, account_id.as_deref()).await;
@@ -834,7 +853,7 @@ impl CodexProvider {
         loop {
             let builder = self
                 .http_client
-                .post(CODEX_API_ENDPOINT)
+                .post(&self.api_endpoint)
                 .header("Content-Type", "application/json")
                 .header("Accept", "text/event-stream");
             let builder = Self::codex_headers(builder, &token, account_id.as_deref(), &body);
@@ -860,6 +879,7 @@ impl CodexProvider {
                     if let Ok(refreshed) = self.refresh_after_auth_failure(&token).await {
                         debug!("Codex stream hit a 401 — token refreshed, retrying once");
                         token = refreshed;
+                        account_id = self.account_id();
                         continue;
                     }
                 }
@@ -980,28 +1000,10 @@ impl CodexProvider {
                     }
                 }
                 Some("reasoning") => {
-                    if let Some(summaries) = item.get("summary").and_then(|v| v.as_array()) {
-                        let reasoning: String = summaries
-                            .iter()
-                            .filter_map(|s| s.get("text").and_then(|t| t.as_str()))
-                            .collect::<Vec<_>>()
-                            .join("");
-                        if !reasoning.is_empty() {
-                            content.push(ContentBlock::Thinking {
-                                thinking: reasoning,
-                                signature: String::new(),
-                            });
-                        }
-                    }
-                    if let Some(data) = item
-                        .get("encrypted_content")
-                        .and_then(|v| v.as_str())
-                        .filter(|data| !data.is_empty())
-                    {
-                        content.push(ContentBlock::RedactedThinking {
-                            data: data.to_string(),
-                        });
-                    }
+                    content.push(crate::provider_types::responses_reasoning_block(
+                        item,
+                        claurst_core::types::ResponsesReasoningProvider::Codex,
+                    ))
                 }
                 Some("function_call") => {
                     has_tool_call = true;
@@ -1115,6 +1117,7 @@ impl CodexProvider {
             // item completes — keeping the (summary, encrypted_content) pair
             // and the ordering relative to function calls.
             let mut reasoning_items: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            let mut reasoning_summaries: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
@@ -1371,6 +1374,7 @@ impl CodexProvider {
                                             },
                                         });
                                     }
+                                    reasoning_summaries.entry(output_index).or_default().push_str("\n\n");
                                     yield Ok(StreamEvent::ThinkingDelta {
                                         index: output_index,
                                         thinking: "\n\n".to_string(),
@@ -1406,6 +1410,7 @@ impl CodexProvider {
                                     });
                                 }
                                 if !delta.is_empty() {
+                                    reasoning_summaries.entry(output_index).or_default().push_str(delta);
                                     yield Ok(StreamEvent::ThinkingDelta {
                                         index: output_index,
                                         thinking: delta.to_string(),
@@ -1439,22 +1444,18 @@ impl CodexProvider {
                                 {
                                     yield Ok(StreamEvent::ContentBlockStop { index: output_index });
                                 }
-                                // Carry the reasoning item's encrypted state so
-                                // the next (stateless, store:false) request can
-                                // replay it and the model keeps its chain.
-                                if let Some(data) = json_val
-                                    .get("item")
-                                    .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("reasoning"))
-                                    .and_then(|item| item.get("encrypted_content"))
-                                    .and_then(|value| value.as_str())
-                                    .filter(|data| !data.is_empty())
+                                if let Some(item) = json_val.get("item")
+                                    .filter(|item| item["type"].as_str() == Some("reasoning"))
                                 {
-                                    yield Ok(StreamEvent::ContentBlockStart {
-                                        index: output_index,
-                                        content_block: claurst_core::types::ContentBlock::RedactedThinking {
-                                            data: data.to_string(),
-                                        },
-                                    });
+                                    let mut block = crate::provider_types::responses_reasoning_block(
+                                        item, claurst_core::types::ResponsesReasoningProvider::Codex,
+                                    );
+                                    if let claurst_core::types::ContentBlock::ResponsesReasoning { summary, .. } = &mut block {
+                                        if summary.is_empty() {
+                                            *summary = reasoning_summaries.remove(&output_index).unwrap_or_default();
+                                        }
+                                    }
+                                    yield Ok(StreamEvent::ContentBlockStart { index: output_index, content_block: block });
                                     yield Ok(StreamEvent::ContentBlockStop { index: output_index });
                                 }
                             }
@@ -1476,6 +1477,22 @@ impl CodexProvider {
                                         // No reassignment: this branch is the
                                         // stream-completion handler — execution
                                         // never re-enters the guard below.
+                                    }
+
+                                    if let Some(items) = response.get("output").and_then(Value::as_array) {
+                                        for (index, item) in items.iter().enumerate() {
+                                            if item["type"].as_str() == Some("reasoning") {
+                                                let mut block = crate::provider_types::responses_reasoning_block(
+                                                    item, claurst_core::types::ResponsesReasoningProvider::Codex,
+                                                );
+                                                if let claurst_core::types::ContentBlock::ResponsesReasoning { summary, .. } = &mut block {
+                                                    if summary.is_empty() {
+                                                        *summary = reasoning_summaries.get(&index).cloned().unwrap_or_default();
+                                                    }
+                                                }
+                                                yield Ok(StreamEvent::ContentBlockStart { index, content_block: block });
+                                            }
+                                        }
                                     }
 
                                     // Reasoning blocks whose item never saw
@@ -1762,7 +1779,7 @@ mod tests {
             let redacted_start = events[stop..]
                 .iter()
                 .position(|event| matches!(event,
-                    StreamEvent::ContentBlockStart { index: i, content_block: ContentBlock::RedactedThinking { data } }
+                    StreamEvent::ContentBlockStart { index: i, content_block: ContentBlock::ResponsesReasoning { encrypted_content: Some(data), .. } }
                     if *i == index && data == encrypted))
                 .map(|p| stop + p)
                 .expect("item's encrypted state must pair with its summary");
@@ -1780,7 +1797,7 @@ mod tests {
                 StreamEvent::ContentBlockStart { index: 1, content_block: ContentBlock::ToolUse { .. } }))
             .expect("function call block must start");
         let enc1 = events.iter().position(|event| matches!(event,
-            StreamEvent::ContentBlockStart { content_block: ContentBlock::RedactedThinking { data }, .. } if data == "ENC-1"))
+            StreamEvent::ContentBlockStart { content_block: ContentBlock::ResponsesReasoning { encrypted_content: Some(data), .. }, .. } if data == "ENC-1"))
             .expect("item 0 encrypted state present");
         assert!(enc1 < tool_start, "item 0's pair must complete before the tool call");
         let thinking2 = events.iter().position(|event| matches!(event,
@@ -1872,7 +1889,11 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 StreamEvent::ContentBlockStart {
-                    content_block: ContentBlock::RedactedThinking { data },
+                    content_block:
+                        ContentBlock::ResponsesReasoning {
+                            encrypted_content: Some(data),
+                            ..
+                        },
                     ..
                 } => Some(data.as_str()),
                 _ => None,
@@ -1914,12 +1935,11 @@ mod tests {
         req.messages = vec![
             Message::user("list files"),
             Message::assistant_blocks(vec![
-                ContentBlock::Thinking {
-                    thinking: "Listing files first.".into(),
-                    signature: String::new(),
-                },
-                ContentBlock::RedactedThinking {
-                    data: "ENC-1".into(),
+                ContentBlock::ResponsesReasoning {
+                    provider: claurst_core::types::ResponsesReasoningProvider::Codex,
+                    item_id: Some("rs_42".into()),
+                    summary: "Listing files first.".into(),
+                    encrypted_content: Some("ENC-1".into()),
                 },
                 ContentBlock::ToolUse {
                     id: "call_42".into(),
@@ -1951,12 +1971,13 @@ mod tests {
             .collect();
         assert_eq!(types, ["user", "reasoning", "function_call", "function_call_output", "assistant"]);
         assert_eq!(input[1]["encrypted_content"], "ENC-1");
+        assert_eq!(input[1]["id"], "rs_42");
         assert_eq!(input[1]["summary"][0]["text"], "Listing files first.");
     }
 
     #[test]
     fn codex_models_url_pins_the_catalog_client_version() {
-        let url = codex_models_url();
+        let url = codex_models_url(CODEX_API_ENDPOINT);
         assert_eq!(
             url,
             format!(
@@ -2270,11 +2291,130 @@ mod tests {
         assert_eq!(provider.account_id().as_deref(), Some("ws_123"));
     }
 
+    static AUTH_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct TestHome {
+        previous: Option<std::ffi::OsString>,
+        directory: std::path::PathBuf,
+    }
+
+    impl TestHome {
+        fn new() -> Self {
+            let directory =
+                std::env::temp_dir().join(format!("claurst-codex-auth-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&directory).unwrap();
+            let previous = std::env::var_os("CLAURST_HOME");
+            std::env::set_var("CLAURST_HOME", &directory);
+            Self {
+                previous,
+                directory,
+            }
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+            match self.previous.take() {
+                Some(previous) => std::env::set_var("CLAURST_HOME", previous),
+                None => std::env::remove_var("CLAURST_HOME"),
+            }
+        }
+    }
+
+    /// Both HTTP paths must retry a rejected bearer exactly once using the
+    /// refreshed token/account, and preserve response usage headers. All URLs
+    /// point at loopback, including catalog hydration and token exchange.
+    #[test]
+    fn auth_401_retries_with_refreshed_token_and_account_on_both_paths() {
+        let _catalog_lock = CATALOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let _catalog = with_live_catalog(Vec::new());
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _serial = AUTH_HOME_LOCK.lock().await;
+        for (streaming, reject_again) in [(false, false), (true, false), (false, true), (true, true)] {
+            let _home = TestHome::new();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let id_token = jwt(json!({"https://api.openai.com/auth":{"chatgpt_account_id":"new-account"}}));
+            let server = tokio::spawn(async move {
+                let mut response_headers = Vec::new();
+                let mut refreshes = 0;
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0; 4096];
+                    let headers = loop {
+                        let n = socket.read(&mut buffer).await.unwrap();
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&buffer[..n]);
+                        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&bytes[..end]).into_owned();
+                            let length: usize = headers.lines().find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
+                            }).unwrap_or(0);
+                            if bytes.len() >= end + 4 + length { break headers; }
+                        }
+                    };
+                    let path = headers.lines().next().unwrap().split_whitespace().nth(1).unwrap();
+                    let mut done = false;
+                    let (status, body) = if path.starts_with("/models?") {
+                        (200, json!({"models":[{"slug":"test-model","visibility":"list","supported_in_api":true}]}))
+                    } else if path == "/token" {
+                        refreshes += 1;
+                        (200, json!({"access_token":"fresh-token","refresh_token":"fresh-refresh","expires_in":3600,"id_token":id_token}))
+                    } else {
+                        assert_eq!(path, "/responses");
+                        let lower = headers.to_ascii_lowercase();
+                        response_headers.push(lower.clone());
+                        if lower.contains("authorization: bearer stale-token") {
+                            (401, json!({"error":{"message":"expired token"}}))
+                        } else {
+                            assert!(lower.contains("authorization: bearer fresh-token"));
+                            assert!(lower.contains("chatgpt-account-id: new-account"));
+                            done = true;
+                            (if reject_again { 401 } else { 200 }, json!({"id":"resp_test","model":"test-model","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{}}))
+                        }
+                    };
+                    let body = body.to_string();
+                    socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nx-codex-primary-used-percent: 12.5\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                    if done { return (response_headers, refreshes); }
+                }
+            });
+            let mut provider = CodexProvider::new(CodexTokens {
+                access_token: "stale-token".into(),
+                refresh_token: Some("stale-refresh".into()),
+                account_id: Some("old-account".into()),
+                ..Default::default()
+            });
+            provider.api_endpoint = format!("http://{address}/responses");
+            provider.token_endpoint = format!("http://{address}/token");
+            if streaming {
+                let response = provider.send_responses_streaming_request(&request(None)).await;
+                if reject_again { assert!(response.is_err()); } else {
+                    assert_eq!(CodexProvider::parse_rate_limits(response.unwrap().headers()).unwrap().primary_used_percent, Some(12.5));
+                }
+            } else {
+                let response = provider.send_responses_request(&request(None)).await;
+                if reject_again { assert!(response.is_err()); } else {
+                    assert_eq!(response.unwrap().rate_limits.unwrap().primary_used_percent, Some(12.5));
+                }
+            }
+            let (requests, refreshes) = server.await.unwrap();
+            assert_eq!(requests.len(), 2, "401 must cause one replay only");
+            assert_eq!(refreshes, 1);
+            assert!(requests[0].contains("chatgpt-account-id: old-account"));
+        }
+        });
+    }
+
     #[tokio::test]
     async fn access_token_adopts_fresh_tokens_refreshed_by_another_instance() {
-        let home = std::env::temp_dir().join(format!("claurst-codex-{}", uuid::Uuid::new_v4()));
-        let prev_home = std::env::var_os("CLAURST_HOME");
-        std::env::set_var("CLAURST_HOME", &home);
+        let _serial = AUTH_HOME_LOCK.lock().await;
+        let _home = TestHome::new();
 
         let stale = CodexProvider::new(CodexTokens {
             access_token: jwt(json!({ "exp": 1 })),
@@ -2293,12 +2433,6 @@ mod tests {
         // No network: the expired in-memory token must be replaced by the
         // one on disk without POSTing the spent refresh token.
         let token = stale.access_token().await;
-
-        match prev_home {
-            Some(v) => std::env::set_var("CLAURST_HOME", v),
-            None => std::env::remove_var("CLAURST_HOME"),
-        }
-        let _ = std::fs::remove_dir_all(&home);
 
         saved.unwrap();
         assert_eq!(token.unwrap(), fresh_access);

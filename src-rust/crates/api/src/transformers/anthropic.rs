@@ -216,7 +216,14 @@ impl MessageTransformer for AnthropicTransformer {
                         .to_string();
                     content.push(ContentBlock::Thinking { thinking, signature });
                 }
-                // redacted_thinking, citations, etc. — skip silently for now.
+                "redacted_thinking" => {
+                    if let Some(data) = block.get("data").and_then(serde_json::Value::as_str) {
+                        content.push(ContentBlock::RedactedThinking {
+                            data: data.to_owned(),
+                        });
+                    }
+                }
+                // Other response metadata is not replayable content.
                 _ => {}
             }
         }

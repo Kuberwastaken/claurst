@@ -7,21 +7,16 @@ pub(crate) fn remove_empty_messages(messages: &[Message]) -> Vec<Message> {
         .collect()
 }
 
-pub(crate) fn normalize_anthropic_messages(messages: &[Message]) -> Vec<Message> {
+pub fn normalize_anthropic_messages(messages: &[Message]) -> Vec<Message> {
     scrub_tool_ids(
         &remove_empty_messages(&drop_foreign_thinking(messages)),
         scrub_anthropic_tool_id,
     )
 }
 
-/// Anthropic's wire format rejects thinking replayed from other providers:
-/// `redacted_thinking` ciphertext is server-side state only the issuing
-/// Responses backend can decrypt (Codex -> Anthropic turns must not forward
-/// it, or the API answers 400), and a thinking block without a file
-/// signature is unverifiable. Codex and Copilot translate reason streams
-/// into unsigned Thinking blocks, so signature emptiness is what marks a
-/// block as this crate's internal provenance rather than trail evidence
-/// Anthropic itself signed.
+/// Native Anthropic signed and redacted blocks remain untouched. Responses
+/// reasoning has an explicit backend origin and cannot cross this boundary;
+/// unsigned legacy thinking is also unverifiable to Anthropic.
 fn drop_foreign_thinking(messages: &[Message]) -> Vec<Message> {
     messages
         .iter()
@@ -30,7 +25,7 @@ fn drop_foreign_thinking(messages: &[Message]) -> Vec<Message> {
                 return Some(message.clone());
             };
             let has_foreign = blocks.iter().any(|block| match block {
-                ContentBlock::RedactedThinking { .. } => true,
+                ContentBlock::ResponsesReasoning { .. } => true,
                 ContentBlock::Thinking { signature, .. } => signature.is_empty(),
                 _ => false,
             });
@@ -40,7 +35,7 @@ fn drop_foreign_thinking(messages: &[Message]) -> Vec<Message> {
             let kept: Vec<ContentBlock> = blocks
                 .iter()
                 .filter(|block| match block {
-                    ContentBlock::RedactedThinking { .. } => false,
+                    ContentBlock::ResponsesReasoning { .. } => false,
                     ContentBlock::Thinking { signature, .. } => !signature.is_empty(),
                     _ => true,
                 })
@@ -193,9 +188,9 @@ mod tests {
         ));
     }
 
-    /// Provider-boundary filtering: redacted_thinking ciphertext and unsigned
-    /// (foreign-produced) Thinking blocks must not reach an Anthropic-format
-    /// endpoint — redacted ciphertext 400s, unsigned thinking is unverifiable.
+    /// Provider-boundary filtering: Responses reasoning and unsigned
+    /// legacy Thinking blocks must not reach an Anthropic-format
+    /// endpoint. Native signed and redacted Anthropic blocks survive.
     /// Signed thinking and other blocks survive, and a message whose blocks
     /// are all foreign is dropped entirely.
     #[test]
@@ -208,8 +203,11 @@ mod tests {
                     thinking: "codex replay".to_string(),
                     signature: String::new(),
                 },
-                ContentBlock::RedactedThinking {
-                    data: "gAAAAA".to_string(),
+                ContentBlock::ResponsesReasoning {
+                    provider: claurst_core::types::ResponsesReasoningProvider::Codex,
+                    item_id: Some("rs_foreign".into()),
+                    summary: "foreign".into(),
+                    encrypted_content: Some("gAAAAA".into()),
                 },
                 ContentBlock::Thinking {
                     thinking: "native".to_string(),
@@ -220,8 +218,11 @@ mod tests {
                 },
             ]),
             Message::user("question"),
-            Message::assistant_blocks(vec![ContentBlock::RedactedThinking {
-                data: "only-foreign".to_string(),
+            Message::assistant_blocks(vec![ContentBlock::ResponsesReasoning {
+                provider: claurst_core::types::ResponsesReasoningProvider::Copilot,
+                item_id: None,
+                summary: String::new(),
+                encrypted_content: Some("only-foreign".into()),
             }]),
         ];
 
@@ -238,5 +239,25 @@ mod tests {
             ContentBlock::Thinking { signature, .. } if signature == "sig-anthropic"
         ));
         assert!(matches!(&blocks[1], ContentBlock::Text { text } if text == "answer"));
+    }
+    #[test]
+    fn native_anthropic_redacted_thinking_survives_normalization() {
+        let messages = vec![Message::assistant_blocks(vec![
+            ContentBlock::RedactedThinking {
+                data: "native-opaque-state".into(),
+            },
+            ContentBlock::Thinking {
+                thinking: "native summary".into(),
+                signature: "native-signature".into(),
+            },
+            ContentBlock::Text {
+                text: "answer".into(),
+            },
+        ])];
+        let normalized = normalize_anthropic_messages(&messages);
+        assert_eq!(
+            serde_json::to_value(&normalized).unwrap(),
+            serde_json::to_value(&messages).unwrap()
+        );
     }
 }

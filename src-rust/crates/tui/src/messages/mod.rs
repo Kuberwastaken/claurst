@@ -509,7 +509,10 @@ pub fn render_transcript_user_message(
                 };
                 lines.extend(rendered);
             }
-            ContentBlock::Thinking { thinking, .. } => {
+            ContentBlock::Thinking { thinking, .. }
+            | ContentBlock::ResponsesReasoning {
+                summary: thinking, ..
+            } => {
                 flush_text(&mut pending_text, &mut lines);
                 lines.extend(render_transcript_reasoning_block(&thinking, false, inner_width));
             }
@@ -614,7 +617,10 @@ pub fn render_transcript_assistant_message_tagged(
                 }
                 pending_text.push_str(&text);
             }
-            ContentBlock::Thinking { thinking, .. } => {
+            ContentBlock::Thinking { thinking, .. }
+            | ContentBlock::ResponsesReasoning {
+                summary: thinking, ..
+            } => {
                 flush_text(&mut pending_text, &mut out, ctx.width);
                 let thinking_hash = {
                     use std::collections::hash_map::DefaultHasher;
@@ -802,7 +808,10 @@ pub fn render_transcript_assistant_message(
                 }
                 pending_text.push_str(&text);
             }
-            ContentBlock::Thinking { thinking, .. } => {
+            ContentBlock::Thinking { thinking, .. }
+            | ContentBlock::ResponsesReasoning {
+                summary: thinking, ..
+            } => {
                 flush_text(&mut pending_text, &mut lines);
                 let thinking_hash = {
                     use std::collections::hash_map::DefaultHasher;
@@ -1560,7 +1569,10 @@ fn tool_result_text(content: &ToolResultContent) -> String {
                 .iter()
                 .filter_map(|block| match block {
                     ContentBlock::Text { text } => Some(text.as_str()),
-                    ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+                    ContentBlock::Thinking { thinking, .. }
+                    | ContentBlock::ResponsesReasoning {
+                        summary: thinking, ..
+                    } => Some(thinking.as_str()),
                     ContentBlock::RedactedThinking { .. } => Some("[redacted thinking]"),
                     _ => None,
                 })
@@ -1597,7 +1609,10 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
                 }
                 pending_text.push_str(&text);
             }
-            ContentBlock::Thinking { thinking, .. } => {
+            ContentBlock::Thinking { thinking, .. }
+            | ContentBlock::ResponsesReasoning {
+                summary: thinking, ..
+            } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
                 // Compute a stable hash of the thinking content for per-block expansion tracking
                 let thinking_hash = {

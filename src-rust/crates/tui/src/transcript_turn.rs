@@ -38,7 +38,11 @@ impl<'a> TranscriptTurn<'a> {
 
         for (_, message) in self.assistant_messages.iter().rev() {
             for block in message.content_blocks().into_iter().rev() {
-                if let ContentBlock::Thinking { thinking, .. } = block {
+                if let ContentBlock::Thinking { thinking, .. }
+                | ContentBlock::ResponsesReasoning {
+                    summary: thinking, ..
+                } = block
+                {
                     if let Some(text) = reasoning_heading(&thinking) {
                         return Some(text);
                     }
