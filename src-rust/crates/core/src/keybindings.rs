@@ -298,6 +298,8 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("pagedown", "selectionPageDown", KeyContext::Transcript),
         ("home", "selectionGoStart", KeyContext::Transcript),
         ("end", "selectionGoEnd", KeyContext::Transcript),
+        ("ctrl+c", "selectionCopy", KeyContext::Transcript),
+        ("ctrl+d", "exit", KeyContext::Transcript),
         ("enter", "selectionCopy", KeyContext::Transcript),
         ("escape", "selectionCancel", KeyContext::Transcript),
 

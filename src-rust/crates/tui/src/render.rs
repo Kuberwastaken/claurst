@@ -550,6 +550,7 @@ fn reset_render_caches() {
 /// Render the entire application into the current frame.
 pub fn render_app(frame: &mut Frame, app: &App) {
     let size = frame.area();
+    app.last_terminal_width.set(size.width);
     app.last_selectable_area.set(size);
 
     // Fill the entire frame with a black background so the terminal's default
@@ -932,6 +933,10 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     apply_selection_highlight(frame, app);
     cache_selectable_row_text(frame, app);
     render_context_menu(frame, app);
+
+    // Apply the active theme palette last, over everything rendered above,
+    // so overlays and widgets are remapped consistently in a single pass.
+    crate::theme::apply_theme_pass(frame.buffer_mut());
 }
 
 /// Snapshot the rendered text of every row inside the selectable area into
@@ -982,9 +987,24 @@ fn apply_selection_highlight(frame: &mut Frame, app: &App) {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        if app.kb_terminal_width != app.last_terminal_width.get() {
+            return;
+        }
+        let first = app.kb_anchor_line.min(app.kb_cursor_line);
+        let last = app.kb_anchor_line.max(app.kb_cursor_line);
+        let top = app.last_render_scroll_offset.get() as usize;
+        if last < top || first >= top.saturating_add(area.height as usize) {
+            return;
+        }
+        let right = area.x.saturating_add(area.width).saturating_sub(1);
+        let (anchor_col, focus_col) = if app.kb_anchor_line <= app.kb_cursor_line {
+            (area.x, right)
+        } else {
+            (right, area.x)
+        };
         (
-            (area.x, app.kb_anchor_screen_row.get()),
-            (area.x, app.kb_cursor_screen_row.get()),
+            (anchor_col, app.kb_anchor_screen_row.get()),
+            (focus_col, app.kb_cursor_screen_row.get()),
         )
     } else {
         match (app.selection_anchor, app.selection_focus) {
@@ -1300,7 +1320,7 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     // cursor/anchor are content line indices; this cache is the source of
     // truth for copy (so selections extending past the viewport copy in
     // full). Must run before `lines` is moved into the list widget.
-    if app.kb_select_mode {
+    if app.kb_select_mode && app.kb_terminal_width == app.last_terminal_width.get() {
         let texts: Vec<String> = lines
             .iter()
             .map(|item| flatten_line_text(&item.line))
@@ -2878,6 +2898,25 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
+        // Skills + MCP count indicator: render only the non-zero halves so a
+        // user with skills but no MCP servers doesn't see "0 mcp".
+        if app.skill_count > 0 || app.mcp_server_count > 0 {
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+            let mut label = String::new();
+            if app.skill_count > 0 {
+                label.push_str(&format!("{} skill{}", app.skill_count, if app.skill_count == 1 { "" } else { "s" }));
+            }
+            if app.mcp_server_count > 0 {
+                if !label.is_empty() {
+                    label.push_str(" \u{00b7} ");
+                }
+                label.push_str(&format!("{} mcp", app.mcp_server_count));
+            }
+            parts.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
+        }
+
         // 4. Rate limits
         if let Some(pct) = app.rate_limit_5h_pct {
             if pct > 0.0 {
@@ -4417,5 +4456,43 @@ mod status_line_tests {
             usage: None,
         });
         assert!(app.retry_status.is_none(), "a completed turn clears the pill");
+    }
+}
+
+#[cfg(test)]
+mod keyboard_selection_highlight_tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn kb_selection_highlights_whole_last_line_and_no_offscreen_phantom() {
+        let mut app = App::new(
+            claurst_core::Config::default(),
+            claurst_core::cost::CostTracker::new(),
+        );
+        app.kb_select_mode = true;
+        app.kb_terminal_width = 12;
+        app.last_terminal_width.set(12);
+        app.last_selectable_area.set(Rect::new(1, 1, 10, 3));
+        app.kb_anchor_screen_row.set(1);
+        app.kb_cursor_screen_row.set(2);
+        app.kb_anchor_line = 0;
+        app.kb_cursor_line = 1;
+        let mut terminal = Terminal::new(TestBackend::new(12, 5)).unwrap();
+        terminal
+            .draw(|frame| apply_selection_highlight(frame, &app))
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(10, 2)].bg,
+            Color::Rgb(200, 200, 200)
+        );
+        app.last_render_scroll_offset.set(4);
+        terminal
+            .draw(|frame| apply_selection_highlight(frame, &app))
+            .unwrap();
+        assert_ne!(
+            terminal.backend().buffer()[(1, 1)].bg,
+            Color::Rgb(200, 200, 200)
+        );
     }
 }

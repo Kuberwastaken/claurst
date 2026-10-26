@@ -441,7 +441,11 @@ Inspect MCP servers. In the TUI, `/mcp` without arguments opens the MCP panel. S
 /mcp resources [server]                  — resources from connected servers
 /mcp prompts [server]                    — prompt templates from connected servers
 /mcp get-prompt <server> <prompt> [key=value ...]
+/mcp enable <name>                       — re-enable a disabled server and rebuild connections live
+/mcp disable <name>                      — persist the toggle under disabledMcpServers in global settings
 ```
+
+`/mcp disable <name>` persists the toggle under `disabledMcpServers` in the global settings: the server is not connected, its tools are not registered, and it is skipped at startup. `/mcp enable <name>` reverts it and rebuilds the connections live. Project-level settings files cannot re-enable a server disabled globally.
 
 ---
 
@@ -459,14 +463,20 @@ Show or switch the output style (the response persona added to the system prompt
 
 ### /theme
 
-Without arguments, opens the theme picker (Default, Dark, Light, Solarized, Nord, Dracula, Monokai, Deuteranopia). `/theme <name>` sets the theme and saves it to settings.
+Without arguments, opens the theme picker (Default, Dark, Light, Solarized, Nord, Dracula, Monokai, Deuteranopia). `/theme <name>` sets the theme and saves it to settings; the name can also be a custom theme loaded from `~/.claurst/themes/<name>.toml`.
 
 ```
-/theme
+/theme              # open the picker
 /theme dark
 /theme light
 /theme solarized
+/theme my-palette   # custom theme from ~/.claurst/themes/my-palette.toml
 ```
+
+Built-in themes: `default`, `dark`, `light`, `deuteranopia`, `solarized`, `nord`,
+`dracula`, `monokai`. Custom themes are TOML files under `~/.claurst/themes/`
+(see the configuration reference for the file format). Unknown names fail with a
+list of available themes and change nothing.
 
 ---
 
@@ -1315,7 +1325,8 @@ Copy the most recent assistant response to the system clipboard. Pass a number t
 Press `ctrl+x` then `v` to enter keyboard selection mode (the chord keeps a
 bare `v` free for typing). A cursor bar appears at the bottom of the
 transcript. The selection is anchored to the transcript's content lines, so
-it survives scrolling and terminal resizes.
+it survives scrolling. Changing the terminal width cancels selection because
+it rewraps transcript lines; changing only the height preserves it.
 Use the arrow keys to extend the selection up or down. `PageUp`/`PageDown`
 scroll by a page, `Home`/`End` jump to the top/bottom of the transcript.
 `Enter` copies the selected text to the clipboard and exits selection mode.

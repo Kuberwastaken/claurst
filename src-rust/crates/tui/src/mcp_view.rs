@@ -23,6 +23,9 @@ pub enum McpViewStatus {
     Connected,
     Connecting,
     Disconnected,
+    /// The user disabled this server via `/mcp disable`; it is not connected
+    /// and its tools are not registered.
+    Disabled,
     Error,
 }
 
@@ -32,6 +35,7 @@ impl McpViewStatus {
             Self::Connected => "connected",
             Self::Connecting => "connecting",
             Self::Disconnected => "disconnected",
+            Self::Disabled => "disabled",
             Self::Error => "error",
         }
     }
@@ -40,6 +44,7 @@ impl McpViewStatus {
             Self::Connected => "●",
             Self::Connecting => "◌",
             Self::Disconnected => "○",
+            Self::Disabled => "⊘",
             Self::Error => "⚠",
         }
     }
@@ -48,6 +53,7 @@ impl McpViewStatus {
             Self::Connected => Color::Green,
             Self::Connecting => Color::Yellow,
             Self::Disconnected => Color::DarkGray,
+            Self::Disabled => Color::Magenta,
             Self::Error => Color::Red,
         }
     }

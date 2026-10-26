@@ -203,6 +203,10 @@ impl App {
     /// Process a keyboard event. Returns `true` when the input should be
     /// submitted (Enter pressed with no blocking dialog).
     pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
+        if self.kb_select_mode && self.kb_terminal_width != self.last_terminal_width.get() {
+            self.handle_terminal_resize(self.last_terminal_width.get());
+            return false;
+        }
         // Make Ctrl shortcuts layout-independent before any handler runs: on
         // non-Latin layouts (Ukrainian / Russian, …) a Ctrl combo reports the
         // Cyrillic glyph at the physical key, which would otherwise miss the
@@ -1240,23 +1244,9 @@ impl App {
             self.keybindings.cancel_chord();
         }
 
-        // ---- Keyboard selection mode: swallow unbound keys -----------------
-        // When kb_select_mode is active, the Transcript keybinding context
-        // handles movement (up/down/etc.), copy (Enter/Ctrl+C), and cancel
-        // (Esc).  Anything that falls through here was not bound in the
-        // Transcript context.  Swallow it to prevent the hardcoded handlers
-        // below from inserting characters or triggering actions, EXCEPT:
-        //   - Ctrl+C: copy the selection (possibly empty) and exit mode
-        //     (hardcoded handler below).
-        //   - Ctrl+D: exit the app (hardcoded handler below).
+        // Selection owns the input until a configurable action handles it.
         if self.kb_select_mode {
-            let is_ctrl_c = key.code == KeyCode::Char('c')
-                && key.modifiers.contains(KeyModifiers::CONTROL);
-            let is_ctrl_d = key.code == KeyCode::Char('d')
-                && key.modifiers.contains(KeyModifiers::CONTROL);
-            if !is_ctrl_c && !is_ctrl_d {
-                return false;
-            }
+            return false;
         }
 
         // Clear any active text selection on key press (except Ctrl+C which copies it).
@@ -2571,7 +2561,7 @@ impl App {
     // kb_anchor_line index the rendered transcript lines (0 = topmost),
     // independent of scroll position and pane geometry. Screen coordinates
     // are derived at render time (see render.rs), so the selection survives
-    // scrolling and terminal resizes.
+    // scrolling. Width changes cancel because they rewrap content lines.
 
     /// Enter keyboard selection mode.
     /// Called from the `enterSelection` keybinding action (`ctrl+x v`, gated
@@ -2582,11 +2572,28 @@ impl App {
             return;
         }
         self.kb_select_mode = true;
-        // Start anchored at the bottom line of the transcript (most recent
-        // content).
-        self.kb_cursor_line = self.total_message_lines.get().saturating_sub(1);
+        self.kb_terminal_width = self.last_terminal_width.get();
+        let total = self.total_message_lines.get();
+        let top = if self.auto_scroll {
+            total.saturating_sub(self.last_msg_area.get().height as usize)
+        } else {
+            self.last_max_scroll.get().saturating_sub(self.scroll_offset)
+        };
+        self.kb_cursor_line = top
+            .saturating_add(self.last_msg_area.get().height as usize)
+            .saturating_sub(1)
+            .min(total.saturating_sub(1));
         self.kb_anchor_line = self.kb_cursor_line;
         self.status_message = Some("Selection mode: ↑↓ move · Enter copy · Esc cancel".to_string());
+    }
+
+    /// Width changes rewrap content lines, so retaining their indices could
+    /// silently copy different text. Height-only changes keep the selection.
+    pub fn handle_terminal_resize(&mut self, width: u16) {
+        if self.kb_select_mode && width != self.kb_terminal_width {
+            self.exit_kb_selection();
+            self.status_message = Some("Selection cancelled: terminal width changed".into());
+        }
     }
 
     /// Exit keyboard selection mode and clear selection state.
@@ -2673,19 +2680,16 @@ impl App {
         if visible == 0 {
             return;
         }
-        let dist_from_bottom = total - 1 - self.kb_cursor_line;
-        if dist_from_bottom >= visible {
-            // Cursor above the viewport — scroll up just enough to show it
-            // with some context below.
-            let want = dist_from_bottom + 1 - visible / 4;
-            self.scroll_offset = want.min(self.last_max_scroll.get());
-            self.auto_scroll = false;
-        } else if dist_from_bottom < visible / 4 {
-            // Cursor near the bottom — resume auto-follow so new content
-            // keeps arriving under the cursor.
-            self.scroll_offset = 0;
-            self.auto_scroll = true;
+        self.kb_cursor_line = self.kb_cursor_line.min(total - 1);
+        let max_scroll = self.last_max_scroll.get();
+        let mut top = max_scroll.saturating_sub(self.scroll_offset.min(max_scroll));
+        if self.kb_cursor_line < top {
+            top = self.kb_cursor_line;
+        } else if self.kb_cursor_line >= top.saturating_add(visible) {
+            top = self.kb_cursor_line + 1 - visible;
         }
+        self.scroll_offset = max_scroll.saturating_sub(top);
+        self.auto_scroll = self.scroll_offset == 0;
     }
 
     /// Handle a key event while in legacy history-search mode.

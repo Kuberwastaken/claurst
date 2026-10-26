@@ -1711,17 +1711,12 @@ fn test_kb_selection_scroll_keeps_cursor_visible() {
         "view should have scrolled up to keep the cursor visible, offset = {}",
         app.scroll_offset
     );
-    // Moving back down near the bottom resumes auto-follow. 14 downs
-    // put the cursor at line 28, one line from the bottom — inside the
-    // near-bottom band (visible/4 = 2), so auto-follow resumes.
-    for _ in 0..14 {
+    // Moving to the final line returns to the bottom viewport.
+    for _ in 0..15 {
         app.handle_key_event(press_key(KeyCode::Down, KeyModifiers::NONE));
     }
-    assert_eq!(app.kb_cursor_line, 28);
-    assert!(
-        app.auto_scroll,
-        "near-bottom cursor should re-enable auto-scroll"
-    );
+    assert_eq!(app.kb_cursor_line, 29);
+    assert!(app.auto_scroll, "bottom cursor should re-enable auto-scroll");
 }
 
 // ---- Render pipeline integration: selectable area restriction ----
@@ -1869,4 +1864,100 @@ fn test_kb_selection_full_pipeline_enter_move_copy() {
         app.kb_line_text.borrow().is_empty(),
         "line cache must be cleared on exit"
     );
+}
+
+    // ---- MCP view without a manager (issue #418 review: fallback status) ----
+
+    /// With no live manager, `refresh_mcp_view` falls back to the configured
+    /// servers. A server the user disabled via `/mcp disable` must read as
+    /// `Disabled`, not `Disconnected`; otherwise the panel claims a disabled
+    /// server merely lost its connection.
+    #[test]
+    fn mcp_view_without_manager_marks_disabled_servers() {
+        let mut app = make_app();
+        app.config.mcp_servers.push(claurst_core::config::McpServerConfig {
+            name: "srv-a".to_string(),
+            command: Some("echo".to_string()),
+            args: vec![],
+            env: Default::default(),
+            url: None,
+            server_type: "stdio".to_string(),
+            headers: Default::default(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
+            origin: Default::default(),
+        });
+        app.config.mcp_servers.push(claurst_core::config::McpServerConfig {
+            name: "srv-b".to_string(),
+            command: Some("echo".to_string()),
+            args: vec![],
+            env: Default::default(),
+            url: None,
+            server_type: "stdio".to_string(),
+            headers: Default::default(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
+            origin: Default::default(),
+        });
+        app.disabled_mcp_servers.insert("srv-a".to_string());
+        assert!(app.mcp_manager.is_none(), "fixture must have no manager attached");
+
+        app.refresh_mcp_view();
+
+        let srv_a = app
+            .mcp_view
+            .servers
+            .iter()
+            .find(|s| s.name == "srv-a")
+            .expect("disabled server listed");
+        assert_eq!(
+            srv_a.status,
+            crate::mcp_view::McpViewStatus::Disabled,
+            "a user-disabled server must not show as merely disconnected"
+        );
+        let srv_b = app
+            .mcp_view
+            .servers
+            .iter()
+            .find(|s| s.name == "srv-b")
+            .expect("configured server listed");
+        assert_eq!(
+            srv_b.status,
+            crate::mcp_view::McpViewStatus::Disconnected,
+            "a configured-but-never-connected server still reads as disconnected"
+        );
+    }
+
+#[test]
+fn kb_selection_starts_in_scrolled_view_and_cursor_stays_visible_both_directions() {
+    let mut app = make_app();
+    app.total_message_lines.set(30);
+    app.last_msg_area.set(ratatui::layout::Rect::new(0, 0, 80, 10));
+    app.last_selectable_area.set(app.last_msg_area.get());
+    app.last_max_scroll.set(20);
+    app.scroll_offset = 8;
+    app.auto_scroll = false;
+    app.enter_kb_selection();
+    assert_eq!(app.kb_cursor_line, 21);
+    for delta in [-1; 18].into_iter().chain([1; 25]) {
+        app.move_kb_cursor(delta);
+        let top = 20usize.saturating_sub(app.scroll_offset);
+        assert!((top..top + 10).contains(&app.kb_cursor_line));
+    }
+}
+
+#[test]
+fn kb_selection_width_change_cancels_before_copy_but_height_change_preserves() {
+    let mut app = make_app();
+    app.last_terminal_width.set(80);
+    app.total_message_lines.set(10);
+    app.last_msg_area.set(ratatui::layout::Rect::new(0, 0, 80, 10));
+    app.last_selectable_area.set(app.last_msg_area.get());
+    app.enter_kb_selection();
+    app.handle_terminal_resize(80);
+    assert!(app.kb_select_mode);
+    app.handle_terminal_resize(60);
+    assert!(!app.kb_select_mode);
+    assert!(app.status_message.as_deref().is_some_and(|s| s.contains("width changed")));
+    assert!(app.kb_line_text.borrow().is_empty());
 }
