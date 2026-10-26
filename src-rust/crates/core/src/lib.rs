@@ -95,6 +95,10 @@ pub use types::{
 pub use config::{AgentDefinition, BudgetSplitPolicy, Config, CommandTemplate, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme, builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars};
 pub use import_config::{ClaudeMdPreview, ImportExecutionResult, ImportPaths, ImportPreview, ImportSelection, PreviewAction, PreviewField, SettingsPreview, build_import_preview, execute_import, summarize_import_result};
 
+// Durable queue for mid-turn steering input (soft interrupts).
+pub mod soft_interrupt_store;
+pub use soft_interrupt_store::PersistedSoftInterrupt;
+
 // Skill discovery: filesystem and git URL skill loading.
 pub mod skill_discovery;
 pub use skill_discovery::{DiscoveredSkill, RegisteredSkill, SkillRegistry, discover_skills, parse_skill_file};
@@ -207,6 +211,15 @@ pub mod types {
 
     // ---- Content blocks --------------------------------------------------
 
+    /// Origin of opaque Responses API reasoning. Only the issuing backend
+    /// may receive this state on replay; native Anthropic blocks stay separate.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ResponsesReasoningProvider {
+        Codex,
+        Copilot,
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     pub enum ContentBlock {
@@ -240,6 +253,15 @@ pub mod types {
         },
         RedactedThinking {
             data: String,
+        },
+        /// One Responses API reasoning item, kept intact through persistence.
+        ResponsesReasoning {
+            provider: ResponsesReasoningProvider,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            item_id: Option<String>,
+            summary: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            encrypted_content: Option<String>,
         },
         Document {
             source: DocumentSource,
@@ -455,7 +477,12 @@ pub mod types {
             match &self.content {
                 MessageContent::Blocks(blocks) => blocks
                     .iter()
-                    .filter(|b| matches!(b, ContentBlock::Thinking { .. }))
+                    .filter(|b| {
+                        matches!(
+                            b,
+                            ContentBlock::Thinking { .. } | ContentBlock::ResponsesReasoning { .. }
+                        )
+                    })
                     .collect(),
                 _ => vec![],
             }

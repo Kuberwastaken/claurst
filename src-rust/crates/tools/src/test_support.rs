@@ -213,3 +213,65 @@ mod accept_edits_tests {
         assert_eq!(run_write_tools(&default, &fresh).await, vec![false; 5]);
     }
 }
+
+#[cfg(unix)]
+mod bound_edit_tests {
+    use super::*;
+    use crate::Tool;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn batch_notebook_and_patch_refuse_swaps_after_permission_check() {
+        for tool in [
+            Box::new(crate::BatchEditTool) as Box<dyn Tool>,
+            Box::new(crate::NotebookEditTool),
+            Box::new(crate::ApplyPatchTool),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(dir.path()).unwrap();
+            let ws = root.join("ws");
+            let outside = root.join("outside");
+            std::fs::create_dir_all(&ws).unwrap();
+            std::fs::create_dir_all(&outside).unwrap();
+            let file = ws.join("file.ipynb");
+            let secret = outside.join("secret.ipynb");
+            let content = if tool.name() == "NotebookEdit" {
+                json!({"cells":[{"cell_type":"code","id":"c1","source":["old"],"outputs":[],"metadata":{},"execution_count":null}],"metadata":{},"nbformat":4,"nbformat_minor":5}).to_string()
+            } else {
+                "old\n".to_string()
+            };
+            std::fs::write(&file, &content).unwrap();
+            std::fs::write(&secret, &content).unwrap();
+            let manager = claurst_core::permissions::PermissionManager::new(
+                claurst_core::config::PermissionMode::AcceptEdits,
+                &claurst_core::config::Settings::default(),
+            );
+            let ctx = context_with_handler(
+                ws,
+                Arc::new(SwapAfterCheckHandler::new(
+                    manager,
+                    Some((file.clone(), secret.clone())),
+                )),
+            );
+            let input = match tool.name() {
+                "BatchEdit" => {
+                    json!({"edits":[{"file_path":file,"old_string":"old","new_string":"changed"}]})
+                }
+                "NotebookEdit" => {
+                    json!({"notebook_path":file,"cell_id":"c1","new_source":"changed"})
+                }
+                _ => {
+                    json!({"patch":format!("--- {0}\n+++ {0}\n@@ -1 +1 @@\n-old\n+changed\n",file.display())})
+                }
+            };
+            let result = tool.execute(input, &ctx).await;
+            assert!(
+                result.is_error,
+                "{} followed swapped path: {}",
+                tool.name(),
+                result.content
+            );
+            assert_eq!(std::fs::read_to_string(secret).unwrap(), content);
+        }
+    }
+}

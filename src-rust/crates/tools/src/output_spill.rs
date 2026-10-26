@@ -126,7 +126,11 @@ impl OutputAccumulator {
     }
 }
 
-/// A private (0600) spill file being written.
+/// A spill file being written. Unix creates directories with mode 0700 and
+/// files with mode 0600. Windows uses inherited ACLs from the configured
+/// Claurst home (normally inside the user's profile); no separate ACL is
+/// installed. A custom CLAURST_HOME must therefore have an appropriately
+/// restricted parent ACL.
 #[derive(Debug)]
 pub(crate) struct SpillFile {
     path: PathBuf,
@@ -134,8 +138,8 @@ pub(crate) struct SpillFile {
 }
 
 impl SpillFile {
-    /// Create `path` readable only by the owner, never clobbering an existing
-    /// file. The first call in a process also sweeps stale spill files from the
+    /// Create `path` without clobbering an existing file. Unix restricts it to
+    /// the owner; Windows inherits the directory ACL as documented above. The first call in a process also sweeps stale spill files from the
     /// same directory.
     fn create(path: &Path) -> std::io::Result<Self> {
         static SWEEP: Once = Once::new();
