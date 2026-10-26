@@ -90,7 +90,10 @@ fn content_tokens(content: &MessageContent) -> u64 {
         MessageContent::Blocks(blocks) => {
             blocks.iter().map(|b| match b {
                 ContentBlock::Text { text } => estimate_chars(text),
-                ContentBlock::Thinking { thinking, .. } => estimate_chars(thinking),
+                ContentBlock::Thinking { thinking, .. }
+                | ContentBlock::ResponsesReasoning {
+                    summary: thinking, ..
+                } => estimate_chars(thinking),
                 ContentBlock::ToolUse { name, input, .. } => {
                     estimate_chars(name) + estimate_chars(&input.to_string())
                 }

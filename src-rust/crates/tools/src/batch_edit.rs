@@ -28,6 +28,14 @@ struct BatchEditInput {
     description: Option<String>,
 }
 
+struct PreparedEdit {
+    path: std::path::PathBuf,
+    real: std::path::PathBuf,
+    file: std::fs::File,
+    before: String,
+    after: String,
+}
+
 #[async_trait]
 impl Tool for BatchEditTool {
     // Gates itself: calls `ctx.check_permission` in `execute()` (#210).
@@ -93,194 +101,159 @@ impl Tool for BatchEditTool {
             return ToolResult::error("edits array must not be empty".to_string());
         }
 
-        // Permission check (one check covers the whole batch).
         let description = params.description.as_deref().unwrap_or("batch file edits");
-        let targets: Vec<std::path::PathBuf> =
-            params.edits.iter().map(|edit| ctx.resolve_path(&edit.file_path)).collect();
-        if let Err(e) = ctx.check_permission_for_paths(
-            self.name(),
-            &format!("BatchEdit: {}", description),
-            &targets,
-        ) {
-            return ToolResult::error(e.to_string());
-        }
-
-        // Lock every target file for the whole batch (#443).
-        let paths: Vec<std::path::PathBuf> =
-            params.edits.iter().map(|edit| ctx.resolve_path(&edit.file_path)).collect();
-        let _locks = crate::lock_files(paths.iter().map(|p| p.as_path())).await;
-
-        // ----------------------------------------------------------------
-        // Phase 1: read all files and validate every edit before writing
-        // ----------------------------------------------------------------
-
-        // (resolved_path_string, original_content, new_content)
-        let mut prepared: Vec<(String, String, String)> = Vec::with_capacity(params.edits.len());
-        let mut pre_check_errors: Vec<String> = Vec::new();
-        let mut path_content: HashMap<String, String> = HashMap::new();
-
-        for (i, (edit, path)) in params.edits.iter().zip(&paths).enumerate() {
-            debug!(path = %path.display(), index = i, "BatchEdit pre-check");
-
-            if edit.old_string.is_empty() {
-                pre_check_errors.push(format!("Edit {}: old_string must not be empty", i));
-                continue;
+        let paths: Vec<std::path::PathBuf> = params
+            .edits
+            .iter()
+            .map(|edit| ctx.resolve_path(&edit.file_path))
+            .collect();
+        let mut grants = Vec::with_capacity(paths.len());
+        for path in &paths {
+            match ctx.check_permission_for_path(
+                self.name(),
+                &format!("BatchEdit: {} ({})", description, path.display()),
+                path.clone(),
+                false,
+            ) {
+                Ok(grant) => grants.push(grant),
+                Err(e) => return ToolResult::error(e.to_string()),
             }
-
-            let original = if let Some(content) = path_content.get(&path.display().to_string()) {
-                // use cached edited content if available
-                content.clone()
-            } else {
-                match tokio::fs::read_to_string(path).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        pre_check_errors.push(format!(
-                            "Edit {}: cannot read {}: {}",
-                            i,
-                            path.display(),
-                            e
-                        ));
-                        continue;
-                    }
+        }
+        let _locks = crate::lock_files(paths.iter().map(|p| p.as_path())).await;
+        let mut prepared: Vec<PreparedEdit> = Vec::new();
+        let mut by_path: HashMap<std::path::PathBuf, usize> = HashMap::new();
+        let mut errors = Vec::new();
+        for (i, ((edit, path), grant)) in params.edits.iter().zip(&paths).zip(grants).enumerate() {
+            debug!(path = %path.display(), index = i, "BatchEdit pre-check");
+            let file = match crate::open_regular_file(path) {
+                Ok(file) => file,
+                Err(e) => {
+                    errors.push(format!("Edit {}: cannot read {}: {}", i, path.display(), e));
+                    continue;
                 }
             };
-
-            // Detect the current content's dominant line ending BEFORE editing
-            // so it survives the write (#225).  Match on an LF-normalized view
-            // but splice the replacement into the original bytes so untouched
-            // lines keep their exact endings.  `original` here is either the raw
-            // on-disk content or a previous edit's output (both real EOLs).
-            let eol = crate::line_endings::LineEnding::detect(&original);
-            let normalized = original.replace("\r\n", "\n");
-            let old_string = edit.old_string.replace("\r\n", "\n");
-            let new_string = edit.new_string.replace("\r\n", "\n");
-
-            let count = normalized.matches(&old_string).count();
-            if count == 0 {
-                pre_check_errors.push(format!(
-                    "Edit {}: old_string not found in {}",
-                    i,
-                    path.display()
-                ));
-                continue;
-            }
-            if count > 1 {
-                pre_check_errors.push(format!(
-                    "Edit {}: old_string appears {} times in {} (must be unique)",
-                    i,
-                    count,
-                    path.display()
-                ));
-                continue;
-            }
-
-            let (new_content, _replacements) = crate::line_endings::replace_preserving_eol(
-                &original,
-                &old_string,
-                &new_string,
-                eol,
+            let real = match ctx.confirm_opened_path(
+                self.name(),
+                "BatchEdit",
+                path,
+                &file,
+                grant,
                 false,
-            );
-            prepared.push((path.display().to_string(), original, new_content.clone()));
-            // update path_content so future edits see the new content
-            path_content.insert(path.display().to_string(), new_content);
+            ) {
+                Ok(real) => real,
+                Err(e) => {
+                    errors.push(format!("Edit {}: {}", i, e));
+                    continue;
+                }
+            };
+            let index = match by_path.get(&real) {
+                Some(index) => *index,
+                None => {
+                    let mut before = String::new();
+                    if let Err(e) = std::io::Read::read_to_string(&mut &file, &mut before) {
+                        errors.push(format!("Edit {}: cannot read {}: {}", i, path.display(), e));
+                        continue;
+                    }
+                    let index = prepared.len();
+                    by_path.insert(real.clone(), index);
+                    prepared.push(PreparedEdit {
+                        path: path.clone(),
+                        real,
+                        file,
+                        after: before.clone(),
+                        before,
+                    });
+                    index
+                }
+            };
+            match crate::file_edit::resolve_edit(
+                &prepared[index].after,
+                &edit.old_string,
+                &edit.new_string,
+                false,
+            ) {
+                Ok((after, _, _)) => prepared[index].after = after,
+                Err(e) => errors.push(format!("Edit {} in {}: {}", i, path.display(), e)),
+            }
         }
-
-        if !pre_check_errors.is_empty() {
+        if !errors.is_empty() {
             return ToolResult::error(format!(
                 "BatchEdit aborted — {} validation error(s):\n{}",
-                pre_check_errors.len(),
-                pre_check_errors.join("\n")
+                errors.len(),
+                errors.join("\n")
             ));
         }
-
-        let edit_count = prepared.len();
-        let unique_files: std::collections::HashSet<&str> =
-            prepared.iter().map(|(p, _, _)| p.as_str()).collect();
-        let file_count = unique_files.len();
-
-        // ----------------------------------------------------------------
-        // Phase 2: write all files; roll back on any failure
-        // ----------------------------------------------------------------
-
-        // merge file writes into a single transaction
-        let mut by_file_writing: HashMap<String, (String, String)> = HashMap::new();
-        for (path_str, original, new_content) in prepared.into_iter() {
-            by_file_writing
-                .entry(path_str.clone())
-                .and_modify(|v| v.1 = new_content.clone()) // only update new_content
-                .or_insert((original, new_content));
-        }
-        let unique_writings = by_file_writing
-            .into_iter()
-            .map(|(path_str, (original, new_content))| (path_str, original, new_content))
-            .collect::<Vec<_>>();
-
-        for (i, (path_str, original, new_content)) in unique_writings.iter().enumerate() {
-            let path = std::path::Path::new(path_str);
-            match crate::write_atomic(path, new_content.as_bytes()).await {
-                Ok(()) => {
+        // Writes and rollback both retain the inode they are allowed to replace.
+        // Each successful atomic rename returns its new handle for rollback.
+        let mut written: Vec<(usize, std::fs::File)> = Vec::new();
+        for (index, edit) in prepared.iter().enumerate() {
+            match crate::write_atomic_bound(&edit.file, &edit.real, edit.after.as_bytes()).await {
+                Ok(installed) => {
+                    written.push((index, installed));
                     ctx.record_file_change(
-                        path.to_path_buf(),
-                        original.as_bytes(),
-                        new_content.as_bytes(),
+                        edit.path.clone(),
+                        edit.before.as_bytes(),
+                        edit.after.as_bytes(),
                         self.name(),
                     );
                 }
-                Err(e) => {
-                    // Attempt rollback of already-written files.
-                    let mut rollback_errors: Vec<String> = Vec::new();
-
-                    // rollback in reverse order to preserve original file state
-                    for (rb_path, rb_original, rb_new_content) in unique_writings[0..i].iter().rev()
-                    {
-                        if let Err(re) =
-                            crate::write_atomic(std::path::Path::new(rb_path), rb_original.as_bytes())
-                                .await
+                Err(error) => {
+                    let mut restored = 0;
+                    let mut rollback_errors = Vec::new();
+                    for (index, installed) in written.iter().rev() {
+                        let previous = &prepared[*index];
+                        match crate::write_atomic_bound(
+                            installed,
+                            &previous.real,
+                            previous.before.as_bytes(),
+                        )
+                        .await
                         {
-                            rollback_errors.push(format!("  rollback {}: {}", rb_path, re));
-                        } else {
-                            let rb_path = std::path::Path::new(rb_path);
-                            ctx.record_file_change(
-                                rb_path.to_path_buf(),
-                                rb_new_content.as_bytes(),
-                                rb_original.as_bytes(),
-                                self.name(),
-                            );
+                            Ok(_) => {
+                                restored += 1;
+                                ctx.record_file_change(
+                                    previous.path.clone(),
+                                    previous.after.as_bytes(),
+                                    previous.before.as_bytes(),
+                                    self.name(),
+                                );
+                            }
+                            Err(error) => rollback_errors.push(format!(
+                                "rollback {}: {}",
+                                previous.path.display(),
+                                error
+                            )),
                         }
                     }
-
-                    let mut msg = format!(
+                    let mut message = format!(
                         "BatchEdit failed while writing {} ({}). Rolled back {} file(s).",
-                        path_str, e, i
+                        edit.path.display(),
+                        error,
+                        restored
                     );
                     if !rollback_errors.is_empty() {
-                        msg.push_str(&format!(
+                        message.push_str(&format!(
                             "\nRollback errors:\n{}",
                             rollback_errors.join("\n")
                         ));
                     }
-                    return ToolResult::error(msg);
+                    return ToolResult::error(message);
                 }
             }
         }
-
-        // ----------------------------------------------------------------
-        // Build success response
-        // ----------------------------------------------------------------
-
-        let summary = format!(
+        let edit_count = params.edits.len();
+        let file_count = prepared.len();
+        ToolResult::success(format!(
             "BatchEdit applied {} edit{} across {} file{}.",
             edit_count,
-            if edit_count != 1 { "s" } else { "" },
+            if edit_count == 1 { "" } else { "s" },
             file_count,
-            if file_count != 1 { "s" } else { "" },
-        );
-
-        ToolResult::success(summary).with_metadata(json!({
+            if file_count == 1 { "" } else { "s" },
+        ))
+        .with_metadata(json!({
             "edits_applied": edit_count,
             "files_modified": file_count,
-            "files": unique_writings.iter().map(|(p, _, _)| p).collect::<Vec<_>>(),
+            "files": prepared.iter().map(|edit| &edit.path).collect::<Vec<_>>(),
         }))
     }
 }
@@ -353,5 +326,89 @@ mod tests {
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().contains(".claurst-tmp-"));
         assert!(!tmp_left, "atomic write must not leave a temp file behind");
+    }
+    #[tokio::test]
+    async fn batch_and_single_edit_share_bom_and_whitespace_matching() {
+        let dir = tempfile::tempdir().unwrap();
+        let single = dir.path().join("single.txt");
+        let batch = dir.path().join("batch.txt");
+        let original = "\u{feff}first  \r\nsecond\r\n";
+        std::fs::write(&single, original).unwrap();
+        std::fs::write(&batch, original).unwrap();
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let one = crate::FileEditTool
+            .execute(
+                json!({"file_path":single,"old_string":"\u{feff}first   ","new_string":"FIRST"}),
+                &ctx,
+            )
+            .await;
+        let many = BatchEditTool.execute(json!({"edits":[{"file_path":batch,"old_string":"\u{feff}first   ","new_string":"FIRST"}]}), &ctx).await;
+        assert!(!one.is_error, "{}", one.content);
+        assert!(!many.is_error, "{}", many.content);
+        assert_eq!(
+            std::fs::read(&single).unwrap(),
+            std::fs::read(&batch).unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&batch).unwrap(),
+            "\u{feff}FIRST\r\nsecond\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_batch_edit_leaves_every_file_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        std::fs::write(&first, "old\n").unwrap();
+        std::fs::write(&second, "value \nvalue\t\n").unwrap();
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let result = BatchEditTool
+            .execute(
+                json!({"edits":[
+                    {"file_path":first,"old_string":"old","new_string":"new"},
+                    {"file_path":second,"old_string":"value  ","new_string":"new"}
+                ]}),
+                &ctx,
+            )
+            .await;
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("matches 2 places"),
+            "{}",
+            result.content
+        );
+        assert_eq!(std::fs::read_to_string(first).unwrap(), "old\n");
+        assert_eq!(
+            std::fs::read_to_string(second).unwrap(),
+            "value \nvalue\t\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn aliases_in_a_batch_share_staged_content_and_one_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file.txt");
+        let alias = dir.path().join("alias.txt");
+        std::fs::write(&file, "first\nsecond\n").unwrap();
+        std::os::unix::fs::symlink(&file, &alias).unwrap();
+        let ctx = allow_all_context(dir.path().to_path_buf());
+        let result = BatchEditTool
+            .execute(
+                json!({"edits":[
+                    {"file_path":file,"old_string":"first","new_string":"FIRST"},
+                    {"file_path":alias,"old_string":"FIRST\nsecond","new_string":"FINAL"}
+                ]}),
+                &ctx,
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(result.metadata.unwrap()["files_modified"], 1);
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "FINAL\n");
+        assert!(std::fs::symlink_metadata(alias)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 }

@@ -63,6 +63,12 @@ Section headings below use the implementation type names; the model sees these n
 
 When one response contains several tool calls, their PreToolUse hooks run one at a time, then every call that was not blocked runs concurrently and the results are returned in the original order. `Write`, `Edit`, `BatchEdit`, `ApplyPatch` and `NotebookEdit` lock each file they change for the whole call, so two calls on the same file do not interleave.
 
+### Schema Dialects
+
+Providers accept different subsets of JSON Schema, so tool schemas are normalized per provider before each request (`src-rust/crates/schema_dialect`, wired through `claurst-api`'s `schema_dialect_map`). Gemini gets the narrowest subset, Bedrock and Anthropic their own, OpenAI-compatible routes theirs. Keywords a dialect does not support are stripped, `oneOf` is rewritten to `anyOf` where required, and dangling `required` entries are pruned.
+
+When a provider still rejects a schema, the rejection is not fatal if the error names the offending construct: the keyword is learned (persisted in `~/.claurst/schema-quirks.json`), the tool schemas are re-filtered without it, and the same turn is retried once. A rejection that names nothing actionable fails the turn as before. Learned quirks apply to every later request for that provider.
+
 ---
 
 ## Permission System
@@ -94,6 +100,8 @@ Set with `--permission-mode` (`default`, `accept-edits`, `bypass-permissions`, `
 | `plan` | `Read`, `Glob`, `Grep`, `LSP`, `Skill`, `ListMcpResources` and `ReadMcpResource` run anywhere without a prompt; every other tool is denied |
 | `acceptEdits` | `Edit`, `Write`, `NotebookEdit`, `BatchEdit` and `ApplyPatch` run without a prompt for targets inside the workspace; everything else behaves as in `default` |
 | `bypassPermissions` | Every tool runs without a prompt unless a deny rule covers it. `--dangerously-skip-permissions` and `yoloMode` select it; both refuse to start as root |
+
+File tools refuse writes to Claurst’s global settings, approval-rule files, and credential stores in every mode. Use the settings and authentication commands to change these files. Existing symlink aliases and configured credential locations are checked as well. This path guard is separate from shell sandboxing.
 
 Bash commands rated Critical by the classifier are refused in every mode. In headless (`--print`) runs nobody can answer a prompt, so a call that would ask is rejected with the reason returned to the model.
 
@@ -159,7 +167,7 @@ Perform an exact string replacement within an existing file. Fails if `old_strin
 | `new_string` | string | yes | Replacement text |
 | `replace_all` | boolean | no | Replace all occurrences (default: false) |
 
-Whitespace and indentation must match exactly.
+Matching is exact first. If there is no exact match, Edit tries whole lines while ignoring line endings and trailing whitespace; ambiguous matches are rejected. UTF-8 BOMs and untouched line endings are preserved. A miss includes a bounded closest-region hint.
 
 ---
 
@@ -174,7 +182,7 @@ Apply multiple `FileEditTool`-style edits in a single tool call. More efficient 
 | `edits` | array | yes | Array of `{file_path, old_string, new_string}` objects; each `old_string` must occur exactly once |
 | `description` | string | no | Human-readable description of the batch |
 
-Edits within the same file are applied in order. Every edit is validated before anything is written; if one fails (string not found, not unique), the batch is rejected and no file changes. If a write fails partway, files already written are rolled back.
+Edits within the same file are applied in order, including paths that resolve to the same file. BatchEdit uses the same matching rules as Edit. Every edit is validated before anything is written; if one fails, the batch is rejected and no file changes. If a write fails partway, rollback uses the handles returned by earlier writes and reports files it cannot safely restore, rather than blindly reopening their paths.
 
 ---
 
@@ -216,7 +224,7 @@ Apply a patch to one or more files. Two formats are accepted, detected from the 
 
 **Unified diffs.** Each hunk's body is delimited by the line counts in its `@@ -l,s +l,s @@` header, as in `git apply`, so removed lines that start with `--`, added lines that start with `++`, and empty context lines whose leading space was stripped all stay in the hunk. A header whose counts do not match its lines is an error. `--- /dev/null` creates the file (it must not exist) and `+++ /dev/null` deletes it (its hunks must remove every line). Later hunks are located from their header line shifted by the earlier hunks' net change.
 
-**Writes and permissions.** Every change is computed before anything is written; if one fails, no file is touched. Each path the patch writes, including a move destination, gets the same permission check as `FileEditTool` on that path. All paths are locked for the whole call, in the same sorted order as the other file-editing tools, so concurrent edits cannot interleave or deadlock. Updates and deletes go through the file handle that was checked, so a symlink swapped in afterwards cannot redirect them.
+**Writes and permissions.** Every change is computed before anything is written; if one fails, no file is touched. Each path the patch writes, including a move destination, gets the same permission check as `FileEditTool` on that path. All paths are locked for the whole call, in the same sorted order as the other file-editing tools, so concurrent edits cannot interleave or deadlock. Existing-file updates retain the verified file handle and use inode-checked, directory-relative writes on Unix. New paths, moves and deletes use separate path-based operations; the current Windows fallback also resolves paths again.
 
 **Codex models.** With the `codex` provider, gpt-5 and later models get this tool as `apply_patch`, a freeform tool constrained by the official Lark grammar, as the official Codex client sends it. Their raw patch text arrives as the `patch` input. Other providers and models see the JSON tool above.
 
@@ -278,7 +286,9 @@ Task statuses: `running`, `completed`, `failed: <reason>`, `cancelled`.
 
 **Permission level:** Execute
 
-Execute a command in a pseudo-terminal (PTY) so programs that check `isatty()` behave as in a terminal. There is no stdin writer, so interactive programs cannot be driven. Pagers are disabled (`PAGER`, `GIT_PAGER`, `GH_PAGER` = `cat`, `GIT_TERMINAL_PROMPT=0`) and `CLAURST=1` / `AGENT=1` are set. Output larger than 2000 lines / 50 KiB at either end is cut to its head and tail; the full output is saved to a private file under `<claurst home>/tool-output/`, named in a trailing `Full output: <path>` line, and readable without a permission prompt. Files older than 7 days are deleted.
+Execute a command in a pseudo-terminal (PTY) so programs that check `isatty()` behave as in a terminal. There is no stdin writer, so interactive programs cannot be driven. Pagers are disabled (`PAGER`, `GIT_PAGER`, `GH_PAGER` = `cat`, `GIT_TERMINAL_PROMPT=0`) and `CLAURST=1` / `AGENT=1` are set. Output larger than 2000 lines / 50 KiB at either end is cut to its head and tail; the full output is saved to a file under `<claurst home>/tool-output/`, named in a trailing `Full output: <path>` line, and readable without a permission prompt. Files older than 7 days are deleted.
+
+On Unix, new spill directories use mode `0700` and files use `0600`. On Windows, spill files and directories inherit ACLs from their parent; Claurst does not install a separate ACL. The default Claurst home is inside the user profile. If `CLAURST_HOME` points elsewhere, use a directory whose parent ACL restricts access appropriately.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

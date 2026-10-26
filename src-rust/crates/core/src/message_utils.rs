@@ -58,7 +58,10 @@ pub fn get_message_text(msg: &Message) -> String {
             .iter()
             .filter_map(|b| match b {
                 ContentBlock::Text { text } => Some(text.as_str()),
-                ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+                ContentBlock::Thinking { thinking, .. }
+                | ContentBlock::ResponsesReasoning {
+                    summary: thinking, ..
+                } => Some(thinking.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()

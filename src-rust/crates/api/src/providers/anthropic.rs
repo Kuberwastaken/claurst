@@ -1,4 +1,4 @@
-// providers/anthropic.rs — AnthropicProvider: wraps AnthropicClient in the
+// providers/anthropic.rs: AnthropicProvider wraps AnthropicClient in the
 // unified LlmProvider trait.
 //
 // Phase 2A: create_message and create_message_stream are fully implemented by
@@ -59,15 +59,14 @@ impl AnthropicProvider {
     /// Build a [`CreateMessageRequest`] from a [`ProviderRequest`].
     fn build_request(request: &ProviderRequest) -> CreateMessageRequest {
         let normalized_messages = normalize_anthropic_messages(&request.messages);
-        let api_messages: Vec<ApiMessage> = normalized_messages
-            .iter()
-            .map(ApiMessage::from)
-            .collect();
+        let api_messages: Vec<ApiMessage> =
+            normalized_messages.iter().map(ApiMessage::from).collect();
 
         let api_tools: Option<Vec<ApiToolDefinition>> = if request.tools.is_empty() {
             None
         } else {
-            Some(request.tools.iter().map(ApiToolDefinition::from).collect())
+            let filtered = crate::schema_dialect_map::filter_tools("anthropic", &request.tools);
+            Some(filtered.iter().map(ApiToolDefinition::from).collect())
         };
 
         let system = request.system_prompt.clone();
@@ -98,7 +97,11 @@ impl AnthropicProvider {
         }
         // `output_config.effort` for adaptive-thinking models; the query loop
         // fills it from `claurst_api::anthropic_reasoning`.
-        if let Some(effort) = request.provider_options.get("effort").and_then(|v| v.as_str()) {
+        if let Some(effort) = request
+            .provider_options
+            .get("effort")
+            .and_then(|v| v.as_str())
+        {
             builder = builder.effort(effort);
         }
 
@@ -124,13 +127,15 @@ impl AnthropicProvider {
             AnthropicStreamEvent::MessageStart { id, model, usage } => {
                 Some(StreamEvent::MessageStart { id, model, usage })
             }
-            AnthropicStreamEvent::ContentBlockStart { index, content_block } => {
-                Some(StreamEvent::ContentBlockStart { index, content_block })
-            }
+            AnthropicStreamEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => Some(StreamEvent::ContentBlockStart {
+                index,
+                content_block,
+            }),
             AnthropicStreamEvent::ContentBlockDelta { index, delta } => match delta {
-                ContentDelta::TextDelta { text } => {
-                    Some(StreamEvent::TextDelta { index, text })
-                }
+                ContentDelta::TextDelta { text } => Some(StreamEvent::TextDelta { index, text }),
                 ContentDelta::ThinkingDelta { thinking } => {
                     Some(StreamEvent::ThinkingDelta { index, thinking })
                 }
@@ -138,7 +143,10 @@ impl AnthropicProvider {
                     Some(StreamEvent::SignatureDelta { index, signature })
                 }
                 ContentDelta::InputJsonDelta { partial_json } => {
-                    Some(StreamEvent::InputJsonDelta { index, partial_json })
+                    Some(StreamEvent::InputJsonDelta {
+                        index,
+                        partial_json,
+                    })
                 }
             },
             AnthropicStreamEvent::ContentBlockStop { index } => {
@@ -152,9 +160,13 @@ impl AnthropicProvider {
                 })
             }
             AnthropicStreamEvent::MessageStop => Some(StreamEvent::MessageStop),
-            AnthropicStreamEvent::Error { error_type, message } => {
-                Some(StreamEvent::Error { error_type, message })
-            }
+            AnthropicStreamEvent::Error {
+                error_type,
+                message,
+            } => Some(StreamEvent::Error {
+                error_type,
+                message,
+            }),
             AnthropicStreamEvent::Ping => None,
         }
     }
@@ -168,12 +180,19 @@ fn client_error_to_provider_error(
 ) -> ProviderError {
     use claurst_core::error::ClaudeError;
     match err {
-        ClaudeError::ApiStatus { status: 429, message, retry_after }
-            if !crate::retry::is_fatal_message(&message) =>
-        {
-            ProviderError::RateLimited { provider: provider.clone(), retry_after }
-        }
-        ClaudeError::ApiStatus { status, message, retry_after } => ProviderError::ServerError {
+        ClaudeError::ApiStatus {
+            status: 429,
+            message,
+            retry_after,
+        } if !crate::retry::is_fatal_message(&message) => ProviderError::RateLimited {
+            provider: provider.clone(),
+            retry_after,
+        },
+        ClaudeError::ApiStatus {
+            status,
+            message,
+            retry_after,
+        } => ProviderError::ServerError {
             provider: provider.clone(),
             status: Some(status),
             is_retryable: crate::retry::is_retryable_status(status)
@@ -261,7 +280,10 @@ impl LlmProvider for AnthropicProvider {
                             }
                         }
                         StreamEvent::MessageStop => break,
-                        StreamEvent::Error { error_type, message } => {
+                        StreamEvent::Error {
+                            error_type,
+                            message,
+                        } => {
                             return Err(ProviderError::StreamError {
                                 provider: self.id.clone(),
                                 message: format!("[{}] {}", error_type, message),
@@ -274,7 +296,7 @@ impl LlmProvider for AnthropicProvider {
             }
         }
 
-        // Finalize every block in stream-index order — a single ordered pass
+        // Finalize every block in stream-index order: a single ordered pass
         // that preserves interleave (thinking → text → tool_use, …). No block is
         // appended out of band, so signed-thinking replay order is intact. #217.
         let final_content: Vec<ContentBlock> = blocks.finish();
@@ -285,6 +307,7 @@ impl LlmProvider for AnthropicProvider {
             stop_reason,
             usage,
             model,
+            rate_limits: None,
         })
     }
 
@@ -295,7 +318,7 @@ impl LlmProvider for AnthropicProvider {
     // the two Anthropic stacks #228 wants collapsed under one `AnthropicMessages`
     // protocol (see the matching TODO on `AnthropicClient::process_sse_stream`).
     // Not done in this pass because `AnthropicClient` is a public type the TUI and
-    // other crates depend on directly — deferring keeps everything green.
+    // other crates depend on directly: deferring keeps everything green.
     async fn create_message_stream(
         &self,
         request: ProviderRequest,

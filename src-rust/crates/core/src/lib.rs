@@ -211,6 +211,15 @@ pub mod types {
 
     // ---- Content blocks --------------------------------------------------
 
+    /// Origin of opaque Responses API reasoning. Only the issuing backend
+    /// may receive this state on replay; native Anthropic blocks stay separate.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ResponsesReasoningProvider {
+        Codex,
+        Copilot,
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     pub enum ContentBlock {
@@ -244,6 +253,15 @@ pub mod types {
         },
         RedactedThinking {
             data: String,
+        },
+        /// One Responses API reasoning item, kept intact through persistence.
+        ResponsesReasoning {
+            provider: ResponsesReasoningProvider,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            item_id: Option<String>,
+            summary: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            encrypted_content: Option<String>,
         },
         Document {
             source: DocumentSource,
@@ -459,7 +477,12 @@ pub mod types {
             match &self.content {
                 MessageContent::Blocks(blocks) => blocks
                     .iter()
-                    .filter(|b| matches!(b, ContentBlock::Thinking { .. }))
+                    .filter(|b| {
+                        matches!(
+                            b,
+                            ContentBlock::Thinking { .. } | ContentBlock::ResponsesReasoning { .. }
+                        )
+                    })
                     .collect(),
                 _ => vec![],
             }

@@ -94,6 +94,27 @@ pub struct ProviderRequest {
 // ProviderResponse
 // ---------------------------------------------------------------------------
 
+/// Subscription usage windows reported alongside a response (Codex
+/// `x-codex-{primary,secondary}-used-percent` headers, percent 0-100).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitUsage {
+    /// Primary window usage percent (the short, e.g. 5-hour window).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_used_percent: Option<f32>,
+    /// Secondary window usage percent (the weekly window).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secondary_used_percent: Option<f32>,
+}
+
+impl From<RateLimitUsage> for StreamEvent {
+    fn from(usage: RateLimitUsage) -> Self {
+        StreamEvent::RateLimits {
+            primary_used_percent: usage.primary_used_percent,
+            secondary_used_percent: usage.secondary_used_percent,
+        }
+    }
+}
+
 /// A normalised response returned by any provider adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderResponse {
@@ -111,6 +132,40 @@ pub struct ProviderResponse {
 
     /// The model that produced this response (as reported by the provider).
     pub model: String,
+
+    /// Subscription usage windows the provider reported with this response,
+    /// when it reports them (Codex sets this on non-streaming responses via
+    /// its `x-codex-*` headers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limits: Option<RateLimitUsage>,
+}
+
+/// Preserve a complete Responses reasoning item with its issuing backend.
+pub(crate) fn responses_reasoning_block(
+    item: &Value,
+    provider: claurst_core::types::ResponsesReasoningProvider,
+) -> ContentBlock {
+    let summary = item
+        .get("summary")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+        .unwrap_or_default();
+    ContentBlock::ResponsesReasoning {
+        provider,
+        item_id: item.get("id").and_then(Value::as_str).map(str::to_owned),
+        summary,
+        encrypted_content: item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .filter(|data| !data.is_empty())
+            .map(str::to_owned),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +267,7 @@ enum PartialBlock {
         id: String,
         name: String,
         json_buf: String,
+        initial_input: Value,
         /// Opaque provider signature (e.g. Gemini's `thoughtSignature`) captured
         /// on `ContentBlockStart`; echoed back on the finalized block (#311).
         thought_signature: Option<String>,
@@ -236,10 +292,16 @@ impl PartialBlock {
                 thinking_buf: thinking,
                 signature_buf: signature,
             },
-            ContentBlock::ToolUse { id, name, thought_signature, .. } => PartialBlock::ToolUse {
+            ContentBlock::ToolUse {
+                id,
+                name,
+                input,
+                thought_signature,
+            } => PartialBlock::ToolUse {
                 id,
                 name,
                 json_buf: String::new(),
+                initial_input: input,
                 thought_signature,
             },
             other => PartialBlock::Passthrough(other),
@@ -256,10 +318,25 @@ impl PartialBlock {
                 thinking: thinking_buf,
                 signature: signature_buf,
             },
-            PartialBlock::ToolUse { id, name, json_buf, thought_signature } => {
-                let input =
-                    serde_json::from_str(&json_buf).unwrap_or(Value::Object(Default::default()));
-                ContentBlock::ToolUse { id, name, input, thought_signature }
+            PartialBlock::ToolUse {
+                id,
+                name,
+                json_buf,
+                initial_input,
+                thought_signature,
+            } => {
+                let input = if json_buf.is_empty() {
+                    initial_input
+                } else {
+                    crate::tool_json::parse_tool_input(&json_buf)
+                        .unwrap_or(Value::Object(Default::default()))
+                };
+                ContentBlock::ToolUse {
+                    id,
+                    name,
+                    input,
+                    thought_signature,
+                }
             }
             PartialBlock::Passthrough(block) => block,
         }
@@ -275,12 +352,23 @@ impl PartialBlock {
 /// model's interleave order (thinking-first / signed-thinking replay) survives.
 /// See issue #217.
 #[derive(Default)]
-pub(crate) struct StreamBlockAccumulator {
-    partials: std::collections::BTreeMap<usize, PartialBlock>,
+pub struct StreamBlockAccumulator {
+    partials: std::collections::BTreeMap<(usize, u8), PartialBlock>,
+}
+
+// Chat-compatible adapters may emit thinking and text at the same index.
+// Completed Responses reasoning replaces the streamed thinking placeholder.
+fn block_lane(block: &ContentBlock) -> u8 {
+    match block {
+        ContentBlock::Thinking { .. } | ContentBlock::ResponsesReasoning { .. } => 0,
+        ContentBlock::Text { .. } => 2,
+        ContentBlock::ToolUse { .. } => 3,
+        _ => 1,
+    }
 }
 
 impl StreamBlockAccumulator {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
@@ -288,24 +376,30 @@ impl StreamBlockAccumulator {
     /// lifecycle events (`MessageStart`, `MessageDelta`, `MessageStop`,
     /// `ContentBlockStop`, `Error`) are ignored so callers still handle those
     /// (id / model / usage / stop_reason) themselves.
-    pub(crate) fn on_event(&mut self, event: &StreamEvent) {
+    pub fn on_event(&mut self, event: &StreamEvent) {
         match event {
             StreamEvent::ContentBlockStart {
                 index,
                 content_block,
             } => {
-                self.partials
-                    .insert(*index, PartialBlock::from_start(content_block.clone()));
+                self.partials.insert(
+                    (*index, block_lane(content_block)),
+                    PartialBlock::from_start(content_block.clone()),
+                );
             }
             StreamEvent::TextDelta { index, text } => {
-                if let Some(PartialBlock::Text(buf)) = self.partials.get_mut(index) {
+                if let PartialBlock::Text(buf) = self
+                    .partials
+                    .entry((*index, 2))
+                    .or_insert_with(|| PartialBlock::Text(String::new()))
+                {
                     buf.push_str(text);
                 }
             }
             StreamEvent::ThinkingDelta { index, thinking } => {
                 if let PartialBlock::Thinking { thinking_buf, .. } = self
                     .partials
-                    .entry(*index)
+                    .entry((*index, 0))
                     .or_insert_with(PartialBlock::empty_thinking)
                 {
                     thinking_buf.push_str(thinking);
@@ -316,7 +410,7 @@ impl StreamBlockAccumulator {
                 // providers; fold it into the same thinking block.
                 if let PartialBlock::Thinking { thinking_buf, .. } = self
                     .partials
-                    .entry(*index)
+                    .entry((*index, 0))
                     .or_insert_with(PartialBlock::empty_thinking)
                 {
                     thinking_buf.push_str(reasoning);
@@ -325,7 +419,7 @@ impl StreamBlockAccumulator {
             StreamEvent::SignatureDelta { index, signature } => {
                 if let PartialBlock::Thinking { signature_buf, .. } = self
                     .partials
-                    .entry(*index)
+                    .entry((*index, 0))
                     .or_insert_with(PartialBlock::empty_thinking)
                 {
                     signature_buf.push_str(signature);
@@ -335,7 +429,9 @@ impl StreamBlockAccumulator {
                 index,
                 partial_json,
             } => {
-                if let Some(PartialBlock::ToolUse { json_buf, .. }) = self.partials.get_mut(index) {
+                if let Some(PartialBlock::ToolUse { json_buf, .. }) =
+                    self.partials.get_mut(&(*index, 3))
+                {
                     json_buf.push_str(partial_json);
                 }
             }
@@ -345,11 +441,31 @@ impl StreamBlockAccumulator {
 
     /// Consume the accumulator, producing finalized content blocks in the
     /// stream-index order the model emitted them.
-    pub(crate) fn finish(self) -> Vec<ContentBlock> {
-        self.partials
-            .into_values()
-            .map(PartialBlock::finish)
-            .collect()
+    pub fn finish(self) -> Vec<ContentBlock> {
+        self.finish_with_invalid_tools().0
+    }
+
+    /// Finalize in wire order and retain invalid tool IDs so callers never
+    /// execute malformed arguments using the placeholder input.
+    pub fn finish_with_invalid_tools(
+        self,
+    ) -> (Vec<ContentBlock>, std::collections::HashMap<String, String>) {
+        let mut invalid = std::collections::HashMap::new();
+        let blocks = self.partials.into_values().map(|partial| {
+            if let PartialBlock::ToolUse { id, json_buf, .. } = &partial {
+                if !json_buf.is_empty() {
+                    if let Err(error) = crate::tool_json::parse_tool_input(json_buf) {
+                        invalid.insert(id.clone(), error.to_string());
+                    }
+                }
+            }
+            partial.finish()
+        }).filter(|block| !matches!(block,
+            ContentBlock::Text { text } if text.is_empty()
+        ) && !matches!(block,
+            ContentBlock::Thinking { thinking, signature } if thinking.is_empty() && signature.is_empty()
+        )).collect();
+        (blocks, invalid)
     }
 }
 

@@ -474,6 +474,7 @@ mod tests {
                     content: Vec::new(),
                     stop_reason: StopReason::EndTurn,
                     usage: UsageInfo::default(),
+                    rate_limits: None,
                 })
             } else {
                 Err(ProviderError::RateLimited {

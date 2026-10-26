@@ -191,7 +191,10 @@ fn estimate_block_chars(block: &ContentBlock) -> usize {
                 blocks.iter().map(estimate_block_chars).sum()
             }
         },
-        ContentBlock::Thinking { thinking, .. } => thinking.len(),
+        ContentBlock::Thinking { thinking, .. }
+        | ContentBlock::ResponsesReasoning {
+            summary: thinking, ..
+        } => thinking.len(),
         ContentBlock::RedactedThinking { data } => data.len(),
         _ => 200, // default for images/documents
     }

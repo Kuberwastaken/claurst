@@ -447,6 +447,22 @@ fn flatten_line_text(line: &Line<'_>) -> String {
         .join("")
 }
 
+/// Map a transcript content line index to the screen row it currently occupies
+/// inside `pane`, given the current top-row `scroll`. Lines above or below the
+/// viewport clamp to the pane's top/bottom row (the highlight extends to the
+/// edge, like mouse drags) — the full range still copies from the line cache.
+fn project_line_to_pane_row(line: usize, pane: Rect, scroll: usize) -> u16 {
+    if pane.height == 0 {
+        return pane.y;
+    }
+    let offset = line.saturating_sub(scroll);
+    if offset >= pane.height as usize {
+        pane.y.saturating_add(pane.height).saturating_sub(1)
+    } else {
+        pane.y + offset as u16
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct MessageLinesCacheKey {
     width: u16,
@@ -551,6 +567,7 @@ fn reset_render_caches() {
 /// Render the entire application into the current frame.
 pub fn render_app(frame: &mut Frame, app: &App) {
     let size = frame.area();
+    app.last_terminal_width.set(size.width);
     app.last_selectable_area.set(size);
 
     // Fill the entire frame with a black background so the terminal's default
@@ -938,6 +955,19 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     }
 
     // ---- Text selection highlight (topmost post-pass) ---------------------
+    // Restrict the selectable area to the transcript pane (last_msg_area)
+    // so keyboard and mouse selection can't roam over the prompt box,
+    // status bar, or other UI chrome. Falls back to the full frame when
+    // the transcript is empty (welcome screen).
+    let selectable = {
+        let msg = app.last_msg_area.get();
+        if msg.width > 0 && msg.height > 0 {
+            msg
+        } else {
+            size
+        }
+    };
+    app.last_selectable_area.set(selectable);
     apply_selection_highlight(frame, app);
     cache_selectable_row_text(frame, app);
     render_context_menu(frame, app);
@@ -986,13 +1016,40 @@ fn cache_selectable_row_text(frame: &mut Frame, app: &App) {
 /// Post-render pass: invert colours on selected cells and extract the
 /// selection text into `app.selection_text`.
 fn apply_selection_highlight(frame: &mut Frame, app: &App) {
-    let (anchor, focus) = match (app.selection_anchor, app.selection_focus) {
-        (Some(a), Some(f)) => (a, f),
-        _ => return,
+    // Keyboard selection mode: the anchor/focus screen rows come from the
+    // renderer's projection of the content lines (kb_anchor_line / kb_cursor_line),
+    // not from mouse-driven selection_anchor/focus. The column spans the full
+    // pane width (line selection).
+    let (anchor, focus) = if app.kb_select_mode {
+        let area = app.last_selectable_area.get();
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        if app.kb_terminal_width != app.last_terminal_width.get() {
+            return;
+        }
+        let first = app.kb_anchor_line.min(app.kb_cursor_line);
+        let last = app.kb_anchor_line.max(app.kb_cursor_line);
+        let top = app.last_render_scroll_offset.get() as usize;
+        if last < top || first >= top.saturating_add(area.height as usize) {
+            return;
+        }
+        let right = area.x.saturating_add(area.width).saturating_sub(1);
+        let (anchor_col, focus_col) = if app.kb_anchor_line <= app.kb_cursor_line {
+            (area.x, right)
+        } else {
+            (right, area.x)
+        };
+        (
+            (anchor_col, app.kb_anchor_screen_row.get()),
+            (focus_col, app.kb_cursor_screen_row.get()),
+        )
+    } else {
+        match (app.selection_anchor, app.selection_focus) {
+            (Some(a), Some(f)) => (a, f),
+            _ => return,
+        }
     };
-    if anchor == focus {
-        return;
-    }
 
     let selectable_area = app.last_selectable_area.get();
     if selectable_area.width == 0 || selectable_area.height == 0 {
@@ -1026,6 +1083,20 @@ fn apply_selection_highlight(frame: &mut Frame, app: &App) {
         focus.0.clamp(selectable_area.x, max_col),
         focus.1.clamp(selectable_area.y, max_row),
     );
+
+    // When anchor == focus, show a cursor bar on the single cell so the
+    // user sees the selection entry point immediately (review point #10).
+    if anchor == focus {
+        if let Some(cell) = frame.buffer_mut().cell_mut((anchor.0, anchor.1)) {
+            cell.set_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(200, 200, 200)),
+            );
+        }
+        *app.selection_text.borrow_mut() = String::new();
+        return;
+    }
 
     // Normalise so start ≤ end (row-major order).
     let (start, end) = if (anchor.1, anchor.0) <= (focus.1, focus.0) {
@@ -1288,6 +1359,7 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     // at render time). Prevents unbounded inflation when scrolling past the top
     // (#223).
     app.last_max_scroll.set(max_scroll);
+    app.total_message_lines.set(content_height as usize);
     // scroll_offset counts lines above the bottom (0 = at bottom).
     // ratatui scroll() takes an absolute top-row index, so convert:
     //   top_row = max_scroll - scroll_offset  (clamped to [0, max_scroll])
@@ -1322,11 +1394,42 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     let mut list = VirtualList::new();
     list.viewport_height = msg_area.height;
     list.sticky_bottom = app.auto_scroll;
-    list.set_items(lines);
-    list.scroll_offset = scroll as u16;
+
+    // Populate the content-line cache for keyboard selection mode. The
+    // cursor/anchor are content line indices; this cache is the source of
+    // truth for copy (so selections extending past the viewport copy in
+    // full). Must run before `lines` is moved into the list widget.
+    if app.kb_select_mode && app.kb_terminal_width == app.last_terminal_width.get() {
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|item| flatten_line_text(&item.line))
+            .collect();
+        *app.kb_line_text.borrow_mut() = texts;
+    }
 
     // Track scroll offset for selection validation
     app.last_render_scroll_offset.set(scroll as u16);
+
+    list.set_items(lines);
+    list.scroll_offset = scroll as u16;
+
+    // Project the keyboard selection's content lines to screen rows so
+    // apply_selection_highlight (the topmost post-pass in render_app) can
+    // highlight the visible part. Clamping to the pane edge mirrors how
+    // mouse drags clamp: the highlight visibly extends to the edge while
+    // copy reads the full content range from the line cache.
+    if app.kb_select_mode {
+        app.kb_anchor_screen_row.set(project_line_to_pane_row(
+            app.kb_anchor_line,
+            msg_area,
+            scroll,
+        ));
+        app.kb_cursor_screen_row.set(project_line_to_pane_row(
+            app.kb_cursor_line,
+            msg_area,
+            scroll,
+        ));
+    }
 
     list.render(msg_area, frame.buffer_mut());
 
@@ -4677,5 +4780,43 @@ mod status_line_tests {
             usage: None,
         });
         assert!(app.retry_status.is_none(), "a completed turn clears the pill");
+    }
+}
+
+#[cfg(test)]
+mod keyboard_selection_highlight_tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn kb_selection_highlights_whole_last_line_and_no_offscreen_phantom() {
+        let mut app = App::new(
+            claurst_core::Config::default(),
+            claurst_core::cost::CostTracker::new(),
+        );
+        app.kb_select_mode = true;
+        app.kb_terminal_width = 12;
+        app.last_terminal_width.set(12);
+        app.last_selectable_area.set(Rect::new(1, 1, 10, 3));
+        app.kb_anchor_screen_row.set(1);
+        app.kb_cursor_screen_row.set(2);
+        app.kb_anchor_line = 0;
+        app.kb_cursor_line = 1;
+        let mut terminal = Terminal::new(TestBackend::new(12, 5)).unwrap();
+        terminal
+            .draw(|frame| apply_selection_highlight(frame, &app))
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(10, 2)].bg,
+            Color::Rgb(200, 200, 200)
+        );
+        app.last_render_scroll_offset.set(4);
+        terminal
+            .draw(|frame| apply_selection_highlight(frame, &app))
+            .unwrap();
+        assert_ne!(
+            terminal.backend().buffer()[(1, 1)].bg,
+            Color::Rgb(200, 200, 200)
+        );
     }
 }

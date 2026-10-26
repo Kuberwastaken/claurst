@@ -3699,8 +3699,8 @@ async fn run_interactive(
                 Event::Mouse(mouse) => {
                     app.handle_mouse_event(mouse);
                 }
-                Event::Resize(_, _) => {
-                    // Terminal resize - will be handled on next draw
+                Event::Resize(width, _) => {
+                    app.handle_terminal_resize(width);
                 }
                 Event::FocusGained => app.terminal_focused = true,
                 Event::FocusLost => app.terminal_focused = false,
