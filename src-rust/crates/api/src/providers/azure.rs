@@ -88,7 +88,7 @@ impl AzureProvider {
             &request.messages,
             request.system_prompt.as_ref(),
         );
-        let tools = OpenAiProvider::to_openai_tools_pub("openai", &request.tools);
+        let tools = OpenAiProvider::to_openai_tools_pub(&self.id, &request.tools);
 
         let mut body = json!({
             "model": request.model,
@@ -158,7 +158,7 @@ impl AzureProvider {
             &request.messages,
             request.system_prompt.as_ref(),
         );
-        let tools = OpenAiProvider::to_openai_tools_pub("openai", &request.tools);
+        let tools = OpenAiProvider::to_openai_tools_pub(&self.id, &request.tools);
 
         let mut body = json!({
             "model": request.model,

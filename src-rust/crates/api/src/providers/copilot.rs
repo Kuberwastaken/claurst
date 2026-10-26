@@ -46,6 +46,7 @@ use crate::providers::openai::OpenAiProvider;
 pub struct CopilotProvider {
     id: ProviderId,
     token: String,
+    base_url: String,
     http_client: reqwest::Client,
 }
 
@@ -59,16 +60,13 @@ impl CopilotProvider {
         Self {
             id: ProviderId::new(ProviderId::GITHUB_COPILOT),
             token,
+            base_url: "https://api.githubcopilot.com".into(),
             http_client,
         }
     }
 
     pub fn from_env() -> Option<Self> {
         std::env::var("GITHUB_TOKEN").ok().map(Self::new)
-    }
-
-    fn base_url() -> &'static str {
-        "https://api.githubcopilot.com"
     }
 
     fn block_has_image(block: &ContentBlock) -> bool {
@@ -205,6 +203,11 @@ impl CopilotProvider {
     /// Check whether a provider error indicates the model/endpoint is
     /// unsupported and a fallback to Chat Completions is worth trying.
     fn is_responses_api_fallback_candidate(err: &ProviderError) -> bool {
+        // A schema rejection must reach the query loop's learning/retry path.
+        // Falling back here hides the rejected construct behind another request.
+        if claurst_schema_dialect::rejection::is_schema_error(&err.to_string()) {
+            return false;
+        }
         matches!(
             err,
             ProviderError::InvalidRequest { .. }
@@ -685,8 +688,7 @@ impl CopilotProvider {
         &self,
         request: &ProviderRequest,
     ) -> Result<ProviderResponse, ProviderError> {
-        let tools: Vec<Value> = request
-            .tools
+        let tools: Vec<Value> = crate::schema_dialect_map::filter_tools(&self.id, &request.tools)
             .iter()
             .map(|tool| {
                 json!({
@@ -711,7 +713,7 @@ impl CopilotProvider {
         }
         Self::apply_responses_provider_options(&mut body, &request.provider_options);
 
-        let url = format!("{}/responses", Self::base_url());
+        let url = format!("{}/responses", self.base_url);
         let builder = self
             .http_client
             .post(&url)
@@ -830,7 +832,7 @@ impl CopilotProvider {
             &request.messages,
             request.system_prompt.as_ref(),
         );
-        let tools = OpenAiProvider::to_openai_tools_pub("openai", &request.tools);
+        let tools = OpenAiProvider::to_openai_tools_pub(&self.id, &request.tools);
 
         let mut body = json!({
             "model": request.model,
@@ -854,7 +856,7 @@ impl CopilotProvider {
         }
         Self::apply_chat_provider_options(&mut body, &request.provider_options);
 
-        let url = format!("{}/chat/completions", Self::base_url());
+        let url = format!("{}/chat/completions", self.base_url);
 
         let builder = self
             .http_client
@@ -903,7 +905,7 @@ impl CopilotProvider {
             &request.messages,
             request.system_prompt.as_ref(),
         );
-        let tools = OpenAiProvider::to_openai_tools_pub("openai", &request.tools);
+        let tools = OpenAiProvider::to_openai_tools_pub(&self.id, &request.tools);
 
         let mut body = json!({
             "model": request.model,
@@ -927,7 +929,7 @@ impl CopilotProvider {
         }
         Self::apply_chat_provider_options(&mut body, &request.provider_options);
 
-        let url = format!("{}/chat/completions", Self::base_url());
+        let url = format!("{}/chat/completions", self.base_url);
 
         let builder = self
             .http_client
@@ -1235,7 +1237,7 @@ impl LlmProvider for CopilotProvider {
 
     async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         // Try to fetch the live model list from the Copilot API.
-        let url = format!("{}/models", Self::base_url());
+        let url = format!("{}/models", self.base_url);
         let builder = self.http_client.get(&url);
         let builder = self
             .copilot_headers(builder)
@@ -1343,7 +1345,7 @@ impl LlmProvider for CopilotProvider {
     }
 
     async fn health_check(&self) -> Result<ProviderStatus, ProviderError> {
-        let url = format!("{}/models", Self::base_url());
+        let url = format!("{}/models", self.base_url);
         let builder = self.http_client.get(&url);
         let builder = self.copilot_headers(builder);
 
@@ -1376,6 +1378,142 @@ impl LlmProvider for CopilotProvider {
             caching: false,
             structured_output: true,
             system_prompt_style: SystemPromptStyle::SystemMessage,
+        }
+    }
+}
+
+#[cfg(test)]
+mod schema_recovery_tests {
+    use super::*;
+    use claurst_core::types::{Message, ToolDefinition};
+    use claurst_schema_dialect::quirks;
+    use futures::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Exercise both public routes against HTTP: schema failures must escape
+    /// Responses routing, be learned under the canonical provider ID, and be
+    /// removed when the same request is rebuilt. No Chat fallback is permitted.
+    #[tokio::test]
+    async fn responses_schema_rejection_is_learned_and_filtered_on_retry() {
+        for streaming in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            quirks::use_test_path(dir.path().join("quirks.json"));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let mut bodies = Vec::new();
+                for attempt in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0; 4096];
+                    loop {
+                        let n = socket.read(&mut buffer).await.unwrap();
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&buffer[..n]);
+                        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&bytes[..end]);
+                            assert!(headers.starts_with("POST /responses HTTP/1.1"), "{headers}");
+                            let length: usize = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse().unwrap())
+                                })
+                                .unwrap();
+                            if bytes.len() >= end + 4 + length {
+                                bodies.push(
+                                    serde_json::from_slice::<Value>(
+                                        &bytes[end + 4..end + 4 + length],
+                                    )
+                                    .unwrap(),
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    let (status, body) = if attempt == 0 {
+                        (
+                            400,
+                            json!({"error":{"message":"Invalid schema for function 'lookup': 'additionalProperties' is not permitted", "type":"invalid_request_error", "code":"invalid_function_parameters"}}),
+                        )
+                    } else {
+                        (
+                            200,
+                            json!({"id":"response","model":"gpt-5.4","output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}]}),
+                        )
+                    };
+                    let body = body.to_string();
+                    socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
+                bodies
+            });
+            let mut provider = CopilotProvider::new("fixture-token".into());
+            provider.base_url = format!("http://{address}");
+            let request = ProviderRequest {
+                model: "gpt-5.4".into(),
+                messages: vec![Message::user("lookup")],
+                tools: vec![ToolDefinition {
+                    name: "lookup".into(),
+                    description: "fixture".into(),
+                    input_schema: json!({"type":"object", "properties":{"data":{"type":"object", "propertyNames":{"type":"string"}}}, "additionalProperties":false}),
+                }],
+                system_prompt: None,
+                max_tokens: 16,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                stop_sequences: vec![],
+                thinking: None,
+                provider_options: json!({}),
+            };
+            let error = if streaming {
+                match provider.create_message_stream(request.clone()).await {
+                    Err(error) => error,
+                    Ok(_) => panic!("schema rejection must escape Responses routing"),
+                }
+            } else {
+                provider.create_message(request.clone()).await.unwrap_err()
+            };
+            let learned =
+                crate::schema_dialect_map::recover_description(provider.id(), &error.to_string());
+            assert!(learned.as_deref().unwrap().contains("additionalProperties"));
+            assert!(
+                crate::schema_dialect_map::recover_description(provider.id(), &error.to_string())
+                    .is_none(),
+                "a repeated rejection cannot trigger another recovery"
+            );
+            if streaming {
+                let mut events = provider.create_message_stream(request).await.unwrap();
+                let mut text = String::new();
+                while let Some(event) = events.next().await {
+                    if let StreamEvent::TextDelta { text: delta, .. } = event.unwrap() {
+                        text.push_str(&delta);
+                    }
+                }
+                assert_eq!(text, "done");
+            } else {
+                assert!(
+                    matches!(&provider.create_message(request).await.unwrap().content[0], ContentBlock::Text { text } if text == "done")
+                );
+            }
+            let bodies = server.await.unwrap();
+            assert_eq!(
+                bodies[0]["tools"][0]["parameters"]["additionalProperties"],
+                false
+            );
+            for body in &bodies {
+                assert!(
+                    body["tools"][0]["parameters"]["properties"]["data"]
+                        .get("propertyNames")
+                        .is_none(),
+                    "known dialect exclusions apply on every attempt"
+                );
+                assert_eq!(body["tools"][0]["name"], "lookup");
+            }
+            assert!(bodies[1]["tools"][0]["parameters"]
+                .get("additionalProperties")
+                .is_none());
         }
     }
 }

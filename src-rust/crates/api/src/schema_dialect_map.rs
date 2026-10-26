@@ -10,6 +10,21 @@ use claurst_schema_dialect::dialect::DialectSpec;
 use claurst_schema_dialect::registry;
 use claurst_schema_dialect::{normalize, recover_from_error, RecoveryAction};
 
+// Shared wire syntax does not imply shared backend validation. Keep learned
+// rejections isolated even when providers begin with the same accepted subset.
+const AZURE: DialectSpec = DialectSpec {
+    id: "azure",
+    ..registry::OPENAI
+};
+const COPILOT: DialectSpec = DialectSpec {
+    id: "github-copilot",
+    ..registry::OPENAI
+};
+const COHERE: DialectSpec = DialectSpec {
+    id: "cohere",
+    ..registry::OPENAI
+};
+
 /// Dialect for `provider_id`, or `None` when no entry covers it. Unmapped
 /// providers keep receiving their schemas untouched.
 ///
@@ -20,13 +35,16 @@ use claurst_schema_dialect::{normalize, recover_from_error, RecoveryAction};
 /// the turn where the same error on the openai route would self-heal.
 pub fn spec_for(provider_id: &str) -> Option<&'static DialectSpec> {
     match provider_id {
-        "google" | "gemini" | "antigravity" => Some(match provider_id {
+        "google" | "gemini" | "google-vertex" | "antigravity" => Some(match provider_id {
             "antigravity" => &registry::ANTIGRAVITY_BRIDGE,
             _ => &registry::GEMINI,
         }),
-        "bedrock" => Some(&registry::BEDROCK),
+        "bedrock" | "amazon-bedrock" => Some(&registry::BEDROCK),
         "anthropic" => Some(&registry::ANTHROPIC),
-        "openai" | "azure" | "copilot" | "cohere" => Some(&registry::OPENAI),
+        "openai" => Some(&registry::OPENAI),
+        "azure" => Some(&AZURE),
+        "copilot" | "github-copilot" => Some(&COPILOT),
+        "cohere" => Some(&COHERE),
         "openrouter" => Some(&registry::OPENROUTER),
         _ => None,
     }
@@ -105,7 +123,7 @@ mod tests {
             "type": "object",
             "properties": { "data": { "type": "object", "propertyNames": { "type": "string" } } },
         }));
-        for provider in ["openai", "azure", "copilot", "cohere"] {
+        for provider in ["openai", "azure", "copilot", "github-copilot", "cohere"] {
             let filtered = filter_tools(provider, &tools);
             assert!(
                 filtered[0].input_schema["properties"]["data"]
@@ -122,6 +140,53 @@ mod tests {
                 "a rejection naming a keyword must be actionable for {provider}"
             );
         }
+    }
+
+    #[test]
+    fn learned_rejections_do_not_cross_backend_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        claurst_schema_dialect::quirks::use_test_path(dir.path().join("quirks.json"));
+        let tools = tool(json!({"type":"object", "additionalProperties":false}));
+        for provider in ["openai", "azure", "github-copilot", "cohere"] {
+            assert!(filter_tools(provider, &tools)[0]
+                .input_schema
+                .get("additionalProperties")
+                .is_some());
+        }
+        assert!(
+            recover_description("github-copilot", "'additionalProperties' is not permitted")
+                .is_some()
+        );
+        assert!(filter_tools("copilot", &tools)[0]
+            .input_schema
+            .get("additionalProperties")
+            .is_none());
+        for provider in ["openai", "azure", "cohere"] {
+            assert!(
+                filter_tools(provider, &tools)[0]
+                    .input_schema
+                    .get("additionalProperties")
+                    .is_some(),
+                "Copilot must not alter {provider}"
+            );
+        }
+        claurst_schema_dialect::quirks::reset_cache_for_tests();
+        assert!(filter_tools("github-copilot", &tools)[0]
+            .input_schema
+            .get("additionalProperties")
+            .is_none());
+        assert!(filter_tools("openai", &tools)[0]
+            .input_schema
+            .get("additionalProperties")
+            .is_some());
+        assert_eq!(
+            spec_for("amazon-bedrock").unwrap().id,
+            spec_for("bedrock").unwrap().id
+        );
+        assert_eq!(
+            spec_for("google-vertex").unwrap().id,
+            spec_for("google").unwrap().id
+        );
     }
 
     #[test]
