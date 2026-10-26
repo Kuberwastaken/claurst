@@ -1400,48 +1400,29 @@ impl App {
             // ---- Quit / cancel ----------------------------------------
             // Accept both 'c' and 'C' so Shift+Ctrl+C also triggers copy
             // (issue #149 follow-up).
-            KeyCode::Char(c)
-                if (c == 'c' || c == 'C') && key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                // In keyboard selection mode Ctrl+C always means "copy and
-                // leave", even with an empty selection — it must never arm
-                // the exit confirmation (review on #387).
-                if self.kb_select_mode {
-                    self.copy_kb_selection();
-                    self.exit_kb_selection();
-                } else {
-                    // If text is selected, copy it to clipboard instead of quitting.
-                    let sel_text = self.selection_text.borrow().clone();
-                    if self.selection_anchor.is_some() && !sel_text.is_empty() {
-                        // Text is selected: copy to clipboard.
-                        let copied = crate::image_paste::write_clipboard_text(&sel_text);
-                        if copied {
-                            self.push_notification(
-                                NotificationKind::Info,
-                                "Copied to clipboard".to_string(),
-                                Some(2),
-                            );
-                        }
-                        // Exit keyboard selection mode if active.
-                        if self.kb_select_mode {
-                            self.exit_kb_selection();
-                        } else {
-                            self.selection_anchor = None;
-                            self.selection_focus = None;
-                            *self.selection_text.borrow_mut() = String::new();
-                        }
-                    } else if self.turn_running() {
-                        self.interrupt_turn();
-                    } else {
-                        // No text selected and not streaming: handle exit confirmation sequence.
-                        // Always clear the prompt input on Ctrl+C.
-                        if !self.prompt_input.is_empty() {
-                            self.prompt_input.clear();
-                            self.refresh_prompt_input();
-                        }
-                        self.handle_exit_key_confirmation('c');
+            KeyCode::Char(c) if (c == 'c' || c == 'C') && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // If text is selected, copy it to clipboard instead of quitting.
+                let sel_text = self.selection_text.borrow().clone();
+                if self.selection_anchor.is_some() && !sel_text.is_empty() {
+                    // Text is selected: copy to clipboard.
+                    let copied = crate::image_paste::write_clipboard_text(&sel_text);
+                    self.selection_anchor = None;
+                    self.selection_focus = None;
+                    *self.selection_text.borrow_mut() = String::new();
+                    if copied {
+                        self.push_notification(NotificationKind::Info, "Copied to clipboard".to_string(), Some(2));
                     }
-                } // else: not in kb selection mode
+                } else if self.turn_running() {
+                    self.interrupt_turn();
+                } else {
+                    // No text selected and not streaming: handle exit confirmation sequence.
+                    // Always clear the prompt input on Ctrl+C.
+                    if !self.prompt_input.is_empty() {
+                        self.prompt_input.clear();
+                        self.refresh_prompt_input();
+                    }
+                    self.handle_exit_key_confirmation('c');
+                }
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Ctrl+D on empty input: trigger two-press exit confirmation (like Ctrl+C).
@@ -2632,8 +2613,8 @@ impl App {
 
     /// Copy the keyboard selection to the clipboard, if non-empty. The text
     /// comes from the render-time line cache (kb_line_text), so selections
-    /// that extend past the viewport copy in full. Shared by Enter
-    /// (selectionCopy action) and Ctrl+C (hardcoded handler).
+    /// that extend past the viewport copy in full. Shared by the configurable selectionCopy bindings
+    /// (Enter and Ctrl+C by default).
     pub(super) fn copy_kb_selection(&mut self) {
         let text = self.kb_selection_text();
         if !text.is_empty() {
