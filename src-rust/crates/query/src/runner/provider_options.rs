@@ -163,6 +163,23 @@ pub(crate) fn build_provider_options(
         }
     }
 
+    // The MiniMax adapter accepts Flash's five native effort values. Keep the
+    // absent effort absent (the API defaults to max), and preserve higher rungs
+    // instead of collapsing them through the generic OpenAI mapping.
+    if provider_id == "minimax" && model_id == "minimax-m3.1-flash" {
+        if let Some(level) = effort_level {
+            use claurst_core::effort::EffortLevel;
+            let effort = match level {
+                EffortLevel::None | EffortLevel::Minimal | EffortLevel::Low => "low",
+                EffortLevel::Medium => "medium",
+                EffortLevel::High => "high",
+                EffortLevel::XHigh => "xhigh",
+                EffortLevel::Max | EffortLevel::Ultracode => "max",
+            };
+            options.insert("effort".to_string(), serde_json::json!(effort));
+        }
+    }
+
     // Anthropic: `output_config.effort` for adaptive-thinking models, read by
     // `AnthropicProvider` (the thinking field itself travels in
     // `ProviderRequest::thinking`).

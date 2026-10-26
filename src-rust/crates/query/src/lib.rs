@@ -1220,7 +1220,10 @@ pub async fn run_query_loop(
                     let mut text_chunks: Vec<String> = Vec::new();
                     // Accumulate reasoning/thinking content for providers like
                     // DeepSeek that require reasoning_content to be sent back.
-                    let mut thinking_chunks: Vec<String> = Vec::new();
+                    // Keep each thinking block paired with its signature for
+                    // replay on the next MiniMax/Anthropic-compatible turn.
+                    let mut thinking_blocks: std::collections::BTreeMap<usize, (String, String)> =
+                        std::collections::BTreeMap::new();
                     // Opaque reasoning state (Codex `encrypted_content`)
                     // that must be replayed on the next request.
                     let mut redacted_thinking_blocks: Vec<ContentBlock> = Vec::new();
@@ -1300,11 +1303,20 @@ pub async fn run_query_loop(
                                             claurst_api::StreamEvent::TextDelta { text, .. } => {
                                                 text_chunks.push(text.clone());
                                             }
-                                            claurst_api::StreamEvent::ThinkingDelta { thinking, .. } => {
-                                                thinking_chunks.push(thinking.clone());
+                                            claurst_api::StreamEvent::ContentBlockStart {
+                                                index,
+                                                content_block: ContentBlock::Thinking { thinking, signature },
+                                            } => {
+                                                thinking_blocks.insert(*index, (thinking.clone(), signature.clone()));
                                             }
-                                            claurst_api::StreamEvent::ReasoningDelta { reasoning, .. } => {
-                                                thinking_chunks.push(reasoning.clone());
+                                            claurst_api::StreamEvent::ThinkingDelta { index, thinking } => {
+                                                thinking_blocks.entry(*index).or_default().0.push_str(thinking);
+                                            }
+                                            claurst_api::StreamEvent::ReasoningDelta { index, reasoning } => {
+                                                thinking_blocks.entry(*index).or_default().0.push_str(reasoning);
+                                            }
+                                            claurst_api::StreamEvent::SignatureDelta { index, signature } => {
+                                                thinking_blocks.entry(*index).or_default().1.push_str(signature);
                                             }
                                             claurst_api::StreamEvent::InputJsonDelta { index, partial_json } => {
                                                 if let Some((_, _, buf, _)) = tool_call_blocks.get_mut(index) {
@@ -1430,12 +1442,12 @@ pub async fn run_query_loop(
 
                     // Thinking / reasoning block — must come first so that
                     // inject_reasoning_for_tool_turns can find it later.
-                    let combined_thinking = thinking_chunks.join("");
-                    if !combined_thinking.is_empty() {
-                        content_blocks.push(ContentBlock::Thinking {
-                            thinking: combined_thinking.clone(),
-                            signature: String::new(),
-                        });
+                    let combined_thinking: String = thinking_blocks.values()
+                        .map(|(thinking, _)| thinking.as_str()).collect();
+                    for (thinking, signature) in thinking_blocks.into_values() {
+                        if !thinking.is_empty() || !signature.is_empty() {
+                            content_blocks.push(ContentBlock::Thinking { thinking, signature });
+                        }
                     }
                     content_blocks.append(&mut redacted_thinking_blocks);
 
@@ -3214,6 +3226,9 @@ mod tests {
             }
         }
     }
+
+    #[path = "minimax_tests.rs"]
+    mod minimax_tests;
 
     fn noop_tools() -> Vec<Box<dyn Tool>> {
         vec![Box::new(MockTool {
