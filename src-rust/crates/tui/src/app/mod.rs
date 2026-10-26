@@ -122,6 +122,11 @@ pub fn try_copy_to_clipboard(text: &str) -> bool {
 pub struct App {
     // Core state
     pub config: Config,
+    /// Names of MCP servers the user disabled (persisted in global settings
+    /// under `disabledMcpServers`). Populated by the CLI at startup and after
+    /// `/mcp enable|disable` reconnects. Used to render the `disabled` state
+    /// in the /mcp view.
+    pub disabled_mcp_servers: std::collections::HashSet<String>,
     pub cost_tracker: Arc<CostTracker>,
     pub messages: Vec<Message>,
     /// Combined display list kept in sync with `messages`: real conversation turns
@@ -729,6 +734,7 @@ impl App {
             elicitation: crate::elicitation_dialog::ElicitationDialogState::new(),
             model_picker: ModelPickerState::new(),
             session_browser: SessionBrowserState::new(),
+            disabled_mcp_servers: std::collections::HashSet::new(),
             session_branching: crate::session_branching::SessionBranchingState::new(),
             tasks_overlay: TasksOverlay::new(),
             export_dialog: ExportDialogState::new(),

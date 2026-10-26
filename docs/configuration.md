@@ -90,6 +90,7 @@ with the global list.
   "permissionRules": [],
   "enabledPlugins": [],
   "disabledPlugins": [],
+  "disabledMcpServers": [],
   "hasCompletedOnboarding": false
 }
 ```
