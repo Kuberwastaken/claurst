@@ -844,7 +844,28 @@ pub fn should_auto_compact(input_tokens: u64, model: &str, state: &AutoCompactSt
 /// of the window so a large `max_tokens` on a small local model can't push the
 /// threshold to zero.
 pub fn auto_compact_threshold(window: u64, output_reserve: u64) -> u64 {
-    let by_fraction = (window as f64 * AUTOCOMPACT_TRIGGER_FRACTION) as u64;
+    auto_compact_threshold_with_fraction(
+        window,
+        output_reserve,
+        AUTOCOMPACT_TRIGGER_FRACTION as f32,
+    )
+}
+
+/// Configured fraction must be finite and strictly between zero and one.
+/// Invalid values use the default 90% trigger.
+pub fn auto_compact_threshold_with_fraction(
+    window: u64,
+    output_reserve: u64,
+    fraction: f32,
+) -> u64 {
+    let fraction = if fraction.is_finite() && fraction > 0.0 && fraction < 1.0 {
+        f64::from(fraction)
+    } else {
+        AUTOCOMPACT_TRIGGER_FRACTION
+    };
+    // Config values originate as f32; round away representation noise at
+    // exact token boundaries (e.g. 0.9 * 200_000).
+    let by_fraction = (window as f64 * fraction).round() as u64;
     let by_reserve = window.saturating_sub(output_reserve.min(window / 4));
     by_fraction.min(by_reserve)
 }
@@ -880,13 +901,13 @@ const SUMMARISER_SYSTEM_PROMPT: &str =
 /// UI. Streaming is the one request path every adapter implements (the Codex
 /// backend only accepts streamed requests, and some non-streaming paths are
 /// stubs), so this works wherever the main loop works.
-async fn request_summary(
+async fn request_summary_once(
     provider: &dyn LlmProvider,
     model: &str,
     system: &str,
     prompt: &str,
     max_tokens: u32,
-) -> Result<(String, Option<StopReason>), ClaudeError> {
+) -> Result<(String, Option<StopReason>), claurst_api::ProviderError> {
     let request = ProviderRequest {
         model: model.to_string(),
         messages: vec![Message::user(prompt)],
@@ -904,17 +925,70 @@ async fn request_summary(
     let mut stream = provider.create_message_stream(request).await?;
     let mut text = String::new();
     let mut stop_reason = None;
+    let mut completed = false;
     while let Some(event) = stream.next().await {
         match event? {
             StreamEvent::TextDelta { text: delta, .. } => text.push_str(&delta),
             StreamEvent::MessageDelta { stop_reason: Some(reason), .. } => {
                 stop_reason = Some(reason);
             }
-            StreamEvent::MessageStop => break,
+            StreamEvent::MessageStop => {
+                completed = true;
+                break;
+            }
+            StreamEvent::Error {
+                error_type,
+                message,
+            } => {
+                return Err(claurst_api::ProviderError::Other {
+                    provider: provider.id().clone(),
+                    message: format!("{error_type}: {message}"),
+                    status: None,
+                    body: None,
+                })
+            }
             _ => {}
         }
     }
+    if !completed {
+        return Err(claurst_api::ProviderError::StreamError {
+            provider: provider.id().clone(),
+            message: "summary stream ended before completion".into(),
+            partial_response: None,
+        });
+    }
     Ok((text, stop_reason))
+}
+
+/// One transient retry at most, bounded by the caller's configured budget.
+/// Fatal/auth/schema failures return immediately; server wait hints use the
+/// same capped delay policy as ordinary requests.
+async fn request_summary(
+    provider: &dyn LlmProvider,
+    model: &str,
+    system: &str,
+    prompt: &str,
+    max_tokens: u32,
+    retry: &claurst_api::RetryConfig,
+) -> Result<(String, Option<StopReason>), ClaudeError> {
+    let mut attempt = 0;
+    loop {
+        match request_summary_once(provider, model, system, prompt, max_tokens).await {
+            Ok(summary) => return Ok(summary),
+            Err(error) => {
+                if attempt < retry.max_retries.min(SUMMARY_ATTEMPTS - 1) {
+                    if let claurst_api::RetryDecision::Retry { after } =
+                        claurst_api::retry::classify_provider_error(&error)
+                    {
+                        attempt += 1;
+                        tokio::time::sleep(retry.delay_for(attempt, after)).await;
+                        continue;
+                    }
+                }
+                return Err(error.into());
+            }
+        }
+    }
 }
 
 /// Upper bound on summary output tokens (mirrors TypeScript
@@ -1068,6 +1142,7 @@ async fn generate_summary(
     model: &str,
     head: &[Message],
     max_summary_tokens: u32,
+    retry: &claurst_api::RetryConfig,
     custom_instructions: Option<&str>,
 ) -> Result<String, ClaudeError> {
     // Iterative UPDATE mode: if a prior <compact-summary> already lives in the
@@ -1084,9 +1159,10 @@ async fn generate_summary(
             SUMMARISER_SYSTEM_PROMPT,
             &prompt,
             max_summary_tokens,
+            retry,
         )
-        .await
-        .and_then(|(raw, stop_reason)| validate_summary(&raw, stop_reason, head_tokens));
+        .await?;
+        let outcome = validate_summary(&outcome.0, outcome.1, head_tokens);
         match outcome {
             Ok(summary) => break summary,
             Err(e) if attempt < SUMMARY_ATTEMPTS => {
@@ -1115,7 +1191,7 @@ async fn generate_summary(
 /// The most recent user-authored turns in `head` (oldest first), at most
 /// [`RECENT_USER_TURNS`] within [`RECENT_USER_TURNS_MAX_CHARS`]. Tool results
 /// and earlier compaction summaries are skipped.
-fn recent_user_turns(head: &[Message]) -> Vec<String> {
+fn recent_user_turns(head: &[Message], max_chars: usize) -> Vec<String> {
     let mut turns = Vec::new();
     let mut used = 0;
     for msg in head.iter().rev() {
@@ -1132,7 +1208,7 @@ fn recent_user_turns(head: &[Message]) -> Vec<String> {
         {
             continue;
         }
-        if used + text.len() > RECENT_USER_TURNS_MAX_CHARS {
+        if used + text.len() > max_chars {
             break;
         }
         used += text.len();
@@ -1149,8 +1225,8 @@ fn recent_user_turns(head: &[Message]) -> Vec<String> {
 /// The summary is wrapped in <compact-summary> tags by the callers so the NEXT
 /// compaction can detect it (via extract_previous_summary) and fold it forward
 /// in UPDATE mode.
-fn summary_message(mut body: String, head: &[Message]) -> Message {
-    let recent = recent_user_turns(head);
+fn summary_message(mut body: String, head: &[Message], recent_chars: usize) -> Message {
+    let recent = recent_user_turns(head, recent_chars);
     if !recent.is_empty() {
         body.push_str(
             "\n\n<recent-user-messages>\nThe user's most recent messages from that portion, verbatim:",
@@ -1191,8 +1267,20 @@ async fn summarise_head(
         return Ok(messages.to_vec());
     }
     let head = &messages[..split_at];
-    let summary = generate_summary(provider, model, head, max_summary_tokens, None).await?;
-    let mut new_messages = vec![summary_message(summarised_notice(&summary, head), head)];
+    let summary = generate_summary(
+        provider,
+        model,
+        head,
+        max_summary_tokens,
+        &claurst_api::RetryConfig::default(),
+        None,
+    )
+    .await?;
+    let mut new_messages = vec![summary_message(
+        summarised_notice(&summary, head),
+        head,
+        RECENT_USER_TURNS_MAX_CHARS,
+    )];
     new_messages.extend_from_slice(&messages[split_at..]);
     Ok(new_messages)
 }
@@ -1276,13 +1364,42 @@ pub async fn compact_conversation(
     max_summary_tokens: u32,
     custom_instructions: Option<&str>,
 ) -> Result<Option<Compaction>, ClaudeError> {
+    compact_conversation_for_window(
+        provider,
+        model,
+        messages,
+        trigger,
+        max_summary_tokens,
+        context_window_for_model(model),
+        &claurst_api::RetryConfig::default(),
+        custom_instructions,
+    )
+    .await
+}
+
+/// Compact with the registry-resolved window and the caller's retry policy.
+pub(crate) async fn compact_conversation_for_window(
+    provider: &dyn LlmProvider,
+    model: &str,
+    messages: &[Message],
+    trigger: CompactionTrigger,
+    max_summary_tokens: u32,
+    context_window: u64,
+    retry: &claurst_api::RetryConfig,
+    custom_instructions: Option<&str>,
+) -> Result<Option<Compaction>, ClaudeError> {
+    let keep_recent_tokens = KEEP_RECENT_TOKENS.min((context_window / 4).max(1));
+    let max_summary_tokens =
+        max_summary_tokens.min((context_window / 8).clamp(1, u64::from(MAX_SUMMARY_TOKENS)) as u32);
+    let recent_chars =
+        RECENT_USER_TURNS_MAX_CHARS.min((context_window / 16).saturating_mul(3) as usize);
     let total = messages.len();
-    let split_at = compute_keep_split_index(messages, KEEP_RECENT_TOKENS);
+    let split_at = compute_keep_split_index(messages, keep_recent_tokens);
 
     if split_at == 0 {
         debug!(
             total,
-            keep_recent_tokens = KEEP_RECENT_TOKENS,
+            keep_recent_tokens,
             "Whole conversation fits the keep-recent budget – keeping everything"
         );
         return Ok(None);
@@ -1291,20 +1408,26 @@ pub async fn compact_conversation(
     info!(
         total,
         split_at,
-        keep_recent_tokens = KEEP_RECENT_TOKENS,
+        keep_recent_tokens,
         ?trigger,
         "Compacting conversation (token-budget keep)"
     );
 
     let head = &messages[..split_at];
-    let (notice, summarised) =
-        match generate_summary(provider, model, head, max_summary_tokens, custom_instructions)
-            .await
-        {
-            Ok(summary) => (summarised_notice(&summary, head), true),
-            Err(e) if trigger == CompactionTrigger::Overflow => {
-                warn!(error = %e, "Summariser failed after a context-window error; keeping only the recent tail");
-                let mut notice = format!(
+    let (notice, summarised) = match generate_summary(
+        provider,
+        model,
+        head,
+        max_summary_tokens,
+        retry,
+        custom_instructions,
+    )
+    .await
+    {
+        Ok(summary) => (summarised_notice(&summary, head), true),
+        Err(e) if trigger == CompactionTrigger::Overflow => {
+            warn!(error = %e, "Summariser failed after a context-window error; keeping only the recent tail");
+            let mut notice = format!(
                     "This session is being continued from a previous conversation that ran out of context. \
                      The earlier portion of the conversation (originally {} messages, ~{} tokens) could not \
                      be summarised and was dropped.",
@@ -1322,7 +1445,7 @@ pub async fn compact_conversation(
             Err(e) => return Err(e),
         };
 
-    let summary = summary_message(notice, head);
+    let summary = summary_message(notice, head, recent_chars);
     let summary_uuid = summary.uuid.clone().unwrap_or_default();
     let mut new_messages = Vec::with_capacity(1 + total - split_at);
     new_messages.push(summary);
@@ -1359,13 +1482,17 @@ pub async fn auto_compact_if_needed(
     context_window: u64,
     max_output_tokens: u32,
     state: &mut AutoCompactState,
+    trigger_fraction: f32,
+    retry: &claurst_api::RetryConfig,
 ) -> Option<Compaction> {
-    if !should_auto_compact_for_window(
-        input_tokens,
-        context_window,
-        u64::from(max_output_tokens),
-        state,
-    ) {
+    if state.disabled
+        || input_tokens
+            < auto_compact_threshold_with_fraction(
+                context_window,
+                u64::from(max_output_tokens),
+                trigger_fraction,
+            )
+    {
         return None;
     }
 
@@ -1376,12 +1503,14 @@ pub async fn auto_compact_if_needed(
         "Auto-compact triggered"
     );
 
-    match compact_conversation(
+    match compact_conversation_for_window(
         provider,
         model,
         messages,
         CompactionTrigger::Threshold,
         summary_token_budget(max_output_tokens),
+        context_window,
+        retry,
         None,
     )
     .await
@@ -1699,6 +1828,7 @@ pub async fn context_collapse(
          summary as instructed. Plain text only.",
         &collapse_prompt,
         1_000,
+        &claurst_api::RetryConfig::default(),
     )
     .await?;
 
@@ -2470,6 +2600,8 @@ mod tests {
         id: claurst_core::provider_id::ProviderId,
         replies: std::sync::Mutex<std::collections::VecDeque<Reply>>,
         calls: std::sync::atomic::AtomicUsize,
+        failure: Option<claurst_api::ProviderError>,
+        requests: std::sync::Mutex<Vec<(u32, std::time::Instant)>>,
     }
 
     impl ScriptedSummariser {
@@ -2478,6 +2610,8 @@ mod tests {
                 id: claurst_core::provider_id::ProviderId::new("openai"),
                 replies: std::sync::Mutex::new(replies.into()),
                 calls: std::sync::atomic::AtomicUsize::new(0),
+                failure: None,
+                requests: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -2511,10 +2645,20 @@ mod tests {
             >,
             claurst_api::ProviderError,
         > {
-            assert!(request.tools.is_empty(), "the summariser must not offer tools");
+            assert!(
+                request.tools.is_empty(),
+                "the summariser must not offer tools"
+            );
+            self.requests
+                .lock()
+                .unwrap()
+                .push((request.max_tokens, std::time::Instant::now()));
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let reply = self.replies.lock().unwrap().pop_front().flatten();
             let Some((text, stop)) = reply else {
+                if let Some(error) = &self.failure {
+                    return Err(error.clone());
+                }
                 return Err(claurst_api::ProviderError::ServerError {
                     provider: self.id.clone(),
                     status: Some(500),
@@ -2696,5 +2840,92 @@ mod tests {
             .unwrap();
         assert!(out.is_none());
         assert_eq!(provider.calls(), 0);
+    }
+    #[tokio::test]
+    async fn small_windows_bound_the_tail_summary_and_verbatim_turns() {
+        for window in [8_192, 16_384, 32_768] {
+            let provider = ScriptedSummariser::new(vec![GOOD]);
+            let history = plain_convo(15, 3_000);
+            let retry = claurst_api::RetryConfig::with_max_retries(Some(0));
+            let result = compact_conversation_for_window(
+                &provider,
+                "small-local",
+                &history,
+                CompactionTrigger::Threshold,
+                MAX_SUMMARY_TOKENS,
+                window,
+                &retry,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let requests = provider.requests.lock().unwrap();
+            assert!(u64::from(requests[0].0) <= window / 8);
+            assert!(result.record.tokens_after < auto_compact_threshold(window, 1_000));
+            assert!(result.record.tokens_after < result.record.tokens_before);
+            assert_eq!(
+                result.messages.last().unwrap().get_all_text(),
+                history.last().unwrap().get_all_text()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn summary_retry_policy_honors_auth_disabled_retries_and_retry_after() {
+        let pid = claurst_core::provider_id::ProviderId::new("openai");
+        for error in [
+            claurst_api::ProviderError::AuthFailed {
+                provider: pid.clone(),
+                message: "invalid key".into(),
+            },
+            claurst_api::ProviderError::QuotaExceeded {
+                provider: pid.clone(),
+                message: "quota".into(),
+            },
+            claurst_api::ProviderError::InvalidRequest {
+                provider: pid.clone(),
+                message: "schema".into(),
+            },
+        ] {
+            let mut provider = ScriptedSummariser::new(vec![None, GOOD]);
+            provider.failure = Some(error);
+            assert!(compact(&provider, CompactionTrigger::Manual).await.is_err());
+            assert_eq!(
+                provider.calls(),
+                1,
+                "fatal errors must not be repeated by validation recovery"
+            );
+        }
+        let provider = ScriptedSummariser::new(vec![None, GOOD]);
+        let retry = claurst_api::RetryConfig::with_max_retries(Some(0));
+        assert!(compact_conversation_for_window(
+            &provider,
+            "test",
+            &turns_history(),
+            CompactionTrigger::Manual,
+            4_000,
+            100_000,
+            &retry,
+            None
+        )
+        .await
+        .is_err());
+        assert_eq!(provider.calls(), 1);
+
+        let mut provider = ScriptedSummariser::new(vec![None, GOOD]);
+        provider.failure = Some(claurst_api::ProviderError::RateLimited {
+            provider: pid,
+            retry_after: Some(std::time::Duration::from_millis(40)),
+        });
+        assert!(compact(&provider, CompactionTrigger::Manual)
+            .await
+            .unwrap()
+            .is_some());
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1].1.duration_since(requests[0].1) >= std::time::Duration::from_millis(40)
+        );
     }
 }

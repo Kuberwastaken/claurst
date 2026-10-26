@@ -21,6 +21,7 @@ use crate::provider_error::ProviderError;
 /// 29+ context-overflow patterns that appear across all major providers.
 static OVERFLOW_PATTERNS: &[&str] = &[
     "prompt is too long",
+    "input length and max_tokens exceed context limit",
     "input is too long for requested model",
     "expected maxlength:",
     "exceeds the context window",
@@ -58,18 +59,25 @@ static OVERFLOW_PATTERNS: &[&str] = &[
 
 /// Returns `true` if `message` matches any known context-overflow pattern.
 ///
-/// The comparison is case-insensitive.  Patterns are matched as substrings
-/// (not full regexes) for performance — the pattern table is designed so that
-/// simple substring matching is sufficient.
+/// The comparison is case-insensitive. Literal fragments separated by `.*`
+/// must appear in order; no other regular-expression syntax is interpreted.
 pub fn is_context_overflow(message: &str) -> bool {
     let lower = message.to_lowercase();
     // Rate limits ("too many tokens per minute") are transient, not overflow.
     if lower.contains("rate limit") || lower.contains("rate_limit") || lower.contains("per minute") {
         return false;
     }
-    OVERFLOW_PATTERNS
-        .iter()
-        .any(|pattern| lower.contains(&pattern.to_lowercase()))
+    OVERFLOW_PATTERNS.iter().any(|pattern| {
+        let mut remaining = lower.as_str();
+        pattern.split(".*").all(|fragment| {
+            if let Some(index) = remaining.find(fragment) {
+                remaining = &remaining[index + fragment.len()..];
+                true
+            } else {
+                false
+            }
+        })
+    })
 }
 
 /// Convert an HTTP error response into the appropriate [`ProviderError`].
@@ -265,6 +273,30 @@ mod tests {
         assert!(is_context_overflow("This exceeds the context window"));
         assert!(is_context_overflow("Maximum context length exceeded"));
         assert!(!is_context_overflow("something else went wrong"));
+    }
+
+    #[test]
+    fn overflow_patterns_match_fragments_in_order_and_the_anthropic_literal() {
+        for message in [
+            "Input token count 18000 exceeds the maximum 16384",
+            "context length is only 8192 tokens",
+            "input length 9000 exceeds the available context length 8192",
+            "Input length and max_tokens exceed context limit: 18000 > 16384",
+        ] {
+            assert!(is_context_overflow(message), "{message}");
+        }
+        assert!(!is_context_overflow(
+            "exceeded the token count but no context limit"
+        ));
+        assert!(!is_context_overflow(
+            "Rate limit: input token count 18000 exceeds the maximum per minute"
+        ));
+        let error = parse_error_response(
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"input length and max_tokens exceed context limit"}}"#,
+            &ProviderId::new("anthropic"),
+        );
+        assert!(matches!(error, ProviderError::ContextOverflow { .. }));
     }
 
     #[test]

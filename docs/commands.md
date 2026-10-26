@@ -368,6 +368,49 @@ project settings file cannot enable it. Same root/sudo guard as
 
 ---
 
+### ! — shell commands
+
+Enable `config.bangCommands.enabled` in global settings, then submit
+`!command` to execute a shell command directly. The command is not sent to
+the model. Bang commands are disabled in plan mode; project settings cannot
+enable them.
+
+```json
+{"config":{"bangCommands":{"enabled":true,"showInTranscript":true}}}
+```
+
+Each invocation starts a fresh shell (`bash` on Unix, `cmd` on Windows).
+One command runs at a time, with a 60-second deadline. Large output keeps
+bounded head/tail windows (about 100 KiB) and a path to the complete saved
+output. Timeout output is labelled partial. Set `showInTranscript` to
+`false` to hide the command/output annotation.
+
+---
+
+### /poke
+
+Toggle auto-poke. When enabled, Claurst sends a continuation prompt
+automatically when the model stops a turn with incomplete todos. Opt-in:
+auto-poke is OFF by default.
+
+```
+/poke          — toggle auto-poke on/off
+/poke on       — enable auto-poke
+/poke off      — disable auto-poke
+/poke status   — show enabled state, poke budget, and incomplete count
+```
+
+Safety rails:
+- Only fires after a clean `end_turn` stop. Esc-aborted turns, `max_tokens`
+  truncation, and provider refusals never auto-poke.
+- Budget of 48 pokes per session.
+- Stops after 3 consecutive turns with no todo-state change.
+
+Setting persists to `~/.claurst/settings.json` under `"autoPokeEnabled"`
+(default: `false`).
+
+---
+
 ## Configuration & Settings
 
 ### /config

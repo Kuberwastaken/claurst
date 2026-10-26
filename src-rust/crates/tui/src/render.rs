@@ -934,7 +934,8 @@ pub fn render_app(frame: &mut Frame, app: &App) {
             let is_welcome_screen = app.messages.is_empty()
                 && app.streaming_text.is_empty()
                 && app.streaming_thinking.is_empty()
-                && app.tool_use_blocks.is_empty();
+                && app.tool_use_blocks.is_empty()
+                && app.system_annotations.is_empty();
             render_error_modal(
                 frame,
                 size,
@@ -1283,7 +1284,8 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     let transcript_empty = app.messages.is_empty()
         && app.streaming_text.is_empty()
         && app.streaming_thinking.is_empty()
-        && app.tool_use_blocks.is_empty();
+        && app.tool_use_blocks.is_empty()
+        && app.system_annotations.is_empty();
 
     if transcript_empty {
         app.last_msg_area.set(Rect::default());

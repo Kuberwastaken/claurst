@@ -276,6 +276,8 @@ pub struct App {
     /// when the background discovery spawned at startup finishes, via
     /// [`App::set_discovered_slash_commands`]; never contains built-ins.
     pub discovered_slash_commands: Vec<(String, String)>,
+    /// Pending bang command result to display (from a spawned task).
+    pub bang_command_pending: Option<tokio::sync::mpsc::Receiver<(String, String)>>,
     /// Queued request for a real MCP reconnect from the interactive loop.
     pub pending_mcp_reconnect: bool,
     /// Set after an in-session provider connection (e.g. a Claude Pro/Max OAuth
@@ -449,6 +451,17 @@ pub struct App {
     /// next iteration to dequeue and submit the next queued message.
     pub pending_auto_submit: bool,
     parked_session_inputs: std::collections::HashMap<String, steering::ParkedSessionInput>,
+    /// Current session id, kept in sync with `ToolContext::session_id` so
+    /// auto-poke can read the session's persisted todos.
+    pub session_id: String,
+    /// Auto-poke state: how many continuation prompts were sent this session.
+    pub auto_poke_count: u32,
+    /// Consecutive poked turns without any todo-state change. When this
+    /// reaches `NO_PROGRESS_THRESHOLD`, auto-poking stops.
+    pub no_progress_turns: u32,
+    /// Hash of the todo state at the last poke check, for no-progress
+    /// detection.
+    pub last_todo_hash: String,
     /// Connect-a-provider dialog (/connect command).
     pub connect_dialog: DialogSelectState,
     /// Import-config source picker (/import-config command).
@@ -759,6 +772,7 @@ impl App {
             remote_session_url: None,
             mcp_manager: None,
             discovered_slash_commands: Vec::new(),
+            bang_command_pending: None,
             pending_mcp_reconnect: false,
             pending_provider_reload: false,
             pending_mcp_panel_auth: None,
@@ -828,6 +842,10 @@ impl App {
             pending_steers: Vec::new(),
             pending_auto_submit: false,
             parked_session_inputs: std::collections::HashMap::new(),
+            session_id: String::new(),
+            auto_poke_count: 0,
+            no_progress_turns: 0,
+            last_todo_hash: String::new(),
             connect_dialog: DialogSelectState::new("Connect a provider", provider_picker_items()),
             import_config_picker: DialogSelectState::new("Import config", import_config_picker_items()),
             import_config_dialog: ImportConfigDialogState::new(),

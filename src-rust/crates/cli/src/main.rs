@@ -15,6 +15,7 @@
 mod codex_oauth_flow;
 mod headless;
 mod oauth_flow;
+mod prompt_dispatch;
 mod session_resume;
 mod upgrade;
 
@@ -721,6 +722,32 @@ async fn main() -> anyhow::Result<()> {
     ));
     let current_turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
+    // Load plugins and register any plugin-provided MCP servers into the
+    // in-memory config (does not modify the settings file on disk).
+    // Bare mode skips plugin discovery entirely and uses an empty registry so
+    // no plugin commands, hooks, or MCP servers are loaded from an untrusted
+    // repo. Downstream code still works against the empty registry.
+    let plugin_registry = if cli.bare {
+        claurst_plugins::PluginRegistry::new()
+    } else {
+        claurst_plugins::load_plugins(&cwd, &[]).await
+    };
+    let plugin_hook_count = plugin_registry
+        .hook_map()
+        .values()
+        .flatten()
+        .map(|group| group.hooks.len())
+        .sum::<usize>();
+    info!(
+        plugins = plugin_registry.enabled_count(),
+        commands = plugin_registry.all_command_defs().len(),
+        hooks = plugin_hook_count,
+        "Plugins loaded"
+    );
+    config.mcp_servers = plugin_registry.mcp_roster(&config.mcp_servers);
+    claurst_plugins::set_global_hooks(&plugin_registry);
+    claurst_plugins::set_global_registry(plugin_registry);
+
     // Initialize MCP servers first (needed for ToolContext.mcp_manager).
     //
     // SECURITY (issue #123): project-defined MCP servers (from a repo's
@@ -729,7 +756,7 @@ async fn main() -> anyhow::Result<()> {
     // processes. User/global servers are unaffected. The untrusted project
     // servers are surfaced to the TUI for an approval prompt, or skipped (with
     // a notice) in headless mode unless trust was granted.
-    let mut mcp_project_root = claurst_core::mcp_trust::project_root_for(&cwd);
+    let mcp_project_root = project_mcp_root(&cwd, None, &config.mcp_servers);
     let mcp_decision = {
         let store = claurst_core::mcp_trust::McpTrustStore::load();
         claurst_core::mcp_trust::partition_mcp_servers(
@@ -741,7 +768,7 @@ async fn main() -> anyhow::Result<()> {
             &settings.disabled_mcp_servers,
         )
     };
-    let mut pending_project_mcp = mcp_decision.pending.clone();
+    let pending_project_mcp = mcp_decision.pending.clone();
     if !pending_project_mcp.is_empty() {
         let names: Vec<&str> = pending_project_mcp.iter().map(|s| s.name.as_str()).collect();
         if is_headless {
@@ -858,82 +885,6 @@ async fn main() -> anyhow::Result<()> {
     // (AgentTool lives in cc-query to avoid a circular cc-tools ↔ cc-query dependency).
     // Wrap in Arc so the list can be shared by the main loop AND the cron scheduler.
     let tools = build_tools_with_mcp(mcp_manager_arc.clone());
-
-    // Load plugins and register any plugin-provided MCP servers into the
-    // in-memory config (does not modify the settings file on disk).
-    // Bare mode skips plugin discovery entirely and uses an empty registry so
-    // no plugin commands, hooks, or MCP servers are loaded from an untrusted
-    // repo. Downstream code still works against the empty registry.
-    let plugin_registry = if cli.bare {
-        claurst_plugins::PluginRegistry::new()
-    } else {
-        claurst_plugins::load_plugins(&cwd, &[]).await
-    };
-    {
-        let plugin_cmd_count = plugin_registry.all_command_defs().len();
-        let plugin_hook_count = plugin_registry
-            .hook_map()
-            .values()
-            .flatten()
-            .map(|group| group.hooks.len())
-            .sum::<usize>();
-        info!(
-            plugins = plugin_registry.enabled_count(),
-            commands = plugin_cmd_count,
-            hooks = plugin_hook_count,
-            "Plugins loaded"
-        );
-
-        // Register plugin MCP servers into the in-memory config so they are
-        // picked up by any subsequent MCP manager construction.
-        let existing_names: std::collections::HashSet<String> = config
-            .mcp_servers
-            .iter()
-            .map(|s| s.name.clone())
-            .collect();
-        let mut plugin_servers = Vec::new();
-        for mcp_server in plugin_registry.all_mcp_servers() {
-            if !existing_names.contains(&mcp_server.name) {
-                plugin_servers.push(mcp_server.clone());
-                config.mcp_servers.push(mcp_server);
-            }
-        }
-
-        // SECURITY (#493): servers from a project's `.claurst/plugins/` are
-        // project-origin. The manager above started before plugins loaded, so
-        // they would only launch on the next MCP-runtime rebuild, which re-runs
-        // the trust gate; queue the unapproved ones for the TUI approval prompt
-        // here, like servers from a project's settings file.
-        let plugin_pending = pending_project_plugin_mcp(
-            &plugin_servers,
-            &mut mcp_project_root,
-            &cwd,
-            settings.trust_project_mcp_servers,
-            &claurst_core::mcp_trust::McpTrustStore::load(),
-            &settings.disabled_mcp_servers,
-        );
-        if !plugin_pending.is_empty() {
-            let names: Vec<&str> = plugin_pending.iter().map(|s| s.name.as_str()).collect();
-            if is_headless {
-                warn!(
-                    servers = ?names,
-                    "Skipping MCP server(s) from project plugins pending approval. \
-                     Approve them in the interactive TUI, or pass --trust-project-mcp \
-                     (or set trustProjectMcpServers) to launch them in headless mode."
-                );
-            } else {
-                info!(
-                    servers = ?names,
-                    "MCP server(s) from project plugins require approval before launching."
-                );
-            }
-        }
-        pending_project_mcp.extend(plugin_pending);
-    }
-    // Plugin hooks run through the core hook engine after settings hooks
-    // (#447); the registry is then shared with commands and tools.
-    claurst_plugins::set_global_hooks(&plugin_registry);
-    claurst_plugins::set_global_registry(plugin_registry);
 
     // Build model registry for dynamic model/provider resolution.
     // The registry is pre-populated with a hardcoded snapshot and enriched
@@ -1109,38 +1060,52 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
-/// Gate the MCP servers that plugins contributed (#493) and return the
-/// project-origin ones still pending approval, for the TUI approval prompt.
-///
-/// The startup gate ran before plugins loaded, so these servers were never
-/// queued; the MCP-runtime rebuild re-runs the gate before launching them. A
-/// repo with project plugins but no `.claurst/settings.json` has no root from
-/// `project_root_for`, so approvals are keyed by `cwd`, the directory the
-/// project plugins were loaded from.
-fn pending_project_plugin_mcp(
-    plugin_servers: &[claurst_core::config::McpServerConfig],
-    mcp_project_root: &mut Option<PathBuf>,
+/// Plugin-only projects have no settings-derived root; use their cwd for
+/// persistent approvals while preserving an existing settings-derived root.
+fn project_mcp_root(
     cwd: &std::path::Path,
-    trust_all_project: bool,
-    store: &claurst_core::mcp_trust::McpTrustStore,
-    disabled: &std::collections::HashSet<String>,
-) -> Vec<claurst_core::config::McpServerConfig> {
-    if !plugin_servers
+    existing: Option<PathBuf>,
+    servers: &[claurst_core::config::McpServerConfig],
+) -> Option<PathBuf> {
+    existing
+        .or_else(|| claurst_core::mcp_trust::project_root_for(cwd))
+        .or_else(|| {
+            servers
+                .iter()
+                .any(|server| server.origin == claurst_core::config::McpServerOrigin::Project)
+                .then(|| cwd.to_path_buf())
+        })
+}
+
+/// Queue new project launch identities, retain still-pending prompts, and
+/// avoid asking again for identities declined earlier in the session.
+fn refresh_mcp_approval_queue(
+    decision: &claurst_core::mcp_trust::McpGateDecision,
+    seen: &mut std::collections::HashSet<String>,
+    pending: &mut std::collections::VecDeque<claurst_core::config::McpServerConfig>,
+) {
+    let current: std::collections::HashSet<String> = decision
+        .allowed
         .iter()
-        .any(|s| s.origin == claurst_core::config::McpServerOrigin::Project)
-    {
-        return Vec::new();
-    }
-    let root = mcp_project_root.get_or_insert_with(|| cwd.to_path_buf());
-    claurst_core::mcp_trust::partition_mcp_servers(
-        plugin_servers,
-        Some(root.as_path()),
-        trust_all_project,
-        &std::collections::HashSet::new(),
-        store,
-        disabled,
-    )
-    .pending
+        .chain(&decision.pending)
+        .filter(|s| s.origin == claurst_core::config::McpServerOrigin::Project)
+        .map(claurst_core::mcp_trust::server_fingerprint)
+        .collect();
+    let pending_identities: std::collections::HashSet<String> = decision
+        .pending
+        .iter()
+        .map(claurst_core::mcp_trust::server_fingerprint)
+        .collect();
+    pending
+        .retain(|s| pending_identities.contains(&claurst_core::mcp_trust::server_fingerprint(s)));
+    pending.extend(
+        decision
+            .pending
+            .iter()
+            .filter(|s| !seen.contains(&claurst_core::mcp_trust::server_fingerprint(s)))
+            .cloned(),
+    );
+    *seen = current;
 }
 
 fn start_mcp_manager(
@@ -2221,6 +2186,9 @@ async fn run_interactive(
     // OAuth session must report zero cost (issue #499).
     app.anthropic_bearer_auth = anthropic_bearer_auth;
     app.sync_cost_pricing();
+    // Sync the session id at startup so auto-poke reads this session's
+    // todos from the first turn on, not only after /new or a resume.
+    app.session_id = tool_ctx.session_id.clone();
     app.disabled_mcp_servers = settings.disabled_mcp_servers.clone();
     // Startup skill discovery runs on the blocking pool so a cold
     // `skills.urls` clone never holds the terminal. When it finishes, the
@@ -2272,6 +2240,16 @@ async fn run_interactive(
     // Seed the project-MCP approval queue: untrusted project servers that the
     // user must approve before they are allowed to launch (issue #123).
     app.mcp_project_root = mcp_project_root;
+    let mut mcp_seen_roster: std::collections::HashSet<String> = app
+        .config
+        .mcp_servers
+        .iter()
+        .filter(|s| {
+            s.origin == claurst_core::config::McpServerOrigin::Project
+                && !settings.disabled_mcp_servers.contains(&s.name)
+        })
+        .map(claurst_core::mcp_trust::server_fingerprint)
+        .collect();
     app.mcp_pending_project = pending_project_mcp.into_iter().collect();
     if let Some(warning) = resume_warning {
         app.status_message = Some(warning);
@@ -2599,8 +2577,8 @@ async fn run_interactive(
             last_auto_scroll = app.auto_scroll;
         }
 
-        // Load/drain the session browser and welcome-screen session lists
-        // (this loop does not go through `App::run`; issue #382).
+        // Load/drain the session browser and welcome-screen session lists,
+        // plus bang-command and voice events (issue #382).
         app.poll_session_loads();
 
         // Draw the UI
@@ -2633,6 +2611,8 @@ async fn run_interactive(
         // Poll for crossterm events (keyboard/mouse) with short timeout
         // unless an auto-submit (queued message) is pending — in which case
         // synthesize an Enter event to dequeue and submit it.
+        let automatic_submission = app.pending_key.is_none()
+            && app.pending_auto_submit && !app.is_streaming;
         let synthetic_event: Option<Event> = if let Some(k) = app.pending_key.take() {
             // A non-character key swallowed by the paste-burst drain — replay
             // it so the keystroke that ended a raw-key paste is not lost.
@@ -2733,6 +2713,9 @@ async fn run_interactive(
                         // model, so they wait for the turn to end (issue #149).
                         // Both show in the queued-prompt dock until delivered.
                         let input = app.take_input();
+                        if prompt_dispatch::try_bang(&mut app, &input) {
+                            continue;
+                        }
                         if input.starts_with('/') {
                             app.queued_messages.push_back(input);
                         } else if !input.is_empty() {
@@ -2769,6 +2752,11 @@ async fn run_interactive(
                         if input.is_empty() {
                             continue;
                         }
+                        if prompt_dispatch::try_bang(&mut app, &input) {
+                            continue;
+                        }
+
+                        app.record_prompt_submission(&input, automatic_submission);
 
                         // Check for slash command
                         if input.starts_with('/') {
@@ -3056,6 +3044,10 @@ async fn run_interactive(
                                             }
                                         }
                                     }
+                                }
+                                Some(CommandResult::ReloadMcpRoster(summary)) => {
+                                    app.pending_mcp_reconnect = true;
+                                    app.status_message = Some(summary);
                                 }
                                 Some(CommandResult::McpAuthFlow {
                                     server_name,
@@ -4860,6 +4852,35 @@ async fn run_interactive(
         }
 
         if !app.is_streaming && current_query.is_none() && app.take_pending_mcp_reconnect() {
+            // Re-read hierarchical settings so import retains project servers,
+            // then overlay the freshly published plugin snapshot. A read error
+            // preserves the current roster instead of silently dropping it.
+            match Settings::load_hierarchical(&cmd_ctx.working_dir).await {
+                Ok(mut refreshed) => {
+                    refreshed.trust_project_mcp_servers |= settings.trust_project_mcp_servers;
+                    let configured = if claurst_core::feature_gates::is_bare_mode() {
+                        Vec::new()
+                    } else {
+                        refreshed.effective_config().mcp_servers
+                    };
+                    let roster = claurst_plugins::global_plugin_registry().map_or_else(
+                        || configured.clone(),
+                        |registry| registry.mcp_roster(&configured),
+                    );
+                    cmd_ctx.config.mcp_servers = roster.clone();
+                    tool_ctx.config.mcp_servers = roster.clone();
+                    app.config.mcp_servers = roster;
+                    settings = refreshed;
+                }
+                Err(error) => {
+                    warn!(%error, "MCP roster refresh failed; preserving the current roster")
+                }
+            }
+            app.mcp_project_root = project_mcp_root(
+                &cmd_ctx.working_dir,
+                app.mcp_project_root.take(),
+                &cmd_ctx.config.mcp_servers,
+            );
             // Re-apply the project-MCP trust gate on reconnect: only user
             // servers plus project servers approved this session, persisted, or
             // globally trusted are launched (issue #123).
@@ -4872,13 +4893,18 @@ async fn run_interactive(
                 &store,
                 &settings.disabled_mcp_servers,
             );
-            let new_mcp_manager = start_mcp_manager(&decision.allowed);
             // Shut the old manager down before installing the new one so its
             // transports (stdio children, HTTP sessions) are closed and no
             // server runs twice (issue #418 review).
             if let Some(old_manager) = tool_ctx.mcp_manager.clone() {
                 old_manager.shutdown().await;
             }
+            let new_mcp_manager = start_mcp_manager(&decision.allowed);
+            refresh_mcp_approval_queue(
+                &decision,
+                &mut mcp_seen_roster,
+                &mut app.mcp_pending_project,
+            );
             // Log the roster change for post-mortem: which servers the rebuild
             // keeps, which are dropped (disabled by the user, untrusted, or
             // failed to connect — per-server connect errors are logged inside
@@ -5679,6 +5705,49 @@ mod bare_mode_tests {
     use super::*;
 
     #[test]
+    fn roster_refresh_reprompts_changes_but_not_declines_or_disabled_servers() {
+        use claurst_core::config::{McpServerConfig, McpServerOrigin};
+        use claurst_core::mcp_trust::{partition_mcp_servers, McpTrustStore};
+        let mut server: McpServerConfig = serde_json::from_value(serde_json::json!({"name":"repo", "command":"first", "args":[], "env":{}, "server_type":"stdio"})).unwrap();
+        server.origin = McpServerOrigin::Project;
+        let mut seen = std::collections::HashSet::new();
+        let mut pending = std::collections::VecDeque::new();
+        let gate = |server: &McpServerConfig, disabled| {
+            partition_mcp_servers(
+                std::slice::from_ref(server),
+                None,
+                false,
+                &Default::default(),
+                &McpTrustStore::default(),
+                &disabled,
+            )
+        };
+        refresh_mcp_approval_queue(&gate(&server, Default::default()), &mut seen, &mut pending);
+        assert_eq!(pending.len(), 1);
+        pending.clear(); // User declined this identity.
+        refresh_mcp_approval_queue(&gate(&server, Default::default()), &mut seen, &mut pending);
+        assert!(pending.is_empty());
+        server.command = Some("changed".into());
+        refresh_mcp_approval_queue(&gate(&server, Default::default()), &mut seen, &mut pending);
+        assert_eq!(pending.len(), 1);
+        refresh_mcp_approval_queue(
+            &gate(&server, ["repo".into()].into()),
+            &mut seen,
+            &mut pending,
+        );
+        assert!(
+            pending.is_empty(),
+            "disabled servers must leave the approval queue"
+        );
+        refresh_mcp_approval_queue(&gate(&server, Default::default()), &mut seen, &mut pending);
+        assert_eq!(
+            pending.len(),
+            1,
+            "re-enabling an untrusted server must prompt"
+        );
+    }
+
+    #[test]
     fn bare_flag_parses_and_implies_no_claude_md() {
         let cli = Cli::parse_from(["claurst", "--bare"]);
         assert!(cli.bare, "--bare should set cli.bare");
@@ -5720,12 +5789,28 @@ mod bare_mode_tests {
         let cwd = std::env::temp_dir().join("claurst-493-project");
         let mut store = McpTrustStore::default();
 
+        let gate = |servers: &[McpServerConfig],
+                    root: &mut Option<PathBuf>,
+                    cwd: &std::path::Path,
+                    trust_all,
+                    store: &McpTrustStore,
+                    disabled: &std::collections::HashSet<String>| {
+            *root = project_mcp_root(cwd, root.take(), servers);
+            claurst_core::mcp_trust::partition_mcp_servers(
+                servers,
+                root.as_deref(),
+                trust_all,
+                &std::collections::HashSet::new(),
+                store,
+                disabled,
+            )
+            .pending
+        };
         // (a) unapproved project-plugin server is pending; (b) with no
         // settings-derived project root, approvals are keyed by cwd.
         let mut root = None;
         let disabled = std::collections::HashSet::new();
-        let pending =
-            pending_project_plugin_mcp(&servers, &mut root, &cwd, false, &store, &disabled);
+        let pending = gate(&servers, &mut root, &cwd, false, &store, &disabled);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].name, "repo-srv");
         assert_eq!(root.as_deref(), Some(cwd.as_path()));
@@ -5733,27 +5818,20 @@ mod bare_mode_tests {
         // An existing project root is kept.
         let other = std::env::temp_dir().join("claurst-493-settings-root");
         let mut root = Some(other.clone());
-        pending_project_plugin_mcp(&servers, &mut root, &cwd, false, &store, &disabled);
+        gate(&servers, &mut root, &cwd, false, &store, &disabled);
         assert_eq!(root, Some(other));
 
         // (c) nothing pending once approved for cwd, or with global trust.
         store.approve(&cwd, &servers[1]);
         let mut root = None;
-        assert!(
-            pending_project_plugin_mcp(&servers, &mut root, &cwd, false, &store, &disabled)
-                .is_empty()
-        );
+        assert!(gate(&servers, &mut root, &cwd, false, &store, &disabled).is_empty());
         let mut root = None;
         let empty = McpTrustStore::default();
-        assert!(
-            pending_project_plugin_mcp(&servers, &mut root, &cwd, true, &empty, &disabled)
-                .is_empty()
-        );
+        assert!(gate(&servers, &mut root, &cwd, true, &empty, &disabled).is_empty());
 
         // User-only plugin servers leave the root untouched.
         let mut root = None;
-        assert!(pending_project_plugin_mcp(&servers[..1], &mut root, &cwd, false, &empty, &disabled)
-            .is_empty());
+        assert!(gate(&servers[..1], &mut root, &cwd, false, &empty, &disabled).is_empty());
         assert!(root.is_none());
     }
 

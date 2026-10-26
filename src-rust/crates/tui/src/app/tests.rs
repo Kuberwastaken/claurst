@@ -467,6 +467,207 @@ use crate::session_browser::SessionBrowserMode;
         assert!(app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE)));
     }
 
+    /// Build an `App` for auto-poke tests with `auto_poke_enabled` on and a
+    /// known session id. Mounts a tempdir `CLAURST_HOME` via [`SessionHome`]
+    /// so nothing touches real user state. Callers must hold
+    /// [`SESSION_HOME_LOCK`] for the whole test: `CLAURST_HOME` is
+    /// process-global.
+    fn make_poke_app(todos: &[serde_json::Value]) -> (App, SessionHome) {
+        let home = SessionHome::new();
+        let app_dir = home.dir.path().join("todos");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let mut app = make_app();
+        app.config.auto_poke_enabled = true;
+        app.session_id = "poke-test-session".to_string();
+        if !todos.is_empty() {
+            claurst_tools::todo_write::save_todos_in(
+                &app_dir,
+                &app.session_id,
+                todos,
+            );
+        }
+        (app, home)
+    }
+
+    fn todo(id: &str, status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "content": format!("task {}", id),
+            "status": status,
+            "priority": "medium",
+        })
+    }
+
+    #[tokio::test]
+    async fn test_poke_command_toggles_setting() {
+        // `/poke` persists to settings.json, so mount a tempdir home under
+        // the shared env lock — never the real user settings.
+        let _lock = SESSION_HOME_LOCK.lock().await;
+        let _home = SessionHome::new();
+        let mut app = make_app();
+        assert!(!app.config.auto_poke_enabled);
+        assert!(app.intercept_slash_command_with_args("poke", "on"));
+        assert!(app.config.auto_poke_enabled);
+        assert!(app.intercept_slash_command_with_args("poke", "off"));
+        assert!(!app.config.auto_poke_enabled);
+        // No-arg toggle flips.
+        assert!(app.intercept_slash_command_with_args("poke", ""));
+        assert!(app.config.auto_poke_enabled);
+    }
+
+    #[tokio::test]
+    async fn test_check_auto_poke_disabled_does_not_queue() {
+        let _lock = SESSION_HOME_LOCK.lock().await;
+        let (mut app, _home) = make_poke_app(&[todo("1", "pending")]);
+        app.config.auto_poke_enabled = false;
+        app.check_auto_poke("end_turn");
+        assert!(app.queued_messages.is_empty());
+        assert!(!app.pending_auto_submit);
+    }
+
+    #[tokio::test]
+    async fn test_check_auto_poke_end_turn_with_incomplete_todos_queues() {
+        let _lock = SESSION_HOME_LOCK.lock().await;
+        let (mut app, _home) = make_poke_app(&[todo("1", "pending")]);
+        app.check_auto_poke("end_turn");
+        assert_eq!(app.queued_messages.len(), 1);
+        assert!(app.pending_auto_submit);
+        assert_eq!(app.auto_poke_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_check_auto_poke_ignores_abort_and_max_tokens() {
+        let _lock = SESSION_HOME_LOCK.lock().await;
+        let (mut app, _home) = make_poke_app(&[todo("1", "pending")]);
+        // Esc abort, cancellation, truncation, refusal: never poke.
+        for reason in ["abort", "cancelled", "max_tokens", "content_filtered"] {
+            app.check_auto_poke(reason);
+            assert!(app.queued_messages.is_empty(), "poked on {}", reason);
+        }
+        assert_eq!(app.auto_poke_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_check_auto_poke_all_complete_does_not_queue() {
+        let _lock = SESSION_HOME_LOCK.lock().await;
+        let (mut app, _home) =
+            make_poke_app(&[todo("1", "completed"), todo("2", "completed")]);
+        app.check_auto_poke("end_turn");
+        assert!(app.queued_messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_check_auto_poke_budget_exhausted_stops() {
+        let _lock = SESSION_HOME_LOCK.lock().await;
+        let (mut app, _home) = make_poke_app(&[todo("1", "pending")]);
+        app.auto_poke_count = claurst_tools::todo_write::MAX_AUTO_POKES;
+        app.check_auto_poke("end_turn");
+        assert!(app.queued_messages.is_empty());
+        assert!(app.status_message.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_check_auto_poke_no_progress_stops() {
+        let _lock = SESSION_HOME_LOCK.lock().await;
+        let (mut app, _home) = make_poke_app(&[todo("1", "pending")]);
+        // First poke records the hash.
+        app.check_auto_poke("end_turn");
+        assert_eq!(app.auto_poke_count, 1);
+        // Simulate two more no-progress turns (todo state unchanged). The
+        // main loop submits each queued poke before the next turn completes,
+        // so drain the queue between checks like it would. The first call
+        // records the hash; calls 2 and 3 increment the no-progress counter
+        // to 1 and 2 and still poke.
+        for _ in 0..2 {
+            let queued = app.queued_messages.pop_front().unwrap();
+            app.record_prompt_submission(&queued, true);
+            app.check_auto_poke("end_turn");
+        }
+        assert_eq!(app.auto_poke_count, 3);
+        assert_eq!(app.no_progress_turns, claurst_tools::todo_write::NO_PROGRESS_THRESHOLD - 1);
+        // Fourth check reaches the threshold and stops without queueing.
+        let queued = app.queued_messages.pop_front().unwrap();
+        app.record_prompt_submission(&queued, true);
+        app.check_auto_poke("end_turn");
+        assert_eq!(app.auto_poke_count, 3);
+        assert!(app.status_message.is_some());
+    }
+
+    #[tokio::test]
+    async fn poke_settings_load_failure_keeps_existing_bytes_and_live_config() {
+        let _lock = SESSION_HOME_LOCK.lock().await;
+        let _home = SessionHome::new();
+        let path = claurst_core::Settings::config_dir().join("settings.json");
+        std::fs::write(&path, b"{invalid existing settings").unwrap();
+        let mut app = make_app();
+        app.handle_poke_command("on");
+        assert!(!app.config.auto_poke_enabled);
+        assert!(app.status_message.as_deref().is_some_and(|s| s.contains("unchanged")));
+        assert_eq!(std::fs::read(&path).unwrap(), b"{invalid existing settings");
+        app.handle_poke_command("status");
+        assert!(app.status_message.as_deref().is_some_and(|s| s.contains("Auto-poke: OFF")));
+        app.no_progress_turns = 2;
+        app.record_prompt_submission("new work", false);
+        assert_eq!(app.no_progress_turns, 0);
+    }
+
+    #[tokio::test]
+    async fn test_reset_auto_poke_state_clears_counters() {
+        let _lock = SESSION_HOME_LOCK.lock().await;
+        let (mut app, _home) = make_poke_app(&[todo("1", "pending")]);
+        // Burn through part of the budget so there is non-zero state to
+        // clear. The main loop submits each queued poke before the next turn
+        // completes, so drain the queue between checks like it would.
+        app.check_auto_poke("end_turn");
+        app.queued_messages.pop_front();
+        app.check_auto_poke("end_turn");
+        assert_eq!(app.auto_poke_count, 2);
+        assert!(!app.last_todo_hash.is_empty());
+        app.reset_auto_poke_state();
+        assert_eq!(app.auto_poke_count, 0);
+        assert_eq!(app.no_progress_turns, 0);
+        assert!(app.last_todo_hash.is_empty());
+        // After a reset the budget is available again.
+        app.queued_messages.clear();
+        app.check_auto_poke("end_turn");
+        assert_eq!(app.auto_poke_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_check_auto_poke_no_duplicate_while_queued() {
+        let _lock = SESSION_HOME_LOCK.lock().await;
+        let (mut app, _home) = make_poke_app(&[todo("1", "pending")]);
+        // A poke already sits in the queue (not yet submitted): a second
+        // TurnComplete must not stack another one on top.
+        app.queued_messages
+            .push_back(claurst_tools::todo_write::build_auto_poke_message(1));
+        app.check_auto_poke("end_turn");
+        assert_eq!(app.queued_messages.len(), 1);
+        assert_eq!(app.auto_poke_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_check_auto_poke_silent_while_goal_active() {
+        let _lock = SESSION_HOME_LOCK.lock().await;
+        let (app, _home) = make_poke_app(&[todo("1", "pending")]);
+        // No active goal in the store -> the goal guard must not block a poke.
+        assert!(!app.goal_active());
+        let mut app = app;
+        app.check_auto_poke("end_turn");
+        assert_eq!(app.queued_messages.len(), 1);
+        // With an active goal recorded for this session the poke is skipped.
+        let store = claurst_core::GoalStore::open_default()
+            .expect("goal store must open under the tempdir CLAURST_HOME");
+        store
+            .set_goal(&app.session_id, "finish everything", None)
+            .unwrap();
+        assert!(app.goal_active());
+        app.queued_messages.clear();
+        app.check_auto_poke("end_turn");
+        assert!(app.queued_messages.is_empty());
+        assert_eq!(app.auto_poke_count, 1); // unchanged by the blocked poke
+    }
+
     #[test]
     fn test_cc_statusline_slash_command() {
         let mut app = make_app();

@@ -70,22 +70,25 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
-// Global plugin registry (set once at startup, read by commands / tools)
+// Global plugin registry (replaceable snapshots for commands / tools)
 // ---------------------------------------------------------------------------
 
-static GLOBAL_PLUGIN_REGISTRY: OnceLock<PluginRegistry> = OnceLock::new();
+static GLOBAL_PLUGIN_REGISTRY: OnceLock<std::sync::RwLock<Option<std::sync::Arc<PluginRegistry>>>> =
+    OnceLock::new();
 
-/// Store the fully-loaded `PluginRegistry` into a process-global static so
-/// that slash commands and tools can query it without carrying the registry
-/// through every call frame.
+/// Publish a complete registry snapshot. Existing readers keep their snapshot
+/// while reloads atomically replace the registry for subsequent commands.
 pub fn set_global_registry(registry: PluginRegistry) {
-    // OnceLock::set fails silently if already initialised (e.g. during tests).
-    let _ = GLOBAL_PLUGIN_REGISTRY.set(registry);
+    let slot = GLOBAL_PLUGIN_REGISTRY.get_or_init(|| std::sync::RwLock::new(None));
+    *slot.write().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(registry));
 }
 
-/// Access the global `PluginRegistry`, if it has been set.
-pub fn global_plugin_registry() -> Option<&'static PluginRegistry> {
-    GLOBAL_PLUGIN_REGISTRY.get()
+pub fn global_plugin_registry() -> Option<std::sync::Arc<PluginRegistry>> {
+    GLOBAL_PLUGIN_REGISTRY
+        .get()?
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// Register the hooks of `registry`'s enabled plugins with the core hook
@@ -125,6 +128,9 @@ pub async fn load_plugins(
     extra_paths: &[std::path::PathBuf],
 ) -> PluginRegistry {
     let mut registry = PluginRegistry::new();
+    if claurst_core::feature_gates::is_bare_mode() {
+        return registry;
+    }
 
     // User plugins.
     let user_dir = default_user_plugins_dir();
@@ -150,6 +156,15 @@ pub async fn load_plugins(
         registry.extend(plugins, errors);
     }
 
+    // Only global settings control plugin enablement. A repository cannot
+    // re-enable a plugin the user disabled.
+    let settings = claurst_core::config::Settings::load_sync().unwrap_or_default();
+    for name in &settings.enabled_plugins {
+        registry.enable(name);
+    }
+    for name in &settings.disabled_plugins {
+        registry.disable(name);
+    }
     registry
 }
 

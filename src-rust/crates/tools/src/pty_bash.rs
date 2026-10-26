@@ -87,6 +87,30 @@ fn default_timeout() -> u64 {
     120_000
 }
 
+/// Execute a shell command explicitly submitted by the user (for example
+/// `!command`). The caller owns opt-in/plan-mode checks; model-issued calls
+/// must continue through `PtyBashTool` and its permission gates.
+/// Uses the same bounded capture, spill files, deadline and owned-process
+/// cleanup as the Bash tool, with fresh shell state for each invocation.
+pub async fn run_user_shell(
+    command: &str,
+    working_dir: &Path,
+    timeout: Duration,
+    spill_dir: &Path,
+) -> ToolResult {
+    let cwd = working_dir.to_path_buf();
+    let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    #[cfg(unix)]
+    {
+        let state = parking_lot::Mutex::new(ShellState::new());
+        run_pty_foreground(command, &state, &cwd, timeout, timeout_ms, spill_dir).await
+    }
+    #[cfg(windows)]
+    {
+        run_windows_fallback(command, &cwd, timeout, timeout_ms, spill_dir).await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shell state helpers — Unix only (used by the PTY wrapper script)
 // ---------------------------------------------------------------------------
@@ -2040,6 +2064,42 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn user_shell_deadline_kills_descendants_and_keeps_partial_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("user-shell-child.pid");
+        let command = format!(
+            "sleep 30 & child=$!; printf '%s' \"$child\" > '{}'; echo before-deadline; wait \"$child\"",
+            pid_file.display()
+        );
+        // Allow shell startup under parallel test/build load; the sleeping child
+        // must still be terminated well before its natural 30-second exit.
+        let result = tokio::time::timeout(Duration::from_secs(5), run_user_shell(
+            &command, dir.path(), Duration::from_millis(1500), dir.path(),
+        )).await.expect("explicit user shell must respect its deadline");
+        assert!(result.is_error);
+        assert!(result.content.contains("timed out"), "{}", result.content);
+        assert!(result.content.contains("before-deadline"), "{}", result.content);
+        let pid: u32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
+        assert_process_stopped(pid).await;
+    }
+
+    #[tokio::test]
+    async fn user_shell_drains_past_display_cap_without_sigpipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = run_user_shell(
+            "awk 'BEGIN { for (i=0; i<600000; i++) print \"y\" }'; printf end-marker",
+            dir.path(), Duration::from_secs(10), dir.path(),
+        ).await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("omitted"), "display must be bounded");
+        assert!(result.content.contains("end-marker"));
+        let (_, path) = result.content.rsplit_once("Full output: ").unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        assert!(bytes.ends_with(b"end-marker"));
+        assert!(bytes.len() >= 1_200_000);
+    }
+
     /// #465: a timed-out foreground command surfaces what it printed before
     /// the timeout instead of swallowing it, and must not fold a half-finished
     /// run's state block into the session's shell state.
@@ -2144,7 +2204,7 @@ mod tests {
         let spill_dir = tempfile::tempdir().unwrap();
         let pid_file = spill_dir.path().join("child.pid");
         let command = format!(
-            "yes | head -c 1200000; sleep 30 & child=$!; printf '%s' \"$child\" > '{}'; wait \"$child\"",
+            "awk 'BEGIN {{ for (i=0; i<600000; i++) print \"y\" }}'; sleep 30 & child=$!; printf '%s' \"$child\" > '{}'; wait \"$child\"",
             pid_file.display()
         );
         let started = run_in_background(
@@ -2195,7 +2255,7 @@ mod tests {
         assert!(
             spilled.ends_with(b"y\n"),
             "lossy tail: {:?}",
-            &spilled[..spilled.len().min(16)]
+            &spilled[spilled.len().saturating_sub(80)..]
         );
         let pid: u32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
         assert_process_stopped(pid).await;
@@ -2436,7 +2496,7 @@ mod tests {
         let started = run_in_background(
             "printf short; { sleep 10 & }; wait".to_string(),
             std::env::temp_dir(),
-            500,
+            1500,
             spill_dir.path(),
             None,
             None,
@@ -2458,7 +2518,11 @@ mod tests {
         })
         .await
         .expect("timeout must finish after the drain grace");
-        assert!(task.output_is_partial);
+        assert!(
+            matches!(&task.status, claurst_core::tasks::TaskStatus::Failed(reason) if reason.contains("timed out")),
+            "unexpected terminal state: {:?}; output: {}", task.status, task.render_output()
+        );
+        assert!(task.output_is_partial, "timeout did not capture fixture output: {}", task.render_output());
         assert!(task.render_output().contains("Partial output:"));
         let path = task
             .output_file

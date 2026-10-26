@@ -61,6 +61,7 @@ project file sets them:
 | `providers` / `config.provider_configs` | Can point the API base URL, and your API key, at another host |
 | `workspace_paths`, `additional_dirs` | Widen the auto-allowed read set |
 | `permission_mode`, `permissionRules`, `allowedBashPrefixes`, `allowed_tools`, `skipDangerousModePermissionPrompt` | Grant or pre-approve permissions |
+| `autoPokeEnabled` (`config.autoPokeEnabled`) | Auto-submits turns; combined with pre-approved permissions it would form a self-driving loop the user never opted into |
 | `trustProjectMcpServers` | Bypasses the project MCP server approval prompt |
 | `enabledPlugins` | Enables plugins, which can ship hooks and servers |
 | `remoteControlAtStartup` | Exposes the session over the remote-control bridge |
@@ -173,6 +174,7 @@ The `config` object holds runtime behaviour options.
 |-----|------|---------|-------------|
 | `permission_mode` | string | `"default"` | Controls how tool permissions are enforced. One of `"default"`, `"acceptEdits"`, `"bypassPermissions"`, `"plan"`. Currently replaced at startup by `--permission-mode` (default `default`), so set the mode with the flag or `yoloMode`. |
 | `yoloMode` | boolean | `false` | Persistent YOLO mode: the effective permission mode is `bypassPermissions`. Global-only in the settings merge: a project settings file cannot enable it. |
+| `autoPokeEnabled` | boolean | `false` | Opt-in auto-poke: send a continuation prompt when the model stops a turn with incomplete todos. Only fires after a clean `end_turn` stop; budget of 48 pokes per session; stops after 3 consecutive no-progress turns. Toggle at runtime with `/poke`. Global-only in the settings merge: a project settings file cannot enable it. Note the camelCase key. |
 
 See [Permission Modes](#permission-modes) for a full description of each value.
 
@@ -189,8 +191,8 @@ See [Permission Modes](#permission-modes) for a full description of each value.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `auto_compact` | boolean | — | Not read by the query loop: auto-compaction is on unless `--no-auto-compact` is passed. The top-level `autoCompact` key is not read either. |
-| `compact_threshold` | float | — | Not used: the trigger point is fixed. |
+| `auto_compact` | boolean | `true` | Enable automatic threshold compaction and overflow recovery. A `false` here, in top-level `autoCompact`, in another settings layer, or `--no-auto-compact` disables it. Manual `/compact` remains available. |
+| `compact_threshold` | float | `0.9` | Fraction of the resolved context window at which automatic compaction starts, subject to the response reserve. Must be strictly between 0 and 1; invalid values use the default. |
 
 See [Auto-compaction](advanced.md#auto-compaction) for when compaction runs.
 
