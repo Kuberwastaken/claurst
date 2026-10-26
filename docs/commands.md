@@ -357,6 +357,25 @@ project settings file cannot enable it. Same root/sudo guard as
 
 ---
 
+### ! — shell commands
+
+Enable `config.bangCommands.enabled` in global settings, then submit
+`!command` to execute a shell command directly. The command is not sent to
+the model. Bang commands are disabled in plan mode; project settings cannot
+enable them.
+
+```json
+{"config":{"bangCommands":{"enabled":true,"showInTranscript":true}}}
+```
+
+Each invocation starts a fresh shell (`bash` on Unix, `cmd` on Windows).
+One command runs at a time, with a 60-second deadline. Large output keeps
+bounded head/tail windows (about 100 KiB) and a path to the complete saved
+output. Timeout output is labelled partial. Set `showInTranscript` to
+`false` to hide the command/output annotation.
+
+---
+
 ## Configuration & Settings
 
 ### /config
