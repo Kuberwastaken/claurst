@@ -27,12 +27,12 @@ pub mod bun_tls;
 pub mod codex_adapter;
 
 // Provider-agnostic unified types (Phase 1A).
-pub mod provider_types;
 pub mod provider_error;
+pub mod provider_types;
 
 // Provider abstraction traits (Phase 1B).
-pub mod provider;
 pub mod auth;
+pub mod provider;
 pub mod stream_parser;
 pub mod transform;
 
@@ -60,11 +60,12 @@ pub mod error_handling;
 
 // Unified retry policy: classification, back-off, Retry-After (#439).
 pub mod retry;
+pub mod schema_dialect_map;
 
 // Repair-then-reject parsing of streamed tool-call arguments (#439).
 pub mod tool_json;
 
-// Message transform layer — concrete transformers (Phase 4).
+// Message transform layer: concrete transformers (Phase 4).
 pub mod transformers;
 
 // ---------------------------------------------------------------------------
@@ -74,55 +75,54 @@ pub use client::AnthropicClient;
 pub use streaming::{AnthropicStreamEvent, StreamHandler};
 pub use types::*;
 
-// Phase 1A re-exports — provider-agnostic layer.
-pub use provider_types::*;
+// Phase 1A re-exports: provider-agnostic layer.
 pub use provider_error::ProviderError;
+pub use provider_types::*;
 
-// Phase 1B re-exports — provider abstraction traits.
-pub use provider::{LlmProvider, ModelInfo};
+// Phase 1B re-exports: provider abstraction traits.
 pub use auth::{AuthProvider, LoginFlow};
-pub use stream_parser::{SseByteDecoder, StreamParser, SseStreamParser, JsonLinesStreamParser};
+pub use provider::{LlmProvider, ModelInfo};
+pub use stream_parser::{JsonLinesStreamParser, SseByteDecoder, SseStreamParser, StreamParser};
 pub use transform::MessageTransformer;
 
 // #228 protocol layer re-exports.
 pub use protocol::{LineStreamDecoder, OpenAiChatDecoder};
 
-// Phase 1C re-exports — provider registry.
+// Phase 1C re-exports: provider registry.
 pub use registry::ProviderRegistry;
 
-// Phase 1D re-exports — concrete provider adapters.
+// Phase 1D re-exports: concrete provider adapters.
 pub use providers::AnthropicProvider;
 pub use providers::GoogleProvider;
 pub use providers::MinimaxProvider;
 pub use providers::OpenAiProvider;
 pub use providers::message_normalization::normalize_anthropic_messages;
 
-// Phase 3 re-exports — model registry.
-pub use model_registry::{
-    CostBreakdown, CostTier, CostTierCondition, ExperimentalMode, InterleavedReasoning, Modality,
-    ModelEntry, ModelRegistry, ModelStatus, ProviderEntry, ProviderOverride,
-    apply_session_cost_pricing, catalog_pricing, effective_model_for_config,
-};
+// Phase 3 re-exports: model registry.
 pub use effort_support::{
     anthropic_reasoning, model_is_reasoning, supported_efforts, variant_ladder, AnthropicReasoning,
+};
+pub use model_registry::{
+    apply_session_cost_pricing, catalog_pricing, effective_model_for_config, CostBreakdown,
+    CostTier, CostTierCondition, ExperimentalMode, InterleavedReasoning, Modality, ModelEntry,
+    ModelRegistry, ModelStatus, ProviderEntry, ProviderOverride,
 };
 pub use variants::{
     variant_efforts, OPENAI_NONE_EFFORT_RELEASE_DATE, OPENAI_XHIGH_EFFORT_RELEASE_DATE,
 };
 
-// Phase 6 re-exports — provider-aware error handling.
+// Phase 6 re-exports: provider-aware error handling.
 pub use error_handling::{is_context_overflow, parse_error_response};
 pub use retry::{RetryConfig, RetryDecision};
 
-// Phase 2E re-exports — Azure, Bedrock, and GitHub Copilot providers.
+// Phase 2E re-exports: Azure, Bedrock, and GitHub Copilot providers.
 pub use providers::AzureProvider;
 pub use providers::BedrockProvider;
 pub use providers::CopilotProvider;
 
-// Phase 2B re-exports — OpenAI-compatible generic adapter + common factories.
+// Phase 2B re-exports: OpenAI-compatible generic adapter + common factories.
 pub use providers::{
-    OpenAiCompatProvider,
-    ollama, lm_studio, deepseek, groq, xai, openrouter, mistral, opencode_zen,
+    deepseek, groq, lm_studio, mistral, ollama, opencode_zen, openrouter, xai, OpenAiCompatProvider,
 };
 
 // ---------------------------------------------------------------------------
@@ -148,7 +148,11 @@ static REQUEST_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(DEFAULT_REQUEST_TIMEOUT_
 /// Override the process-wide request timeout. A value of `0` resets to
 /// [`DEFAULT_REQUEST_TIMEOUT_SECS`]. Idempotent; safe to call multiple times.
 pub fn set_request_timeout_secs(secs: u64) {
-    let value = if secs == 0 { DEFAULT_REQUEST_TIMEOUT_SECS } else { secs };
+    let value = if secs == 0 {
+        DEFAULT_REQUEST_TIMEOUT_SECS
+    } else {
+        secs
+    };
     REQUEST_TIMEOUT_SECS.store(value, Ordering::Relaxed);
 }
 
@@ -171,19 +175,19 @@ pub fn request_timeout() -> Duration {
 ///
 /// The value is GENEROUS and never smaller than the configured request timeout,
 /// so legitimately slow-but-progressing local models (whose chunks reset the
-/// timer) are never cut off — the goal is only to bound true infinite stalls.
+/// timer) are never cut off: the goal is only to bound true infinite stalls.
 pub fn stream_idle_timeout() -> Duration {
     request_timeout().max(Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))
 }
 
-// Composite "Free" provider — stacks many free-tier upstreams behind one
+// Composite "Free" provider: stacks many free-tier upstreams behind one
 // `free/auto` model id.
 pub use providers::{FreeEntry, FreeProvider, FreeUpstream, FREE_CATALOG};
 
-// Phase 2D re-exports — Cohere native provider.
+// Phase 2D re-exports: Cohere native provider.
 pub use providers::CohereProvider;
 
-// Phase 4 re-exports — concrete message transformers.
+// Phase 4 re-exports: concrete message transformers.
 pub use transformers::{AnthropicTransformer, OpenAiChatTransformer};
 
 // ---------------------------------------------------------------------------
@@ -397,14 +401,9 @@ pub mod streaming {
             content_block: ContentBlock,
         },
         /// Incremental delta for an existing content block.
-        ContentBlockDelta {
-            index: usize,
-            delta: ContentDelta,
-        },
+        ContentBlockDelta { index: usize, delta: ContentDelta },
         /// A content block is finished.
-        ContentBlockStop {
-            index: usize,
-        },
+        ContentBlockStop { index: usize },
         /// Final message-level delta (stop_reason, usage).
         MessageDelta {
             stop_reason: Option<String>,
@@ -413,14 +412,10 @@ pub mod streaming {
         /// The message is complete.
         MessageStop,
         /// An error occurred during streaming.
-        Error {
-            error_type: String,
-            message: String,
-        },
+        Error { error_type: String, message: String },
         /// A ping/keep-alive event.
         Ping,
     }
-
 
     /// The delta payload inside a `content_block_delta` event.
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -520,8 +515,7 @@ pub mod client {
     use super::*;
 
     /// Provider selection for API calls.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    #[derive(Default)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub enum Provider {
         /// Use Anthropic's API
         #[default]
@@ -529,8 +523,6 @@ pub mod client {
         /// Use OpenAI Codex via OAuth
         Codex,
     }
-
-    
 
     /// Configuration for the HTTP client.
     #[derive(Debug, Clone)]
@@ -594,7 +586,7 @@ pub mod client {
             self.config.use_bearer_auth
         }
 
-        /// First user (non-meta) message text — input to the `cc_version` client
+        /// First user (non-meta) message text: input to the `cc_version` client
         /// hash. Mirrors the official `juA`: skips `<system-reminder>` blocks.
         fn first_user_message_text(messages: &[ApiMessage]) -> String {
             let is_meta = |s: &str| s.trim_start().starts_with("<system-reminder>");
@@ -638,10 +630,12 @@ pub mod client {
                 text,
                 cache_control: None,
             };
-            let billing_block =
-                text_block(claurst_core::oauth_config::claude_code_billing_header(&first_user_text));
-            let identity_block =
-                text_block(claurst_core::oauth_config::CLAUDE_CODE_SYSTEM_PROMPT_PREFIX.to_string());
+            let billing_block = text_block(claurst_core::oauth_config::claude_code_billing_header(
+                &first_user_text,
+            ));
+            let identity_block = text_block(
+                claurst_core::oauth_config::CLAUDE_CODE_SYSTEM_PROMPT_PREFIX.to_string(),
+            );
 
             // Drop a leading "You are Claurst…" / "You are a Claude agent…" line:
             // the injected official identity must be the only one the server sees.
@@ -723,7 +717,7 @@ pub mod client {
             &self,
             mut request: CreateMessageRequest,
         ) -> Result<CreateMessageResponse, ClaudeError> {
-            // Deferred key validation — fail here rather than at construction
+            // Deferred key validation: fail here rather than at construction
             // so that non-Anthropic provider setups don't crash on startup.
             if self.config.api_key.is_empty() && self.config.provider != Provider::Codex {
                 // Check if this model might belong to another provider, giving
@@ -734,7 +728,11 @@ pub mod client {
                         "Model '{}' is a Google model. Use `--provider google` or set GOOGLE_API_KEY.",
                         model
                     )
-                } else if model.starts_with("gpt-") || model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
+                } else if model.starts_with("gpt-")
+                    || model.starts_with("o1")
+                    || model.starts_with("o3")
+                    || model.starts_with("o4")
+                {
                     format!(
                         "Model '{}' is an OpenAI model. Use `--provider openai` or set OPENAI_API_KEY.",
                         model
@@ -766,11 +764,13 @@ pub mod client {
                     )
                 } else {
                     "Set ANTHROPIC_API_KEY, run `claurst auth login`, \
-                     or use --provider to select a different provider (e.g. --provider openai).".to_string()
+                     or use --provider to select a different provider (e.g. --provider openai)."
+                        .to_string()
                 };
-                return Err(ClaudeError::Auth(
-                    format!("No API key for the selected model. {}", hint)
-                ));
+                return Err(ClaudeError::Auth(format!(
+                    "No API key for the selected model. {}",
+                    hint
+                )));
             }
             // Route to Codex if configured
             if self.config.provider == Provider::Codex {
@@ -781,9 +781,14 @@ pub mod client {
             self.apply_oauth_stealth(&mut request);
             let body = serde_json::to_value(&request).map_err(ClaudeError::Json)?;
 
-            let resp = self.send_with_retry(&body, self.config.retry.max_retries).await?;
+            let resp = self
+                .send_with_retry(&body, self.config.retry.max_retries)
+                .await?;
             let status = resp.status();
-            let text = resp.text().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
 
             if !status.is_success() {
                 return Err(self.parse_api_error(status.as_u16(), &text, None));
@@ -813,7 +818,10 @@ pub mod client {
                 .map_err(|e| ClaudeError::Other(format!("Codex request failed: {}", e)))?;
 
             let status = resp.status();
-            let text = resp.text().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
 
             if !status.is_success() {
                 return Err(self.parse_api_error(status.as_u16(), &text, None));
@@ -846,7 +854,8 @@ pub mod client {
             request: CreateMessageRequest,
             handler: Arc<dyn StreamHandler>,
         ) -> Result<mpsc::Receiver<streaming::AnthropicStreamEvent>, ClaudeError> {
-            self.open_stream(request, handler, self.config.retry.max_retries).await
+            self.open_stream(request, handler, self.config.retry.max_retries)
+                .await
         }
 
         /// Like [`create_message_stream`](Self::create_message_stream) but makes
@@ -874,7 +883,11 @@ pub mod client {
                         "Model '{}' is a Google model. Use `--provider google` or set GOOGLE_API_KEY.",
                         model
                     )
-                } else if model.starts_with("gpt-") || model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
+                } else if model.starts_with("gpt-")
+                    || model.starts_with("o1")
+                    || model.starts_with("o3")
+                    || model.starts_with("o4")
+                {
                     format!(
                         "Model '{}' is an OpenAI model. Use `--provider openai` or set OPENAI_API_KEY.",
                         model
@@ -882,7 +895,10 @@ pub mod client {
                 } else if model.starts_with("deepseek") {
                     format!("Model '{}' is a DeepSeek model. Use `--provider deepseek` or set DEEPSEEK_API_KEY.", model)
                 } else if model.starts_with("grok") {
-                    format!("Model '{}' is an xAI model. Use `--provider xai` or set XAI_API_KEY.", model)
+                    format!(
+                        "Model '{}' is an xAI model. Use `--provider xai` or set XAI_API_KEY.",
+                        model
+                    )
                 } else if model.starts_with("mistral") || model.starts_with("codestral") {
                     format!("Model '{}' is a Mistral model. Use `--provider mistral` or set MISTRAL_API_KEY.", model)
                 } else if model.starts_with("command-") {
@@ -891,11 +907,13 @@ pub mod client {
                     format!("Model '{}' looks like a Llama model. Use `--provider groq` or `--provider ollama` for local.", model)
                 } else {
                     "Set ANTHROPIC_API_KEY, run `claurst auth login`, \
-                     or use --provider to select a different provider (e.g. --provider openai).".to_string()
+                     or use --provider to select a different provider (e.g. --provider openai)."
+                        .to_string()
                 };
-                return Err(ClaudeError::Auth(
-                    format!("No API key for the selected model. {}", hint)
-                ));
+                return Err(ClaudeError::Auth(format!(
+                    "No API key for the selected model. {}",
+                    hint
+                )));
             }
             // Codex provider doesn't support streaming yet
             if self.config.provider == Provider::Codex {
@@ -1208,9 +1226,7 @@ pub mod client {
                 for line in decoder.push(&chunk) {
                     let line = line.trim_end_matches('\r');
                     if let Some(frame) = parser.feed_line(line) {
-                        if let Some(event) =
-                            Self::frame_to_event(&frame.event, &frame.data)
-                        {
+                        if let Some(event) = Self::frame_to_event(&frame.event, &frame.data) {
                             saw_message_stop |=
                                 matches!(event, streaming::AnthropicStreamEvent::MessageStop);
                             handler.on_event(&event);
@@ -1435,9 +1451,7 @@ impl CreateMessageRequest {
         let mut budget = MAX_CACHE_BREAKPOINTS.saturating_sub(existing);
 
         let system_marked = match &self.system {
-            Some(SystemPrompt::Blocks(blocks)) => {
-                blocks.iter().any(|b| b.cache_control.is_some())
-            }
+            Some(SystemPrompt::Blocks(blocks)) => blocks.iter().any(|b| b.cache_control.is_some()),
             _ => false,
         };
         if budget > 0 && !system_marked {
@@ -1470,7 +1484,13 @@ impl CreateMessageRequest {
             }
         }
 
-        for message in self.messages.iter_mut().rev().filter(|m| m.role == "user").take(2) {
+        for message in self
+            .messages
+            .iter_mut()
+            .rev()
+            .filter(|m| m.role == "user")
+            .take(2)
+        {
             if budget == 0 {
                 break;
             }
@@ -1615,7 +1635,9 @@ impl CreateMessageRequestBuilder {
 
     /// Set `output_config.effort`.
     pub fn effort(mut self, effort: impl Into<String>) -> Self {
-        self.output_config = Some(OutputConfig { effort: effort.into() });
+        self.output_config = Some(OutputConfig {
+            effort: effort.into(),
+        });
         self
     }
 
@@ -1709,7 +1731,10 @@ impl StreamAccumulator {
                         name: name.clone(),
                         json_buf: String::new(),
                     },
-                    ContentBlock::Thinking { thinking, signature } => PartialBlock::Thinking {
+                    ContentBlock::Thinking {
+                        thinking,
+                        signature,
+                    } => PartialBlock::Thinking {
                         thinking_buf: thinking.clone(),
                         signature_buf: signature.clone(),
                     },
@@ -1763,7 +1788,12 @@ impl StreamAccumulator {
                                     Value::Object(Default::default())
                                 }
                             };
-                            ContentBlock::ToolUse { id, name, input, thought_signature: None }
+                            ContentBlock::ToolUse {
+                                id,
+                                name,
+                                input,
+                                thought_signature: None,
+                            }
                         }
                         PartialBlock::Thinking {
                             thinking_buf,
@@ -1844,12 +1874,21 @@ mod tests {
             content,
         };
         CreateMessageRequest::builder("claude-opus-4-6", 1024)
-            .system(SystemPrompt::Blocks(vec![block("stable"), block("dynamic")]))
+            .system(SystemPrompt::Blocks(vec![
+                block("stable"),
+                block("dynamic"),
+            ]))
             .tools(vec![tool("Read"), tool("Bash")])
             .messages(vec![
                 msg("user", json!("first")),
-                msg("assistant", json!([{ "type": "tool_use", "id": "t1", "name": "Read", "input": {} }])),
-                msg("user", json!([{ "type": "tool_result", "tool_use_id": "t1", "content": "ok" }])),
+                msg(
+                    "assistant",
+                    json!([{ "type": "tool_use", "id": "t1", "name": "Read", "input": {} }]),
+                ),
+                msg(
+                    "user",
+                    json!([{ "type": "tool_result", "tool_use_id": "t1", "content": "ok" }]),
+                ),
                 msg("assistant", json!([{ "type": "text", "text": "done" }])),
                 msg("user", json!("second")),
             ])
@@ -1880,12 +1919,18 @@ mod tests {
             body["messages"][2]["content"],
             json!([{ "type": "tool_result", "tool_use_id": "t1", "content": "ok", "cache_control": eph }])
         );
-        assert_eq!(body["messages"][3]["content"], json!([{ "type": "text", "text": "done" }]));
+        assert_eq!(
+            body["messages"][3]["content"],
+            json!([{ "type": "text", "text": "done" }])
+        );
         assert_eq!(
             body["messages"][4]["content"],
             json!([{ "type": "text", "text": "second", "cache_control": eph }])
         );
-        assert_eq!(body.to_string().matches("cache_control").count(), MAX_CACHE_BREAKPOINTS);
+        assert_eq!(
+            body.to_string().matches("cache_control").count(),
+            MAX_CACHE_BREAKPOINTS
+        );
     }
 
     #[test]
@@ -1895,7 +1940,10 @@ mod tests {
         request.apply_cache_breakpoints();
         request.apply_cache_breakpoints();
         let body = serde_json::to_value(&request).expect("serialize");
-        assert_eq!(body.to_string().matches("cache_control").count(), MAX_CACHE_BREAKPOINTS);
+        assert_eq!(
+            body.to_string().matches("cache_control").count(),
+            MAX_CACHE_BREAKPOINTS
+        );
 
         let mut request = CreateMessageRequest::builder("claude-opus-4-6", 1024)
             .system_text("plain system")
@@ -1910,8 +1958,13 @@ mod tests {
             body["system"],
             json!([{ "type": "text", "text": "plain system", "cache_control": { "type": "ephemeral" } }])
         );
-        assert_eq!(body["messages"][0]["content"][0]["cache_control"], json!({ "type": "ephemeral" }));
-        assert!(body["messages"][0]["content"][1].get("cache_control").is_none());
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert!(body["messages"][0]["content"][1]
+            .get("cache_control")
+            .is_none());
     }
 
     #[test]
@@ -1973,7 +2026,11 @@ mod tests {
         let (msg, _usage, stop) = acc.finish();
         assert_eq!(msg.get_text(), Some("Hello world!"));
         assert_eq!(stop.as_deref(), Some("end_turn"));
-        assert_eq!(msg.uuid.as_deref(), Some("m1"), "the API message id is kept");
+        assert_eq!(
+            msg.uuid.as_deref(),
+            Some("m1"),
+            "the API message id is kept"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2016,15 +2073,13 @@ mod tests {
 
         // A byte stream that never yields models a provider that begins a
         // streamed response and then pauses indefinitely (issue #185).
-        let mut stalled =
-            futures::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
+        let mut stalled = futures::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
 
         // The exact construct used by the streaming loops: wrapping the chunk
         // read in tokio::time::timeout must elapse rather than hang forever.
         // A short duration keeps the test fast; production uses the generous
         // stream_idle_timeout() value asserted below.
-        let result =
-            tokio::time::timeout(Duration::from_millis(50), stalled.next()).await;
+        let result = tokio::time::timeout(Duration::from_millis(50), stalled.next()).await;
         assert!(
             result.is_err(),
             "a stalled stream must hit the idle timeout, not hang"

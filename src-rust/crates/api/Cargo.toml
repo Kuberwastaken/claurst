@@ -31,3 +31,8 @@ urlencoding = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 hmac = "0.12"
+claurst-schema-dialect = { workspace = true }
+
+[dev-dependencies]
+claurst-schema-dialect = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }
