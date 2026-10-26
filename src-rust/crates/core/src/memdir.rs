@@ -625,66 +625,75 @@ pub struct AutoMemoryEntry {
 /// `MEMORY.md` gains one index line per file. Writing is atomic (temp +
 /// rename) and serialized against other writers by a lock file in `dir`, so
 /// overlapping turns, subagents or a second session in the same repository
-/// cannot wipe the store. A busy or failing writer skips silently: memory
-/// extraction is best-effort and must never break the turn.
+/// cannot wipe the store. A busy or failing writer returns an error so
+/// extraction can leave its cursor unchanged and retry the same window.
 ///
-/// Returns the paths of the topic files written; empty when nothing was
-/// stored.
-pub fn append_auto_memories(dir: &Path, entries: &[AutoMemoryEntry]) -> Vec<PathBuf> {
-    if entries.is_empty() || std::fs::create_dir_all(dir).is_err() {
-        return Vec::new();
+/// Returns paths written; an empty successful batch contains only duplicates.
+pub fn append_auto_memories(
+    dir: &Path,
+    entries: &[AutoMemoryEntry],
+) -> std::io::Result<Vec<PathBuf>> {
+    if entries.is_empty() {
+        return Ok(Vec::new());
     }
-    let lock_path = dir.join(".memdir.lock");
-    let mut lock = match fslock::LockFile::open(&lock_path) {
-        Ok(lock) => lock,
-        Err(e) => {
-            tracing::debug!(path = %lock_path.display(), error = %e, "memdir lock open failed");
-            return Vec::new();
-        }
-    };
-    if !lock.try_lock_with_pid().unwrap_or(false) {
-        tracing::debug!(path = %lock_path.display(), "memdir store busy; skipping append");
-        return Vec::new();
+    std::fs::create_dir_all(dir)?;
+    let mut lock = fslock::LockFile::open(&dir.join(".memdir.lock"))?;
+    if !lock.try_lock_with_pid()? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "memdir store busy",
+        ));
     }
-
     let mut written = Vec::new();
     for entry in entries {
-        if let Some(path) = write_entry_locked(dir, entry) {
+        if let Some(path) = write_entry_locked(dir, entry)? {
             written.push(path);
         }
     }
-    written
+    Ok(written)
 }
 
-/// Write one entry under the store lock. `None` means the entry was already
-/// stored (a topic file carrying the same fact exists) or the write failed.
-fn write_entry_locked(dir: &Path, entry: &AutoMemoryEntry) -> Option<PathBuf> {
-    let auto_dir = dir.join("auto");
-    if std::fs::create_dir_all(&auto_dir).is_err() {
-        return None;
-    }
-    let slug = slug_for(&entry.name);
+/// Cross-process ownership of a project's extraction transaction. The caller
+/// keeps this handle alive through the request, memory writes and cursor commit.
+pub fn try_lock_extraction(dir: &Path) -> std::io::Result<Option<fslock::LockFile>> {
+    std::fs::create_dir_all(dir)?;
+    let mut lock = fslock::LockFile::open(&dir.join(".extraction.lock"))?;
+    Ok(lock.try_lock_with_pid()?.then_some(lock))
+}
 
-    // Same topic written before: append the fact to the oldest topic file
-    // instead of spawning a near-duplicate. Same fact already present in it:
-    // keep the first copy and drop this one.
+/// Session ids never become path components directly, including ids supplied
+/// by embedding clients. Each session's progress is independent within a project.
+pub fn extraction_cursor_path(dir: &Path, session_id: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    dir.join(".extraction-cursors").join(format!(
+        "{}.json",
+        hex::encode(Sha256::digest(session_id.as_bytes()))
+    ))
+}
+
+/// None means the fact was already stored. Errors must not consume an
+/// extraction cursor: the same window needs to remain eligible for a retry.
+fn write_entry_locked(dir: &Path, entry: &AutoMemoryEntry) -> std::io::Result<Option<PathBuf>> {
+    let auto_dir = dir.join("auto");
+    std::fs::create_dir_all(&auto_dir)?;
+    let slug = slug_for(&entry.name);
     let topic_files = matching_topic_files(&auto_dir, &slug);
     if let Some(oldest) = topic_files.first() {
-        let existing_bodies: Vec<String> = topic_files
+        let existing_bodies = topic_files
             .iter()
-            .map(|p| std::fs::read_to_string(p).unwrap_or_default())
-            .collect();
-        if existing_bodies
+            .map(std::fs::read_to_string)
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let duplicate = existing_bodies
             .iter()
-            .any(|body| body.contains(&entry.content))
-        {
-            return None;
+            .any(|body| body.contains(&entry.content));
+        if !duplicate {
+            let body = format!("{}\n{}\n", existing_bodies[0].trim_end(), entry.content);
+            atomic_write(oldest, body.as_bytes())?;
         }
-        let body = format!("{}\n{}\n", existing_bodies[0].trim_end(), entry.content);
-        if atomic_write(oldest, body.as_bytes()).is_err() {
-            return None;
+        if let Some(filename) = oldest.file_name().and_then(|name| name.to_str()) {
+            append_to_index(dir, &format!("auto/{filename}"), &entry.description)?;
         }
-        return Some(oldest.clone());
+        return Ok((!duplicate).then(|| oldest.clone()));
     }
     let seq = next_seq(&auto_dir, &slug);
     let filename = format!("{seq}-{slug}.md");
@@ -696,11 +705,9 @@ fn write_entry_locked(dir: &Path, entry: &AutoMemoryEntry) -> Option<PathBuf> {
         entry.memory_type.as_str(),
         entry.content
     );
-    if atomic_write(&path, body.as_bytes()).is_err() {
-        return None;
-    }
-    append_to_index(dir, &filename, &entry.description);
-    Some(path)
+    atomic_write(&path, body.as_bytes())?;
+    append_to_index(dir, &format!("auto/{filename}"), &entry.description)?;
+    Ok(Some(path))
 }
 
 /// Existing `NN-<slug>.md` files in the auto directory, oldest first.
@@ -765,7 +772,7 @@ fn escape_frontmatter(value: &str) -> String {
 
 /// Append one index line to `MEMORY.md`, deduplicated by filename marker and
 /// capped at `MAX_ENTRYPOINT_LINES` lines (oldest auto lines drop first).
-fn append_to_index(dir: &Path, filename: &str, description: &str) {
+fn append_to_index(dir: &Path, filename: &str, description: &str) -> std::io::Result<()> {
     let index_path = dir.join(MEMORY_ENTRYPOINT);
     let marker = format!("({filename})");
     let base_line = format!("- [{}]({})", filename, filename);
@@ -775,9 +782,13 @@ fn append_to_index(dir: &Path, filename: &str, description: &str) {
         format!("{base_line} — {description}")
     };
 
-    let existing = std::fs::read_to_string(&index_path).unwrap_or_default();
+    let existing = match std::fs::read_to_string(&index_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
     if existing.contains(&marker) {
-        return;
+        return Ok(());
     }
 
     let mut lines: Vec<String> = existing
@@ -795,9 +806,7 @@ fn append_to_index(dir: &Path, filename: &str, description: &str) {
         }
     }
     let content = format!("{}\n", lines.join("\n"));
-    if let Err(e) = atomic_write(&index_path, content.as_bytes()) {
-        tracing::debug!(path = %index_path.display(), error = %e, "memdir index write failed");
-    }
+    atomic_write(&index_path, content.as_bytes())
 }
 
 /// Write `bytes` to a temp file in the same directory, fsync, rename over
@@ -1167,7 +1176,8 @@ mod tests {
                 "uses cargo",
                 "The project uses cargo.",
             )],
-        );
+        )
+        .unwrap();
         assert_eq!(written.len(), 1);
         let path = &written[0];
         assert!(path.starts_with(dir.path().join("auto")));
@@ -1177,17 +1187,32 @@ mod tests {
         assert!(body.contains("The project uses cargo."));
         let index = std::fs::read_to_string(dir.path().join(MEMORY_ENTRYPOINT)).unwrap();
         assert!(index.contains(&format!(
-            "({})",
+            "(auto/{})",
             path.file_name().unwrap().to_string_lossy()
         )));
+    }
+
+    #[test]
+    fn retry_repairs_index_after_topic_write_succeeded_but_index_failed() {
+        let dir = make_temp_dir();
+        std::fs::create_dir(dir.path().join(MEMORY_ENTRYPOINT)).unwrap();
+        let entry = auto_entry("Build tool", "uses cargo", "The project uses cargo.");
+        assert!(append_auto_memories(dir.path(), std::slice::from_ref(&entry)).is_err());
+        std::fs::remove_dir(dir.path().join(MEMORY_ENTRYPOINT)).unwrap();
+        assert!(append_auto_memories(dir.path(), &[entry])
+            .unwrap()
+            .is_empty());
+        let index = std::fs::read_to_string(dir.path().join(MEMORY_ENTRYPOINT)).unwrap();
+        assert!(index.contains("(auto/0-build-tool.md)"));
+        assert!(dir.path().join("auto/0-build-tool.md").is_file());
     }
 
     #[test]
     fn test_append_same_fact_stored_once() {
         let dir = make_temp_dir();
         let entry = auto_entry("Build tool", "uses cargo", "The project uses cargo.");
-        let first = append_auto_memories(dir.path(), std::slice::from_ref(&entry));
-        let second = append_auto_memories(dir.path(), &[entry]);
+        let first = append_auto_memories(dir.path(), std::slice::from_ref(&entry)).unwrap();
+        let second = append_auto_memories(dir.path(), &[entry]).unwrap();
         assert_eq!(first.len(), 1);
         assert!(second.is_empty());
         let auto_dir = dir.path().join("auto");
@@ -1205,7 +1230,8 @@ mod tests {
                 "uses cargo",
                 "The project uses cargo.",
             )],
-        );
+        )
+        .unwrap();
         let second = append_auto_memories(
             dir.path(),
             &[auto_entry(
@@ -1213,7 +1239,8 @@ mod tests {
                 "targets wasm",
                 "Wasm is a build target.",
             )],
-        );
+        )
+        .unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(second.len(), 1);
         assert_eq!(first[0], second[0]);
@@ -1250,7 +1277,8 @@ mod tests {
                     "Unit tests are preferred.",
                 ),
             ],
-        );
+        )
+        .unwrap();
         assert_eq!(written.len(), 2);
         let names: Vec<String> = written
             .iter()
@@ -1308,8 +1336,9 @@ mod tests {
                 "uses cargo",
                 "The project uses cargo.",
             )],
-        );
-        assert!(written.is_empty());
+        )
+        .unwrap_err();
+        assert_eq!(written.kind(), std::io::ErrorKind::WouldBlock);
         // The held lock must not corrupt the directory or drop files that
         // were already there.
         assert!(!dir.path().join("auto").exists());
@@ -1321,7 +1350,8 @@ mod tests {
                 "uses cargo",
                 "The project uses cargo.",
             )],
-        );
+        )
+        .unwrap();
         assert_eq!(after.len(), 1);
     }
 }

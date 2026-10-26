@@ -4,6 +4,12 @@ User-visible changes per release. Pull request numbers refer to [Kuberwastaken/c
 
 ---
 
+## Unreleased
+
+### Features
+
+- **Custom themes and named palettes** (#419): `/theme <name>` switches to a built-in palette (dark, light, deuteranopia, solarized, nord, dracula, monokai) or a custom TOML palette in `~/.claurst/themes/<name>.toml`, applied live; the whole rendered frame is repainted through a channel-separated color remap pass, so light and colorful palettes stay readable. Bare `/theme` opens a picker with swatches.
+
 ## v0.2.0
 
 ### Breaking changes

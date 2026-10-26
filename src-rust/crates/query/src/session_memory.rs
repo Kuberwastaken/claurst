@@ -85,6 +85,10 @@ pub struct ExtractionCursor {
     pub last_uuid: Option<String>,
     /// History length at the previous extraction.
     pub message_count: usize,
+    #[serde(default)]
+    process_epoch: String,
+    #[serde(default)]
+    snapshot_sequence: u64,
 }
 
 impl ExtractionCursor {
@@ -290,7 +294,20 @@ pub struct ExtractionRoute {
     pub anthropic_client: AnthropicClient,
     /// memdir store directory for the project.
     pub store_dir: std::path::PathBuf,
+    /// Identity of the continuing session, independent of the project store.
+    pub session_id: String,
+    /// Assigned before spawning, so a delayed old snapshot cannot roll a
+    /// newer cursor backwards when task scheduling differs from turn order.
+    pub snapshot_sequence: u64,
 }
+
+pub fn next_extraction_sequence() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+static PROCESS_EPOCH: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| uuid::Uuid::new_v4().to_string());
 
 /// Send one extraction request through the active route and return the raw
 /// model text. Any failure maps to `None` (debug log, turn unaffected).
@@ -493,11 +510,25 @@ fn should_extract(cursor: &ExtractionCursor, messages: &[Message]) -> bool {
     if cursor.last_uuid.is_none() {
         return messages.len() >= MIN_MESSAGES_TO_EXTRACT;
     }
-    messages.len()
-        >= cursor
-            .message_count
-            .saturating_add(MIN_DELTA_MESSAGES_TO_EXTRACT)
+    // A rewind/compaction has a new tail even if its total length is smaller.
+    // A stale snapshot queued behind a newer extraction cannot move progress
+    // backwards when it still contains the committed UUID.
+    if let Some(position) = messages
+        .iter()
+        .position(|message| message.uuid == cursor.last_uuid)
+    {
+        return messages.len().saturating_sub(position + 1) >= MIN_DELTA_MESSAGES_TO_EXTRACT;
+    }
+    messages.len() >= MIN_MESSAGES_TO_EXTRACT
 }
+
+// Serialize whole project transactions, including the paid request and cursor
+// recheck. Weak entries are pruned so opening projects does not retain locks.
+static EXTRACTION_LOCKS: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<std::path::PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    >,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Turn-end extraction entry point, called from the query loop's `end_turn`
 /// branch AFTER the gate (`extraction_allowed`) has passed.
@@ -511,13 +542,43 @@ pub async fn extract_and_store(
     messages: &[Message],
     working_dir: &Path,
 ) -> usize {
-    let cursor_path = route.store_dir.join(".extraction_cursor.json");
+    let lock = {
+        let Ok(mut locks) = EXTRACTION_LOCKS.lock() else {
+            return 0;
+        };
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        match locks
+            .get(&route.store_dir)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(route.store_dir.clone(), Arc::downgrade(&lock));
+                lock
+            }
+        }
+    };
+    let _guard = lock.lock().await;
+    let _process_guard = match memdir::try_lock_extraction(&route.store_dir) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return 0,
+        Err(error) => {
+            debug!(%error, "memory extraction lock failed");
+            return 0;
+        }
+    };
+    let cursor_path = memdir::extraction_cursor_path(&route.store_dir, &route.session_id);
     let cursor: ExtractionCursor = tokio::fs::read_to_string(&cursor_path)
         .await
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
+    if cursor.process_epoch == *PROCESS_EPOCH && route.snapshot_sequence <= cursor.snapshot_sequence
+    {
+        return 0;
+    }
     let window = cursor.window(messages);
     if window.is_empty() {
         return 0;
@@ -535,27 +596,40 @@ pub async fn extract_and_store(
         return 0;
     };
     let entries = parse_extraction_response(&response);
-    let new_count = entries.len();
-    if new_count > 0 {
+    let new_count = if entries.is_empty() {
+        0
+    } else {
         let written = tokio::task::spawn_blocking({
             let dir = route.store_dir.clone();
             move || memdir::append_auto_memories(&dir, &entries)
         })
-        .await
-        .unwrap_or_default();
-        info!(
-            count = written.len(),
-            "Memory extraction stored new entries"
-        );
-    }
+        .await;
+        match written {
+            Ok(Ok(paths)) => {
+                info!(count = paths.len(), "Memory extraction stored new entries");
+                paths.len()
+            }
+            error => {
+                debug!(?error, "memory storage failed; extraction cursor retained");
+                return 0;
+            }
+        }
+    };
 
     // Advance the cursor whether or not the model produced anything: the
     // window was seen. Write through the same atomic path as the store.
     let mut advanced = cursor;
     advanced.advance(messages);
+    advanced.process_epoch = PROCESS_EPOCH.clone();
+    advanced.snapshot_sequence = route.snapshot_sequence;
     if let Ok(json) = serde_json::to_string(&advanced) {
         let tmp = cursor_path.with_extension("json.tmp");
-        if tokio::fs::write(&tmp, &json).await.is_ok() {
+        let Some(parent) = cursor_path.parent() else {
+            return new_count;
+        };
+        if tokio::fs::create_dir_all(parent).await.is_ok()
+            && tokio::fs::write(&tmp, &json).await.is_ok()
+        {
             let _ = tokio::fs::rename(&tmp, &cursor_path).await;
         }
     }
@@ -697,6 +771,7 @@ mod tests {
         let cursor = ExtractionCursor {
             last_uuid: Some("gone".to_string()),
             message_count: 50,
+            ..Default::default()
         };
         let msgs = make_messages(30);
         let window = cursor.window(&msgs);

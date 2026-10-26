@@ -142,8 +142,10 @@ impl Tool for MonitorTool {
                     None => ToolResult::error(format!("Task {} not found", id)),
                     Some(t) => {
                         if let TaskStatus::Running = t.status {
-                            // Kill by PID if available.
-                            if let Some(pid) = t.pid {
+                            // Owned tasks use their token to kill the complete
+                            // process group before reaping it. PID fallback is
+                            // only for legacy tasks without a cancellation loop.
+                            if let Some(pid) = t.pid.filter(|_| t.cancel_token.is_none()) {
                                 // On Windows use taskkill; on Unix send SIGTERM.
                                 #[cfg(windows)]
                                 {

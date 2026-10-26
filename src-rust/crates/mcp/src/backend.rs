@@ -78,6 +78,11 @@ pub trait McpClientBackend: Send + Sync {
 
     /// Subscribe to raw notification payloads emitted by the backend.
     fn subscribe_to_notifications(&self) -> BoxStream<'static, anyhow::Result<Value>>;
+
+    /// Close the live transport and wait for its cleanup to finish. Safe on
+    /// an already-closed backend; a client without a backend (test clients)
+    /// is a no-op. After this, further requests fail instead of hanging.
+    async fn close(&self);
 }
 
 /// Pick the preferred backend for a configured transport type.

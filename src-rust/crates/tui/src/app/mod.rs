@@ -122,6 +122,11 @@ pub fn try_copy_to_clipboard(text: &str) -> bool {
 pub struct App {
     // Core state
     pub config: Config,
+    /// Names of MCP servers the user disabled (persisted in global settings
+    /// under `disabledMcpServers`). Populated by the CLI at startup and after
+    /// `/mcp enable|disable` reconnects. Used to render the `disabled` state
+    /// in the /mcp view.
+    pub disabled_mcp_servers: std::collections::HashSet<String>,
     pub cost_tracker: Arc<CostTracker>,
     pub messages: Vec<Message>,
     /// Combined display list kept in sync with `messages`: real conversation turns
@@ -530,6 +535,14 @@ pub struct App {
     /// None when no goal is active. Updated by the REPL after each turn.
     pub active_goal_badge: Option<String>,
 
+    /// Number of discovered skills (from `.claurst/skills/` etc.) for the
+    /// status-bar indicator. Populated by the caller after `App::new` so the
+    /// constructor stays cheap and never runs filesystem/network discovery.
+    pub skill_count: usize,
+    /// Number of connected MCP servers for the status-bar indicator.
+    /// Updated by the REPL whenever the MCP runtime (re)connects.
+    pub mcp_server_count: usize,
+
     // ---- Thinking block expansion state ----------------------------------
     /// Set of thinking block content hashes that are expanded.
     pub thinking_expanded: std::collections::HashSet<u64>,
@@ -630,7 +643,7 @@ impl App {
             reg.apply_model_overrides(&config.model_overrides);
             reg
         };
-        Self {
+        let app = Self {
             config,
             cost_tracker,
             messages: Vec::new(),
@@ -729,6 +742,7 @@ impl App {
             elicitation: crate::elicitation_dialog::ElicitationDialogState::new(),
             model_picker: ModelPickerState::new(),
             session_browser: SessionBrowserState::new(),
+            disabled_mcp_servers: std::collections::HashSet::new(),
             session_branching: crate::session_branching::SessionBranchingState::new(),
             tasks_overlay: TasksOverlay::new(),
             export_dialog: ExportDialogState::new(),
@@ -845,6 +859,8 @@ impl App {
             worktree_branch: None,
             agent_type_badge: None,
             active_goal_badge: None,
+            skill_count: 0,
+            mcp_server_count: 0,
             thinking_expanded: std::collections::HashSet::new(),
             last_msg_area: Cell::new(ratatui::layout::Rect::default()),
             last_selectable_area: Cell::new(ratatui::layout::Rect::default()),
@@ -871,6 +887,18 @@ impl App {
             managed_agents_active: false,
             last_exit_key_warning: None,
             exit_key_sequence_start: None,
+        };
+        app.init_theme();
+        app
+    }
+
+    /// Publish the theme configured in `config.theme` to the theme module so
+    /// the render pass applies it. Unknown theme names fall back to the
+    /// native ("default") palette.
+    fn init_theme(&self) {
+        let name = self.config.theme.name();
+        if let Err(error) = crate::theme::set_theme(name, Some(&crate::themes_dir())) {
+            tracing::warn!("failed to load theme '{}': {}", name, error);
         }
     }
 
@@ -998,8 +1026,34 @@ impl App {
         );
     }
 
+    /// Apply the theme given as a `Theme` enum value: publish the matching
+    /// palette to the theme module and update `self.config.theme` so the next
+    /// frame renders with the new palette. Persistence is left to the caller
+    /// (the config command already saved settings).
+    ///
+    /// Returns `false` and sets a status message when the theme fails to
+    /// load, so the caller can keep the error instead of a success message.
+    pub fn apply_theme_name(&mut self, theme: &Theme) -> bool {
+        let name = theme.name();
+        if let Err(error) = crate::theme::set_theme(name, Some(&crate::themes_dir())) {
+            self.status_message =
+                Some(format!("Theme '{}' failed to load: {}", name, error));
+            return false;
+        }
+        self.config.theme = theme.clone();
+        true
+    }
+
     /// Apply a theme by name, persisting it to config.
+    ///
+    /// Also publishes the theme to the theme module so the next frame is
+    /// rendered with the new palette. Persistence errors are surfaced as a
+    /// status message but do not roll back the in-memory theme.
     pub fn apply_theme(&mut self, theme_name: &str) {
+        if let Err(error) = crate::theme::set_theme(theme_name, Some(&crate::themes_dir())) {
+            self.status_message = Some(format!("Theme '{}' failed to load: {}", theme_name, error));
+            return;
+        }
         let theme = match theme_name {
             "dark" => Theme::Dark,
             "light" => Theme::Light,
