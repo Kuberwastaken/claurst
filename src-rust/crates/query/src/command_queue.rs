@@ -136,6 +136,55 @@ impl CommandQueue {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Keep delayed background completions attached to the session that
+    /// launched them, even after the interactive queue switches sessions.
+    pub fn push_for_session(
+        &self,
+        session: &str,
+        command: QueuedCommand,
+        priority: CommandPriority,
+    ) -> claurst_core::Result<()> {
+        let mut state = self.state();
+        let location = state
+            .persistence
+            .as_ref()
+            .ok_or_else(|| claurst_core::ClaudeError::Other("session queue is not bound".into()))?
+            .clone();
+        if location.session != session {
+            let entries =
+                claurst_core::soft_interrupt_store::load_in(&location.directory, session)?;
+            let order = entries
+                .iter()
+                .map(|entry| entry.seq)
+                .max()
+                .map_or(0, |seq| seq.saturating_add(1));
+            if let Some(entry) = snapshot(&command, order, priority) {
+                claurst_core::soft_interrupt_store::append_in(&location.directory, session, entry)?;
+            }
+            return Ok(());
+        }
+        let seq = state.next_seq;
+        state.next_seq += 1;
+        let order = state.next_order;
+        state.next_order += 1;
+        let persisted = snapshot(&command, order, priority);
+        let persisted_result = persisted.as_ref().map_or(Ok(()), |entry| {
+            claurst_core::soft_interrupt_store::append_in(
+                &location.directory,
+                session,
+                entry.clone(),
+            )
+        });
+        state.heap.push(QueueEntry {
+            command,
+            priority,
+            seq,
+            order,
+            persisted,
+        });
+        persisted_result
+    }
+
     /// Push a command and mirror its stable identity to the pending store.
     /// Store failures leave it queued; delivery retries persistence and never
     /// acknowledges input until the session journal accepts its message.
@@ -152,9 +201,13 @@ impl CommandQueue {
             }
             Some(snapshot)
         });
-        state.heap.push(QueueEntry { command, priority, seq,
+        state.heap.push(QueueEntry {
+            command,
+            priority,
+            seq,
             order,
-            persisted, });
+            persisted,
+        });
         seq
     }
 
@@ -260,7 +313,7 @@ impl CommandQueue {
                 rank => {
                     return Err(claurst_core::ClaudeError::Other(format!(
                         "invalid persisted steering priority {rank}"
-                    )))
+                    )));
                 }
             };
             entries.push(QueueEntry {
@@ -325,8 +378,7 @@ impl CommandQueue {
             .position(|entry| entry.seq == id)
             .map(|index| entries.swap_remove(index).command);
         state.heap = BinaryHeap::from(entries);
-        Ok(
-        removed)
+        Ok(removed)
     }
 
     /// Snapshot for rebuilding a session's pending-input dock after a bind.
@@ -350,10 +402,12 @@ impl CommandQueue {
     pub fn is_empty(&self) -> bool {
         self.state().heap.is_empty()
     }
-} fn snapshot(
+}
+fn snapshot(
     command: &QueuedCommand,
     seq: u64,
-    priority: CommandPriority,) -> Option<PersistedSoftInterrupt> {
+    priority: CommandPriority,
+) -> Option<PersistedSoftInterrupt> {
     let message = command_message(command)?;
     Some(PersistedSoftInterrupt {
         id: format!("steer-{}", uuid::Uuid::new_v4()),
@@ -365,21 +419,21 @@ impl CommandQueue {
 
 fn command_message(command: &QueuedCommand) -> Option<claurst_core::types::Message> {
     use claurst_core::types::Message;
-        match command {
-            QueuedCommand::InjectUserMessage(text) => Some(Message::user(text)),
-            QueuedCommand::InjectSystemMessage(text) => {
+    match command {
+        QueuedCommand::InjectUserMessage(text) => Some(Message::user(text)),
+        QueuedCommand::InjectSystemMessage(text) => {
             Some(Message::user(format!("[System]: {text}")))
-            }
-            QueuedCommand::SetModel(_)
-            | QueuedCommand::Compact
-            | QueuedCommand::Clear
-            | QueuedCommand::TriggerSkill(_) => None,
-            }
         }
+        QueuedCommand::SetModel(_)
+        | QueuedCommand::Compact
+        | QueuedCommand::Clear
+        | QueuedCommand::TriggerSkill(_) => None,
+    }
+}
 
 pub fn drain_command_queue(queue: &CommandQueue) -> Vec<claurst_core::types::Message> {
     queue.drain().iter().filter_map(command_message).collect()
-    }
+}
 
 /// Commit pending identities to the session journal before removing them from
 /// disk or the heap. Replays already present in recovered history are only
@@ -457,7 +511,10 @@ mod tests {
     fn equal_priority_drains_in_push_order() {
         let queue = CommandQueue::new();
         for text in ["first", "second", "third"] {
-            queue.push(QueuedCommand::InjectUserMessage(text.into()), CommandPriority::Normal,);
+            queue.push(
+                QueuedCommand::InjectUserMessage(text.into()),
+                CommandPriority::Normal,
+            );
         }
         assert_eq!(texts(queue.drain()), ["first", "second", "third"]);
         assert!(queue.is_empty());
@@ -466,17 +523,32 @@ mod tests {
     #[test]
     fn higher_priority_drains_first() {
         let queue = CommandQueue::new();
-        queue.push(QueuedCommand::InjectUserMessage("normal".into()), CommandPriority::Normal,);
-        queue.push(QueuedCommand::InjectUserMessage("high".into()), CommandPriority::High,);
+        queue.push(
+            QueuedCommand::InjectUserMessage("normal".into()),
+            CommandPriority::Normal,
+        );
+        queue.push(
+            QueuedCommand::InjectUserMessage("high".into()),
+            CommandPriority::High,
+        );
         assert_eq!(texts(queue.drain()), ["high", "normal"]);
     }
 
     #[test]
     fn remove_takes_back_one_command_and_keeps_the_order_of_the_rest() {
         let queue = CommandQueue::new();
-        let a = queue.push(QueuedCommand::InjectUserMessage("a".into()), CommandPriority::Normal,);
-        let b = queue.push(QueuedCommand::InjectUserMessage("b".into()), CommandPriority::Normal,);
-        let c = queue.push(QueuedCommand::InjectUserMessage("c".into()), CommandPriority::Normal,);
+        let a = queue.push(
+            QueuedCommand::InjectUserMessage("a".into()),
+            CommandPriority::Normal,
+        );
+        let b = queue.push(
+            QueuedCommand::InjectUserMessage("b".into()),
+            CommandPriority::Normal,
+        );
+        let c = queue.push(
+            QueuedCommand::InjectUserMessage("c".into()),
+            CommandPriority::Normal,
+        );
         assert!(queue.contains(b));
         assert!(matches!(queue.remove(b), Some(QueuedCommand::InjectUserMessage(t)) if t == "b"));
         assert!(!queue.contains(b));
@@ -490,7 +562,10 @@ mod tests {
     fn handles_share_one_queue() {
         let queue = CommandQueue::new();
         let other = queue.clone();
-        other.push(QueuedCommand::InjectUserMessage("x".into()), CommandPriority::Normal,);
+        other.push(
+            QueuedCommand::InjectUserMessage("x".into()),
+            CommandPriority::Normal,
+        );
         assert!(!queue.is_empty());
         let messages = drain_command_queue(&queue);
         assert_eq!(messages.len(), 1);
@@ -505,7 +580,7 @@ mod tests {
         let mut conversation = claurst_core::history::ConversationSession::new("test-model".into());
         conversation.id = session.to_string();
         claurst_core::session_journal::SessionJournal::new(&dir.join("sessions"), &conversation)
-}
+    }
 
     #[test]
     fn repeated_initialization_is_idempotent_and_restore_survives_two_crashes() {
@@ -717,6 +792,55 @@ mod tests {
         assert_eq!(
             queue.state().heap.peek().unwrap().priority,
             CommandPriority::High
+        );
+    }
+
+    #[test]
+    fn delayed_completion_is_parked_with_its_launching_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = CommandQueue::new();
+        queue.enable_persistence_in(dir.path(), "A").unwrap();
+        queue.switch_session("B").unwrap();
+        queue
+            .push_for_session(
+                "A",
+                QueuedCommand::InjectUserMessage("A finished".into()),
+                CommandPriority::Normal,
+            )
+            .unwrap();
+        assert!(queue.is_empty());
+        queue
+            .push_for_session(
+                "B",
+                QueuedCommand::InjectUserMessage("B finished".into()),
+                CommandPriority::Normal,
+            )
+            .unwrap();
+        assert_eq!(queue.pending_user_messages()[0].1, "B finished");
+        queue.switch_session("A").unwrap();
+        assert_eq!(queue.pending_user_messages()[0].1, "A finished");
+    }
+
+    #[test]
+    fn same_session_switch_is_idempotent_and_failed_target_load_keeps_old_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = CommandQueue::new();
+        queue.enable_persistence_in(dir.path(), "A").unwrap();
+        let id = queue.push(
+            QueuedCommand::InjectUserMessage("A input".into()),
+            CommandPriority::High,
+        );
+        queue.switch_session("A").unwrap();
+        assert_eq!(queue.pending_user_messages(), vec![(id, "A input".into())]);
+        std::fs::write(dir.path().join("pending-soft-interrupts/B.json"), "broken").unwrap();
+        assert!(queue.switch_session("B").is_err());
+        assert_eq!(queue.pending_user_messages(), vec![(id, "A input".into())]);
+        assert_eq!(queue.state().persistence.as_ref().unwrap().session, "A");
+        assert_eq!(
+            claurst_core::soft_interrupt_store::load_in(dir.path(), "A")
+                .unwrap()
+                .len(),
+            1
         );
     }
 

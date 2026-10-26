@@ -40,6 +40,7 @@ pub(super) async fn load_session_entries() -> Vec<SessionEntry> {
                 title: s.title.unwrap_or_else(|| "(untitled)".to_string()),
                 last_updated,
                 cost_usd: s.total_cost,
+                working_dir: s.working_dir,
             }
         })
         .collect()
