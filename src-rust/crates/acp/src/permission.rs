@@ -15,12 +15,51 @@ use std::sync::{Arc, Mutex};
 
 use agent_client_protocol_schema as acp;
 use claurst_core::permissions::{
-    is_shell_tool, ApprovalScope, PermissionDecision, PermissionManager, PermissionRequest,
+    is_shell_tool, ApprovalScope, PermissionDecision, PermissionManager, PermissionHandler,
+    PermissionRequest,
 };
 use claurst_tools::{PendingPermissionStore, PendingPermissionRequest};
 use tracing::{debug, warn};
 
 use crate::connection::Connection;
+
+/// The ACP permission handler.
+///
+/// Same manager delegation as the TUI's `ManagedInteractivePermissionHandler`,
+/// except a poisoned manager lock denies instead of allowing: under ACP
+/// nobody is watching a terminal, so an unknown permission state must fail
+/// closed (issue #467).
+pub struct AcpPermissionHandler {
+    pub manager: Arc<Mutex<PermissionManager>>,
+}
+
+impl AcpPermissionHandler {
+    pub fn new(manager: Arc<Mutex<PermissionManager>>) -> Self {
+        Self { manager }
+    }
+}
+
+impl PermissionHandler for AcpPermissionHandler {
+    fn check_permission(&self, request: &PermissionRequest) -> PermissionDecision {
+        if let Ok(m) = self.manager.lock() {
+            return m.evaluate(
+                &request.tool_name,
+                &request.description,
+                request.path.as_deref(),
+                request.working_dir.as_deref(),
+                &request.allowed_roots,
+            );
+        }
+        // Poisoned lock: an interactive session could fall back to allow
+        // because the user sees the dialog; the ACP client cannot be trusted
+        // to watch, so fail closed.
+        PermissionDecision::Deny
+    }
+
+    fn request_permission(&self, request: &PermissionRequest) -> PermissionDecision {
+        self.check_permission(request)
+    }
+}
 
 /// Drain a single pending permission request, route it through the
 /// connection as `session/request_permission`, and fire the oneshot with
@@ -241,6 +280,32 @@ mod tests {
             allowed_roots: Vec::new(),
             context_description: None,
         }
+    }
+
+    #[test]
+    fn poisoned_manager_lock_denies_rather_than_allowing() {
+        let manager = Arc::new(Mutex::new(claurst_core::permissions::PermissionManager::new(
+            claurst_core::PermissionMode::Default,
+            &claurst_core::config::Settings::default(),
+        )));
+        // Poison the lock so every later lock() fails.
+        let poisoner = manager.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poisoner.lock().expect("lock before poisoning");
+            panic!("poisoning the manager lock for the test");
+        }));
+
+        let handler = AcpPermissionHandler::new(manager);
+        // The TUI handler would fall back to Allow ("user is watching");
+        // under ACP nobody is watching, so the decision must fail closed.
+        assert_eq!(
+            handler.check_permission(&request("Write", false)),
+            PermissionDecision::Deny
+        );
+        assert_eq!(
+            handler.check_permission(&request("Bash", true)),
+            PermissionDecision::Deny
+        );
     }
 
     #[test]

@@ -1,11 +1,9 @@
 //! Slash-command catalog and dispatch.
 
-use claurst_core::config::Theme;
 use claurst_core::types::Role;
 use crate::notifications::NotificationKind;
 use crate::overlays::HelpEntry;
 use super::App;
-use super::run::open_file_externally;
 use super::try_copy_to_clipboard;
 
 pub(super) const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
@@ -201,14 +199,7 @@ impl App {
                 true
             }
             "theme" => {
-                let current = match &self.config.theme {
-                    Theme::Dark => "dark",
-                    Theme::Light => "light",
-                    Theme::Default => "default",
-                    Theme::Deuteranopia => "deuteranopia",
-                    Theme::Custom(s) => s.as_str(),
-                };
-                self.theme_screen.open(current);
+                self.theme_screen.open(self.config.theme.name());
                 true
             }
             "stats" => {
@@ -472,13 +463,13 @@ impl App {
                 false
             }
             "keybindings" => {
-                // Open the keybindings.json file in the external editor
-                let keybindings_path = claurst_core::config::Settings::config_dir().join("keybindings.json");
-
-                if let Err(e) = open_file_externally(&keybindings_path) {
-                    eprintln!("Failed to open keybindings file: {}", e);
-                }
-                true
+                // The CLI layer owns `/keybindings`:
+                // `claurst_commands::KeybindingsCommand` writes the template
+                // on first use and opens the file in the system editor.
+                // This TUI intercept must NOT open it a second time for the
+                // same command (issue #495) — fall through to the CLI layer
+                // like /doctor, /init, /login, /logout do.
+                false
             }
             "help" => {
                 // Open the help overlay (same as pressing `?` or F1).

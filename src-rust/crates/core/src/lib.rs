@@ -1439,7 +1439,7 @@ pub mod config {
         Plan,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    #[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
     #[serde(rename_all = "camelCase")]
     pub enum Theme {
         #[default]
@@ -1448,6 +1448,74 @@ pub mod config {
         Light,
         Custom(String),
         Deuteranopia,
+    }
+
+    impl<'de> serde::Deserialize<'de> for Theme {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            // Accept both the enum forms (`"dark"`, `{"custom": "my-theme"}`)
+            // and any bare string as `Custom` (`"solarized"`, `"nord"`, or a
+            // custom palette name from ~/.claurst/themes/). Without this,
+            // `"theme": "solarized"` fails to parse and the whole settings
+            // file falls back to defaults.
+            struct ThemeVisitor;
+
+            impl<'de> serde::de::Visitor<'de> for ThemeVisitor {
+                type Value = Theme;
+
+                fn expecting(
+                    &self,
+                    formatter: &mut std::fmt::Formatter<'_>,
+                ) -> std::fmt::Result {
+                    formatter.write_str("a theme name or a custom theme object")
+                }
+
+                fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Theme, E> {
+                    Ok(match value {
+                        "default" => Theme::Default,
+                        "dark" => Theme::Dark,
+                        "light" => Theme::Light,
+                        "deuteranopia" => Theme::Deuteranopia,
+                        other => Theme::Custom(other.to_string()),
+                    })
+                }
+
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Theme, A::Error> {
+                    // The externally tagged {"custom": name} form.
+                    let key = map
+                        .next_key::<String>()?
+                        .ok_or_else(|| serde::de::Error::custom("empty theme object"))?;
+                    let value: String = map.next_value()?;
+                    if key == "custom" {
+                        Ok(Theme::Custom(value))
+                    } else {
+                        self.visit_str(&value)
+                    }
+                }
+            }
+
+            deserializer.deserialize_any(ThemeVisitor)
+        }
+    }
+
+    impl Theme {
+        /// Canonical theme name: the string `/theme <name>` accepts, the
+        /// picker highlights, and settings round-trip. `Custom` passes the
+        /// user's name through unchanged.
+        pub fn name(&self) -> &str {
+            match self {
+                Theme::Default => "default",
+                Theme::Dark => "dark",
+                Theme::Light => "light",
+                Theme::Deuteranopia => "deuteranopia",
+                Theme::Custom(name) => name.as_str(),
+            }
+        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1561,6 +1629,13 @@ pub mod config {
         /// Names of plugins that have been explicitly disabled by the user.
         #[serde(default, rename = "disabledPlugins")]
         pub disabled_plugins: std::collections::HashSet<String>,
+        /// Names of MCP servers the user has explicitly disabled. Disabled
+        /// servers stay in `config.mcpServers` but are not connected and their
+        /// tools are not registered, until re-enabled via `/mcp enable`.
+        /// User-global only: a project settings file cannot re-enable a server
+        /// the user disabled (same security reasoning as the plugin sets).
+        #[serde(default, rename = "disabledMcpServers")]
+        pub disabled_mcp_servers: std::collections::HashSet<String>,
         /// Whether the user has completed the first-launch onboarding flow.
         /// Mirrors TS `hasAcknowledgedSafetyNotice` / `hasCompletedOnboarding`.
         #[serde(default, rename = "hasCompletedOnboarding")]
@@ -2418,6 +2493,10 @@ pub mod config {
                 permission_rules: base.permission_rules,
                 enabled_plugins: base.enabled_plugins,
                 disabled_plugins: { let mut s = base.disabled_plugins; s.extend(over.disabled_plugins); s },
+                // SECURITY: only the user's global settings may flip MCP server
+                // enablement — a project file must not be able to re-enable a
+                // server the user disabled.
+                disabled_mcp_servers: base.disabled_mcp_servers,
                 has_completed_onboarding: over.has_completed_onboarding || base.has_completed_onboarding,
                 last_seen_version: over.last_seen_version.or(base.last_seen_version),
                 provider: over.provider.or(base.provider),
@@ -2576,6 +2655,47 @@ pub mod config {
             assert_eq!(
                 tokio::fs::read_to_string(path).await.unwrap(),
                 MALFORMED_SETTINGS
+            );
+        }
+
+        /// `disabledMcpServers` survives a save/load roundtrip through the
+        /// global settings file, so `/mcp disable` persists across restarts.
+        #[test]
+        fn disabled_mcp_servers_roundtrip() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            let mut settings = Settings::default();
+            settings
+                .disabled_mcp_servers
+                .insert("my-server".to_string());
+            settings.save_to_path_sync(&path).unwrap();
+
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                raw.contains("disabledMcpServers"),
+                "field must serialize under its camelCase name"
+            );
+
+            let restored = Settings::load_from_path_sync(&path).unwrap();
+            assert!(restored.disabled_mcp_servers.contains("my-server"));
+            assert_eq!(restored.disabled_mcp_servers.len(), 1);
+        }
+
+        /// Security: a project settings file must not be able to re-enable an
+        /// MCP server the user disabled globally. The merge keeps the global
+        /// `disabledMcpServers` untouched by the overlay.
+        #[test]
+        fn project_settings_cannot_clear_disabled_mcp_servers() {
+            let mut base = Settings::default();
+            base.disabled_mcp_servers.insert("locked".to_string());
+
+            let mut over = Settings::default();
+            over.disabled_mcp_servers.clear();
+
+            let merged = Settings::merge(base, over);
+            assert!(
+                merged.disabled_mcp_servers.contains("locked"),
+                "project settings must not re-enable a user-disabled MCP server"
             );
         }
     }
@@ -5344,7 +5464,7 @@ pub mod history {
 // cost module
 // ---------------------------------------------------------------------------
 pub mod cost {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
 
     /// Free upstream provider IDs used in the free provider system.
@@ -5364,6 +5484,23 @@ pub mod cost {
         "zai",
         "zhipuai",
     ];
+
+    /// Providers whose usage is billed through a flat subscription instead of
+    /// per-token rates:
+    ///
+    /// * `codex` / `openai-codex` — ChatGPT Plus/Pro subscription (the Codex
+    ///   provider is OAuth-only, so this id always means the subscription).
+    /// * `anthropic-oauth` — the connect-picker alias for Claude Pro/Max
+    ///   OAuth; at request time it dispatches as `anthropic` with Bearer auth.
+    ///
+    /// Issue #499: subscription usage must report zero cost, never a made-up
+    /// per-token price.
+    pub fn is_subscription_provider(provider_id: &str) -> bool {
+        matches!(
+            provider_id,
+            crate::ProviderId::CODEX | "openai-codex" | "anthropic-oauth"
+        )
+    }
 
     /// Check if a model name is an upstream-prefixed free model (e.g., "groq/llama-3.3-70b-versatile").
     fn is_free_upstream_model(model: &str) -> bool {
@@ -5417,50 +5554,110 @@ pub mod cost {
             cache_read_per_mtk: 0.0,
         };
 
-        /// Default pricing is Opus (most capable, highest cost).
-        pub fn default_pricing() -> Self {
-            Self::OPUS
+        /// Per-MTok rates with the 5-minute cache write at 1.25x input, which
+        /// holds for every Claude model on Anthropic's pricing page.
+        const fn claude(input: f64, output: f64, cache_read: f64) -> Self {
+            Self {
+                input_per_mtk: input,
+                output_per_mtk: output,
+                cache_creation_per_mtk: input * 1.25,
+                cache_read_per_mtk: cache_read,
+            }
+        }
+
+        /// True when `id` (lowercase, dots turned into dashes) names `family`
+        /// at exactly `version`, optionally followed by a `-` suffix such as a
+        /// date or `-thinking`: `opus-5` matches `claude-opus-5-20260901` but
+        /// not `claude-opus-50`.
+        fn is_claude_version(id: &str, family: &str, version: &str) -> bool {
+            id.match_indices(family).any(|(i, _)| {
+                id[i + family.len()..]
+                    .strip_prefix(version)
+                    .is_some_and(|tail| tail.is_empty() || tail.starts_with('-'))
+            })
+        }
+
+        /// Rates for Claude versions priced differently from the family
+        /// constants above. Source:
+        /// https://platform.claude.com/docs/en/about-claude/pricing (checked
+        /// 2026-10-24). Cache reads are 0.1x input except Opus 5.5 and
+        /// Sonnet 5.5 (0.05x) and Fable/Mythos 5.1 (0.025x). Order matters:
+        /// `5-5` is checked before `5`.
+        fn claude_version_pricing(id: &str) -> Option<Self> {
+            let is = |family: &str, version: &str| Self::is_claude_version(id, family, version);
+            if is("fable-", "5-1") || is("mythos-", "5-1") {
+                Some(Self::claude(10.0, 50.0, 0.25))
+            } else if is("fable-", "5") || is("mythos-", "5") {
+                Some(Self::claude(10.0, 50.0, 1.0))
+            } else if is("opus-", "5-5") {
+                Some(Self::claude(4.0, 20.0, 0.20))
+            } else if ["5", "4-8", "4-7", "4-6", "4-5"]
+                .iter()
+                .any(|v| is("opus-", v))
+            {
+                Some(Self::claude(5.0, 25.0, 0.50))
+            } else if is("sonnet-", "5-5") {
+                Some(Self::claude(2.0, 10.0, 0.10))
+            } else if is("sonnet-", "5") {
+                Some(Self::claude(2.0, 10.0, 0.20))
+            } else if is("haiku-", "4-5") {
+                Some(Self::claude(1.0, 5.0, 0.10))
+            } else {
+                None
+            }
         }
 
         /// Pick pricing based on model name substring matching.
-        pub fn for_model(model: &str) -> Self {
+        ///
+        /// Returns `None` for models we have no price for (issue #499): callers
+        /// should resolve the price from the model catalog instead, and the
+        /// tracker reports zero cost rather than inventing a default rate.
+        /// Only the Claude families (and free models) are priced here — these
+        /// are the models that work with no catalog entry at all.
+        pub fn for_model(model: &str) -> Option<Self> {
             // Check for free models first (those with "-free" suffix, "free/" prefix, or upstream-prefixed free model)
             if model.ends_with("-free") || model.starts_with("free/") || is_free_upstream_model(model) {
-                Self::FREE
-            } else if model.contains("opus") {
-                Self::OPUS
-            } else if model.contains("haiku") {
-                Self::HAIKU
+                Some(Self::FREE)
             } else {
-                // Default to Sonnet pricing for unknown models
-                Self::SONNET
+                let id = model.to_ascii_lowercase().replace('.', "-");
+                if Self::is_claude_version(&id, "haiku-", "5-5") {
+                    // Haiku 5.5 costs 5x more for prompts over 100k tokens; one
+                    // flat rate can't express that, so no fallback price.
+                    None
+                } else if let Some(pricing) = Self::claude_version_pricing(&id) {
+                    Some(pricing)
+                } else if model.contains("opus") {
+                    Some(Self::OPUS)
+                } else if model.contains("sonnet") {
+                    Some(Self::SONNET)
+                } else if model.contains("haiku") {
+                    Some(Self::HAIKU)
+                } else {
+                    // Unknown model: no default pricing (issue #499).
+                    None
+                }
             }
         }
     }
 
-    impl Default for ModelPricing {
-        fn default() -> Self {
-            Self::OPUS
-        }
-    }
-
     /// Thread-safe, lock-free cost tracker that accumulates token usage.
+    ///
+    /// Pricing starts unknown (`None`) so a model without a catalog price
+    /// reports zero cost instead of an invented default rate (issue #499);
+    /// subscription providers report zero regardless.
     #[derive(Debug, Default)]
     pub struct CostTracker {
         input_tokens: AtomicU64,
         output_tokens: AtomicU64,
         cache_creation_tokens: AtomicU64,
         cache_read_tokens: AtomicU64,
-        pricing: parking_lot::RwLock<ModelPricing>,
+        pricing: parking_lot::RwLock<Option<ModelPricing>>,
+        subscription: AtomicBool,
     }
 
-    // We need a default for RwLock<ModelPricing> -- use Opus as default.
     impl CostTracker {
         pub fn new() -> Arc<Self> {
-            Arc::new(Self {
-                pricing: parking_lot::RwLock::new(ModelPricing::OPUS),
-                ..Default::default()
-            })
+            Arc::new(Self::default())
         }
 
         pub fn with_model(model: &str) -> Arc<Self> {
@@ -5472,6 +5669,30 @@ pub mod cost {
 
         pub fn set_model(&self, model: &str) {
             *self.pricing.write() = ModelPricing::for_model(model);
+        }
+
+        /// Override pricing directly (e.g. resolved from the model catalog).
+        /// `None` marks the price as known to be absent: cost reports zero.
+        pub fn set_pricing(&self, pricing: Option<ModelPricing>) {
+            *self.pricing.write() = pricing;
+        }
+
+        /// The pricing currently configured on this tracker, if any. `None`
+        /// means "no per-token price known" (unknown model, issue #499) —
+        /// consumers must not fall back to an invented default rate.
+        pub fn pricing(&self) -> Option<ModelPricing> {
+            *self.pricing.read()
+        }
+
+        /// Set whether usage is billed through a flat subscription (ChatGPT
+        /// Plus/Pro, Claude Pro/Max OAuth). Subscription cost always reports
+        /// zero (issue #499).
+        pub fn set_subscription(&self, subscription: bool) {
+            self.subscription.store(subscription, Ordering::Relaxed);
+        }
+
+        pub fn is_subscription(&self) -> bool {
+            self.subscription.load(Ordering::Relaxed)
         }
 
         pub fn add_usage(
@@ -5490,7 +5711,14 @@ pub mod cost {
         }
 
         pub fn total_cost_usd(&self) -> f64 {
-            let pricing = *self.pricing.read();
+            if self.is_subscription() {
+                return 0.0;
+            }
+            let Some(pricing) = *self.pricing.read() else {
+                // Unknown model, price never resolved: report zero rather
+                // than guessing a per-token rate (issue #499).
+                return 0.0;
+            };
             let input = self.input_tokens.load(Ordering::Relaxed) as f64;
             let output = self.output_tokens.load(Ordering::Relaxed) as f64;
             let cache_creation = self.cache_creation_tokens.load(Ordering::Relaxed) as f64;
@@ -5528,8 +5756,12 @@ pub mod cost {
 
         /// Produce a human-readable summary string, e.g. for display in the TUI.
         pub fn summary(&self) -> String {
-            let cost = self.total_cost_usd();
             let total = self.total_tokens();
+            if self.is_subscription() {
+                // Flat-subscription billing: no dollar figure to show (issue #499).
+                return format!("{} tokens", total);
+            }
+            let cost = self.total_cost_usd();
             if cost == 0.0 {
                 format!("{} tokens ($0.00)", total)
             } else if cost < 0.01 {
@@ -5982,6 +6214,9 @@ pub mod tasks {
         /// windows (#442).
         #[serde(default)]
         pub output_file: Option<std::path::PathBuf>,
+        /// The capture ended at a timeout, so the attached file is partial.
+        #[serde(default)]
+        pub output_is_partial: bool,
         /// OS process ID, if applicable.
         pub pid: Option<u32>,
         /// Cancellation token for the task's in-process work loop. Signalling it
@@ -6003,6 +6238,7 @@ pub mod tasks {
                 output: Vec::new(),
                 omitted_output_lines: 0,
                 output_file: None,
+                output_is_partial: false,
                 pid: None,
                 cancel_token: None,
             }
@@ -6024,14 +6260,23 @@ pub mod tasks {
                 let split = OUTPUT_WINDOW_LINES.min(self.output.len());
                 let head = self.output[..split].join("\n");
                 let tail = self.output[split..].join("\n");
-                join_head_tail(
-                    head_window(&head, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES),
-                    tail_window(&tail, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES),
-                    &format!("{} lines", self.omitted_output_lines),
-                )
+                let head_cut = head_window(&head, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES);
+                let tail_cut = tail_window(&tail, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES);
+                // The windows' byte caps can drop lines of their own, on top
+                // of the compaction count the registry tracks; the marker
+                // counts both (#465).
+                let omitted = self.omitted_output_lines
+                    + dropped_lines(&head, head_cut)
+                    + dropped_lines(&tail, tail_cut);
+                join_head_tail(head_cut, tail_cut, &format!("{omitted} lines"))
             };
             if let Some(path) = &self.output_file {
-                text.push_str(&format!("\n\nFull output: {}", path.display()));
+                let label = if self.output_is_partial {
+                    "Partial output"
+                } else {
+                    "Full output"
+                };
+                text.push_str(&format!("\n\n{label}: {}", path.display()));
             }
             text
         }
@@ -6040,6 +6285,14 @@ pub mod tasks {
         pub fn is_running(&self) -> bool {
             matches!(self.status, TaskStatus::Running)
         }
+    }
+
+    /// Lines present in `text` but not in `window`, i.e. the lines a
+    /// head/tail window's byte cap dropped (#465). A cut landing mid-line
+    /// leaves a partial line behind, so this is a lower bound.
+    fn dropped_lines(text: &str, window: &str) -> u64 {
+        let lines = |s: &str| (!s.is_empty()) as u64 + s.matches('\n').count() as u64;
+        lines(text).saturating_sub(lines(window))
     }
 
     /// Thread-safe registry of background tasks.
@@ -6065,6 +6318,11 @@ pub mod tasks {
         /// Update the status of a task.  No-op if the ID is unknown.
         pub fn update_status(&self, id: &str, status: TaskStatus) {
             if let Some(mut entry) = self.tasks.get_mut(id) {
+                // A cancelled worker may finish draining after the user stop.
+                // Its late completion must not revive the task or notify.
+                if entry.status == TaskStatus::Cancelled {
+                    return;
+                }
                 let is_terminal = !matches!(status, TaskStatus::Running);
                 entry.status = status;
                 if is_terminal && entry.completed_at.is_none() {
@@ -6129,10 +6387,12 @@ pub mod tasks {
             self.update_status(id, TaskStatus::Cancelled);
         }
 
-        /// Record the file holding a task's full output.  No-op if unknown.
-        pub fn set_output_file(&self, id: &str, path: std::path::PathBuf) {
+        /// Record a task's captured output file and whether it ended early.
+        /// No-op if the task is unknown.
+        pub fn set_output_file(&self, id: &str, path: std::path::PathBuf, is_partial: bool) {
             if let Some(mut entry) = self.tasks.get_mut(id) {
                 entry.output_file = Some(path);
+                entry.output_is_partial = is_partial;
             }
         }
 
@@ -6183,9 +6443,34 @@ pub mod tasks {
             assert!(rendered.contains("lines omitted"));
             assert!(rendered.len() <= 2 * OUTPUT_WINDOW_BYTES + 100);
 
-            registry.set_output_file(&id, std::path::PathBuf::from("/spill/x.txt"));
+            registry.set_output_file(&id, std::path::PathBuf::from("/spill/x.txt"), false);
             let rendered = registry.get(&id).unwrap().render_output();
             assert!(rendered.ends_with("line 99999\n\nFull output: /spill/x.txt"));
+        }
+
+        #[test]
+        fn late_worker_completion_does_not_overwrite_user_cancel() {
+            let registry = TaskRegistry::new();
+            let id = registry.register(BackgroundTask::new("cancelled"));
+            registry.cancel(&id);
+            registry.complete(&id);
+            registry.update_status(&id, TaskStatus::Failed("late exit".into()));
+            assert_eq!(registry.get(&id).unwrap().status, TaskStatus::Cancelled);
+        }
+
+        #[test]
+        fn timeout_file_is_labelled_partial() {
+            let registry = TaskRegistry::new();
+            let id = registry.register(BackgroundTask::new("timeout"));
+            registry.set_output_file(
+                &id,
+                std::path::PathBuf::from("/spill/partial.txt"),
+                true,
+            );
+            assert!(
+                registry.get(&id).unwrap().render_output()
+                    .ends_with("Partial output: /spill/partial.txt")
+            );
         }
 
         #[test]
@@ -6196,12 +6481,80 @@ pub mod tasks {
             registry.append_output(&id, "b");
             assert_eq!(registry.get(&id).unwrap().render_output(), "a\nb");
         }
+
+        /// #465: window cuts that land mid-line leave partial lines behind;
+        /// the accounting counts the lines a window dropped exactly.
+        #[test]
+        fn dropped_lines_counts_window_line_cuts() {
+            assert_eq!(dropped_lines("", ""), 0);
+            assert_eq!(dropped_lines("a\nb\nc\nd", "a\nb"), 2);
+            // A window that cuts mid-line still counts that partial line (the
+            // cut byte cap is what removed the rest of it).
+            assert_eq!(dropped_lines("a\nb\nc\nd", "a\nb\nc"), 1);
+            assert_eq!(dropped_lines("only", ""), 1);
+        }
+
+        /// #465: when the windows' byte caps drop lines of their own, the
+        /// marker names those on top of the registry's compaction count.
+        #[test]
+        fn render_output_accounts_for_window_line_cuts() {
+            let mut task = BackgroundTask::new("wide");
+            task.omitted_output_lines = 3;
+            // 100 lines of 60,000 bytes put the head window well past its
+            // byte cap with no complete line kept besides the first.
+            task.output = vec!["x".repeat(60_000); 100];
+            let rendered = task.render_output();
+            // 3 omitted in the registry + 99 lines dropped by the byte cap.
+            assert!(
+                rendered.contains("(102 lines omitted)"),
+                "marker missing from a render of {} bytes",
+                rendered.len()
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_deserializes_bare_names_and_enum_forms() {
+        // Built-in names keep their unit-variant form.
+        assert_eq!(
+            serde_json::from_str::<config::Theme>("\"default\"").unwrap(),
+            config::Theme::Default
+        );
+        assert_eq!(
+            serde_json::from_str::<config::Theme>("\"dark\"").unwrap(),
+            config::Theme::Dark
+        );
+        // Any other bare string becomes Custom so a settings file can say
+        // "theme": "solarized" (or a custom palette name) without breaking
+        // the whole settings parse.
+        assert_eq!(
+            serde_json::from_str::<config::Theme>("\"nord\"").unwrap(),
+            config::Theme::Custom("nord".to_string())
+        );
+        // The externally tagged object form still works.
+        assert_eq!(
+            serde_json::from_str::<config::Theme>("{\"custom\":\"nord\"}").unwrap(),
+            config::Theme::Custom("nord".to_string())
+        );
+        // Roundtrip: a Custom theme serializes back to the object form and
+        // re-parses.
+        let theme = config::Theme::Custom("solarized".to_string());
+        let json = serde_json::to_string(&theme).unwrap();
+        assert_eq!(serde_json::from_str::<config::Theme>(&json).unwrap(), theme);
+        // A Config with a custom theme name parses without breaking the
+        // surrounding settings. Build a full default Config as JSON, swap in
+        // the theme, and re-parse: proves bare-string themes don't break the
+        // parse while covering every required field.
+        let mut value = serde_json::to_value(config::Config::default()).unwrap();
+        value["theme"] = serde_json::Value::String("solarized".to_string());
+        let cfg: config::Config = serde_json::from_value(value).unwrap();
+        assert_eq!(cfg.theme, config::Theme::Custom("solarized".to_string()));
+    }
 
     #[test]
     fn test_message_user() {
@@ -6306,6 +6659,10 @@ mod tests {
         tracker.add_usage(1000, 500, 200, 100);
         assert_eq!(tracker.input_tokens(), 1000);
         assert_eq!(tracker.output_tokens(), 500);
+        // Unpriced and unknown-model trackers report zero (issue #499).
+        assert_eq!(tracker.total_cost_usd(), 0.0);
+        // With explicit pricing, normal per-token accounting applies.
+        tracker.set_pricing(Some(cost::ModelPricing::SONNET));
         assert!(tracker.total_cost_usd() > 0.0);
     }
 
@@ -6439,6 +6796,37 @@ mod tests {
         assert_eq!(cfg.effective_effort_level(), None);
     }
 
+    /// Serializes the `ANTHROPIC_API_KEY` env-mutating tests. The env is
+    /// process-global and the default test harness runs tests on parallel
+    /// threads: without this lock, one test's remove/set races another's
+    /// resolve and the suite flakes under load. The guard snapshots the
+    /// current value on the way in and restores it on drop, so a panicking
+    /// test cannot leak a scratch value either.
+    mod anthropic_api_key_env {
+        use std::sync::{Mutex, MutexGuard, OnceLock};
+
+        pub(crate) struct EnvRestore {
+            _guard: MutexGuard<'static, ()>,
+            orig: Option<String>,
+        }
+
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match &self.orig {
+                    Some(k) => std::env::set_var("ANTHROPIC_API_KEY", k),
+                    None => std::env::remove_var("ANTHROPIC_API_KEY"),
+                }
+            }
+        }
+
+        pub fn lock_and_snapshot() -> EnvRestore {
+            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            let guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|p| p.into_inner());
+            let orig = std::env::var("ANTHROPIC_API_KEY").ok();
+            EnvRestore { _guard: guard, orig }
+        }
+    }
+
     #[test]
     fn test_config_effective_max_tokens_default() {
         let cfg = crate::config::Config::default();
@@ -6455,45 +6843,30 @@ mod tests {
     fn test_config_resolve_api_key_from_config() {
         // When config.api_key is set, it should be returned regardless of env var
         // (Config key takes priority — resolve_api_key returns it first)
-        let orig = std::env::var("ANTHROPIC_API_KEY").ok();
+        let _env = anthropic_api_key_env::lock_and_snapshot();
         std::env::remove_var("ANTHROPIC_API_KEY");
 
         let cfg = crate::config::Config { api_key: Some("sk-ant-config-key".to_string()), ..Default::default() };
         assert_eq!(cfg.resolve_api_key(), Some("sk-ant-config-key".to_string()));
-
-        if let Some(k) = orig {
-            std::env::set_var("ANTHROPIC_API_KEY", k);
-        }
     }
 
     #[test]
     fn test_config_resolve_api_key_none() {
         // Temporarily ensure no env var override
-        let orig = std::env::var("ANTHROPIC_API_KEY").ok();
+        let _env = anthropic_api_key_env::lock_and_snapshot();
         std::env::remove_var("ANTHROPIC_API_KEY");
 
         let cfg = crate::config::Config::default();
         assert!(cfg.resolve_api_key().is_none());
-
-        // Restore
-        if let Some(k) = orig {
-            std::env::set_var("ANTHROPIC_API_KEY", k);
-        }
     }
 
     #[test]
     fn test_config_resolve_api_key_from_env() {
-        let orig = std::env::var("ANTHROPIC_API_KEY").ok();
+        let _env = anthropic_api_key_env::lock_and_snapshot();
         std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-env-key");
 
         let cfg = crate::config::Config::default();
         assert_eq!(cfg.resolve_api_key(), Some("sk-ant-env-key".to_string()));
-
-        // Restore
-        std::env::remove_var("ANTHROPIC_API_KEY");
-        if let Some(k) = orig {
-            std::env::set_var("ANTHROPIC_API_KEY", k);
-        }
     }
 
     // ---- OAuth token tests --------------------------------------------------
@@ -6858,30 +7231,123 @@ mod tests {
     #[test]
     fn test_model_pricing_free_variants() {
         // Test that models ending with -free use FREE pricing
-        assert_eq!(cost::ModelPricing::for_model("deepseek-v4-flash-free"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("zen/minimax-m2.5-free"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("deepseek-v4-flash-free"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("zen/minimax-m2.5-free"), Some(cost::ModelPricing::FREE));
 
         // Test that models starting with free/ use FREE pricing
-        assert_eq!(cost::ModelPricing::for_model("free/auto"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("free/some-model"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("free/auto"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("free/some-model"), Some(cost::ModelPricing::FREE));
 
         // Test that upstream-prefixed free models use FREE pricing
-        assert_eq!(cost::ModelPricing::for_model("groq/llama-3.3-70b-versatile"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("cerebras/qwen-3-235b-a22b-instruct-2507"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("google/gemini-2.5-flash"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("mistral/mistral-large-latest"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("sambanova/Meta-Llama-3.3-70B-Instruct"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("nvidia/meta/llama-3.3-70b-instruct"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("cohere/command-r-plus"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("openrouter/free"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("opencode-zen/minimax-m2.5-free"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("zai/glm-4.6"), cost::ModelPricing::FREE);
-        assert_eq!(cost::ModelPricing::for_model("zhipuai/glm-4.5"), cost::ModelPricing::FREE);
+        assert_eq!(cost::ModelPricing::for_model("groq/llama-3.3-70b-versatile"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("cerebras/qwen-3-235b-a22b-instruct-2507"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("google/gemini-2.5-flash"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("mistral/mistral-large-latest"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("sambanova/Meta-Llama-3.3-70B-Instruct"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("nvidia/meta/llama-3.3-70b-instruct"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("cohere/command-r-plus"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("openrouter/free"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("opencode-zen/minimax-m2.5-free"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("zai/glm-4.6"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("zhipuai/glm-4.5"), Some(cost::ModelPricing::FREE));
 
         // Test that other models use their appropriate pricing
-        assert_eq!(cost::ModelPricing::for_model("claude-opus"), cost::ModelPricing::OPUS);
-        assert_eq!(cost::ModelPricing::for_model("claude-haiku"), cost::ModelPricing::HAIKU);
-        assert_eq!(cost::ModelPricing::for_model("claude-sonnet"), cost::ModelPricing::SONNET);
+        assert_eq!(cost::ModelPricing::for_model("claude-opus"), Some(cost::ModelPricing::OPUS));
+        assert_eq!(cost::ModelPricing::for_model("claude-haiku"), Some(cost::ModelPricing::HAIKU));
+        assert_eq!(cost::ModelPricing::for_model("claude-sonnet"), Some(cost::ModelPricing::SONNET));
+    }
+
+    #[test]
+    fn claude_versions_priced_at_current_rates() {
+        // Rates from https://platform.claude.com/docs/en/about-claude/pricing
+        // (input, output, 5m cache write, cache read per MTok). These are the
+        // fallback when the bundled catalog has no entry for the model.
+        let p = |m: &str| {
+            let r =
+                cost::ModelPricing::for_model(m).unwrap_or_else(|| panic!("{m} has no pricing"));
+            (
+                r.input_per_mtk,
+                r.output_per_mtk,
+                r.cache_creation_per_mtk,
+                r.cache_read_per_mtk,
+            )
+        };
+        assert_eq!(p("claude-opus-5-5"), (4.0, 20.0, 5.0, 0.20));
+        assert_eq!(p("claude-opus-5"), (5.0, 25.0, 6.25, 0.50));
+        assert_eq!(p("claude-opus-4-8"), (5.0, 25.0, 6.25, 0.50));
+        assert_eq!(p("claude-opus-4-5-20251101"), (5.0, 25.0, 6.25, 0.50));
+        assert_eq!(p("claude-sonnet-5-5"), (2.0, 10.0, 2.5, 0.10));
+        assert_eq!(p("claude-sonnet-5-20260801"), (2.0, 10.0, 2.5, 0.20));
+        assert_eq!(p("claude-fable-5-1"), (10.0, 50.0, 12.5, 0.25));
+        assert_eq!(p("claude-fable-5"), (10.0, 50.0, 12.5, 1.0));
+        assert_eq!(p("claude-haiku-4-5"), (1.0, 5.0, 1.25, 0.10));
+        // Provider-prefixed and dotted ids resolve the same way.
+        assert_eq!(p("anthropic/claude-opus-5.5"), (4.0, 20.0, 5.0, 0.20));
+        assert_eq!(p("claude-sonnet-5-5-thinking"), (2.0, 10.0, 2.5, 0.10));
+        // Older models keep the family rates.
+        let family = |m: &str| cost::ModelPricing::for_model(m);
+        assert_eq!(family("claude-opus-4-1"), Some(cost::ModelPricing::OPUS));
+        assert_eq!(
+            family("claude-sonnet-4-6"),
+            Some(cost::ModelPricing::SONNET)
+        );
+        assert_eq!(family("claude-3-5-haiku"), Some(cost::ModelPricing::HAIKU));
+        // Haiku 5.5 is priced by prompt length, so there is no flat fallback.
+        assert_eq!(family("claude-haiku-5-5"), None);
+    }
+
+    #[test]
+    fn subscription_providers_report_zero_cost() {
+        assert!(cost::is_subscription_provider("codex"));
+        assert!(cost::is_subscription_provider("openai-codex"));
+        assert!(cost::is_subscription_provider("anthropic-oauth"));
+        assert!(!cost::is_subscription_provider("anthropic"));
+        assert!(!cost::is_subscription_provider("openai"));
+
+        let tracker = CostTracker::new();
+        tracker.set_pricing(Some(cost::ModelPricing::OPUS));
+        tracker.set_subscription(true);
+        // Even a priced tracker reports zero for subscription billing, and the
+        // summary carries no dollar figure (issue #499).
+        tracker.add_usage(10_074, 5, 0, 0);
+        assert_eq!(tracker.total_cost_usd(), 0.0);
+        assert_eq!(tracker.summary(), "10079 tokens");
+
+        // Back to per-token billing: the configured price applies again.
+        tracker.set_subscription(false);
+        assert!(tracker.total_cost_usd() > 0.0);
+    }
+
+    #[test]
+    fn unknown_models_get_no_default_price() {
+        // No pricing configured anywhere: unknown models must not silently get
+        // a default per-token rate (issue #499) — cost stays 0.
+        let tracker = CostTracker::new();
+        tracker.add_usage(10_074, 5, 0, 0);
+        assert_eq!(tracker.total_cost_usd(), 0.0);
+
+        // An explicitly unknown model resolves to no pricing either.
+        assert_eq!(cost::ModelPricing::for_model("gpt-5.6-sol"), None);
+        let tracker = CostTracker::with_model("gpt-5.6-sol");
+        tracker.add_usage(10_074, 5, 0, 0);
+        assert_eq!(tracker.total_cost_usd(), 0.0);
+
+        // Being told "no price" (catalog miss) behaves the same.
+        tracker.set_pricing(None);
+        assert_eq!(tracker.total_cost_usd(), 0.0);
+    }
+
+    #[test]
+    fn known_models_still_priced_normally() {
+        let tracker = CostTracker::with_model("claude-sonnet-4-5");
+        tracker.add_usage(1_000_000, 1_000_000, 0, 0);
+        assert_eq!(tracker.total_cost_usd(), 3.0 + 15.0);
+
+        // Explicit pricing via set_pricing works as before.
+        let tracker = CostTracker::new();
+        tracker.set_pricing(Some(cost::ModelPricing::HAIKU));
+        tracker.add_usage(1_000_000, 1_000_000, 0, 0);
+        assert_eq!(tracker.total_cost_usd(), 0.80 + 4.0);
     }
 
     #[test]

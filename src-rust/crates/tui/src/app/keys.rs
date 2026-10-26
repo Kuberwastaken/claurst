@@ -112,6 +112,7 @@ pub(super) fn key_event_to_keystroke(key: &KeyEvent) -> Option<ParsedKeystroke> 
         KeyCode::Enter     => "enter".to_string(),
         KeyCode::Esc       => "escape".to_string(),
         KeyCode::Home      => "home".to_string(),
+        KeyCode::Insert    => "insert".to_string(),
         KeyCode::Left      => "left".to_string(),
         KeyCode::PageDown  => "pagedown".to_string(),
         KeyCode::PageUp    => "pageup".to_string(),
@@ -1524,7 +1525,21 @@ impl App {
             KeyCode::Char(c) => {
                 let c = self.shift_normalize(c, key.modifiers);
                 if self.prompt_input.vim_enabled && self.prompt_input.vim_mode != VimMode::Insert {
-                    self.prompt_input.vim_command(&c.to_string());
+                    // Ctrl+V is vim's block-visual key: feed the vim state
+                    // machine the \x16 control code instead of the plain 'v'
+                    // character so it reaches the `key == "\x16"` branch in
+                    // `vim_command` (issue #495). In insert mode the clipboard
+                    // paste handler earlier in this function consumed it
+                    // instead.
+                    let vim_key = if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && c == 'v'
+                        && self.prompt_input.vim_mode == VimMode::Normal
+                    {
+                        "\x16".to_string()
+                    } else {
+                        c.to_string()
+                    };
+                    self.prompt_input.vim_command(&vim_key);
                 } else {
                     self.prompt_input.insert_char(c);
                 }
@@ -2136,7 +2151,11 @@ impl App {
                 self.history_search = Some(hs);
                 false
             }
-            "openSearch" => {
+            // `globalSearch` is the legacy/default action name and
+            // `openSearch` is the live one; both open project search
+            // (issue #495). Keep them aliased so old keybindings.json
+            // files and the default ctrl+shift+f binding keep working.
+            "openSearch" | "globalSearch" => {
                 self.global_search.open();
                 self.refresh_global_search();
                 false

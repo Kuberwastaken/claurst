@@ -100,7 +100,17 @@ impl MinimaxProvider {
         if !request.stop_sequences.is_empty() {
             builder = builder.stop_sequences(request.stop_sequences.clone());
         }
-        if request.model.eq_ignore_ascii_case("MiniMax-M3") && request.thinking.is_some() {
+        // Flash always thinks; never forward an Anthropic token budget or
+        // disabled thinking. M3 remains opt-in, and legacy/custom IDs retain
+        // their existing behavior.
+        if request.model.eq_ignore_ascii_case("MiniMax-M3.1-Flash") {
+            builder = builder.thinking(ThinkingConfig::adaptive());
+            if let Some(effort) = request.provider_options.get("effort").and_then(Value::as_str) {
+                if matches!(effort, "low" | "medium" | "high" | "xhigh" | "max") {
+                    builder = builder.effort(effort);
+                }
+            }
+        } else if request.model.eq_ignore_ascii_case("MiniMax-M3") && request.thinking.is_some() {
             builder = builder.thinking(ThinkingConfig::adaptive());
         }
 
@@ -112,8 +122,11 @@ impl MinimaxProvider {
         request: &ProviderRequest,
     ) -> Result<Value, serde_json::Error> {
         let mut body = serde_json::to_value(Self::build_request(request))?;
-        if let Some(service_tier) = &self.service_tier {
-            body["service_tier"] = Value::String(service_tier.clone());
+        // Flash rejects service_tier, even when inherited from provider config.
+        if !request.model.eq_ignore_ascii_case("MiniMax-M3.1-Flash") {
+            if let Some(service_tier) = &self.service_tier {
+                body["service_tier"] = Value::String(service_tier.clone());
+            }
         }
         Ok(body)
     }
@@ -150,6 +163,10 @@ impl MinimaxProvider {
                 let content_block = match content_type {
                     "text" => ContentBlock::Text {
                         text: String::new(),
+                    },
+                    "thinking" => ContentBlock::Thinking {
+                        thinking: value["content_block"]["thinking"].as_str().unwrap_or_default().to_string(),
+                        signature: value["content_block"]["signature"].as_str().unwrap_or_default().to_string(),
                     },
                     "tool_use" => {
                         let id = value.get("content_block")?.get("id")?.as_str()?.to_string();
@@ -370,7 +387,14 @@ impl LlmProvider for MinimaxProvider {
                     Ok(chunk) => {
                         for line in decoder.push(&chunk) {
                             let line = line.trim_end_matches('\r').trim();
-                            if line.is_empty() {
+                            // Standard SSE metadata is not JSON. Keep accepting
+                            // bare JSON lines for existing compatible endpoints.
+                            if line.is_empty()
+                                || line.starts_with(':')
+                                || line.starts_with("event:")
+                                || line.starts_with("id:")
+                                || line.starts_with("retry:")
+                            {
                                 continue;
                             }
 
@@ -464,8 +488,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn configured_base_and_service_tier_reach_the_wire_request() {
+    async fn capture_request(request: ProviderRequest) -> Value {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener should bind");
@@ -516,7 +539,7 @@ mod tests {
             .with_base_url(format!("http://{address}/anthropic"))
             .with_service_tier("priority");
         let _stream = provider
-            .create_message_stream(request("MiniMax-M3", false))
+            .create_message_stream(request)
             .await
             .expect("request should succeed");
 
@@ -529,8 +552,32 @@ mod tests {
             headers.lines().next(),
             Some("POST /anthropic/v1/messages HTTP/1.1")
         );
-        let body: Value = serde_json::from_str(body).expect("body should be JSON");
+        serde_json::from_str(body).expect("body should be JSON")
+    }
+
+    #[tokio::test]
+    async fn configured_base_and_service_tier_reach_the_wire_request() {
+        let body = capture_request(request("MiniMax-M3", false)).await;
         assert_eq!(body["service_tier"], serde_json::json!("priority"));
+    }
+
+    #[tokio::test]
+    async fn flash_never_sends_disabled_thinking_budgets_or_invalid_effort() {
+        for effort in [
+            serde_json::json!("none"),
+            serde_json::json!("minimal"),
+            serde_json::json!("invalid"),
+            serde_json::json!(3),
+            Value::Null,
+        ] {
+            let mut request = request("minimax-m3.1-flash", true);
+            request.thinking.as_mut().unwrap().thinking_type = "disabled".to_string();
+            request.provider_options = serde_json::json!({"effort": effort});
+            let body = capture_request(request).await;
+            assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+            assert!(body.get("service_tier").is_none());
+            assert!(body.get("output_config").is_none());
+        }
     }
 
     #[test]

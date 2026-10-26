@@ -382,6 +382,7 @@ async fn main() -> anyhow::Result<()> {
                     mcp_manager: None,
                     mcp_auth_runner: None,
                     permission_manager: None,
+                    disabled_mcp_servers: settings.disabled_mcp_servers.clone(),
                 };
                 // Collect remaining args after the command name
                 let rest: Vec<&str> = raw_args[2..].iter().map(|s| s.as_str()).collect();
@@ -736,6 +737,7 @@ async fn main() -> anyhow::Result<()> {
             settings.trust_project_mcp_servers,
             &std::collections::HashSet::new(),
             &store,
+            &settings.disabled_mcp_servers,
         )
     };
     let mut pending_project_mcp = mcp_decision.pending.clone();
@@ -763,6 +765,36 @@ async fn main() -> anyhow::Result<()> {
     if is_headless {
         if let Some(manager) = mcp_manager_arc.as_ref() {
             manager.wait_until_settled().await;
+        }
+    }
+
+    // One-time warning for saved permission rules in the legacy
+    // `<server>_<tool>` form (issue #471): the exposed names were renamed to
+    // `mcp__<server>__<tool>` (#459), so a saved rule matching a configured
+    // server no longer matches anything. Sees all saved-rule sources:
+    // allowed_tools / disallowed_tools and the persisted permissionRules.
+    {
+        let mut legacy_specs: Vec<String> = config
+            .allowed_tools
+            .iter()
+            .chain(config.disallowed_tools.iter())
+            .cloned()
+            .collect();
+        legacy_specs.extend(
+            settings
+                .permission_rules
+                .iter()
+                .filter_map(|rule| rule.tool_name.clone()),
+        );
+        let legacy_rules =
+            claurst_mcp::legacy_permission_rule_names(&config.mcp_servers, &legacy_specs);
+        if !legacy_rules.is_empty() {
+            warn!(
+                rules = ?legacy_rules,
+                "Saved permission rules use the legacy <server>_<tool> MCP naming and never \
+                 match now; rename them to mcp__<server>__<tool> (or mcp__<server> to cover \
+                 every tool of a server) in allowed_tools / disallowed_tools or permissionRules"
+            );
         }
     }
 
@@ -877,6 +909,7 @@ async fn main() -> anyhow::Result<()> {
             &cwd,
             settings.trust_project_mcp_servers,
             &claurst_core::mcp_trust::McpTrustStore::load(),
+            &settings.disabled_mcp_servers,
         );
         if !plugin_pending.is_empty() {
             let names: Vec<&str> = plugin_pending.iter().map(|s| s.name.as_str()).collect();
@@ -905,6 +938,19 @@ async fn main() -> anyhow::Result<()> {
     // The registry is pre-populated with a hardcoded snapshot and enriched
     // from the models.dev cache if available.
     let model_registry = load_cached_model_registry(&config);
+
+    // Cost reporting seed (issue #499): configure the shared tracker for the
+    // active provider/model — zero cost for subscription providers (ChatGPT
+    // Codex, Claude Pro/Max OAuth), catalog pricing for known models, and no
+    // invented default rate for unknown ones. The headless `result` event,
+    // `/cost` and the TUI footer all read this same tracker.
+    claurst_api::apply_session_cost_pricing(
+        &cost_tracker,
+        Some(&model_registry),
+        config.selected_provider_id(),
+        config.effective_model(),
+        use_bearer_auth,
+    );
 
     // Build query config
     let mut query_config = claurst_query::QueryConfig::from_config_with_registry(&config, &model_registry);
@@ -988,10 +1034,20 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn the background cron scheduler (fires cron tasks at scheduled times).
     // Cancelled automatically when the process exits since we use a shared token.
+    // The scheduler resolves its tool list at fire time (issue #471) through
+    // `cron_manager_cell`, so tasks pick up MCP tools whose servers connect
+    // after startup.
     let cron_cancel = tokio_util::sync::CancellationToken::new();
+    let cron_manager_cell: Arc<parking_lot::RwLock<Option<Arc<claurst_mcp::McpManager>>>> =
+        Arc::new(parking_lot::RwLock::new(mcp_manager_arc.clone()));
+    let cron_tool_list: claurst_query::ToolListProvider = {
+        let manager_cell = Arc::clone(&cron_manager_cell);
+        let snapshot = query_config.clone();
+        Arc::new(move || tools_for_session(manager_cell.read().clone(), &snapshot))
+    };
     claurst_query::start_cron_scheduler(
         client.clone(),
-        tools.clone(),
+        cron_tool_list,
         tool_ctx.clone(),
         query_config.clone(),
         cron_cancel.clone(),
@@ -1037,10 +1093,12 @@ async fn main() -> anyhow::Result<()> {
             bridge_config,
             has_credentials,
             model_registry,
+            use_bearer_auth,
             user_question_rx,
             pending_project_mcp,
             mcp_project_root,
             skill_discovery,
+            cron_manager_cell,
         )
         .await
     };
@@ -1063,6 +1121,7 @@ fn pending_project_plugin_mcp(
     cwd: &std::path::Path,
     trust_all_project: bool,
     store: &claurst_core::mcp_trust::McpTrustStore,
+    disabled: &std::collections::HashSet<String>,
 ) -> Vec<claurst_core::config::McpServerConfig> {
     if !plugin_servers
         .iter()
@@ -1077,6 +1136,7 @@ fn pending_project_plugin_mcp(
         trust_all_project,
         &std::collections::HashSet::new(),
         store,
+        disabled,
     )
     .pending
 }
@@ -1470,6 +1530,9 @@ struct RefreshedProviderRuntime {
     provider_registry: Arc<claurst_api::ProviderRegistry>,
     model_registry: Arc<claurst_api::ModelRegistry>,
     auth_store: claurst_core::AuthStore,
+    /// Anthropic auth mode resolved for `config` (Bearer = Claude Pro/Max
+    /// OAuth subscription); feeds the cost tracker (issue #499).
+    use_bearer_auth: bool,
 }
 
 async fn refresh_provider_runtime_state(
@@ -1534,6 +1597,7 @@ async fn refresh_provider_runtime_state(
         provider_registry,
         model_registry,
         auth_store: claurst_core::AuthStore::default(),
+        use_bearer_auth,
     })
 }
 
@@ -1578,6 +1642,7 @@ async fn reload_provider_runtime_state(
         provider_registry,
         model_registry,
         auth_store: claurst_core::AuthStore::default(),
+        use_bearer_auth,
     })
 }
 
@@ -1979,7 +2044,7 @@ async fn session_skill_listings(
 
 async fn run_interactive(
     config: Config,
-    settings: claurst_core::config::Settings,
+    mut settings: claurst_core::config::Settings,
     settings_load_error: Option<String>,
     client: Arc<claurst_api::AnthropicClient>,
     tools: Arc<Vec<Box<dyn claurst_tools::Tool>>>,
@@ -1990,10 +2055,15 @@ async fn run_interactive(
     bridge_config: Option<claurst_bridge::BridgeConfig>,
     has_credentials: bool,
     model_registry: Arc<claurst_api::ModelRegistry>,
+    anthropic_bearer_auth: bool,
     user_question_rx: Option<tokio::sync::mpsc::UnboundedReceiver<claurst_tools::UserQuestionEvent>>,
     pending_project_mcp: Vec<claurst_core::config::McpServerConfig>,
     mcp_project_root: Option<PathBuf>,
     skill_discovery: Option<tokio::task::JoinHandle<claurst_core::SkillRegistry>>,
+    // Shared slot for the cron scheduler's session tool list (issue #471):
+    // updated when the MCP runtime is rebuilt so cron tasks resolve fresh
+    // tool lists, including MCP tools from late-connecting servers.
+    cron_manager_cell: Arc<parking_lot::RwLock<Option<Arc<claurst_mcp::McpManager>>>>,
 ) -> anyhow::Result<()> {
     use claurst_commands::{execute_command, CommandContext, CommandResult};
     use claurst_bridge::{BridgeOutbound, TuiBridgeEvent};
@@ -2130,6 +2200,11 @@ async fn run_interactive(
     claurst_tui::spawn_signal_restore_watchers();
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
     app.command_queue = Some(command_queue.clone());
+    // Propagate the startup auth mode into cost reporting: a Claude Pro/Max
+    // OAuth session must report zero cost (issue #499).
+    app.anthropic_bearer_auth = anthropic_bearer_auth;
+    app.sync_cost_pricing();
+    app.disabled_mcp_servers = settings.disabled_mcp_servers.clone();
     // Startup skill discovery runs on the blocking pool so a cold
     // `skills.urls` clone never holds the terminal. When it finishes, the
     // main loop installs the slash commands for autocomplete and every query
@@ -2148,11 +2223,24 @@ async fn run_interactive(
                 }),
                 None => claurst_core::SkillRegistry::default(),
             };
+            // Publish listings before notifying the UI: command receipt also
+            // reads the watch value to populate the skill count.
+            let _ = skill_listings_tx.send(Some(registry.listings()));
             let _ = skill_cmds_tx
                 .send(claurst_commands::skill_command_entries(&registry))
                 .await;
-            let _ = skill_listings_tx.send(Some(registry.listings()));
         });
+    }
+    // Populate the MCP server indicator cheaply from the already-started
+    // manager; the skill count arrives with the async discovery result in
+    // the main loop, so App::new stays cheap and tests never trigger real
+    // skill/MCP discovery.
+    {
+        app.mcp_server_count = tool_ctx
+            .mcp_manager
+            .as_ref()
+            .map(|manager| manager.server_count())
+            .unwrap_or(0);
     }
     if let Some(error) = settings_load_error {
         app.invalid_config_dialog =
@@ -2380,6 +2468,7 @@ async fn run_interactive(
         mcp_manager: tool_ctx.mcp_manager.clone(),
         mcp_auth_runner: None,
         permission_manager: tool_ctx.permission_manager.clone(),
+        disabled_mcp_servers: settings.disabled_mcp_servers.clone(),
     };
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
@@ -2687,6 +2776,7 @@ async fn run_interactive(
                                     cmd_name.as_str(),
                                     "model" | "theme" | "resume" | "session"
                                         | "vim" | "vi" | "voice" | "fast" | "speed"
+                                        | "config" | "settings"
                                 );
                             let handled_by_tui = if skip_tui_for_args {
                                 false
@@ -2995,6 +3085,9 @@ async fn run_interactive(
                                                     "Saved provider state cleared. Run /connect to reconnect."
                                                         .to_string(),
                                                 );
+                                                app.anthropic_bearer_auth =
+                                                    refreshed.use_bearer_auth;
+                                                app.sync_cost_pricing();
                                             }
                                             Err(err) => {
                                                 app.status_message = Some(format!(
@@ -3014,6 +3107,38 @@ async fn run_interactive(
                                         "MCP OAuth — '{}' started. Complete authentication in your browser.\nURL: {}\nCallback URL: {}",
                                         server_name, auth_url, redirect_uri
                                     ));
+                                }
+                                Some(CommandResult::McpServersToggled { server_name, enabled }) => {
+                                    // `/mcp enable|disable` persisted the toggle in
+                                    // global settings; reload them so the reconnect
+                                    // gate below sees the new disabled set, then
+                                    // rebuild the manager + tool list. If the reload
+                                    // fails, keep the runtime as-is: rebuilding
+                                    // against stale settings could relaunch a
+                                    // server the user just disabled.
+                                    match claurst_core::config::Settings::load_hierarchical(
+                                        &tool_ctx.working_dir,
+                                    )
+                                    .await
+                                    {
+                                        Ok(reloaded) => {
+                                            settings = reloaded;
+                                            app.pending_mcp_reconnect = true;
+                                            app.status_message = Some(format!(
+                                                "MCP server '{}' {}. Rebuilding connections...",
+                                                server_name,
+                                                if enabled { "enabled" } else { "disabled" }
+                                            ));
+                                        }
+                                        Err(err) => {
+                                            app.status_message = Some(format!(
+                                                "MCP server '{}' {}, but reloading settings failed: {}. Restart to apply the change.",
+                                                server_name,
+                                                if enabled { "enabled" } else { "disabled" },
+                                                err
+                                            ));
+                                        }
+                                    }
                                 }
                                 Some(CommandResult::Message(msg)) => {
                                     // Suppress text output when TUI already opened an
@@ -3062,6 +3187,12 @@ async fn run_interactive(
                                 Some(CommandResult::ConfigChangeMessage(new_cfg, msg)) => {
                                     let mut applied_cfg = new_cfg;
                                     normalize_provider_from_model(&mut applied_cfg);
+                                    // If the command changed the theme, live-apply it so
+                                    // the next frame renders with the new palette.
+                                    let mut theme_applied = true;
+                                    if applied_cfg.theme != app.config.theme {
+                                        theme_applied = app.apply_theme_name(&applied_cfg.theme);
+                                    }
                                     cmd_ctx.config = applied_cfg.clone();
                                     tool_ctx.config = applied_cfg.clone();
                                     // Mode and tool allow/deny lists may have changed
@@ -3084,7 +3215,11 @@ async fn run_interactive(
                                         &cmd_ctx.config,
                                         &model_registry,
                                     );
-                                    app.status_message = Some(msg);
+                                    // The command's message, unless the live theme
+                                    // apply already surfaced a load error.
+                                    if theme_applied {
+                                        app.status_message = Some(msg);
+                                    }
                                 }
                                 Some(CommandResult::UserMessage(msg)) => {
                                     // Queue a user-visible turn for the model.
@@ -4296,6 +4431,9 @@ async fn run_interactive(
         // Install skill slash commands once startup discovery finishes.
         if let Ok(commands) = skill_cmds_rx.try_recv() {
             app.set_discovered_slash_commands(commands);
+            if let Some(listings) = skill_listings.borrow().as_ref() {
+                app.skill_count = listings.len();
+            }
         }
 
         // Check if the background update task has reported a result.
@@ -4704,6 +4842,10 @@ async fn run_interactive(
                     );
                     app.provider_registry = Some(refreshed.provider_registry);
                     app.has_credentials = true;
+                    // A fresh Claude Pro/Max OAuth login switches usage to
+                    // flat subscription billing — zero reported cost (#499).
+                    app.anthropic_bearer_auth = refreshed.use_bearer_auth;
+                    app.sync_cost_pricing();
                 }
                 Err(err) => {
                     app.status_message =
@@ -4723,10 +4865,51 @@ async fn run_interactive(
                 settings.trust_project_mcp_servers,
                 &app.mcp_session_trusted,
                 &store,
+                &settings.disabled_mcp_servers,
             );
             let new_mcp_manager = start_mcp_manager(&decision.allowed);
+            // Shut the old manager down before installing the new one so its
+            // transports (stdio children, HTTP sessions) are closed and no
+            // server runs twice (issue #418 review).
+            if let Some(old_manager) = tool_ctx.mcp_manager.clone() {
+                old_manager.shutdown().await;
+            }
+            // Log the roster change for post-mortem: which servers the rebuild
+            // keeps, which are dropped (disabled by the user, untrusted, or
+            // failed to connect — per-server connect errors are logged inside
+            // `McpManager::connect_all`).
+            {
+                let kept: Vec<String> = new_mcp_manager
+                    .as_ref()
+                    .map(|m| m.server_names())
+                    .unwrap_or_default();
+                let dropped: Vec<String> = cmd_ctx
+                    .config
+                    .mcp_servers
+                    .iter()
+                    .filter(|s| !kept.contains(&s.name))
+                    .map(|s| {
+                        if settings.disabled_mcp_servers.contains(&s.name) {
+                            format!("{} (disabled)", s.name)
+                        } else {
+                            s.name.clone()
+                        }
+                    })
+                    .collect();
+                info!(
+                    connected = ?kept,
+                    dropped = ?dropped,
+                    "MCP runtime rebuilt"
+                );
+            }
             tool_ctx.mcp_manager = new_mcp_manager.clone();
             app.mcp_manager = new_mcp_manager.clone();
+            // Keep the cron scheduler's tool resolver in sync with the
+            // rebuilt runtime (issue #471).
+            *cron_manager_cell.write() = new_mcp_manager.clone();
+            cmd_ctx.mcp_manager = new_mcp_manager.clone();
+            app.disabled_mcp_servers = settings.disabled_mcp_servers.clone();
+            cmd_ctx.disabled_mcp_servers = settings.disabled_mcp_servers.clone();
             // Read the generation before building: a connect task that bumps
             // it in between then still triggers a rebuild in the idle block.
             mcp_seen_generation = new_mcp_manager.as_ref().map(|manager| manager.generation());
@@ -4736,6 +4919,11 @@ async fn run_interactive(
                 app.refresh_mcp_view();
             }
 
+            let connected = new_mcp_manager
+                .as_ref()
+                .map(|manager| manager.server_count())
+                .unwrap_or(0);
+            app.mcp_server_count = connected;
             app.status_message = Some(if cmd_ctx.config.mcp_servers.is_empty() {
                 "No MCP servers configured.".to_string()
             } else {
@@ -4754,6 +4942,9 @@ async fn run_interactive(
         // servers that failed to start.
         if !app.is_streaming && current_query.is_none() {
             if let Some(manager) = tool_ctx.mcp_manager.clone() {
+                // Connections finish asynchronously, including before the
+                // first generation snapshot, so refresh the cheap live count.
+                app.mcp_server_count = manager.server_count();
                 let generation = manager.generation();
                 if mcp_seen_generation != Some(generation) {
                     mcp_seen_generation = Some(generation);
@@ -5514,7 +5705,9 @@ mod bare_mode_tests {
         // (a) unapproved project-plugin server is pending; (b) with no
         // settings-derived project root, approvals are keyed by cwd.
         let mut root = None;
-        let pending = pending_project_plugin_mcp(&servers, &mut root, &cwd, false, &store);
+        let disabled = std::collections::HashSet::new();
+        let pending =
+            pending_project_plugin_mcp(&servers, &mut root, &cwd, false, &store, &disabled);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].name, "repo-srv");
         assert_eq!(root.as_deref(), Some(cwd.as_path()));
@@ -5522,20 +5715,27 @@ mod bare_mode_tests {
         // An existing project root is kept.
         let other = std::env::temp_dir().join("claurst-493-settings-root");
         let mut root = Some(other.clone());
-        pending_project_plugin_mcp(&servers, &mut root, &cwd, false, &store);
+        pending_project_plugin_mcp(&servers, &mut root, &cwd, false, &store, &disabled);
         assert_eq!(root, Some(other));
 
         // (c) nothing pending once approved for cwd, or with global trust.
         store.approve(&cwd, &servers[1]);
         let mut root = None;
-        assert!(pending_project_plugin_mcp(&servers, &mut root, &cwd, false, &store).is_empty());
+        assert!(
+            pending_project_plugin_mcp(&servers, &mut root, &cwd, false, &store, &disabled)
+                .is_empty()
+        );
         let mut root = None;
         let empty = McpTrustStore::default();
-        assert!(pending_project_plugin_mcp(&servers, &mut root, &cwd, true, &empty).is_empty());
+        assert!(
+            pending_project_plugin_mcp(&servers, &mut root, &cwd, true, &empty, &disabled)
+                .is_empty()
+        );
 
         // User-only plugin servers leave the root untouched.
         let mut root = None;
-        assert!(pending_project_plugin_mcp(&servers[..1], &mut root, &cwd, false, &empty).is_empty());
+        assert!(pending_project_plugin_mcp(&servers[..1], &mut root, &cwd, false, &empty, &disabled)
+            .is_empty());
         assert!(root.is_none());
     }
 

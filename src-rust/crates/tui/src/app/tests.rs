@@ -556,6 +556,15 @@ use super::types::{ContextMenuItem, ContextMenuState};
     }
 
     #[test]
+    fn test_keybindings_slash_command_left_to_cli_layer() {
+        // The commands crate owns /keybindings (template creation + open);
+        // the TUI intercept used to open the file too, popping it twice for
+        // one command (issue #495). It must fall through instead.
+        let mut app = make_app();
+        assert!(!app.intercept_slash_command("keybindings"));
+    }
+
+    #[test]
     fn test_clear_slash_command_clears_messages() {
         let mut app = make_app();
         app.add_message(Role::User, "hello".to_string());
@@ -581,6 +590,38 @@ use super::types::{ContextMenuItem, ContextMenuState};
         assert!(app.prompt_input.vim_enabled);
         assert!(app.intercept_slash_command("vim"));
         assert!(!app.prompt_input.vim_enabled);
+    }
+
+    // ---- Ctrl+V reaches the vim state machine as block-visual (issue #495) --
+
+    #[test]
+    fn ctrl_v_in_vim_normal_enters_visual_block() {
+        let mut app = make_app();
+        app.prompt_input.vim_enabled = true;
+        app.prompt_input.vim_mode = crate::prompt_input::VimMode::Normal;
+        let handled = app.handle_key_event(press_key(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        assert!(!handled);
+        assert_eq!(
+            app.prompt_input.vim_mode,
+            crate::prompt_input::VimMode::VisualBlock,
+            "Ctrl+V must report the \x16 block-visual key to the vim handler"
+        );
+        assert_eq!(
+            app.prompt_input.visual_anchor,
+            Some(app.prompt_input.cursor),
+            "block-visual anchors the selection at the cursor"
+        );
+    }
+
+    #[test]
+    fn plain_v_in_vim_normal_still_enters_charwise_visual() {
+        // The Ctrl+V special case must not disturb the printable-key path.
+        let mut app = make_app();
+        app.prompt_input.vim_enabled = true;
+        app.prompt_input.vim_mode = crate::prompt_input::VimMode::Normal;
+        let handled = app.handle_key_event(press_key(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(!handled);
+        assert_eq!(app.prompt_input.vim_mode, crate::prompt_input::VimMode::Visual);
     }
 
     #[test]
@@ -829,6 +870,22 @@ use super::types::{ContextMenuItem, ContextMenuState};
             .expect("keystroke");
         assert_eq!(ks.key, "с");
         assert!(!ks.ctrl && !ks.alt);
+    }
+
+    #[test]
+    fn test_key_event_to_keystroke_maps_insert_key_name() {
+        // Shift+Insert must reach the binding table as the "insert" key name
+        // with the SHIFT flag preserved (issue #495); before the fix the two
+        // keys returned no keystroke at all.
+        let ks = key_event_to_keystroke(&press_key(KeyCode::Insert, KeyModifiers::SHIFT))
+            .expect("keystroke");
+        assert_eq!(ks.key, "insert");
+        assert!(ks.shift);
+        assert!(!ks.ctrl);
+
+        let ks = key_event_to_keystroke(&press_key(KeyCode::Insert, KeyModifiers::NONE))
+            .expect("keystroke");
+        assert_eq!(ks.key, "insert");
     }
 
     #[test]
@@ -1327,4 +1384,92 @@ use super::types::{ContextMenuItem, ContextMenuState};
         ];
         // Selecting the tool_result would orphan the tool_use: cut before it.
         assert_eq!(rewind_cut_index(&history, 2), 1);
+    }
+
+    // ---- globalSearch / openSearch aliases open project search (#495) ------
+
+    #[test]
+    fn ctrl_shift_f_default_binding_opens_project_search() {
+        // The default ctrl+shift+f binding maps to the legacy "globalSearch"
+        // action name, which used to be dead code.
+        let mut app = make_app();
+        let handled = app.handle_key_event(press_key(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert!(!handled);
+        assert!(app.global_search.visible);
+    }
+
+    #[test]
+    fn global_search_action_aliases_are_equivalent() {
+        // "openSearch" is the live handler; "globalSearch" is the legacy
+        // default action name. Both must open project search.
+        for action in ["openSearch", "globalSearch"] {
+            let mut app = make_app();
+            app.handle_keybinding_action(action);
+            assert!(app.global_search.visible, "{action} must open project search");
+        }
+    }
+
+    // ---- MCP view without a manager (issue #418 review: fallback status) ----
+
+    /// With no live manager, `refresh_mcp_view` falls back to the configured
+    /// servers. A server the user disabled via `/mcp disable` must read as
+    /// `Disabled`, not `Disconnected`; otherwise the panel claims a disabled
+    /// server merely lost its connection.
+    #[test]
+    fn mcp_view_without_manager_marks_disabled_servers() {
+        let mut app = make_app();
+        app.config.mcp_servers.push(claurst_core::config::McpServerConfig {
+            name: "srv-a".to_string(),
+            command: Some("echo".to_string()),
+            args: vec![],
+            env: Default::default(),
+            url: None,
+            server_type: "stdio".to_string(),
+            headers: Default::default(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
+            origin: Default::default(),
+        });
+        app.config.mcp_servers.push(claurst_core::config::McpServerConfig {
+            name: "srv-b".to_string(),
+            command: Some("echo".to_string()),
+            args: vec![],
+            env: Default::default(),
+            url: None,
+            server_type: "stdio".to_string(),
+            headers: Default::default(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
+            origin: Default::default(),
+        });
+        app.disabled_mcp_servers.insert("srv-a".to_string());
+        assert!(app.mcp_manager.is_none(), "fixture must have no manager attached");
+
+        app.refresh_mcp_view();
+
+        let srv_a = app
+            .mcp_view
+            .servers
+            .iter()
+            .find(|s| s.name == "srv-a")
+            .expect("disabled server listed");
+        assert_eq!(
+            srv_a.status,
+            crate::mcp_view::McpViewStatus::Disabled,
+            "a user-disabled server must not show as merely disconnected"
+        );
+        let srv_b = app
+            .mcp_view
+            .servers
+            .iter()
+            .find(|s| s.name == "srv-b")
+            .expect("configured server listed");
+        assert_eq!(
+            srv_b.status,
+            crate::mcp_view::McpViewStatus::Disconnected,
+            "a configured-but-never-connected server still reads as disconnected"
+        );
     }
