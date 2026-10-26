@@ -131,78 +131,13 @@ impl Tool for FileEditTool {
             return ToolResult::error(format!("Failed to read file {}: {}", path.display(), e));
         }
 
-        // Keep a UTF-8 BOM out of matching and put it back on write (#443).
-        let (bom, content) = match original.strip_prefix('\u{feff}') {
-            Some(rest) => ("\u{feff}", rest),
-            None => ("", original.as_str()),
-        };
-
-        // Detect the file's original/dominant line ending BEFORE editing so we
-        // can re-apply it on write (#225).  Matching is done against an
-        // LF-normalized view so CRLF/LF differences never affect the match, but
-        // only the lines the edit actually changes are ever rewritten.
-        let eol = crate::line_endings::LineEnding::detect(content);
-        let normalized = content.replace("\r\n", "\n");
-        let old_string = old_string.replace("\r\n", "\n");
-        let new_string = new_string.replace("\r\n", "\n");
-
-        // Tier 1: exact occurrences.
-        let count = normalized.matches(&old_string).count();
-
-        if count > 1 && !params.replace_all {
-            return ToolResult::error(format!(
-                "old_string appears {} times in {}. Either provide a larger string \
-                 with more surrounding context to make it unique, or set replace_all \
-                 to true to replace every occurrence.",
-                count,
-                path.display()
-            ));
-        }
-
-        let (body, replacements, tier) = if count > 0 {
-            // Perform the replacement on the ORIGINAL bytes, preserving every
-            // untouched region's line endings and re-rendering inserted lines
-            // with the file's dominant line ending.
-            let (body, _) = crate::line_endings::replace_preserving_eol(
-                content,
-                &old_string,
-                &new_string,
-                eol,
-                params.replace_all,
-            );
-            (body, if params.replace_all { count } else { 1 }, "exact")
-        } else {
-            // Tier 2: whole lines, ignoring line endings and trailing whitespace.
-            match find_whitespace_normalized(content, &old_string) {
-                LineMatch::One { start, end } => {
-                    let body = format!("{}{}{}", &content[..start], eol.apply(&new_string), &content[end..]);
-                    (body, 1, "trailing_whitespace_normalized")
+        let (new_content, replacements, tier) =
+            match resolve_edit(&original, old_string, new_string, params.replace_all) {
+                Ok(edit) => edit,
+                Err(error) => {
+                    return ToolResult::error(format!("Cannot edit {}: {}", path.display(), error))
                 }
-                LineMatch::Many(n) => {
-                    return ToolResult::error(format!(
-                        "old_string has no exact match in {}, and ignoring trailing whitespace \
-                         it matches {} places. Copy old_string exactly from the file, with \
-                         enough surrounding lines to make it unique.",
-                        path.display(),
-                        n
-                    ));
-                }
-                LineMatch::None => {
-                    let hint = match closest_region(&normalized, &old_string) {
-                        Some(region) => format!("\n\n{}", region),
-                        None => "\n\nNo similar region was found; re-read the file.".to_string(),
-                    };
-                    return ToolResult::error(format!(
-                        "old_string not found in {}, even ignoring line endings and trailing \
-                         whitespace. Make sure the string matches exactly, including \
-                         indentation.{}",
-                        path.display(),
-                        hint
-                    ));
-                }
-            }
-        };
-        let new_content = format!("{}{}", bom, body);
+            };
 
         // Write back atomically into the directory that holds the opened file.
         if let Err(e) = crate::write_atomic_bound(&file, &real, new_content.as_bytes()).await {
@@ -234,6 +169,100 @@ impl Tool for FileEditTool {
             "match": tier,
         }))
     }
+}
+
+/// Shared Edit/BatchEdit matching: preserve BOM and untouched line endings,
+/// reject ambiguity, and provide a bounded closest-region hint on a miss.
+pub(crate) fn resolve_edit(
+    original: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Result<(String, usize, &'static str), String> {
+    let old_string = old.strip_prefix('\u{feff}').unwrap_or(old);
+    let new_string = new.strip_prefix('\u{feff}').unwrap_or(new);
+    if old_string.is_empty() {
+        return Err("old_string must not be empty".to_string());
+    }
+    if old_string == new_string {
+        return Err("old_string and new_string must be different".to_string());
+    }
+    // Keep a UTF-8 BOM out of matching and put it back on write (#443).
+    let (bom, content) = match original.strip_prefix('\u{feff}') {
+        Some(rest) => ("\u{feff}", rest),
+        None => ("", original),
+    };
+
+    // Detect the file's original/dominant line ending BEFORE editing so we
+    // can re-apply it on write (#225).  Matching is done against an
+    // LF-normalized view so CRLF/LF differences never affect the match, but
+    // only the lines the edit actually changes are ever rewritten.
+    let eol = crate::line_endings::LineEnding::detect(content);
+    let normalized = content.replace("\r\n", "\n");
+    let old_string = old_string.replace("\r\n", "\n");
+    let new_string = new_string.replace("\r\n", "\n");
+
+    // Tier 1: exact occurrences.
+    let count = normalized.matches(&old_string).count();
+
+    if count > 1 && !replace_all {
+        return Err(format!(
+            "old_string appears {} times. Either provide a larger string \
+         with more surrounding context to make it unique, or set replace_all \
+         to true to replace every occurrence.",
+            count
+        ));
+    }
+
+    let (body, replacements, tier) = if count > 0 {
+        // Perform the replacement on the ORIGINAL bytes, preserving every
+        // untouched region's line endings and re-rendering inserted lines
+        // with the file's dominant line ending.
+        let (body, _) = crate::line_endings::replace_preserving_eol(
+            content,
+            &old_string,
+            &new_string,
+            eol,
+            replace_all,
+        );
+        (body, if replace_all { count } else { 1 }, "exact")
+    } else {
+        // Tier 2: whole lines, ignoring line endings and trailing whitespace.
+        match find_whitespace_normalized(content, &old_string) {
+            LineMatch::One { start, end } => {
+                let body = format!(
+                    "{}{}{}",
+                    &content[..start],
+                    eol.apply(&new_string),
+                    &content[end..]
+                );
+                (body, 1, "trailing_whitespace_normalized")
+            }
+            LineMatch::Many(n) => {
+                return Err(format!(
+                    "old_string has no exact match, and ignoring trailing whitespace \
+             it matches {} places. Copy old_string exactly from the file, with \
+             enough surrounding lines to make it unique.",
+                    n
+                ));
+            }
+            LineMatch::None => {
+                let hint = match closest_region(&normalized, &old_string) {
+                    Some(region) => format!("\n\n{}", region),
+                    None => "\n\nNo similar region was found; re-read the file.".to_string(),
+                };
+                return Err(format!(
+                    "old_string not found, even ignoring line endings and trailing \
+             whitespace. Make sure the string matches exactly, including \
+             indentation.{}",
+                    hint
+                ));
+            }
+        }
+    };
+    let new_content = format!("{}{}", bom, body);
+
+    Ok((new_content, replacements, tier))
 }
 
 /// Result of the second-tier, whole-line match.
