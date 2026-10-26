@@ -99,6 +99,10 @@ pub use types::{
     CitationsConfig, ContentBlock, DocumentSource, ImageSource, Message, MessageContent,
     MessageCost, Role, ToolDefinition, ToolResultContent, UsageInfo,};
 
+// Durable queue for mid-turn steering input (soft interrupts).
+pub mod soft_interrupt_store;
+pub use soft_interrupt_store::PersistedSoftInterrupt;
+
 // Skill discovery: filesystem and git URL skill loading.
 pub mod skill_discovery;
 pub use skill_discovery::{

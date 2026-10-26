@@ -2189,18 +2189,13 @@ async fn run_interactive(
     // drains it at each step boundary. When it is non-empty while idle, the
     // main loop starts a turn to deliver it.
     let command_queue = claurst_query::CommandQueue::new();
+    command_queue.enable_persistence(&session.id)?;
     base_query_config.command_queue = Some(command_queue.clone());
     // Background sub-agents and Bash commands report completion into the same
     // queue as `<subagent>` / `<shell>` notices (gated by completionWakeups).
-    tool_ctx.completion_notifier = Some({
-        let queue = command_queue.clone();
-        claurst_tools::CompletionNotifier::new(move |notice| {
-            queue.push(
-                claurst_query::QueuedCommand::InjectUserMessage(notice),
-                claurst_query::CommandPriority::Normal,
-            );
-        })
-    });
+    tool_ctx.completion_notifier = Some(session_resume::completion_notifier(
+        command_queue.clone(), session.id.clone(),
+    ));
     let mut live_config = config.clone();
     if !session.model.is_empty() {
         live_config.model = Some(session.model.clone());
@@ -2220,6 +2215,7 @@ async fn run_interactive(
     claurst_tui::spawn_signal_restore_watchers();
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
     app.command_queue = Some(command_queue.clone());
+    app.switch_session_input(&session.id, &session.id, command_queue.pending_user_messages());
     app.current_session_id = Some(session.id.clone());
     app.session_title = session.title.clone();
     // Propagate the startup auth mode into cost reporting: a Claude Pro/Max
@@ -2872,44 +2868,24 @@ async fn run_interactive(
                                         &cmd_ctx.config,
                                         &model_registry,
                                     );
-                                    session = claurst_commands::build_home_session(
+                                    let fresh = claurst_commands::build_home_session(
                                         model,
                                         Some(tool_ctx.working_dir.display().to_string()),
                                     );
-                                    messages.clear();
-                                    app.replace_messages(Vec::new());
-                                    session_journal =
-                                        claurst_core::session_journal::SessionJournal::for_session(
-                                            &session,
-                                        );
-                                    base_query_config.session_journal =
-                                        Some(session_journal.clone());
-                                    app.context_used_tokens = 0;
-                                    tool_ctx.session_id = session.id.clone();
-                                    cmd_ctx.session_id = session.id.clone();
-                                    cmd_ctx.session_title = None;
-                                    // Keep the TUI's session id in sync so
-                                    // auto-poke reads the new session's todos,
-                                    // and reset its per-session counters.
-                                    app.session_id = tool_ctx.session_id.clone();
-                                    app.reset_auto_poke_state();
-                                    app.current_session_id = Some(session.id.clone());
-                                    // Reset per-turn diff/turn bookkeeping, as
-                                    // ResumeSession does when swapping sessions.
-                                    tool_ctx.file_history = Arc::new(ParkingMutex::new(
-                                        claurst_core::file_history::FileHistory::new(),
-                                    ));
-                                    tool_ctx.current_turn = Arc::new(
-                                        std::sync::atomic::AtomicUsize::new(0)
-                                    );
-                                    app.attach_turn_diff_state(
-                                        tool_ctx.file_history.clone(),
-                                        tool_ctx.current_turn.clone(),
-                                    );
-                                    claurst_tui::update_terminal_title(None);
-                                    app.status_message =
-                                        Some("Started a new session.".to_string());
+                                    match session_resume::apply(
+                                        fresh, &claurst_core::history::sessions_dir(),
+                                        &mut session, &mut session_journal,
+                                        &mut base_query_config, &mut messages,
+                                        &mut app, &mut cmd_ctx, &mut tool_ctx,
+                                    ) {
+                                        Ok(()) => {
+                                            app.context_used_tokens = 0;
+                                            app.status_message = Some("Started a new session.".into());
+                                        }
+                                        Err(error) => app.status_message = Some(format!("Could not start session: {error}")),
+                                    }
                                 }
+
                                 Some(CommandResult::MoveSession {
                                     destination,
                                     moved_changes,

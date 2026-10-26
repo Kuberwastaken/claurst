@@ -396,10 +396,10 @@ impl App {
                 self.session_list_pending = true;
                 true
             }
-            // `/new` (opencode's lazy-home) resets the same visible transcript
-            // state as `/clear`; the CLI layer then swaps in a brand-new session
-            // and overrides the status line to "Started a new session.".
-            "clear" | "new" => {
+            // The CLI publishes /new only after outgoing checkpoint and
+            // queue parking succeed; retain the live transcript until then.
+            "new" => true,
+            "clear" => {
                 self.messages.clear();
                 self.system_annotations.clear();
                 self.display_messages.clear();

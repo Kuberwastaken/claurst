@@ -461,6 +461,7 @@ pub struct App {
     /// Hash of the todo state at the last poke check, for no-progress
     /// detection.
     pub last_todo_hash: String,
+    parked_session_inputs: std::collections::HashMap<String, steering::ParkedSessionInput>,
     /// Connect-a-provider dialog (/connect command).
     pub connect_dialog: DialogSelectState,
     /// Import-config source picker (/import-config command).
@@ -820,6 +821,7 @@ impl App {
             auto_poke_count: 0,
             no_progress_turns: 0,
             last_todo_hash: String::new(),
+            parked_session_inputs: std::collections::HashMap::new(),
             connect_dialog: DialogSelectState::new("Connect a provider", provider_picker_items()),
             import_config_picker: DialogSelectState::new("Import config", import_config_picker_items()),
             import_config_dialog: ImportConfigDialogState::new(),
