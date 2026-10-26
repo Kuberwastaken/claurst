@@ -535,6 +535,14 @@ pub struct App {
     /// None when no goal is active. Updated by the REPL after each turn.
     pub active_goal_badge: Option<String>,
 
+    /// Number of discovered skills (from `.claurst/skills/` etc.) for the
+    /// status-bar indicator. Populated by the caller after `App::new` so the
+    /// constructor stays cheap and never runs filesystem/network discovery.
+    pub skill_count: usize,
+    /// Number of connected MCP servers for the status-bar indicator.
+    /// Updated by the REPL whenever the MCP runtime (re)connects.
+    pub mcp_server_count: usize,
+
     // ---- Thinking block expansion state ----------------------------------
     /// Set of thinking block content hashes that are expanded.
     pub thinking_expanded: std::collections::HashSet<u64>,
@@ -851,6 +859,8 @@ impl App {
             worktree_branch: None,
             agent_type_badge: None,
             active_goal_badge: None,
+            skill_count: 0,
+            mcp_server_count: 0,
             thinking_expanded: std::collections::HashSet::new(),
             last_msg_area: Cell::new(ratatui::layout::Rect::default()),
             last_selectable_area: Cell::new(ratatui::layout::Rect::default()),

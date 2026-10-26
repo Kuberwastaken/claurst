@@ -2178,11 +2178,24 @@ async fn run_interactive(
                 }),
                 None => claurst_core::SkillRegistry::default(),
             };
+            // Publish listings before notifying the UI: command receipt also
+            // reads the watch value to populate the skill count.
+            let _ = skill_listings_tx.send(Some(registry.listings()));
             let _ = skill_cmds_tx
                 .send(claurst_commands::skill_command_entries(&registry))
                 .await;
-            let _ = skill_listings_tx.send(Some(registry.listings()));
         });
+    }
+    // Populate the MCP server indicator cheaply from the already-started
+    // manager; the skill count arrives with the async discovery result in
+    // the main loop, so App::new stays cheap and tests never trigger real
+    // skill/MCP discovery.
+    {
+        app.mcp_server_count = tool_ctx
+            .mcp_manager
+            .as_ref()
+            .map(|manager| manager.server_count())
+            .unwrap_or(0);
     }
     if let Some(error) = settings_load_error {
         app.invalid_config_dialog =
@@ -4373,6 +4386,9 @@ async fn run_interactive(
         // Install skill slash commands once startup discovery finishes.
         if let Ok(commands) = skill_cmds_rx.try_recv() {
             app.set_discovered_slash_commands(commands);
+            if let Some(listings) = skill_listings.borrow().as_ref() {
+                app.skill_count = listings.len();
+            }
         }
 
         // Check if the background update task has reported a result.
@@ -4855,6 +4871,11 @@ async fn run_interactive(
                 app.refresh_mcp_view();
             }
 
+            let connected = new_mcp_manager
+                .as_ref()
+                .map(|manager| manager.server_count())
+                .unwrap_or(0);
+            app.mcp_server_count = connected;
             app.status_message = Some(if cmd_ctx.config.mcp_servers.is_empty() {
                 "No MCP servers configured.".to_string()
             } else {
@@ -4873,6 +4894,9 @@ async fn run_interactive(
         // servers that failed to start.
         if !app.is_streaming && current_query.is_none() {
             if let Some(manager) = tool_ctx.mcp_manager.clone() {
+                // Connections finish asynchronously, including before the
+                // first generation snapshot, so refresh the cheap live count.
+                app.mcp_server_count = manager.server_count();
                 let generation = manager.generation();
                 if mcp_seen_generation != Some(generation) {
                     mcp_seen_generation = Some(generation);
