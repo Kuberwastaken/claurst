@@ -3054,14 +3054,42 @@ mod tests {
         mgr.wait_until_settled().await;
     }
 
-    #[tokio::test]
-    async fn test_auth_state_respects_configured_authorization_header() {
+    // Both auth-state tests redirect the same process-global token directory.
+    // Keep isolation and restoration under one lock for the whole fixture;
+    // restoration also runs when an assertion panics.
+    static TOKEN_STORE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct TokenStoreEnv {
+        previous: Option<std::ffi::OsString>,
+        _directory: tempfile::TempDir,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl TokenStoreEnv {
+        fn new() -> Self {
+            let guard = TOKEN_STORE_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let directory = tempfile::tempdir().expect("temp token store");
+            let previous = std::env::var_os("CLAURST_MCP_TOKENS_DIR");
+            std::env::set_var("CLAURST_MCP_TOKENS_DIR", directory.path());
+            Self { previous, _directory: directory, _guard: guard }
+        }
+    }
+
+    impl Drop for TokenStoreEnv {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("CLAURST_MCP_TOKENS_DIR", value),
+                None => std::env::remove_var("CLAURST_MCP_TOKENS_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_auth_state_respects_configured_authorization_header() {
         // Redirect the on-disk token store into a tempdir so the Required
         // case is deterministic (no real token on this machine). See
         // test_auth_state_uses_token_expiry_datetime for why env is used.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let prev = std::env::var_os("CLAURST_MCP_TOKENS_DIR");
-        std::env::set_var("CLAURST_MCP_TOKENS_DIR", tmp.path());
+        let _token_store = TokenStoreEnv::new();
 
         // A server that authenticates through a configured header does not
         // need OAuth, so /mcp must not send the user to browser auth.
@@ -3078,10 +3106,6 @@ mod tests {
             .insert("plain".to_string(), http_fail_config("plain"));
         assert!(matches!(mgr.auth_state("plain"), McpAuthState::Required { .. }));
 
-        match prev {
-            Some(v) => std::env::set_var("CLAURST_MCP_TOKENS_DIR", v),
-            None => std::env::remove_var("CLAURST_MCP_TOKENS_DIR"),
-        }
     }
 
     #[test]
@@ -3089,9 +3113,7 @@ mod tests {
         // Redirect the on-disk token store into a tempdir so this test never
         // touches (or requires a writable) ~/.claurst. Sandboxed builds run
         // with no HOME and disallow writes outside the build tree.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let prev = std::env::var_os("CLAURST_MCP_TOKENS_DIR");
-        std::env::set_var("CLAURST_MCP_TOKENS_DIR", tmp.path());
+        let _token_store = TokenStoreEnv::new();
 
         let mut mgr = McpManager::new();
         mgr.server_configs.insert(
@@ -3133,10 +3155,6 @@ mod tests {
 
         oauth::remove_mcp_token("remote").ok();
 
-        match prev {
-            Some(v) => std::env::set_var("CLAURST_MCP_TOKENS_DIR", v),
-            None => std::env::remove_var("CLAURST_MCP_TOKENS_DIR"),
-        }
     }
 }
 
