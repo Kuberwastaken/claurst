@@ -207,7 +207,12 @@ impl PluginRegistry {
     pub fn all_mcp_servers(&self) -> Vec<claurst_core::config::McpServerConfig> {
         use claurst_core::config::McpServerOrigin;
         let mut servers: Vec<claurst_core::config::McpServerConfig> = Vec::new();
-        for plugin in self.enabled() {
+        let mut plugins = self.enabled();
+        plugins.sort_by(|a, b| {
+            (a.source == PluginSource::Project, &a.name)
+                .cmp(&(b.source == PluginSource::Project, &b.name))
+        });
+        for plugin in plugins {
             let origin = if plugin.source == PluginSource::Project {
                 McpServerOrigin::Project
             } else {
@@ -226,6 +231,24 @@ impl PluginRegistry {
                     catalog_timeout_ms: None,
                     origin,
                 });
+            }
+        }
+        servers
+    }
+
+    /// Project settings already carry their origin tags. Preserve configured
+    /// servers on name collisions, then add enabled plugin servers in stable
+    /// order. Always project from fresh inputs so reloads remove stale entries.
+    pub fn mcp_roster(
+        &self,
+        configured: &[claurst_core::config::McpServerConfig],
+    ) -> Vec<claurst_core::config::McpServerConfig> {
+        let mut servers = configured.to_vec();
+        let mut names: std::collections::HashSet<String> =
+            servers.iter().map(|s| s.name.clone()).collect();
+        for server in self.all_mcp_servers() {
+            if names.insert(server.name.clone()) {
+                servers.push(server);
             }
         }
         servers
@@ -427,5 +450,77 @@ mod tests {
         };
         assert_eq!(names(&decision.allowed), vec!["user-srv"]);
         assert_eq!(names(&decision.pending), vec!["repo-srv"]);
+    }
+    #[test]
+    fn fresh_roster_preserves_settings_origins_and_removes_reloaded_plugin_servers() {
+        use claurst_core::config::McpServerOrigin;
+        let mut original = PluginRegistry::new();
+        original.insert(with_mcp_server(make_plugin("user"), "plugin-old"));
+        let mut configured = original.all_mcp_servers()[0].clone();
+        configured.name = "configured".into();
+        let mut project = configured.clone();
+        project.name = "project-settings".into();
+        project.origin = McpServerOrigin::Project;
+        let settings = vec![configured.clone(), project.clone()];
+        assert_eq!(original.mcp_roster(&settings).len(), 3);
+
+        let mut reloaded = PluginRegistry::new();
+        reloaded.insert(with_mcp_server(make_plugin("user"), "plugin-new"));
+        let mut repo = with_mcp_server(make_plugin("repo"), "repo-plugin");
+        repo.source = PluginSource::Project;
+        reloaded.insert(repo);
+        // An import replaces the global server list, while project settings
+        // and the current enabled plugin snapshot still participate.
+        configured.name = "imported-global".into();
+        let roster = reloaded.mcp_roster(&[configured, project]);
+        assert_eq!(
+            roster.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            [
+                "imported-global",
+                "project-settings",
+                "plugin-new",
+                "repo-plugin"
+            ]
+        );
+        let decision = claurst_core::mcp_trust::partition_mcp_servers(
+            &roster,
+            None,
+            false,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
+        assert_eq!(
+            decision
+                .allowed
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["imported-global", "plugin-new"]
+        );
+        assert_eq!(decision.pending.len(), 2);
+        reloaded.disable("user");
+        assert!(!reloaded
+            .mcp_roster(&[])
+            .iter()
+            .any(|s| s.name == "plugin-new"));
+    }
+
+    #[test]
+    fn configured_servers_and_user_plugins_win_name_collisions() {
+        use claurst_core::config::McpServerOrigin;
+        let mut registry = PluginRegistry::new();
+        registry.insert(with_mcp_server(make_plugin("z-user"), "shared"));
+        let mut repo = with_mcp_server(make_plugin("a-repo"), "shared");
+        repo.source = PluginSource::Project;
+        registry.insert(repo);
+        let roster = registry.mcp_roster(&[]);
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].origin, McpServerOrigin::User);
+        let mut configured = roster[0].clone();
+        configured.command = Some("configured-bin".into());
+        let roster = registry.mcp_roster(&[configured]);
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].command.as_deref(), Some("configured-bin"));
     }
 }

@@ -131,9 +131,10 @@ impl SlashCommand for PluginCommand {
                 let old_registry = get_registry(&project_dir).await;
                 let (new_registry, diff) =
                     claurst_plugins::reload_plugins(&old_registry, &project_dir, &[]).await;
-                // Re-register plugin hooks (a no-op under --bare).
                 claurst_plugins::set_global_hooks(&new_registry);
-                CommandResult::Message(claurst_plugins::format_reload_summary(&new_registry, &diff))
+                let summary = claurst_plugins::format_reload_summary(&new_registry, &diff);
+                claurst_plugins::set_global_registry(new_registry);
+                CommandResult::ReloadMcpRoster(summary)
             }
             claurst_plugins::PluginSubCommand::Help => {
                 CommandResult::Message(
@@ -169,10 +170,10 @@ impl SlashCommand for ReloadPluginsCommand {
         let old_registry = claurst_plugins::load_plugins(&project_dir, &[]).await;
         let (new_registry, diff) =
             claurst_plugins::reload_plugins(&old_registry, &project_dir, &[]).await;
-        // Re-register plugin hooks (a no-op under --bare).
         claurst_plugins::set_global_hooks(&new_registry);
-
-        CommandResult::Message(claurst_plugins::format_reload_summary(&new_registry, &diff))
+        let summary = claurst_plugins::format_reload_summary(&new_registry, &diff);
+        claurst_plugins::set_global_registry(new_registry);
+        CommandResult::ReloadMcpRoster(summary)
     }
 }
 
