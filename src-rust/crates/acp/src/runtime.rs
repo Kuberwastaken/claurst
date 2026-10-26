@@ -47,9 +47,20 @@ impl AgentRuntime {
             }
         };
         let mut config = settings.effective_config();
-        // Plan mode requires interactive UI — fall back to Default so the
-        // ACP permission bridge can route decisions to the client.
-        if config.permission_mode == claurst_core::PermissionMode::Plan {
+        // yoloMode from global settings maps to BypassPermissions with the
+        // same root/sudo guard the CLI applies (cli/src/main.rs) — it is
+        // global-only, so project settings cannot enable it.
+        if config.yolo_mode {
+            #[cfg(unix)]
+            if nix::unistd::Uid::effective().is_root() {
+                anyhow::bail!(
+                    "yoloMode cannot be used with root/sudo privileges for security reasons"
+                );
+            }
+            config.permission_mode = claurst_core::PermissionMode::BypassPermissions;
+        } else if config.permission_mode == claurst_core::PermissionMode::Plan {
+            // Plan mode requires interactive UI — fall back to Default so the
+            // ACP permission bridge can route decisions to the client.
             config.permission_mode = claurst_core::PermissionMode::Default;
         }
         config.project_dir = Some(working_dir.clone());
@@ -97,13 +108,25 @@ impl AgentRuntime {
         query_config.working_directory = Some(working_dir.display().to_string());
         query_config.provider_registry = Some(provider_registry.clone());
 
-        // System context (git status, ...) for this directory, assembled like
-        // the CLI does.
+        // System prompt wiring, exactly like the CLI (cli/src/main.rs): the
+        // default prompt (identity, capabilities, environment) is assembled
+        // by the query loop from the full `claurst_core::system_prompt`
+        // sections; `system_prompt` carries only the custom/append additions,
+        // and the git/IDE context rides separately as `session_context` in
+        // the dynamic block so the cached stable prefix stays byte-stable.
+        // Stuffing the context into `system_prompt` here used to flip the
+        // prompt into "custom prompt" mode, changing the attribution header
+        // and coupling the cache prefix to git state.
         let context = claurst_core::context::ContextBuilder::new(working_dir.clone());
-        let mut system_parts: Vec<String> = config.custom_system_prompt.iter().cloned().collect();
-        system_parts.push(context.build_system_context().await);
-        query_config.system_prompt = Some(system_parts.join("\n\n"));
-        query_config.append_system_prompt = config.append_system_prompt.clone();
+        query_config.session_context = Some(context.build_system_context().await);
+        let additions = [config.custom_system_prompt.clone(), config.append_system_prompt.clone()]
+            .into_iter()
+            .flatten()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        query_config.system_prompt = (!additions.is_empty()).then_some(additions);
+        query_config.append_system_prompt = None;
 
         // AGENTS.md / CLAUDE.md instruction files and the skill listing, both
         // fixed for the session (they go in the cached system block).
