@@ -12,6 +12,21 @@ use claurst_tools::ToolContext;
 use claurst_tui::App;
 use parking_lot::Mutex;
 
+pub(crate) fn completion_notifier(
+    queue: claurst_query::CommandQueue,
+    session: String,
+) -> claurst_tools::CompletionNotifier {
+    claurst_tools::CompletionNotifier::new(move |notice| {
+        if let Err(error) = queue.push_for_session(
+            &session,
+            claurst_query::QueuedCommand::InjectUserMessage(notice),
+            claurst_query::CommandPriority::Normal,
+        ) {
+            tracing::warn!(%error, %session, "Could not persist background completion");
+        }
+    })
+}
+
 /// Call only after the previous query has drained. Acquire the destination
 /// before changing any live state, then bind every writer to that session.
 pub(crate) fn apply(
@@ -34,6 +49,13 @@ pub(crate) fn apply(
     let mut previous = session.clone();
     previous.messages = messages.clone();
     journal.checkpoint(&mut previous)?;
+    let pending = if let Some(queue) = &app.command_queue {
+        queue.switch_session(&resumed.id)?;
+        queue.pending_user_messages()
+    } else {
+        Vec::new()
+    };
+    app.switch_session_input(&session.id, &resumed.id, pending);
 
     *session = resumed;
     *journal = destination;
@@ -47,6 +69,9 @@ pub(crate) fn apply(
     tools.config.model = Some(session.model.clone());
     app.model_name = session.model.clone();
     tools.session_id = session.id.clone();
+    if let Some(queue) = &app.command_queue {
+        tools.completion_notifier = Some(completion_notifier(queue.clone(), session.id.clone()));
+    }
     tools.file_history = Arc::new(Mutex::new(claurst_core::file_history::FileHistory::new()));
     tools.current_turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     commands.session_id = session.id.clone();
@@ -299,6 +324,47 @@ mod tests {
         let loaded = claurst_core::session_journal::load(dir.path(), &live.session.id).unwrap();
         assert_eq!(loaded.session.title, before_title);
         drop(held);
+    }
+
+    #[test]
+    fn failed_outgoing_checkpoint_or_queue_parking_does_not_publish_destination() {
+        for fail_checkpoint in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut live = Harness::new(dir.path());
+            let a = live.session.id.clone();
+            live.app.replace_messages(live.messages.clone());
+            assert!(live.app.intercept_slash_command("new"));
+            assert_eq!(live.app.messages.len(), live.messages.len());
+            let queue = claurst_query::CommandQueue::new();
+            queue.enable_persistence_in(dir.path(), &a).unwrap();
+            live.app.command_queue = Some(queue.clone());
+            live.app.steer("A steer".into());
+            live.app.prompt_input.text = "A draft".into();
+            let held = live.journal.clone();
+            if fail_checkpoint {
+                live.journal = SessionJournal::new(dir.path(), &live.session);
+            } else {
+                std::fs::write(
+                    dir.path()
+                        .join("pending-soft-interrupts")
+                        .join(format!("{a}.json")),
+                    "broken",
+                )
+                .unwrap();
+            }
+            assert!(
+                live.resume(ConversationSession::new("model-b".into()), dir.path())
+                    .is_err()
+            );
+            assert_eq!(live.session.id, a);
+            assert_eq!(live.tools.session_id, a);
+            assert_eq!(live.commands.session_id, a);
+            assert_eq!(live.app.prompt_input.text, "A draft");
+            assert_eq!(live.app.messages.len(), live.messages.len());
+            assert_eq!(live.app.pending_steers.len(), 1);
+            assert_eq!(queue.pending_user_messages()[0].1, "A steer");
+            drop(held);
+        }
     }
 
     #[test]
