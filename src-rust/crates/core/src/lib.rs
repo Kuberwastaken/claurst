@@ -1408,6 +1408,9 @@ pub mod config {
                 degradation_summary_enabled: Default::default(),
                 status_line: Default::default(),
                 completion_wakeups: Default::default(),
+                bang_commands: Default::default(),
+                memory_extraction_enabled: Default::default(),
+                auto_memory_enabled: Default::default(),
                 sandbox: Default::default(),
             }
         }
