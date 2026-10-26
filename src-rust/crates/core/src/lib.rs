@@ -5554,6 +5554,59 @@ pub mod cost {
             cache_read_per_mtk: 0.0,
         };
 
+        /// Per-MTok rates with the 5-minute cache write at 1.25x input, which
+        /// holds for every Claude model on Anthropic's pricing page.
+        const fn claude(input: f64, output: f64, cache_read: f64) -> Self {
+            Self {
+                input_per_mtk: input,
+                output_per_mtk: output,
+                cache_creation_per_mtk: input * 1.25,
+                cache_read_per_mtk: cache_read,
+            }
+        }
+
+        /// True when `id` (lowercase, dots turned into dashes) names `family`
+        /// at exactly `version`, optionally followed by a `-` suffix such as a
+        /// date or `-thinking`: `opus-5` matches `claude-opus-5-20260901` but
+        /// not `claude-opus-50`.
+        fn is_claude_version(id: &str, family: &str, version: &str) -> bool {
+            id.match_indices(family).any(|(i, _)| {
+                id[i + family.len()..]
+                    .strip_prefix(version)
+                    .is_some_and(|tail| tail.is_empty() || tail.starts_with('-'))
+            })
+        }
+
+        /// Rates for Claude versions priced differently from the family
+        /// constants above. Source:
+        /// https://platform.claude.com/docs/en/about-claude/pricing (checked
+        /// 2026-10-24). Cache reads are 0.1x input except Opus 5.5 and
+        /// Sonnet 5.5 (0.05x) and Fable/Mythos 5.1 (0.025x). Order matters:
+        /// `5-5` is checked before `5`.
+        fn claude_version_pricing(id: &str) -> Option<Self> {
+            let is = |family: &str, version: &str| Self::is_claude_version(id, family, version);
+            if is("fable-", "5-1") || is("mythos-", "5-1") {
+                Some(Self::claude(10.0, 50.0, 0.25))
+            } else if is("fable-", "5") || is("mythos-", "5") {
+                Some(Self::claude(10.0, 50.0, 1.0))
+            } else if is("opus-", "5-5") {
+                Some(Self::claude(4.0, 20.0, 0.20))
+            } else if ["5", "4-8", "4-7", "4-6", "4-5"]
+                .iter()
+                .any(|v| is("opus-", v))
+            {
+                Some(Self::claude(5.0, 25.0, 0.50))
+            } else if is("sonnet-", "5-5") {
+                Some(Self::claude(2.0, 10.0, 0.10))
+            } else if is("sonnet-", "5") {
+                Some(Self::claude(2.0, 10.0, 0.20))
+            } else if is("haiku-", "4-5") {
+                Some(Self::claude(1.0, 5.0, 0.10))
+            } else {
+                None
+            }
+        }
+
         /// Pick pricing based on model name substring matching.
         ///
         /// Returns `None` for models we have no price for (issue #499): callers
@@ -5565,15 +5618,24 @@ pub mod cost {
             // Check for free models first (those with "-free" suffix, "free/" prefix, or upstream-prefixed free model)
             if model.ends_with("-free") || model.starts_with("free/") || is_free_upstream_model(model) {
                 Some(Self::FREE)
-            } else if model.contains("opus") {
-                Some(Self::OPUS)
-            } else if model.contains("sonnet") {
-                Some(Self::SONNET)
-            } else if model.contains("haiku") {
-                Some(Self::HAIKU)
             } else {
-                // Unknown model: no default pricing (issue #499).
-                None
+                let id = model.to_ascii_lowercase().replace('.', "-");
+                if Self::is_claude_version(&id, "haiku-", "5-5") {
+                    // Haiku 5.5 costs 5x more for prompts over 100k tokens; one
+                    // flat rate can't express that, so no fallback price.
+                    None
+                } else if let Some(pricing) = Self::claude_version_pricing(&id) {
+                    Some(pricing)
+                } else if model.contains("opus") {
+                    Some(Self::OPUS)
+                } else if model.contains("sonnet") {
+                    Some(Self::SONNET)
+                } else if model.contains("haiku") {
+                    Some(Self::HAIKU)
+                } else {
+                    // Unknown model: no default pricing (issue #499).
+                    None
+                }
             }
         }
     }
@@ -7110,6 +7172,45 @@ mod tests {
         assert_eq!(cost::ModelPricing::for_model("claude-opus"), Some(cost::ModelPricing::OPUS));
         assert_eq!(cost::ModelPricing::for_model("claude-haiku"), Some(cost::ModelPricing::HAIKU));
         assert_eq!(cost::ModelPricing::for_model("claude-sonnet"), Some(cost::ModelPricing::SONNET));
+    }
+
+    #[test]
+    fn claude_versions_priced_at_current_rates() {
+        // Rates from https://platform.claude.com/docs/en/about-claude/pricing
+        // (input, output, 5m cache write, cache read per MTok). These are the
+        // fallback when the bundled catalog has no entry for the model.
+        let p = |m: &str| {
+            let r =
+                cost::ModelPricing::for_model(m).unwrap_or_else(|| panic!("{m} has no pricing"));
+            (
+                r.input_per_mtk,
+                r.output_per_mtk,
+                r.cache_creation_per_mtk,
+                r.cache_read_per_mtk,
+            )
+        };
+        assert_eq!(p("claude-opus-5-5"), (4.0, 20.0, 5.0, 0.20));
+        assert_eq!(p("claude-opus-5"), (5.0, 25.0, 6.25, 0.50));
+        assert_eq!(p("claude-opus-4-8"), (5.0, 25.0, 6.25, 0.50));
+        assert_eq!(p("claude-opus-4-5-20251101"), (5.0, 25.0, 6.25, 0.50));
+        assert_eq!(p("claude-sonnet-5-5"), (2.0, 10.0, 2.5, 0.10));
+        assert_eq!(p("claude-sonnet-5-20260801"), (2.0, 10.0, 2.5, 0.20));
+        assert_eq!(p("claude-fable-5-1"), (10.0, 50.0, 12.5, 0.25));
+        assert_eq!(p("claude-fable-5"), (10.0, 50.0, 12.5, 1.0));
+        assert_eq!(p("claude-haiku-4-5"), (1.0, 5.0, 1.25, 0.10));
+        // Provider-prefixed and dotted ids resolve the same way.
+        assert_eq!(p("anthropic/claude-opus-5.5"), (4.0, 20.0, 5.0, 0.20));
+        assert_eq!(p("claude-sonnet-5-5-thinking"), (2.0, 10.0, 2.5, 0.10));
+        // Older models keep the family rates.
+        let family = |m: &str| cost::ModelPricing::for_model(m);
+        assert_eq!(family("claude-opus-4-1"), Some(cost::ModelPricing::OPUS));
+        assert_eq!(
+            family("claude-sonnet-4-6"),
+            Some(cost::ModelPricing::SONNET)
+        );
+        assert_eq!(family("claude-3-5-haiku"), Some(cost::ModelPricing::HAIKU));
+        // Haiku 5.5 is priced by prompt length, so there is no flat fallback.
+        assert_eq!(family("claude-haiku-5-5"), None);
     }
 
     #[test]
