@@ -126,22 +126,6 @@ impl SessionRegistry {
     pub fn live_cwds(&self) -> std::collections::HashSet<PathBuf> {
         self.inner.iter().map(|entry| entry.value().cwd.clone()).collect()
     }
-
-    /// GC: drop sessions whose working directory no longer has a cached
-    /// runtime. Live sessions never lose theirs — the runtime cache only
-    /// evicts directories with no session — so this only fires for strays
-    /// from a session creation racing an eviction.
-    pub fn gc(&self, live: &std::collections::HashSet<PathBuf>) -> usize {
-        let before = self.inner.len();
-        self.inner.retain(|id, state| {
-            let keep = live.contains(&state.cwd);
-            if !keep {
-                tracing::warn!(session_id = %id, cwd = %state.cwd.display(), "ACP: GC dropping session with no runtime");
-            }
-            keep
-        });
-        before - self.inner.len()
-    }
 }
 
 #[cfg(test)]
@@ -220,29 +204,5 @@ mod tests {
         let registry = SessionRegistry::new();
         let id = acp::SessionId::new("missing");
         assert!(registry.remove(&id).is_none());
-    }
-
-    #[test]
-    fn registry_gc_drops_sessions_whose_directory_has_no_runtime() {
-        let registry = SessionRegistry::new();
-        registry.insert(session("kept", "/tmp/kept"));
-        registry.insert(session("dropped", "/tmp/dropped"));
-        let mut live = std::collections::HashSet::new();
-        live.insert(PathBuf::from("/tmp/kept"));
-
-        assert_eq!(registry.gc(&live), 1);
-        assert!(registry.get(&acp::SessionId::new("kept")).is_some());
-        assert!(registry.get(&acp::SessionId::new("dropped")).is_none());
-    }
-
-    #[test]
-    fn registry_gc_keeps_sessions_whose_directory_still_has_a_runtime() {
-        let registry = SessionRegistry::new();
-        registry.insert(session("kept", "/tmp/kept"));
-        let mut live = std::collections::HashSet::new();
-        live.insert(PathBuf::from("/tmp/kept"));
-
-        assert_eq!(registry.gc(&live), 0);
-        assert!(registry.get(&acp::SessionId::new("kept")).is_some());
     }
 }
