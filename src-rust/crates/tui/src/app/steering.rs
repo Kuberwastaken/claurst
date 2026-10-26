@@ -67,9 +67,14 @@ impl App {
             return Some(text);
         }
         let queue = self.command_queue.as_ref()?;
-        while let Some((id, text)) = self.pending_steers.pop() {
-            if queue.remove(id).is_some() {
-                return Some(text);
+        while let Some((id, text)) = self.pending_steers.last().cloned() {
+            match queue.try_remove(id) {
+                Ok(Some(_)) => { self.pending_steers.pop(); return Some(text); }
+                Ok(None) => { self.pending_steers.pop(); }
+                Err(error) => {
+                    self.status_message = Some(format!("Could not remove queued input: {error}"));
+                    return None;
+                }
             }
         }
         None
@@ -101,14 +106,20 @@ impl App {
     /// them, so the idle wake-up delivers them after the cancel.
     pub fn restore_pending_steers(&mut self) {
         let mut restored: Vec<String> = Vec::new();
+        let mut retained = Vec::new();
         if let Some(ref queue) = self.command_queue {
             for (id, text) in self.pending_steers.drain(..) {
-                if queue.remove(id).is_some() {
-                    restored.push(text);
+                match queue.try_remove(id) {
+                    Ok(Some(_)) => restored.push(text),
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.status_message = Some(format!("Could not remove queued input: {error}"));
+                        retained.push((id, text));
+                    }
                 }
             }
         }
-        self.pending_steers.clear();
+        self.pending_steers = retained;
         restored.extend(self.queued_messages.drain(..));
         if restored.is_empty() {
             return;
@@ -154,6 +165,23 @@ mod tests {
 
     fn dock(app: &App) -> Vec<(PendingKind, String)> {
         app.pending_prompts().map(|(kind, text)| (kind, text.to_string())).collect()
+    }
+
+    #[test]
+    fn failed_durable_takeback_keeps_the_dock_and_input_visible() {
+        let (mut app, queue) = app_with_queue();
+        let dir = tempfile::tempdir().unwrap();
+        queue.enable_persistence_in(dir.path(), "session").unwrap();
+        app.steer("keep visible".into());
+        let store = dir.path().join("pending-soft-interrupts/session.json");
+        std::fs::write(store, "corrupt pending store").unwrap();
+        app.remove_last_pending();
+        assert_eq!(dock(&app), [(PendingKind::Steer, "keep visible".into())]);
+        assert!(!queue.is_empty());
+        assert!(app.status_message.as_deref().unwrap().contains("Could not remove"));
+        app.restore_pending_steers();
+        assert_eq!(app.pending_steers.len(), 1);
+        assert!(app.prompt_input.is_empty());
     }
 
     #[test]

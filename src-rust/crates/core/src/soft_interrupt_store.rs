@@ -13,27 +13,30 @@
 
 use crate::ClaudeError;
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// A queued steering message as stored on disk.
+/// Stable delivery identity is also the journaled Message UUID. Sequence and
+/// priority reconstruct ordering; identity makes replay safe after a crash
+/// between journal acceptance and removal from this store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedSoftInterrupt {
+    pub id: String,
     pub content: String,
-    /// Push order within one drain, oldest first.
     pub seq: u64,
-    /// Push priority: higher drains first. Kept so the heap order of the
-    /// in-memory queue can be reconstructed exactly.
     pub priority: u8,
 }
 
-/// Directory holding one JSON file per session with undelivered input.
 pub fn soft_interrupt_dir_in(config_dir: &Path) -> PathBuf {
     config_dir.join("pending-soft-interrupts")
 }
 
 fn path_for_session_in(config_dir: &Path, session_id: &str) -> crate::Result<PathBuf> {
-    // Same traversal guard as `transcript_path` (issue #204).
-    if session_id.contains('/') || session_id.contains('\\') || session_id.contains("..") {
+    if session_id.is_empty()
+        || session_id.contains('/')
+        || session_id.contains('\\')
+        || session_id.contains("..")
+    {
         return Err(ClaudeError::Other(format!(
             "invalid session id for soft-interrupt store: {session_id}"
         )));
@@ -43,48 +46,77 @@ fn path_for_session_in(config_dir: &Path, session_id: &str) -> crate::Result<Pat
 
 fn read_in(config_dir: &Path, session_id: &str) -> crate::Result<Vec<PersistedSoftInterrupt>> {
     let path = path_for_session_in(config_dir, session_id)?;
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let raw = std::fs::read_to_string(&path)?;
-    serde_json::from_str(&raw).map_err(|err| {
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    serde_json::from_str(&raw).map_err(|error| {
         ClaudeError::Other(format!(
-            "corrupt soft-interrupt store {}: {err}",
+            "corrupt soft-interrupt store {}: {error}",
             path.display()
         ))
     })
 }
 
+fn store_lock(config_dir: &Path, session_id: &str) -> crate::Result<fslock::LockFile> {
+    let path = path_for_session_in(config_dir, session_id)?;
+    let directory = soft_interrupt_dir_in(config_dir);
+    std::fs::create_dir_all(&directory)?;
+    crate::accounts::set_user_only_dir_perms(&directory);
+    let lock_path = path.with_extension("lock");
+    let mut lock = fslock::LockFile::open(&lock_path)?;
+    crate::accounts::set_user_only_perms(&lock_path);
+    lock.lock_with_pid()?;
+    Ok(lock)
+}
+
+// Caller holds the session's store lock for the entire read/modify/write.
 fn write_in(
     config_dir: &Path,
     session_id: &str,
     interrupts: &[PersistedSoftInterrupt],
 ) -> crate::Result<()> {
     let path = path_for_session_in(config_dir, session_id)?;
+    let directory = soft_interrupt_dir_in(config_dir);
     if interrupts.is_empty() {
-        if path.exists() {
-            std::fs::remove_file(&path)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
         }
-        return Ok(());
+    } else {
+        let tmp = directory.join(format!(".{session_id}.{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| -> crate::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&tmp)?;
+            crate::accounts::set_user_only_perms(&tmp);
+            file.write_all(&serde_json::to_vec_pretty(interrupts)?)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp, &path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result?;
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // Write-then-rename keeps readers from ever seeing a torn file.
-    let tmp = path.with_extension("json.tmp");
-    let body = serde_json::to_vec_pretty(interrupts)?;
-    std::fs::write(&tmp, body)?;
-    std::fs::rename(&tmp, &path)?;
+    #[cfg(unix)]
+    std::fs::File::open(&directory)?.sync_all()?;
     Ok(())
 }
 
-/// Load the undelivered interrupts persisted for `session_id`.
 pub fn load_in(config_dir: &Path, session_id: &str) -> crate::Result<Vec<PersistedSoftInterrupt>> {
     read_in(config_dir, session_id)
 }
 
-/// Load and delete the persisted interrupts for `session_id`.
+/// Explicit destructive consumption; durable command delivery uses load plus
+/// journal acceptance plus remove_by_ids instead.
 pub fn take_in(config_dir: &Path, session_id: &str) -> crate::Result<Vec<PersistedSoftInterrupt>> {
+    let _lock = store_lock(config_dir, session_id)?;
     let loaded = read_in(config_dir, session_id)?;
     if !loaded.is_empty() {
         write_in(config_dir, session_id, &[])?;
@@ -92,33 +124,59 @@ pub fn take_in(config_dir: &Path, session_id: &str) -> crate::Result<Vec<Persist
     Ok(loaded)
 }
 
-/// Replace the persisted interrupts for `session_id`.
 pub fn overwrite_in(
     config_dir: &Path,
     session_id: &str,
     interrupts: &[PersistedSoftInterrupt],
 ) -> crate::Result<()> {
+    let _lock = store_lock(config_dir, session_id)?;
     write_in(config_dir, session_id, interrupts)
 }
 
-/// Append one interrupt to those persisted for `session_id`.
+/// Merge unacknowledged entries without removing another writer's input.
+/// Retrying a previously persisted identity is idempotent.
+pub fn merge_in(
+    config_dir: &Path,
+    session_id: &str,
+    interrupts: &[PersistedSoftInterrupt],
+) -> crate::Result<()> {
+    let _lock = store_lock(config_dir, session_id)?;
+    let mut current = read_in(config_dir, session_id)?;
+    for interrupt in interrupts {
+        match current.iter().find(|entry| entry.id == interrupt.id) {
+            Some(existing) if existing != interrupt => {
+                return Err(ClaudeError::Other(
+                    "soft-interrupt identity reused with different content".into(),
+                ))
+            }
+            Some(_) => {}
+            None => current.push(interrupt.clone()),
+        }
+    }
+    write_in(config_dir, session_id, &current)
+}
+
 pub fn append_in(
     config_dir: &Path,
     session_id: &str,
     interrupt: PersistedSoftInterrupt,
 ) -> crate::Result<()> {
+    merge_in(config_dir, session_id, &[interrupt])
+}
+
+pub fn remove_by_ids_in(config_dir: &Path, session_id: &str, ids: &[String]) -> crate::Result<()> {
+    let _lock = store_lock(config_dir, session_id)?;
     let mut current = read_in(config_dir, session_id)?;
-    current.push(interrupt);
+    current.retain(|entry| !ids.contains(&entry.id));
     write_in(config_dir, session_id, &current)
 }
 
-/// Remove the persisted interrupts whose `seq` is in `seqs`, returning the
-/// removed `seq`s in store order. Mirrors `CommandQueue::remove` recovery.
 pub fn remove_by_seqs_in(
     config_dir: &Path,
     session_id: &str,
     seqs: &[u64],
 ) -> crate::Result<Vec<u64>> {
+    let _lock = store_lock(config_dir, session_id)?;
     let mut current = read_in(config_dir, session_id)?;
     let mut removed = Vec::new();
     current.retain(|interrupt| {
@@ -135,8 +193,6 @@ pub fn remove_by_seqs_in(
     Ok(removed)
 }
 
-// Default-config-dir wrappers over the `_in` variants above.
-
 fn config_dir() -> PathBuf {
     crate::config::Settings::config_dir()
 }
@@ -144,19 +200,15 @@ fn config_dir() -> PathBuf {
 pub fn load(session_id: &str) -> crate::Result<Vec<PersistedSoftInterrupt>> {
     load_in(&config_dir(), session_id)
 }
-
 pub fn take(session_id: &str) -> crate::Result<Vec<PersistedSoftInterrupt>> {
     take_in(&config_dir(), session_id)
 }
-
 pub fn overwrite(session_id: &str, interrupts: &[PersistedSoftInterrupt]) -> crate::Result<()> {
     overwrite_in(&config_dir(), session_id, interrupts)
 }
-
 pub fn append(session_id: &str, interrupt: PersistedSoftInterrupt) -> crate::Result<()> {
     append_in(&config_dir(), session_id, interrupt)
 }
-
 pub fn remove_by_seqs(session_id: &str, seqs: &[u64]) -> crate::Result<Vec<u64>> {
     remove_by_seqs_in(&config_dir(), session_id, seqs)
 }
@@ -167,6 +219,7 @@ mod tests {
 
     fn interrupt(content: &str, seq: u64, priority: u8) -> PersistedSoftInterrupt {
         PersistedSoftInterrupt {
+            id: format!("interrupt-{seq}"),
             content: content.to_string(),
             seq,
             priority,
@@ -249,6 +302,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = load_in(dir.path(), "../../etc").unwrap_err();
         assert!(matches!(err, ClaudeError::Other(_)));
+    }
+
+    #[test]
+    fn concurrent_writers_and_identity_acknowledgements_do_not_drop_other_input() {
+        let dir = tempfile::tempdir().unwrap();
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let base = dir.path();
+                scope.spawn(move || {
+                    for index in 0..10 {
+                        append_in(
+                            base,
+                            "session",
+                            PersistedSoftInterrupt {
+                                id: format!("{worker}-{index}"),
+                                content: format!("input {worker}-{index}"),
+                                seq: index,
+                                priority: 1,
+                            },
+                        )
+                        .unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(load_in(dir.path(), "session").unwrap().len(), 40);
+        let ids: Vec<_> = (0..10).map(|index| format!("0-{index}")).collect();
+        remove_by_ids_in(dir.path(), "session", &ids).unwrap();
+        let remaining = load_in(dir.path(), "session").unwrap();
+        assert_eq!(remaining.len(), 30);
+        assert!(remaining.iter().all(|entry| !ids.contains(&entry.id)));
     }
 
     #[test]

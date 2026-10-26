@@ -12,7 +12,15 @@ use tracing::{debug, info, warn};
 
 use crate::connection::{Connection, Inbound};
 use crate::runtime::AgentRuntime;
-use crate::sessions::{SessionRegistry, SessionState};
+use crate::sessions::{ActiveTurn, SessionRegistry, SessionState};
+
+/// One ACP session's prompt turn reserved in `dispatch`, before the handler
+/// task for `session/prompt` is spawned (issue #467).
+struct ReservedPrompt {
+    session: Arc<SessionState>,
+    request: acp::PromptRequest,
+    turn: ActiveTurn,
+}
 
 /// The ACP agent: owns the connection, the per-directory runtimes, and the
 /// session registry.
@@ -36,21 +44,70 @@ impl AgentServer {
 
     /// The runtime for `cwd`, building it (settings, context, MCP servers
     /// for that directory) the first time a session opens there.
-    async fn runtime_for(&self, cwd: &std::path::Path) -> Result<Arc<AgentRuntime>, acp::Error> {
-        let mut runtimes = self.runtimes.lock().await;
-        if let Some(runtime) = runtimes.get(cwd) {
-            return Ok(runtime.clone());
+    ///
+    /// Keyed by the canonical cwd so the same directory reached under
+    /// different spellings (`/a/b`, `/a/b/`) shares one runtime.
+    pub(crate) async fn runtime_for(&self, cwd: &std::path::Path) -> Result<Arc<AgentRuntime>, acp::Error> {
+        // Canonicalize before using the path as the cache key; fall back to
+        // the given path when the directory does not exist yet.
+        let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        self.evict_unused_runtimes(&cwd).await;
+        if let Some(runtime) = {
+            let runtimes = self.runtimes.lock().await;
+            runtimes.get(&cwd).cloned()
+        } {
+            return Ok(runtime);
         }
-        let cwd = cwd.to_path_buf();
-        let runtime = AgentRuntime::build(cwd.clone()).await.map_err(|e| {
+        // Build OUTSIDE the cache lock: MCP connects can take seconds, and
+        // holding the lock across `build().await` serialised `session/new`
+        // for every directory behind the first one's connects.
+        let runtime = Arc::new(AgentRuntime::build(cwd.clone()).await.map_err(|e| {
             acp::Error::new(
                 i32::from(acp::ErrorCode::InternalError),
                 format!("Failed to start the agent for {}: {e}", cwd.display()),
             )
-        })?;
-        let runtime = Arc::new(runtime);
-        runtimes.insert(cwd, runtime.clone());
-        Ok(runtime)
+        })?);
+        let mut runtimes = self.runtimes.lock().await;
+        // Another session/new may have raced us building the same directory;
+        // one runtime wins and the loser's MCP connections close when its Arc
+        // is dropped at the end of this call.
+        match runtimes.get(&cwd) {
+            Some(existing) => Ok(existing.clone()),
+            None => {
+                runtimes.insert(cwd, runtime.clone());
+                Ok(runtime)
+            }
+        }
+    }
+
+    /// Evict the runtimes of directories that no session references (closing
+    /// a workspace must not pin its MCP child processes for the life of the
+    /// agent). `keep_cwd` — the directory a `session/new` is currently
+    /// resolving, with no session yet — is never evicted whether it is cached
+    /// or being built. Session state owns its runtime independently of this
+    /// cache: concurrent session creation must never be discarded based on a
+    /// stale snapshot of the cache keys.
+    async fn evict_unused_runtimes(&self, keep_cwd: &std::path::Path) {
+        let mut evicted: Vec<Arc<AgentRuntime>> = Vec::new();
+        {
+            let mut runtimes = self.runtimes.lock().await;
+            let keep = self.sessions.live_cwds();
+            let stale: Vec<PathBuf> = runtimes
+                .keys()
+                .filter(|dir| dir.as_path() != keep_cwd && !keep.contains(dir.as_path()))
+                .cloned()
+                .collect();
+            for dir in stale {
+                if let Some(stale_runtime) = runtimes.remove(&dir) {
+                    info!(cwd = %dir.display(), "ACP: evicting runtime for unused directory");
+                    evicted.push(stale_runtime);
+                }
+            }
+        }
+        // Release the evicted runtimes (and thus their McpManagers) outside
+        // the cache lock, so their teardown cannot block another directory's
+        // session/new.
+        drop(evicted);
     }
 
     /// Dispatch a single inbound message. Spawns the actual handler on a
@@ -58,23 +115,98 @@ impl AgentServer {
     /// is in flight. Returns the join handle so the caller can wait for
     /// in-flight work to finish before shutting down.
     pub fn dispatch(self: &Arc<Self>, msg: Inbound) -> tokio::task::JoinHandle<()> {
+        // Reserve the prompt turn synchronously, before the handler task is
+        // spawned (issue #467): that task is queued behind everything else on
+        // the runtime, so a `session/cancel` that arrives before it runs must
+        // still hit the turn and produce `stopReason: "cancelled"` as the
+        // schema requires. Keep reservation failures too: a busy request must
+        // not become accepted merely because the previous turn finishes before
+        // its response task gets scheduled.
+        let prompt_turn = match &msg {
+            Inbound::Request { method, params, .. } if method == "session/prompt" => {
+                Some(self.reserve_prompt_turn(params.as_ref()))
+            }
+            _ => None,
+        };
+        // Cancellation belongs to the turn reserved at this wire position,
+        // not whichever turn exists when a background task eventually runs.
+        if let Inbound::Notification { method, params } = &msg {
+            self.handle_notification(method, params.clone());
+        }
         let this = self.clone();
         tokio::spawn(async move {
             match msg {
-                Inbound::Request { id, method, params } => {
-                    let response = this.handle_request(&method, params).await;
-                    let result = match response {
-                        Ok(value) => this.connection.send_response(id, value).await,
-                        Err(err) => this.connection.send_error_response(id, err).await,
-                    };
-                    if let Err(e) = result {
-                        warn!(?e, method = %method, "ACP: failed to send response");
+                Inbound::Request { id, method, params } => match prompt_turn {
+                    Some(Ok(ReservedPrompt {
+                        session,
+                        request,
+                        turn,
+                    })) => {
+                        let response =
+                            crate::prompt::handle(this.connection.clone(), session, request, turn)
+                                .await;
+                        this.send_prompt_response(id, response).await;
                     }
-                }
-                Inbound::Notification { method, params } => {
-                    this.handle_notification(&method, params).await;
-                }
+                    Some(Err(error)) => {
+                        this.send_prompt_response(id, Err(error)).await;
+                    }
+                    None => {
+                        let response = this.handle_request(&method, params).await;
+                        let result = match response {
+                            Ok(value) => this.connection.send_response(id, value).await,
+                            Err(err) => this.connection.send_error_response(id, err).await,
+                        };
+                        if let Err(e) = result {
+                            warn!(?e, method = %method, "ACP: failed to send response");
+                        }
+                    }
+                },
+                Inbound::Notification { .. } => {}
             }
+        })
+    }
+
+    /// Send the response (or error) for a `session/prompt` request whose turn
+    /// was reserved in `dispatch`.
+    async fn send_prompt_response(
+        self: &Arc<Self>,
+        id: acp::RequestId,
+        response: Result<acp::PromptResponse, acp::Error>,
+    ) {
+        let result = match response {
+            Ok(value) => self.connection.send_response(id, value).await,
+            Err(err) => self.connection.send_error_response(id, err).await,
+        };
+        if let Err(e) = result {
+            warn!(?e, method = "session/prompt", "ACP: failed to send response");
+        }
+    }
+
+    /// Reserve a prompt or retain its error synchronously at dispatch time.
+    fn reserve_prompt_turn(
+        self: &Arc<Self>,
+        params: Option<&Value>,
+    ) -> Result<ReservedPrompt, acp::Error> {
+        let request: acp::PromptRequest = parse_params(params.cloned())?;
+        let session = self.sessions.get(&request.session_id).ok_or_else(|| {
+            acp::Error::invalid_params().data(Some(serde_json::json!({
+                "reason": "unknown session",
+                "sessionId": request.session_id,
+            })))
+        })?;
+        let turn = session.begin_turn().ok_or_else(|| {
+            acp::Error::new(
+                i32::from(acp::ErrorCode::InvalidRequest),
+                format!(
+                    "Session {} already has a prompt running",
+                    session.session_id
+                ),
+            )
+        })?;
+        Ok(ReservedPrompt {
+            turn,
+            session,
+            request,
         })
     }
 
@@ -118,7 +250,7 @@ impl AgentServer {
         }
     }
 
-    async fn handle_notification(self: &Arc<Self>, method: &str, params: Option<Value>) {
+    fn handle_notification(self: &Arc<Self>, method: &str, params: Option<Value>) {
         debug!(method, "ACP: dispatch notification");
         match method {
             "session/cancel" => {
@@ -229,7 +361,14 @@ impl AgentServer {
                 }))));
             }
         };
-        crate::prompt::handle(self.connection.clone(), session, req).await
+        // Direct handler path; normal dispatch already reserves synchronously.
+        let Some(turn) = session.begin_turn() else {
+            return Err(acp::Error::new(
+                i32::from(acp::ErrorCode::InvalidRequest),
+                format!("Session {} already has a prompt running", session.session_id),
+            ));
+        };
+        crate::prompt::handle(self.connection.clone(), session, req, turn).await
     }
 }
 

@@ -54,7 +54,9 @@ pub async fn run_acp_server() -> anyhow::Result<()> {
     let server = AgentServer::new(connection.clone());
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let reader_fut = connection::run_reader(connection, tokio::io::stdin(), tx);
+    // Keep the protocol channel private to this reader so child processes
+    // (git, shells, MCP servers, ...) never inherit it. See `protocol_reader`.
+    let reader_fut = connection::run_reader(connection, protocol_reader()?, tx);
 
     // Track in-flight dispatch tasks so they can finish writing their
     // responses before the runtime shuts down. The dispatch future only
@@ -77,6 +79,147 @@ pub async fn run_acp_server() -> anyhow::Result<()> {
 
     info!("ACP: server shutdown");
     Ok(())
+}
+
+/// The reader side of the protocol, detached from what child processes inherit.
+///
+/// On Windows the ACP reader sits in a blocking `ReadFile` on the stdin pipe.
+/// Pipe handles are synchronous, so any other I/O on the same handle blocks
+/// until that read returns. A child that inherits our stdin (every `Command`
+/// without an explicit `.stdin(..)`) queries it while starting up: `git status`
+/// run for the system context during `session/new` never returned, so the
+/// session was never created.
+///
+/// The reader therefore gets a private, non-inheritable duplicate of stdin,
+/// and the process' standard input is pointed at NUL, which is what children
+/// inherit from now on.
+#[cfg(windows)]
+fn protocol_reader() -> std::io::Result<tokio::fs::File> {
+    use std::os::windows::io::{FromRawHandle, IntoRawHandle};
+
+    type Handle = *mut core::ffi::c_void;
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const DUPLICATE_SAME_ACCESS: u32 = 2;
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+    extern "system" {
+        fn GetStdHandle(n_std_handle: u32) -> Handle;
+        fn SetStdHandle(n_std_handle: u32, handle: Handle) -> i32;
+        fn GetCurrentProcess() -> Handle;
+        fn SetHandleInformation(handle: Handle, mask: u32, flags: u32) -> i32;
+        fn DuplicateHandle(
+            source_process: Handle,
+            source: Handle,
+            target_process: Handle,
+            target: *mut Handle,
+            access: u32,
+            inherit: i32,
+            options: u32,
+        ) -> i32;
+    }
+
+    // SAFETY: plain Win32 calls on this process' own handles. `dup` is owned by
+    // the `File` created right after a successful `DuplicateHandle`, and the NUL
+    // handle is intentionally leaked: it becomes the process' standard input.
+    unsafe {
+        let stdin = GetStdHandle(STD_INPUT_HANDLE);
+        if stdin.is_null() || stdin as isize == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let process = GetCurrentProcess();
+        let mut dup: Handle = core::ptr::null_mut();
+        if DuplicateHandle(
+            process,
+            stdin,
+            process,
+            &mut dup,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let private = std::fs::File::from_raw_handle(dup);
+
+        let nul = std::fs::OpenOptions::new()
+            .read(true)
+            .open("NUL")?
+            .into_raw_handle();
+        if SetStdHandle(STD_INPUT_HANDLE, nul) == 0 {
+            let err = std::io::Error::last_os_error();
+            drop(std::fs::File::from_raw_handle(nul));
+            return Err(err);
+        }
+
+        // Best effort: the original handle should not travel to children either.
+        SetHandleInformation(stdin, HANDLE_FLAG_INHERIT, 0);
+        Ok(tokio::fs::File::from_std(private))
+    }
+}
+
+#[cfg(not(windows))]
+fn protocol_reader() -> std::io::Result<tokio::io::Stdin> {
+    Ok(tokio::io::stdin())
+}
+
+#[cfg(all(test, windows))]
+mod stdin_tests {
+    use super::protocol_reader;
+    use std::io::Write;
+    use std::os::windows::io::FromRawHandle;
+    use tokio::io::AsyncReadExt;
+
+    type Handle = *mut core::ffi::c_void;
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const FILE_TYPE_CHAR: u32 = 2;
+    const FILE_TYPE_PIPE: u32 = 3;
+    extern "system" {
+        fn GetStdHandle(n_std_handle: u32) -> Handle;
+        fn SetStdHandle(n_std_handle: u32, handle: Handle) -> i32;
+        fn GetFileType(handle: Handle) -> u32;
+        fn CreatePipe(
+            read: *mut Handle,
+            write: *mut Handle,
+            attrs: *mut core::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+
+    /// Children must inherit NUL, not the protocol pipe, and the reader must
+    /// still receive what the client writes.
+    #[tokio::test]
+    async fn children_do_not_inherit_the_protocol_pipe() {
+        // SAFETY: test-only Win32 calls on handles created here; the original
+        // standard input is restored before the test ends.
+        unsafe {
+            let original = GetStdHandle(STD_INPUT_HANDLE);
+            let (mut read, mut write): (Handle, Handle) =
+                (core::ptr::null_mut(), core::ptr::null_mut());
+            assert_ne!(
+                CreatePipe(&mut read, &mut write, core::ptr::null_mut(), 0),
+                0
+            );
+            assert_ne!(SetStdHandle(STD_INPUT_HANDLE, read), 0);
+            assert_eq!(GetFileType(GetStdHandle(STD_INPUT_HANDLE)), FILE_TYPE_PIPE);
+
+            let mut reader = protocol_reader().expect("protocol reader");
+            assert_eq!(GetFileType(GetStdHandle(STD_INPUT_HANDLE)), FILE_TYPE_CHAR);
+
+            let mut client = std::fs::File::from_raw_handle(write);
+            client
+                .write_all(b"hello\n")
+                .expect("write to protocol pipe");
+            let mut buf = [0u8; 6];
+            reader
+                .read_exact(&mut buf)
+                .await
+                .expect("read from protocol pipe");
+            assert_eq!(&buf, b"hello\n");
+
+            SetStdHandle(STD_INPUT_HANDLE, original);
+        }
+    }
 }
 
 fn install_stderr_tracing() {

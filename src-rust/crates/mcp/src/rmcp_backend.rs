@@ -107,7 +107,6 @@ impl ClientHandler for RmcpNotificationClient {
 pub struct RmcpClientBackend {
     snapshot: McpClientSnapshot,
     peer: rmcp::Peer<RoleClient>,
-    #[allow(dead_code)]
     running: Mutex<RunningService<RoleClient, RmcpNotificationClient>>,
     notifications_rx: Arc<Mutex<mpsc::UnboundedReceiver<Value>>>,
 }
@@ -662,6 +661,17 @@ impl McpClientBackend for RmcpClientBackend {
             }
         });
         Box::pin(ReceiverStream::new(rx))
+    }
+
+    async fn close(&self) {
+        // `close()` takes `&mut RunningService`; the tokio `Mutex` lets us hold
+        // the guard across the await. It cancels the service token and joins
+        // the background task, which calls `transport.close()`; for stdio
+        // that terminates the child process.
+        let mut running = self.running.lock().await;
+        if let Err(e) = running.close().await {
+            tracing::warn!(error = %e, "rmcp service close failed");
+        }
     }
 }
 

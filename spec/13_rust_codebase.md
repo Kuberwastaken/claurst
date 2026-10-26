@@ -1239,40 +1239,37 @@ Full MCP (Model Context Protocol) client implementation. Uses JSON-RPC 2.0 over 
 
 ### Transport
 
-**`McpTransport` trait** (async_trait):
-- `async fn send(&mut self, request: &JsonRpcRequest) -> Result<()>`
-- `async fn recv(&mut self) -> Result<Option<JsonRpcResponse>>`
-- `async fn close(&mut self)`
+**`McpClientBackend` trait** (async_trait, `crates/mcp/src/backend.rs`):
+- `fn kind(&self) -> McpBackendKind`
+- `fn snapshot(&self) -> McpClientSnapshot`
+- `async fn list_tools / call_tool / list_resources / read_resource / list_prompts / get_prompt`
+- `async fn subscribe_resource / unsubscribe_resource`
+- `fn subscribe_to_notifications -> BoxStream<'static, anyhow::Result<Value>>`
 
-**`StdioTransport`:**
-- `StdioTransport::spawn(command: &str, args: &[String], env: &HashMap<String, String>) -> Result<Self>`
-  - Spawns subprocess with piped stdin/stdout
-  - Spawns background reader task forwarding lines to `mpsc::UnboundedReceiver<String>`
-- `send()` — serializes to JSON + newline on stdin
-- `recv()` — receives from channel, deserializes JSON-RPC response
+Concrete transports — a stdio child process, streamable HTTP and the legacy
+SSE fallback — are implemented on the `rmcp` crate in `crates/mcp/src/rmcp_backend.rs`;
+there is no transport abstraction in the MCP crate itself.
 
 ### `McpClient`
 
-**`McpClient::connect_stdio(config: &McpServerConfig) -> Result<Self>`** (async):
-1. Calls `StdioTransport::spawn()`
-2. Calls `initialize()` — sends `initialize` request, receives `InitializeResult`
-3. Sends `notifications/initialized` notification
-4. If `capabilities.tools` present: calls `tools/list`, stores in `self.tools`
-5. If `capabilities.resources` present: calls `resources/list`, stores
-6. If `capabilities.prompts` present: calls `prompts/list`, stores
-7. Returns connected client
+**`McpClient::connect(config, auth_token, timeouts) -> Result<Self>`** (async):
+1. The manager expands `${VAR}` references in `command`, `args`, `env` and
+   `headers` first; an explicit `Authorization` header wins over the stored
+   token
+2. Builds the rmcp backend for the configured transport (stdio spawns the
+   child with piped stdin/stdout; `http` opens a streamable HTTP session
+   over a protocol-version fallback list; `sse` uses the legacy SSE flow)
+3. Runs the `initialize` handshake and keeps `InitializeResult` (server
+   info, capabilities, instructions)
+4. Per advertised capability, fetches `tools/list`, `resources/list` and
+   `prompts/list` into an `McpClientSnapshot`
 
-**`call<T: DeserializeOwned>(&mut self, method, params) -> Result<T>`:**
-- Sequential request/response: sends request with incrementing ID
-- Calls `transport.recv()` in loop until response ID matches
-- Deserializes `result` field
+**`call_tool(name, arguments)`** — `tools/call` with the given arguments
 
-**`call_tool(&mut self, name: &str, arguments: Option<Value>) -> Result<CallToolResult>`:**
-- Calls `tools/call` with `CallToolParams`
+**`list_resources` / `read_resource` / `list_prompts` / `get_prompt`** —
+`resources/list`, `resources/read`, `prompts/list` and `prompts/get`
 
-**`list_resources(&mut self) -> Result<Vec<McpResource>>`** — `resources/list`
-
-**`read_resource(&mut self, uri: &str) -> Result<ResourceContents>`** — `resources/read`
+### `McpManager`
 
 ### `McpManager`
 
