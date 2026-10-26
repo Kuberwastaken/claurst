@@ -6493,6 +6493,37 @@ mod tests {
         assert_eq!(cfg.effective_effort_level(), None);
     }
 
+    /// Serializes the `ANTHROPIC_API_KEY` env-mutating tests. The env is
+    /// process-global and the default test harness runs tests on parallel
+    /// threads: without this lock, one test's remove/set races another's
+    /// resolve and the suite flakes under load. The guard snapshots the
+    /// current value on the way in and restores it on drop, so a panicking
+    /// test cannot leak a scratch value either.
+    mod anthropic_api_key_env {
+        use std::sync::{Mutex, MutexGuard, OnceLock};
+
+        pub(crate) struct EnvRestore {
+            _guard: MutexGuard<'static, ()>,
+            orig: Option<String>,
+        }
+
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match &self.orig {
+                    Some(k) => std::env::set_var("ANTHROPIC_API_KEY", k),
+                    None => std::env::remove_var("ANTHROPIC_API_KEY"),
+                }
+            }
+        }
+
+        pub fn lock_and_snapshot() -> EnvRestore {
+            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            let guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|p| p.into_inner());
+            let orig = std::env::var("ANTHROPIC_API_KEY").ok();
+            EnvRestore { _guard: guard, orig }
+        }
+    }
+
     #[test]
     fn test_config_effective_max_tokens_default() {
         let cfg = crate::config::Config::default();
@@ -6509,45 +6540,30 @@ mod tests {
     fn test_config_resolve_api_key_from_config() {
         // When config.api_key is set, it should be returned regardless of env var
         // (Config key takes priority — resolve_api_key returns it first)
-        let orig = std::env::var("ANTHROPIC_API_KEY").ok();
+        let _env = anthropic_api_key_env::lock_and_snapshot();
         std::env::remove_var("ANTHROPIC_API_KEY");
 
         let cfg = crate::config::Config { api_key: Some("sk-ant-config-key".to_string()), ..Default::default() };
         assert_eq!(cfg.resolve_api_key(), Some("sk-ant-config-key".to_string()));
-
-        if let Some(k) = orig {
-            std::env::set_var("ANTHROPIC_API_KEY", k);
-        }
     }
 
     #[test]
     fn test_config_resolve_api_key_none() {
         // Temporarily ensure no env var override
-        let orig = std::env::var("ANTHROPIC_API_KEY").ok();
+        let _env = anthropic_api_key_env::lock_and_snapshot();
         std::env::remove_var("ANTHROPIC_API_KEY");
 
         let cfg = crate::config::Config::default();
         assert!(cfg.resolve_api_key().is_none());
-
-        // Restore
-        if let Some(k) = orig {
-            std::env::set_var("ANTHROPIC_API_KEY", k);
-        }
     }
 
     #[test]
     fn test_config_resolve_api_key_from_env() {
-        let orig = std::env::var("ANTHROPIC_API_KEY").ok();
+        let _env = anthropic_api_key_env::lock_and_snapshot();
         std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-env-key");
 
         let cfg = crate::config::Config::default();
         assert_eq!(cfg.resolve_api_key(), Some("sk-ant-env-key".to_string()));
-
-        // Restore
-        std::env::remove_var("ANTHROPIC_API_KEY");
-        if let Some(k) = orig {
-            std::env::set_var("ANTHROPIC_API_KEY", k);
-        }
     }
 
     // ---- OAuth token tests --------------------------------------------------
