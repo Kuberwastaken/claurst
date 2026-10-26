@@ -1207,6 +1207,92 @@ use crate::session_browser::SessionBrowserMode;
         assert_eq!(app.session_title.as_deref(), Some("old"));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn browser_filter_prefilter_survives_async_disk_load() {
+        let _lock = SESSION_HOME_LOCK.lock().await;
+        let home = SessionHome::new();
+        let wanted = save_test_session("Beta report", home.dir.path()).await;
+        save_test_session("Alpha work", home.dir.path()).await;
+        let mut app = make_app();
+        app.recent_sessions_pending = false;
+        assert!(app.intercept_slash_command_with_args("sessions", "beta"));
+        assert_eq!(app.session_browser.filter_input, "beta");
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                app.poll_session_loads();
+                if app.session_browser.sessions.len() == 2 { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("browser must finish loading saved sessions");
+        assert_eq!(app.session_browser.visible_sessions().len(), 1);
+        assert_eq!(app.session_browser.selected_session().unwrap().id, wanted);
+    }
+
+    #[test]
+    fn browser_filter_paste_stays_out_of_the_prompt() {
+        let mut app = make_app();
+        app.session_browser.open(vec![]);
+        app.session_browser.start_search();
+        app.handle_paste_data("Beta\nreport".into());
+        assert_eq!(app.session_browser.filter_input, "Beta report");
+        assert!(app.prompt_input.text.is_empty());
+    }
+
+    #[test]
+    fn browser_filter_honors_user_bindings_and_resumes_filtered_session() {
+        let mut app = make_app();
+        let bindings = claurst_core::keybindings::UserKeybindings::from_json_str(
+            r#"{"bindings":[
+                {"chord":"/","action":null,"context":"SessionBrowser"},
+                {"chord":"ctrl+f","action":"startSessionFilter","context":"SessionBrowser"},
+                {"chord":"ctrl+u","action":null,"context":"SessionFilter"},
+                {"chord":"ctrl+l","action":"clearSessionFilter","context":"SessionFilter"}
+            ]}"#,
+        );
+        app.keybindings = claurst_core::keybindings::KeybindingResolver::new(&bindings);
+        app.session_browser.open([("a", "Alpha"), ("b", "Beta"), ("c", "Beta second")]
+            .into_iter().map(|(id, title)| crate::session_browser::SessionEntry {
+                id: id.into(), title: title.into(), last_updated: "now".into(),
+                message_count: 0, cost_usd: 0.0, working_dir: None,
+            }).collect());
+        app.handle_key_event(press_key(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert_eq!(app.session_browser.mode, SessionBrowserMode::Browse);
+        app.handle_key_event(press_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert_eq!(app.session_browser.mode, SessionBrowserMode::Search);
+        for c in "beta".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.session_browser.visible_sessions().len(), 2);
+        app.handle_key_event(press_key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.session_browser.filter_input, "beta");
+        app.handle_key_event(press_key(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert!(app.session_browser.filter_input.is_empty());
+        for c in "beta".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key_event(press_key(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.session_resume_pending.is_none());
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.session_resume_pending.as_deref(), Some("c"));
+        assert!(app.prompt_input.text.is_empty());
+    }
+
+    #[test]
+    fn browser_filter_rename_targets_underlying_session() {
+        let mut app = make_app();
+        app.session_browser.open_with_query([("a", "Alpha"), ("b", "Beta")]
+            .into_iter().map(|(id, title)| crate::session_browser::SessionEntry {
+                id: id.into(), title: title.into(), last_updated: "now".into(),
+                message_count: 0, cost_usd: 0.0, working_dir: None,
+            }).collect(), "beta");
+        app.handle_key_event(press_key(KeyCode::Char('r'), KeyModifiers::NONE));
+        app.session_browser.rename_input = "Renamed Beta".into();
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.session_rename_pending, Some(("b".into(), "Renamed Beta".into())));
+        assert_eq!(app.session_browser.sessions[0].title, "Alpha");
+    }
+
     // ---- free-mode context window (issues #393, #394) ----
 
     #[tokio::test]
