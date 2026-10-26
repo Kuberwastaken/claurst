@@ -4343,6 +4343,18 @@ mod tests {
         assert_eq!(s.vim_mode, VimMode::Normal);
     }
 
+    #[test]
+    fn prompt_input_visual_block_via_ctrl_v_code() {
+        // Ctrl+V arrives at the vim state machine as the \x16 control code.
+        let mut s = PromptInputState::new();
+        s.vim_enabled = true;
+        s.vim_mode = VimMode::Normal;
+        s.cursor = 0;
+        s.vim_command("\x16");
+        assert_eq!(s.vim_mode, VimMode::VisualBlock);
+        assert_eq!(s.visual_anchor, Some(0));
+    }
+
     // ---- Named registers ------------------------------------------------
 
     #[test]

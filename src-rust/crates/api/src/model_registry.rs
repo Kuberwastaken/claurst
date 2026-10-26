@@ -1605,6 +1605,75 @@ pub fn effective_model_for_config(
 }
 
 // ---------------------------------------------------------------------------
+// Cost-tracker pricing resolution (issue #499)
+// ---------------------------------------------------------------------------
+
+/// Map a catalog entry's per-token prices onto the tracker's [`ModelPricing`].
+///
+/// Returns `None` when the entry has no usable prices at all: a price the
+/// catalog doesn't record must surface as zero cost, not as a guessed rate.
+fn model_pricing_from_entry(entry: &ModelEntry) -> Option<claurst_core::cost::ModelPricing> {
+    let cost = &entry.cost;
+    if cost.input.is_none() && cost.output.is_none() {
+        return None;
+    }
+    Some(claurst_core::cost::ModelPricing {
+        input_per_mtk: cost.input.unwrap_or(0.0),
+        output_per_mtk: cost.output.unwrap_or(0.0),
+        cache_creation_per_mtk: cost.cache_write.unwrap_or(0.0),
+        cache_read_per_mtk: cost.cache_read.unwrap_or(0.0),
+    })
+}
+
+/// Look up `model`'s per-token prices in the catalog, first served through
+/// `provider_id` (the usual keyed path), then by bare model id across the
+/// whole catalog.
+pub fn catalog_pricing(
+    registry: Option<&ModelRegistry>,
+    provider_id: &str,
+    model: &str,
+) -> Option<claurst_core::cost::ModelPricing> {
+    let registry = registry?;
+    let entry = registry.resolve_entry(provider_id, model).or_else(|| {
+        registry
+            .find_provider_for_model(model)
+            .and_then(|p| registry.get(&p, model))
+    });
+    entry.and_then(model_pricing_from_entry)
+}
+
+/// Configure a [`CostTracker`] for the active session so the headless `result`
+/// event, `/cost` and the TUI footer all report the same figure (issue #499):
+///
+/// * Subscription providers (`codex` / `openai-codex` ChatGPT plans,
+///   Anthropic OAuth with Bearer auth = Claude Pro/Max) report zero cost.
+/// * Known models are priced from the catalog, falling back to the curated
+///   Claude/free heuristics.
+/// * Unknown models get no invented default rate: cost reports zero.
+pub fn apply_session_cost_pricing(
+    tracker: &claurst_core::cost::CostTracker,
+    registry: Option<&ModelRegistry>,
+    provider_id: &str,
+    model: &str,
+    anthropic_bearer_auth: bool,
+) {
+    let subscription = claurst_core::cost::is_subscription_provider(provider_id)
+        || (provider_id == claurst_core::ProviderId::ANTHROPIC && anthropic_bearer_auth);
+    tracker.set_subscription(subscription);
+    if subscription {
+        // Zero cost regardless of any per-token price the catalog still
+        // records for ChatGPT-served models (issue #499).
+        tracker.set_pricing(None);
+        return;
+    }
+    // Catalog first (it knows exact per-model rates), then the curated
+    // Claude/free heuristics; unknown models resolve to `None` — no default.
+    let pricing = catalog_pricing(registry, provider_id, model)
+        .or_else(|| claurst_core::cost::ModelPricing::for_model(model));
+    tracker.set_pricing(pricing);
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2218,5 +2287,79 @@ mod tests {
         ]));
         assert_eq!(reg.len(), before, "malformed/empty overrides must not add entries");
         assert!(reg.get("custom-openai", "noop").is_none());
+    }
+
+    // ---- Session cost pricing (issue #499) -----------------------------------
+
+    #[test]
+    fn session_cost_pricing_zeroes_subscription_providers() {
+        for provider in ["codex", "openai-codex"] {
+            let tracker = claurst_core::cost::CostTracker::new();
+            tracker.add_usage(10_074, 5, 0, 0);
+            apply_session_cost_pricing(&tracker, None, provider, "gpt-5.6-sol", false);
+            assert!(tracker.is_subscription());
+            assert_eq!(tracker.total_cost_usd(), 0.0, "{provider} must report zero cost");
+        }
+
+        // Anthropic with Bearer (claude.ai OAuth) = Claude Pro/Max subscription.
+        let tracker = claurst_core::cost::CostTracker::new();
+        tracker.add_usage(10_074, 5, 0, 0);
+        apply_session_cost_pricing(&tracker, None, "anthropic", "claude-sonnet-4-5", true);
+        assert!(tracker.is_subscription());
+        assert_eq!(tracker.total_cost_usd(), 0.0);
+
+        // But an Anthropic API-key session stays priced.
+        let tracker = claurst_core::cost::CostTracker::new();
+        apply_session_cost_pricing(&tracker, None, "anthropic", "claude-sonnet-4-5", false);
+        assert!(!tracker.is_subscription());
+        assert!(tracker.total_cost_usd() >= 0.0);
+    }
+
+    #[test]
+    fn session_cost_pricing_unknown_model_gets_no_default() {
+        let reg = ModelRegistry::new();
+        let tracker = claurst_core::cost::CostTracker::new();
+        tracker.add_usage(10_074, 5, 0, 0);
+        // A model the catalog doesn't list and the heuristics don't cover:
+        // no invented default per-token rate — cost reports zero.
+        apply_session_cost_pricing(&tracker, Some(&reg), "openai", "gpt-9.9-nonexistent", false);
+        assert!(!tracker.is_subscription());
+        assert_eq!(tracker.pricing(), None);
+        assert_eq!(tracker.total_cost_usd(), 0.0);
+    }
+
+    #[test]
+    fn session_cost_pricing_prices_known_models_from_catalog() {
+        let reg = ModelRegistry::new();
+        let tracker = claurst_core::cost::CostTracker::new();
+        apply_session_cost_pricing(&tracker, Some(&reg), "anthropic", "claude-sonnet-4-5", false);
+        let entry = reg
+            .resolve_entry("anthropic", "claude-sonnet-4-5")
+            .expect("bundled snapshot should resolve claude-sonnet");
+        let expected_input = entry.cost.input.expect("sonnet has input pricing");
+        let expected_output = entry.cost.output.unwrap_or(0.0);
+        tracker.add_usage(1_000_000, 1_000_000, 0, 0);
+        let cost = tracker.total_cost_usd();
+        let expected = expected_input + expected_output;
+        assert!(cost > 0.0, "catalog-priced model must not report zero");
+        assert!(
+            (cost - expected).abs() < 1e-6,
+            "cost should match the catalog rates for 1M+1M tokens: {cost} vs {expected}"
+        );
+    }
+
+    #[test]
+    fn model_pricing_from_entry_skips_priceless_entries() {
+        // Entries without usable per-token prices (free / subscription
+        // models) must map to no pricing, never to an all-zero estimate.
+        let reg = ModelRegistry::new();
+        let mut entry = reg
+            .resolve_entry("anthropic", "claude-sonnet-4-5")
+            .cloned()
+            .expect("bundled snapshot should resolve claude-sonnet");
+        assert!(model_pricing_from_entry(&entry).is_some());
+        // Wiping the prices must map to no pricing (not zero-rate pricing).
+        entry.cost = CostBreakdown::default();
+        assert_eq!(model_pricing_from_entry(&entry), None);
     }
 }

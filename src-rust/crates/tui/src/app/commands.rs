@@ -5,7 +5,6 @@ use claurst_core::types::Role;
 use crate::notifications::NotificationKind;
 use crate::overlays::HelpEntry;
 use super::App;
-use super::run::open_file_externally;
 use super::try_copy_to_clipboard;
 
 pub(super) const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
@@ -472,13 +471,13 @@ impl App {
                 false
             }
             "keybindings" => {
-                // Open the keybindings.json file in the external editor
-                let keybindings_path = claurst_core::config::Settings::config_dir().join("keybindings.json");
-
-                if let Err(e) = open_file_externally(&keybindings_path) {
-                    eprintln!("Failed to open keybindings file: {}", e);
-                }
-                true
+                // The CLI layer owns `/keybindings`:
+                // `claurst_commands::KeybindingsCommand` writes the template
+                // on first use and opens the file in the system editor.
+                // This TUI intercept must NOT open it a second time for the
+                // same command (issue #495) — fall through to the CLI layer
+                // like /doctor, /init, /login, /logout do.
+                false
             }
             "help" => {
                 // Open the help overlay (same as pressing `?` or F1).
