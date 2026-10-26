@@ -1439,7 +1439,7 @@ pub mod config {
         Plan,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    #[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
     #[serde(rename_all = "camelCase")]
     pub enum Theme {
         #[default]
@@ -1448,6 +1448,74 @@ pub mod config {
         Light,
         Custom(String),
         Deuteranopia,
+    }
+
+    impl<'de> serde::Deserialize<'de> for Theme {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            // Accept both the enum forms (`"dark"`, `{"custom": "my-theme"}`)
+            // and any bare string as `Custom` (`"solarized"`, `"nord"`, or a
+            // custom palette name from ~/.claurst/themes/). Without this,
+            // `"theme": "solarized"` fails to parse and the whole settings
+            // file falls back to defaults.
+            struct ThemeVisitor;
+
+            impl<'de> serde::de::Visitor<'de> for ThemeVisitor {
+                type Value = Theme;
+
+                fn expecting(
+                    &self,
+                    formatter: &mut std::fmt::Formatter<'_>,
+                ) -> std::fmt::Result {
+                    formatter.write_str("a theme name or a custom theme object")
+                }
+
+                fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Theme, E> {
+                    Ok(match value {
+                        "default" => Theme::Default,
+                        "dark" => Theme::Dark,
+                        "light" => Theme::Light,
+                        "deuteranopia" => Theme::Deuteranopia,
+                        other => Theme::Custom(other.to_string()),
+                    })
+                }
+
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Theme, A::Error> {
+                    // The externally tagged {"custom": name} form.
+                    let key = map
+                        .next_key::<String>()?
+                        .ok_or_else(|| serde::de::Error::custom("empty theme object"))?;
+                    let value: String = map.next_value()?;
+                    if key == "custom" {
+                        Ok(Theme::Custom(value))
+                    } else {
+                        self.visit_str(&value)
+                    }
+                }
+            }
+
+            deserializer.deserialize_any(ThemeVisitor)
+        }
+    }
+
+    impl Theme {
+        /// Canonical theme name: the string `/theme <name>` accepts, the
+        /// picker highlights, and settings round-trip. `Custom` passes the
+        /// user's name through unchanged.
+        pub fn name(&self) -> &str {
+            match self {
+                Theme::Default => "default",
+                Theme::Dark => "dark",
+                Theme::Light => "light",
+                Theme::Deuteranopia => "deuteranopia",
+                Theme::Custom(name) => name.as_str(),
+            }
+        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1561,6 +1629,13 @@ pub mod config {
         /// Names of plugins that have been explicitly disabled by the user.
         #[serde(default, rename = "disabledPlugins")]
         pub disabled_plugins: std::collections::HashSet<String>,
+        /// Names of MCP servers the user has explicitly disabled. Disabled
+        /// servers stay in `config.mcpServers` but are not connected and their
+        /// tools are not registered, until re-enabled via `/mcp enable`.
+        /// User-global only: a project settings file cannot re-enable a server
+        /// the user disabled (same security reasoning as the plugin sets).
+        #[serde(default, rename = "disabledMcpServers")]
+        pub disabled_mcp_servers: std::collections::HashSet<String>,
         /// Whether the user has completed the first-launch onboarding flow.
         /// Mirrors TS `hasAcknowledgedSafetyNotice` / `hasCompletedOnboarding`.
         #[serde(default, rename = "hasCompletedOnboarding")]
@@ -2418,6 +2493,10 @@ pub mod config {
                 permission_rules: base.permission_rules,
                 enabled_plugins: base.enabled_plugins,
                 disabled_plugins: { let mut s = base.disabled_plugins; s.extend(over.disabled_plugins); s },
+                // SECURITY: only the user's global settings may flip MCP server
+                // enablement — a project file must not be able to re-enable a
+                // server the user disabled.
+                disabled_mcp_servers: base.disabled_mcp_servers,
                 has_completed_onboarding: over.has_completed_onboarding || base.has_completed_onboarding,
                 last_seen_version: over.last_seen_version.or(base.last_seen_version),
                 provider: over.provider.or(base.provider),
@@ -2576,6 +2655,47 @@ pub mod config {
             assert_eq!(
                 tokio::fs::read_to_string(path).await.unwrap(),
                 MALFORMED_SETTINGS
+            );
+        }
+
+        /// `disabledMcpServers` survives a save/load roundtrip through the
+        /// global settings file, so `/mcp disable` persists across restarts.
+        #[test]
+        fn disabled_mcp_servers_roundtrip() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            let mut settings = Settings::default();
+            settings
+                .disabled_mcp_servers
+                .insert("my-server".to_string());
+            settings.save_to_path_sync(&path).unwrap();
+
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                raw.contains("disabledMcpServers"),
+                "field must serialize under its camelCase name"
+            );
+
+            let restored = Settings::load_from_path_sync(&path).unwrap();
+            assert!(restored.disabled_mcp_servers.contains("my-server"));
+            assert_eq!(restored.disabled_mcp_servers.len(), 1);
+        }
+
+        /// Security: a project settings file must not be able to re-enable an
+        /// MCP server the user disabled globally. The merge keeps the global
+        /// `disabledMcpServers` untouched by the overlay.
+        #[test]
+        fn project_settings_cannot_clear_disabled_mcp_servers() {
+            let mut base = Settings::default();
+            base.disabled_mcp_servers.insert("locked".to_string());
+
+            let mut over = Settings::default();
+            over.disabled_mcp_servers.clear();
+
+            let merged = Settings::merge(base, over);
+            assert!(
+                merged.disabled_mcp_servers.contains("locked"),
+                "project settings must not re-enable a user-disabled MCP server"
             );
         }
     }
@@ -6254,6 +6374,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn theme_deserializes_bare_names_and_enum_forms() {
+        // Built-in names keep their unit-variant form.
+        assert_eq!(
+            serde_json::from_str::<config::Theme>("\"default\"").unwrap(),
+            config::Theme::Default
+        );
+        assert_eq!(
+            serde_json::from_str::<config::Theme>("\"dark\"").unwrap(),
+            config::Theme::Dark
+        );
+        // Any other bare string becomes Custom so a settings file can say
+        // "theme": "solarized" (or a custom palette name) without breaking
+        // the whole settings parse.
+        assert_eq!(
+            serde_json::from_str::<config::Theme>("\"nord\"").unwrap(),
+            config::Theme::Custom("nord".to_string())
+        );
+        // The externally tagged object form still works.
+        assert_eq!(
+            serde_json::from_str::<config::Theme>("{\"custom\":\"nord\"}").unwrap(),
+            config::Theme::Custom("nord".to_string())
+        );
+        // Roundtrip: a Custom theme serializes back to the object form and
+        // re-parses.
+        let theme = config::Theme::Custom("solarized".to_string());
+        let json = serde_json::to_string(&theme).unwrap();
+        assert_eq!(serde_json::from_str::<config::Theme>(&json).unwrap(), theme);
+        // A Config with a custom theme name parses without breaking the
+        // surrounding settings. Build a full default Config as JSON, swap in
+        // the theme, and re-parse: proves bare-string themes don't break the
+        // parse while covering every required field.
+        let mut value = serde_json::to_value(config::Config::default()).unwrap();
+        value["theme"] = serde_json::Value::String("solarized".to_string());
+        let cfg: config::Config = serde_json::from_value(value).unwrap();
+        assert_eq!(cfg.theme, config::Theme::Custom("solarized".to_string()));
+    }
+
+    #[test]
     fn test_message_user() {
         let msg = Message::user("hello");
         assert_eq!(msg.role, Role::User);
@@ -6493,6 +6651,37 @@ mod tests {
         assert_eq!(cfg.effective_effort_level(), None);
     }
 
+    /// Serializes the `ANTHROPIC_API_KEY` env-mutating tests. The env is
+    /// process-global and the default test harness runs tests on parallel
+    /// threads: without this lock, one test's remove/set races another's
+    /// resolve and the suite flakes under load. The guard snapshots the
+    /// current value on the way in and restores it on drop, so a panicking
+    /// test cannot leak a scratch value either.
+    mod anthropic_api_key_env {
+        use std::sync::{Mutex, MutexGuard, OnceLock};
+
+        pub(crate) struct EnvRestore {
+            _guard: MutexGuard<'static, ()>,
+            orig: Option<String>,
+        }
+
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                match &self.orig {
+                    Some(k) => std::env::set_var("ANTHROPIC_API_KEY", k),
+                    None => std::env::remove_var("ANTHROPIC_API_KEY"),
+                }
+            }
+        }
+
+        pub fn lock_and_snapshot() -> EnvRestore {
+            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            let guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|p| p.into_inner());
+            let orig = std::env::var("ANTHROPIC_API_KEY").ok();
+            EnvRestore { _guard: guard, orig }
+        }
+    }
+
     #[test]
     fn test_config_effective_max_tokens_default() {
         let cfg = crate::config::Config::default();
@@ -6509,45 +6698,30 @@ mod tests {
     fn test_config_resolve_api_key_from_config() {
         // When config.api_key is set, it should be returned regardless of env var
         // (Config key takes priority — resolve_api_key returns it first)
-        let orig = std::env::var("ANTHROPIC_API_KEY").ok();
+        let _env = anthropic_api_key_env::lock_and_snapshot();
         std::env::remove_var("ANTHROPIC_API_KEY");
 
         let cfg = crate::config::Config { api_key: Some("sk-ant-config-key".to_string()), ..Default::default() };
         assert_eq!(cfg.resolve_api_key(), Some("sk-ant-config-key".to_string()));
-
-        if let Some(k) = orig {
-            std::env::set_var("ANTHROPIC_API_KEY", k);
-        }
     }
 
     #[test]
     fn test_config_resolve_api_key_none() {
         // Temporarily ensure no env var override
-        let orig = std::env::var("ANTHROPIC_API_KEY").ok();
+        let _env = anthropic_api_key_env::lock_and_snapshot();
         std::env::remove_var("ANTHROPIC_API_KEY");
 
         let cfg = crate::config::Config::default();
         assert!(cfg.resolve_api_key().is_none());
-
-        // Restore
-        if let Some(k) = orig {
-            std::env::set_var("ANTHROPIC_API_KEY", k);
-        }
     }
 
     #[test]
     fn test_config_resolve_api_key_from_env() {
-        let orig = std::env::var("ANTHROPIC_API_KEY").ok();
+        let _env = anthropic_api_key_env::lock_and_snapshot();
         std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-env-key");
 
         let cfg = crate::config::Config::default();
         assert_eq!(cfg.resolve_api_key(), Some("sk-ant-env-key".to_string()));
-
-        // Restore
-        std::env::remove_var("ANTHROPIC_API_KEY");
-        if let Some(k) = orig {
-            std::env::set_var("ANTHROPIC_API_KEY", k);
-        }
     }
 
     // ---- OAuth token tests --------------------------------------------------
