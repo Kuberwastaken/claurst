@@ -325,6 +325,9 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut live = Harness::new(dir.path());
             let a = live.session.id.clone();
+            live.app.replace_messages(live.messages.clone());
+            assert!(live.app.intercept_slash_command("new"));
+            assert_eq!(live.app.messages.len(), live.messages.len());
             let queue = claurst_query::CommandQueue::new();
             queue.enable_persistence_in(dir.path(), &a).unwrap();
             live.app.command_queue = Some(queue.clone());
@@ -350,6 +353,7 @@ mod tests {
             assert_eq!(live.tools.session_id, a);
             assert_eq!(live.commands.session_id, a);
             assert_eq!(live.app.prompt_input.text, "A draft");
+            assert_eq!(live.app.messages.len(), live.messages.len());
             assert_eq!(live.app.pending_steers.len(), 1);
             assert_eq!(queue.pending_user_messages()[0].1, "A steer");
             drop(held);
