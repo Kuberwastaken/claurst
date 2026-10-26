@@ -221,6 +221,7 @@ mod tests {
             mcp_manager: None,
             mcp_auth_runner: None,
             permission_manager: Some(Arc::new(std::sync::Mutex::new(manager))),
+            disabled_mcp_servers: std::collections::HashSet::new(),
         }
     }
 

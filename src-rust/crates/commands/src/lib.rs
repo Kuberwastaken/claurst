@@ -36,6 +36,10 @@ pub struct CommandContext {
     /// rule in effect. `None` outside an interactive session.
     pub permission_manager:
         Option<Arc<std::sync::Mutex<claurst_core::permissions::PermissionManager>>>,
+    /// Server names disabled via `/mcp disable`, as last seen on disk. The
+    /// runtime refreshes it after every toggle so `/mcp status` and friends
+    /// never re-read the settings file (which only covers global servers).
+    pub disabled_mcp_servers: std::collections::HashSet<String>,
 }
 
 /// Result of running a slash command.
@@ -58,6 +62,10 @@ pub enum CommandResult {
         /// The local callback URL waiting for the OAuth redirect.
         redirect_uri: String,
     },
+    /// A server was enabled or disabled via `/mcp enable|disable`. The runtime
+    /// should reload settings and rebuild the MCP manager + tool list so the
+    /// change takes effect in the live session.
+    McpServersToggled { server_name: String, enabled: bool },
     /// Clear the conversation.
     ClearConversation,
     /// Replace the conversation with a specific message list (used by /rewind).
@@ -436,11 +444,16 @@ fn generate_keybindings_template() -> anyhow::Result<String> {
 }
 
 fn parse_theme(name: &str) -> Option<Theme> {
-    match name.trim().to_lowercase().as_str() {
+    // Built-in names are matched case-insensitively; a custom theme name
+    // keeps the user's spelling so it round-trips through settings and the
+    // picker highlight.
+    let trimmed = name.trim();
+    match trimmed.to_lowercase().as_str() {
         "default" | "system" => Some(Theme::Default),
         "dark" => Some(Theme::Dark),
         "light" => Some(Theme::Light),
-        custom if !custom.is_empty() => Some(Theme::Custom(custom.to_string())),
+        "deuteranopia" => Some(Theme::Deuteranopia),
+        _ if !trimmed.is_empty() => Some(Theme::Custom(trimmed.to_string())),
         _ => None,
     }
 }
@@ -1629,6 +1642,7 @@ mod tests {
             mcp_manager: None,
             mcp_auth_runner: None,
             permission_manager: None,
+            disabled_mcp_servers: std::collections::HashSet::new(),
         }
     }
 

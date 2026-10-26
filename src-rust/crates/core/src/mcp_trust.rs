@@ -190,6 +190,8 @@ pub struct McpGateDecision {
 /// Partition `servers` into those allowed to auto-launch and those still
 /// pending approval.
 ///
+/// - Servers named in `disabled` are always excluded from `allowed` (they
+///   are dropped entirely: neither connected nor shown as pending).
 /// - [`McpServerOrigin::User`] servers are always allowed.
 /// - [`McpServerOrigin::Project`] servers are allowed only when any of:
 ///     * `trust_all_project` is set (global opt-in / CLI flag),
@@ -205,9 +207,13 @@ pub fn partition_mcp_servers(
     trust_all_project: bool,
     session_trusted: &HashSet<String>,
     store: &McpTrustStore,
+    disabled: &HashSet<String>,
 ) -> McpGateDecision {
     let mut decision = McpGateDecision::default();
     for server in servers {
+        if disabled.contains(&server.name) {
+            continue;
+        }
         match server.origin {
             McpServerOrigin::User => decision.allowed.push(server.clone()),
             McpServerOrigin::Project => {
@@ -263,8 +269,21 @@ mod tests {
     fn user_servers_always_allowed() {
         let servers = vec![user_server("a"), user_server("b")];
         let store = McpTrustStore::default();
-        let d = partition_mcp_servers(&servers, None, false, &HashSet::new(), &store);
+        let d = partition_mcp_servers(&servers, None, false, &HashSet::new(), &store, &HashSet::new());
         assert_eq!(d.allowed.len(), 2);
+        assert!(d.pending.is_empty());
+    }
+
+    #[test]
+    fn disabled_servers_are_dropped_entirely() {
+        let servers = vec![user_server("on"), user_server("off"), project_server("p", "cmd")];
+        let store = McpTrustStore::default();
+        let mut disabled = HashSet::new();
+        disabled.insert("off".to_string());
+        // The gate drops disabled servers even when everything else is trusted.
+        let d = partition_mcp_servers(&servers, None, true, &HashSet::new(), &store, &disabled);
+        assert_eq!(d.allowed.len(), 2);
+        assert!(d.allowed.iter().all(|s| s.name != "off"));
         assert!(d.pending.is_empty());
     }
 
@@ -272,7 +291,7 @@ mod tests {
     fn project_servers_pending_by_default() {
         let servers = vec![user_server("u"), project_server("p", "evil")];
         let store = McpTrustStore::default();
-        let d = partition_mcp_servers(&servers, None, false, &HashSet::new(), &store);
+        let d = partition_mcp_servers(&servers, None, false, &HashSet::new(), &store, &HashSet::new());
         assert_eq!(d.allowed.len(), 1);
         assert_eq!(d.allowed[0].name, "u");
         assert_eq!(d.pending.len(), 1);
@@ -283,7 +302,7 @@ mod tests {
     fn trust_all_clears_project_servers() {
         let servers = vec![project_server("p", "evil")];
         let store = McpTrustStore::default();
-        let d = partition_mcp_servers(&servers, None, true, &HashSet::new(), &store);
+        let d = partition_mcp_servers(&servers, None, true, &HashSet::new(), &store, &HashSet::new());
         assert_eq!(d.allowed.len(), 1);
         assert!(d.pending.is_empty());
     }
@@ -295,12 +314,12 @@ mod tests {
         session.insert(server_fingerprint(&p));
         let store = McpTrustStore::default();
         // Same identity: allowed.
-        let d = partition_mcp_servers(std::slice::from_ref(&p), None, false, &session, &store);
+        let d = partition_mcp_servers(std::slice::from_ref(&p), None, false, &session, &store, &HashSet::new());
         assert_eq!(d.allowed.len(), 1);
         assert!(d.pending.is_empty());
         // Different command under the same name: re-prompted (not allowed).
         let p2 = project_server("p", "different-binary");
-        let d2 = partition_mcp_servers(&[p2], None, false, &session, &store);
+        let d2 = partition_mcp_servers(&[p2], None, false, &session, &store, &HashSet::new());
         assert!(d2.allowed.is_empty());
         assert_eq!(d2.pending.len(), 1);
     }
@@ -377,6 +396,7 @@ mod tests {
             false,
             &HashSet::new(),
             &store,
+            &HashSet::new(),
         );
         assert_eq!(d.allowed.len(), 1);
         assert!(d.pending.is_empty());

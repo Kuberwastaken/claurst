@@ -10,6 +10,7 @@ use super::keys::{
     normalize_layout_shortcut_key,
 };
 use super::types::{ContextMenuItem, ContextMenuState};
+use crate::session_browser::SessionBrowserMode;
 
     
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
@@ -546,6 +547,70 @@ use super::types::{ContextMenuItem, ContextMenuState};
         assert!(app.intercept_slash_command_with_args("yolo", ""));
         assert!(app.bypass_permissions_dialog.visible);
         assert!(app.yolo_pending);
+    }
+
+    #[test]
+    fn test_session_browser_toggles_route_through_keybindings() {
+        let mut app = make_app();
+        app.session_browser.open(vec![]);
+        assert!(app.session_browser.visible);
+
+        // 'a' toggles paths (KeyContext::SessionBrowser action).
+        assert!(!app.session_browser.show_paths);
+        app.handle_key_event(press_key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(app.session_browser.show_paths);
+
+        // 'p' toggles preview.
+        assert!(app.session_browser.show_preview);
+        app.handle_key_event(press_key(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert!(!app.session_browser.show_preview);
+
+        // Esc closes via the resolver.
+        app.handle_key_event(press_key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.session_browser.visible);
+    }
+
+    #[test]
+    fn session_browser_honors_user_rebinding_without_prompt_leak() {
+        let mut app = make_app();
+        let bindings = claurst_core::keybindings::UserKeybindings::from_json_str(
+            r#"{"bindings":[
+                {"chord":"a","action":null,"context":"SessionBrowser"},
+                {"chord":"x","action":"toggleSessionPaths","context":"SessionBrowser"}
+            ]}"#,
+        );
+        app.keybindings = claurst_core::keybindings::KeybindingResolver::new(&bindings);
+        app.session_browser.open(vec![]);
+        app.handle_key_event(press_key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(!app.session_browser.show_paths);
+        app.handle_key_event(press_key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(app.session_browser.show_paths);
+        app.handle_key_event(press_key(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert!(app.prompt_input.text.is_empty());
+    }
+
+    #[test]
+    fn test_session_browser_rename_still_inline() {
+        let mut app = make_app();
+        let entries = vec![crate::session_browser::SessionEntry {
+            id: "s1".to_string(),
+            title: "hello".to_string(),
+            last_updated: "now".to_string(),
+            message_count: 1,
+            cost_usd: 0.0,
+            working_dir: None,
+        }];
+        app.session_browser.open(entries);
+        // 'r' enters rename mode via the resolver action.
+        app.handle_key_event(press_key(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(app.session_browser.mode, SessionBrowserMode::Rename);
+        // Typing goes to the rename buffer (inline handling).
+        app.handle_key_event(press_key(KeyCode::Char('!'), KeyModifiers::NONE));
+        assert_eq!(app.session_browser.rename_input, "hello!");
+        // Esc cancels rename back to Browse; the browser stays open.
+        app.handle_key_event(press_key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.session_browser.mode, SessionBrowserMode::Browse);
+        assert!(app.session_browser.visible);
     }
 
     #[test]
@@ -1116,11 +1181,116 @@ use super::types::{ContextMenuItem, ContextMenuState};
             last_updated: "just now".to_string(),
             message_count: 1,
             cost_usd: 0.0,
+            working_dir: None,
         }]);
         app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(!app.session_browser.visible);
-        assert_eq!(app.prompt_input.text, "/resume abc-123");
-        assert!(app.pending_auto_submit);
+        // Enter routes through the keybinding resolver: the resume is
+        // signalled to the main loop, not typed into the prompt.
+        assert_eq!(app.session_resume_pending.as_deref(), Some("abc-123"));
+        assert!(app.prompt_input.text.is_empty());
+    }
+
+    #[test]
+    fn browser_rename_queues_persistence_without_replacing_live_title() {
+        let mut app = make_app();
+        app.current_session_id = Some("current".into());
+        app.session_title = Some("old".into());
+        app.session_browser.open(vec![crate::session_browser::SessionEntry {
+            id: "current".into(), title: "old".into(), last_updated: "now".into(),
+            message_count: 0, cost_usd: 0.0, working_dir: None,
+        }]);
+        app.handle_key_event(press_key(KeyCode::Char('r'), KeyModifiers::NONE));
+        app.session_browser.rename_input = "new".into();
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.session_rename_pending, Some(("current".into(), "new".into())));
+        assert_eq!(app.session_title.as_deref(), Some("old"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn browser_filter_prefilter_survives_async_disk_load() {
+        let _lock = SESSION_HOME_LOCK.lock().await;
+        let home = SessionHome::new();
+        let wanted = save_test_session("Beta report", home.dir.path()).await;
+        save_test_session("Alpha work", home.dir.path()).await;
+        let mut app = make_app();
+        app.recent_sessions_pending = false;
+        assert!(app.intercept_slash_command_with_args("sessions", "beta"));
+        assert_eq!(app.session_browser.filter_input, "beta");
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                app.poll_session_loads();
+                if app.session_browser.sessions.len() == 2 { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("browser must finish loading saved sessions");
+        assert_eq!(app.session_browser.visible_sessions().len(), 1);
+        assert_eq!(app.session_browser.selected_session().unwrap().id, wanted);
+    }
+
+    #[test]
+    fn browser_filter_paste_stays_out_of_the_prompt() {
+        let mut app = make_app();
+        app.session_browser.open(vec![]);
+        app.session_browser.start_search();
+        app.handle_paste_data("Beta\nreport".into());
+        assert_eq!(app.session_browser.filter_input, "Beta report");
+        assert!(app.prompt_input.text.is_empty());
+    }
+
+    #[test]
+    fn browser_filter_honors_user_bindings_and_resumes_filtered_session() {
+        let mut app = make_app();
+        let bindings = claurst_core::keybindings::UserKeybindings::from_json_str(
+            r#"{"bindings":[
+                {"chord":"/","action":null,"context":"SessionBrowser"},
+                {"chord":"ctrl+f","action":"startSessionFilter","context":"SessionBrowser"},
+                {"chord":"ctrl+u","action":null,"context":"SessionFilter"},
+                {"chord":"ctrl+l","action":"clearSessionFilter","context":"SessionFilter"}
+            ]}"#,
+        );
+        app.keybindings = claurst_core::keybindings::KeybindingResolver::new(&bindings);
+        app.session_browser.open([("a", "Alpha"), ("b", "Beta"), ("c", "Beta second")]
+            .into_iter().map(|(id, title)| crate::session_browser::SessionEntry {
+                id: id.into(), title: title.into(), last_updated: "now".into(),
+                message_count: 0, cost_usd: 0.0, working_dir: None,
+            }).collect());
+        app.handle_key_event(press_key(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert_eq!(app.session_browser.mode, SessionBrowserMode::Browse);
+        app.handle_key_event(press_key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert_eq!(app.session_browser.mode, SessionBrowserMode::Search);
+        for c in "beta".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.session_browser.visible_sessions().len(), 2);
+        app.handle_key_event(press_key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.session_browser.filter_input, "beta");
+        app.handle_key_event(press_key(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert!(app.session_browser.filter_input.is_empty());
+        for c in "beta".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key_event(press_key(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.session_resume_pending.is_none());
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.session_resume_pending.as_deref(), Some("c"));
+        assert!(app.prompt_input.text.is_empty());
+    }
+
+    #[test]
+    fn browser_filter_rename_targets_underlying_session() {
+        let mut app = make_app();
+        app.session_browser.open_with_query([("a", "Alpha"), ("b", "Beta")]
+            .into_iter().map(|(id, title)| crate::session_browser::SessionEntry {
+                id: id.into(), title: title.into(), last_updated: "now".into(),
+                message_count: 0, cost_usd: 0.0, working_dir: None,
+            }).collect(), "beta");
+        app.handle_key_event(press_key(KeyCode::Char('r'), KeyModifiers::NONE));
+        app.session_browser.rename_input = "Renamed Beta".into();
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.session_rename_pending, Some(("b".into(), "Renamed Beta".into())));
+        assert_eq!(app.session_browser.sessions[0].title, "Alpha");
     }
 
     // ---- free-mode context window (issues #393, #394) ----
@@ -1410,4 +1580,66 @@ use super::types::{ContextMenuItem, ContextMenuState};
             app.handle_keybinding_action(action);
             assert!(app.global_search.visible, "{action} must open project search");
         }
+    }
+
+    // ---- MCP view without a manager (issue #418 review: fallback status) ----
+
+    /// With no live manager, `refresh_mcp_view` falls back to the configured
+    /// servers. A server the user disabled via `/mcp disable` must read as
+    /// `Disabled`, not `Disconnected`; otherwise the panel claims a disabled
+    /// server merely lost its connection.
+    #[test]
+    fn mcp_view_without_manager_marks_disabled_servers() {
+        let mut app = make_app();
+        app.config.mcp_servers.push(claurst_core::config::McpServerConfig {
+            name: "srv-a".to_string(),
+            command: Some("echo".to_string()),
+            args: vec![],
+            env: Default::default(),
+            url: None,
+            server_type: "stdio".to_string(),
+            headers: Default::default(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
+            origin: Default::default(),
+        });
+        app.config.mcp_servers.push(claurst_core::config::McpServerConfig {
+            name: "srv-b".to_string(),
+            command: Some("echo".to_string()),
+            args: vec![],
+            env: Default::default(),
+            url: None,
+            server_type: "stdio".to_string(),
+            headers: Default::default(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
+            origin: Default::default(),
+        });
+        app.disabled_mcp_servers.insert("srv-a".to_string());
+        assert!(app.mcp_manager.is_none(), "fixture must have no manager attached");
+
+        app.refresh_mcp_view();
+
+        let srv_a = app
+            .mcp_view
+            .servers
+            .iter()
+            .find(|s| s.name == "srv-a")
+            .expect("disabled server listed");
+        assert_eq!(
+            srv_a.status,
+            crate::mcp_view::McpViewStatus::Disabled,
+            "a user-disabled server must not show as merely disconnected"
+        );
+        let srv_b = app
+            .mcp_view
+            .servers
+            .iter()
+            .find(|s| s.name == "srv-b")
+            .expect("configured server listed");
+        assert_eq!(
+            srv_b.status,
+            crate::mcp_view::McpViewStatus::Disconnected,
+            "a configured-but-never-connected server still reads as disconnected"
+        );
     }

@@ -1,6 +1,5 @@
 //! Slash-command catalog and dispatch.
 
-use claurst_core::config::Theme;
 use claurst_core::types::Role;
 use crate::notifications::NotificationKind;
 use crate::overlays::HelpEntry;
@@ -83,7 +82,7 @@ pub(super) fn help_command_category(name: &str) -> &'static str {
             "Workspace"
         }
         "agent" | "agents" | "memory" | "plugin" | "survey" | "turns" => "Tools",
-        "session" | "resume" | "rename" | "fork" | "clear" | "new" | "move" | "compact"
+        "session" | "sessions" | "resume" | "rename" | "fork" | "clear" | "new" | "move" | "compact"
         | "quit" | "exit" => "Session",
         _ => "Commands",
     }
@@ -214,14 +213,7 @@ impl App {
                 true
             }
             "theme" => {
-                let current = match &self.config.theme {
-                    Theme::Dark => "dark",
-                    Theme::Light => "light",
-                    Theme::Default => "default",
-                    Theme::Deuteranopia => "deuteranopia",
-                    Theme::Custom(s) => s.as_str(),
-                };
-                self.theme_screen.open(current);
+                self.theme_screen.open(self.config.theme.name());
                 true
             }
             "stats" => {
