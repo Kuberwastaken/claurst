@@ -321,6 +321,26 @@ impl Client {
             .await;
     }
 
+    /// Queue a prompt task without yielding, so current-thread tests control
+    /// the exact ordering of dispatch and handler execution.
+    fn dispatch_prompt(&self, session_id: &acp::SessionId) -> oneshot::Receiver<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.responses.insert(id, tx);
+        self.server.dispatch(connection::Inbound::Request {
+            id: serde_json::from_value(json!(id)).unwrap(),
+            method: "session/prompt".into(),
+            params: Some(
+                serde_json::to_value(acp::PromptRequest::new(
+                    session_id.clone(),
+                    vec![acp::ContentBlock::Text(acp::TextContent::new("hello"))],
+                ))
+                .unwrap(),
+            ),
+        });
+        rx
+    }
+
     pub async fn new_session(&self, cwd: &Path) -> acp::SessionId {
         let response = self
             .call("session/new", acp::NewSessionRequest::new(cwd.to_path_buf()))
@@ -450,7 +470,7 @@ async fn runtimes_without_sessions_are_evicted() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 async fn cancel_before_the_prompt_task_starts_cancels_the_turn() {
     let _home = isolated_home().await;
     let cwd = scratch_dir("cancel-race");
@@ -461,18 +481,82 @@ async fn cancel_before_the_prompt_task_starts_cancels_the_turn() {
     let client = Client::start(scripted_runtime(&cwd, provider.clone()));
     let session_id = client.new_session(&cwd).await;
 
-    let prompt = {
-        let client = client.clone();
-        let session_id = session_id.clone();
-        tokio::spawn(async move { client.prompt(&session_id, "hang").await })
-    };
-    // Deliberately NOT waiting for the provider here: the cancel must reach
-    // the session even when it lands before the prompt handler has begun.
-    client
-        .notify("session/cancel", acp::CancelNotification::new(session_id.clone()))
-        .await;
-    let response = prompt.await.expect("prompt task");
+    // No await between these dispatches: on this current-thread runtime the
+    // prompt handler cannot start before cancellation has been dispatched.
+    let prompt = client.dispatch_prompt(&session_id);
+    client.server.dispatch(connection::Inbound::Notification {
+        method: "session/cancel".into(),
+        params: Some(serde_json::to_value(acp::CancelNotification::new(session_id)).unwrap()),
+    });
+    assert!(provider.requests.lock().is_empty());
+    let response = tokio::time::timeout(Duration::from_secs(2), prompt)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(stop_reason(&response), acp::StopReason::Cancelled);
+    assert!(
+        provider.requests.lock().is_empty(),
+        "pre-start cancellation must skip inference"
+    );
+}
+
+#[tokio::test]
+async fn session_survives_an_independently_evicted_runtime_cache_entry() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("cache-session");
+    let other = scratch_dir("cache-other");
+    let provider = ScriptedProvider::new(vec![Step::Text("still live")]);
+    let client = Client::start(scripted_runtime(&cwd, provider));
+    let session_id = client.new_session(&cwd).await;
+    // Reproduce a cache snapshot that lacks a concurrently created session's
+    // cwd. The session still owns its runtime even when the cache does not.
+    client.server.runtimes.lock().await.remove(&cwd);
+    client.server.runtime_for(&other).await.unwrap();
+    assert!(client.server.sessions.get(&session_id).is_some());
+    let response = client.prompt(&session_id, "continue").await;
+    assert_eq!(stop_reason(&response), acp::StopReason::EndTurn);
+}
+
+#[tokio::test]
+async fn idle_cancel_does_not_cancel_a_later_reserved_prompt() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("idle-cancel");
+    let provider = ScriptedProvider::new(vec![Step::Text("next answer")]);
+    let client = Client::start(scripted_runtime(&cwd, provider.clone()));
+    let session_id = client.new_session(&cwd).await;
+    client.server.dispatch(connection::Inbound::Notification {
+        method: "session/cancel".into(),
+        params: Some(
+            serde_json::to_value(acp::CancelNotification::new(session_id.clone())).unwrap(),
+        ),
+    });
+    let prompt = client.dispatch_prompt(&session_id);
+    let response = tokio::time::timeout(Duration::from_secs(2), prompt)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stop_reason(&response), acp::StopReason::EndTurn);
+    assert_eq!(provider.requests.lock().len(), 1);
+}
+
+#[tokio::test]
+async fn busy_at_dispatch_stays_rejected_after_the_active_turn_finishes() {
+    let _home = isolated_home().await;
+    let cwd = scratch_dir("busy-dispatch");
+    let provider = ScriptedProvider::new(vec![Step::Text("must not run")]);
+    let client = Client::start(scripted_runtime(&cwd, provider.clone()));
+    let session_id = client.new_session(&cwd).await;
+    let session = client.server.sessions.get(&session_id).unwrap();
+    let active = session.begin_turn().unwrap();
+    let prompt = client.dispatch_prompt(&session_id);
+    drop(active); // the response task has not run yet
+    let response = tokio::time::timeout(Duration::from_secs(2), prompt)
+        .await
+        .unwrap()
+        .unwrap();
+    let error: acp::Error = serde_json::from_value(response["error"].clone()).unwrap();
+    assert_eq!(error.code, acp::ErrorCode::InvalidRequest);
+    assert!(provider.requests.lock().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

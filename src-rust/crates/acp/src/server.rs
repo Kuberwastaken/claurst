@@ -82,15 +82,14 @@ impl AgentServer {
 
     /// Evict the runtimes of directories that no session references (closing
     /// a workspace must not pin its MCP child processes for the life of the
-    /// agent) and GC the session registry for sessions whose directory lost
-    /// its runtime. `keep_cwd` — the directory a `session/new` is currently
+    /// agent). `keep_cwd` — the directory a `session/new` is currently
     /// resolving, with no session yet — is never evicted whether it is cached
-    /// or being built. Living sessions always keep their runtime cached, so
-    /// the registry GC only drops strays from the race between a session's
-    /// creation and an eviction pass.
+    /// or being built. Session state owns its runtime independently of this
+    /// cache: concurrent session creation must never be discarded based on a
+    /// stale snapshot of the cache keys.
     async fn evict_unused_runtimes(&self, keep_cwd: &std::path::Path) {
         let mut evicted: Vec<Arc<AgentRuntime>> = Vec::new();
-        let remaining: std::collections::HashSet<PathBuf> = {
+        {
             let mut runtimes = self.runtimes.lock().await;
             let keep = self.sessions.live_cwds();
             let stale: Vec<PathBuf> = runtimes
@@ -104,13 +103,11 @@ impl AgentServer {
                     evicted.push(stale_runtime);
                 }
             }
-            runtimes.keys().cloned().collect()
-        };
+        }
         // Release the evicted runtimes (and thus their McpManagers) outside
         // the cache lock, so their teardown cannot block another directory's
         // session/new.
         drop(evicted);
-        self.sessions.gc(&remaining);
     }
 
     /// Dispatch a single inbound message. Spawns the actual handler on a
@@ -122,28 +119,36 @@ impl AgentServer {
         // spawned (issue #467): that task is queued behind everything else on
         // the runtime, so a `session/cancel` that arrives before it runs must
         // still hit the turn and produce `stopReason: "cancelled"` as the
-        // schema requires. Failures (unparsable params, unknown session, busy
-        // session) fall back to the request handler, which answers with the
-        // JSON-RPC error for each.
+        // schema requires. Keep reservation failures too: a busy request must
+        // not become accepted merely because the previous turn finishes before
+        // its response task gets scheduled.
         let prompt_turn = match &msg {
             Inbound::Request { method, params, .. } if method == "session/prompt" => {
-                self.reserve_prompt_turn(params.as_ref())
+                Some(self.reserve_prompt_turn(params.as_ref()))
             }
             _ => None,
         };
+        // Cancellation belongs to the turn reserved at this wire position,
+        // not whichever turn exists when a background task eventually runs.
+        if let Inbound::Notification { method, params } = &msg {
+            self.handle_notification(method, params.clone());
+        }
         let this = self.clone();
         tokio::spawn(async move {
             match msg {
                 Inbound::Request { id, method, params } => match prompt_turn {
-                    Some(ReservedPrompt {
+                    Some(Ok(ReservedPrompt {
                         session,
                         request,
                         turn,
-                    }) => {
+                    })) => {
                         let response =
                             crate::prompt::handle(this.connection.clone(), session, request, turn)
                                 .await;
                         this.send_prompt_response(id, response).await;
+                    }
+                    Some(Err(error)) => {
+                        this.send_prompt_response(id, Err(error)).await;
                     }
                     None => {
                         let response = this.handle_request(&method, params).await;
@@ -156,9 +161,7 @@ impl AgentServer {
                         }
                     }
                 },
-                Inbound::Notification { method, params } => {
-                    this.handle_notification(&method, params).await;
-                }
+                Inbound::Notification { .. } => {}
             }
         })
     }
@@ -179,14 +182,29 @@ impl AgentServer {
         }
     }
 
-    /// Reserve the turn for a `session/prompt` request. `None` hands the
-    /// decision back to the request handler, which answers with the JSON-RPC
-    /// error for unparsable params, an unknown session or a busy session.
-    fn reserve_prompt_turn(self: &Arc<Self>, params: Option<&Value>) -> Option<ReservedPrompt> {
-        let request: acp::PromptRequest = serde_json::from_value(params?.clone()).ok()?;
-        let session = self.sessions.get(&request.session_id)?;
-        Some(ReservedPrompt {
-            turn: session.begin_turn()?,
+    /// Reserve a prompt or retain its error synchronously at dispatch time.
+    fn reserve_prompt_turn(
+        self: &Arc<Self>,
+        params: Option<&Value>,
+    ) -> Result<ReservedPrompt, acp::Error> {
+        let request: acp::PromptRequest = parse_params(params.cloned())?;
+        let session = self.sessions.get(&request.session_id).ok_or_else(|| {
+            acp::Error::invalid_params().data(Some(serde_json::json!({
+                "reason": "unknown session",
+                "sessionId": request.session_id,
+            })))
+        })?;
+        let turn = session.begin_turn().ok_or_else(|| {
+            acp::Error::new(
+                i32::from(acp::ErrorCode::InvalidRequest),
+                format!(
+                    "Session {} already has a prompt running",
+                    session.session_id
+                ),
+            )
+        })?;
+        Ok(ReservedPrompt {
+            turn,
             session,
             request,
         })
@@ -232,7 +250,7 @@ impl AgentServer {
         }
     }
 
-    async fn handle_notification(self: &Arc<Self>, method: &str, params: Option<Value>) {
+    fn handle_notification(self: &Arc<Self>, method: &str, params: Option<Value>) {
         debug!(method, "ACP: dispatch notification");
         match method {
             "session/cancel" => {
@@ -343,9 +361,7 @@ impl AgentServer {
                 }))));
             }
         };
-        // The fall-back path: `dispatch` already reserves turns synchronously,
-        // so this only runs when the reservation failed (unknown session,
-        // unparsable params) or the client is already over its turn budget.
+        // Direct handler path; normal dispatch already reserves synchronously.
         let Some(turn) = session.begin_turn() else {
             return Err(acp::Error::new(
                 i32::from(acp::ErrorCode::InvalidRequest),
