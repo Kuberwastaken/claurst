@@ -1,6 +1,6 @@
 [package]
 name = "claurst-schema-dialect"
-version = "0.2.0"
+version.workspace = true
 edition = "2024"
 publish = false
 
