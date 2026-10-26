@@ -1160,7 +1160,8 @@ pub mod config {
     // ---- Config ----------------------------------------------------------
 
     /// Top-level configuration values, merged from CLI args + settings file + env.
-    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(default)]
     pub struct Config {
         pub api_key: Option<String>,
         pub model: Option<String>,
@@ -1307,6 +1308,59 @@ pub mod config {
         /// of the global settings by [`Settings::effective_config`].
         #[serde(skip)]
         pub sandbox: crate::sandbox::SandboxSettings,
+    }
+
+    impl Default for Config {
+        fn default() -> Self {
+            Self {
+                api_key: Default::default(),
+                model: Default::default(),
+                max_tokens: Default::default(),
+                permission_mode: Default::default(),
+                theme: Default::default(),
+                output_style: Default::default(),
+                effort: Default::default(),
+                auto_compact: true,
+                compact_threshold: Default::default(),
+                verbose: Default::default(),
+                output_format: Default::default(),
+                mcp_servers: Default::default(),
+                lsp_servers: Default::default(),
+                allowed_tools: Default::default(),
+                disallowed_tools: Default::default(),
+                env: Default::default(),
+                enable_all_mcp_servers: Default::default(),
+                custom_system_prompt: Default::default(),
+                append_system_prompt: Default::default(),
+                disable_claude_mds: Default::default(),
+                project_dir: Default::default(),
+                workspace_paths: Default::default(),
+                additional_dirs: Default::default(),
+                hooks: Default::default(),
+                provider: Default::default(),
+                provider_configs: Default::default(),
+                model_overrides: Default::default(),
+                yolo_mode: Default::default(),
+                formatter: Default::default(),
+                commands: Default::default(),
+                agents: Default::default(),
+                skills: Default::default(),
+                managed_agents: Default::default(),
+                auto_commits: Default::default(),
+                cursor_blink_enabled: Default::default(),
+                file_autocomplete_limit: Default::default(),
+                file_autocomplete_show_hidden_files: Default::default(),
+                file_injection_enabled: Default::default(),
+                file_injection_max_size: Default::default(),
+                request_timeout_secs: Default::default(),
+                max_retries: Default::default(),
+                mouse_capture: Default::default(),
+                degradation_summary_enabled: Default::default(),
+                status_line: Default::default(),
+                completion_wakeups: Default::default(),
+                sandbox: Default::default(),
+            }
+        }
     }
 
     /// `completionWakeups`: per-kind switches for background completion
@@ -1627,7 +1681,8 @@ pub mod config {
 
     // ---- Settings --------------------------------------------------------
 
-    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(default)]
     pub struct Settings {
         #[serde(default)]
         pub config: Config,
@@ -1759,6 +1814,49 @@ pub mod config {
         /// Note: @include in CLAUDE.md/AGENTS.md always injects regardless of this limit.
         #[serde(default = "default_file_injection_max_size", rename = "fileInjectionMaxSize")]
         pub file_injection_max_size: usize,
+    }
+
+    impl Default for Settings {
+        fn default() -> Self {
+            Self {
+                config: Default::default(),
+                version: Default::default(),
+                projects: Default::default(),
+                remote_control_at_startup: Default::default(),
+                trust_project_mcp_servers: Default::default(),
+                permission_rules: Default::default(),
+                enabled_plugins: Default::default(),
+                disabled_plugins: Default::default(),
+                disabled_mcp_servers: Default::default(),
+                has_completed_onboarding: Default::default(),
+                skip_dangerous_mode_permission_prompt: Default::default(),
+                allowed_bash_prefixes: Default::default(),
+                sandbox: Default::default(),
+                last_seen_version: Default::default(),
+                provider: Default::default(),
+                providers: Default::default(),
+                model_overrides: Default::default(),
+                commands: Default::default(),
+                formatter: Default::default(),
+                agents: Default::default(),
+                hooks: Default::default(),
+                skills: Default::default(),
+                managed_agents: Default::default(),
+                auto_copy_on_highlight: Default::default(),
+                show_cwd: Default::default(),
+                show_git_branch: Default::default(),
+                notifications: Default::default(),
+                show_turn_duration: Default::default(),
+                reduce_motion: Default::default(),
+                terminal_progress_bar: Default::default(),
+                terminal_program_status: Default::default(),
+                auto_compact: true,
+                file_autocomplete_limit: Default::default(),
+                file_autocomplete_show_hidden_files: Default::default(),
+                file_injection_enabled: Default::default(),
+                file_injection_max_size: Default::default(),
+            }
+        }
     }
 
     /// A user-defined slash command template.
@@ -1920,7 +2018,10 @@ pub mod config {
 
         /// Resolve the effective compact threshold (0.0 - 1.0).
         pub fn effective_compact_threshold(&self) -> f32 {
-            if self.compact_threshold > 0.0 {
+            if self.compact_threshold.is_finite()
+                && self.compact_threshold > 0.0
+                && self.compact_threshold < 1.0
+            {
                 self.compact_threshold
             } else {
                 crate::constants::DEFAULT_COMPACT_THRESHOLD
@@ -2268,6 +2369,7 @@ pub mod config {
         ///   with the embedded config values taking precedence for keys already present.
         pub fn effective_config(&self) -> Config {
             let mut config = self.config.clone();
+            config.auto_compact &= self.auto_compact;
             config.sandbox = self.sandbox.clone();
             // Top-level `provider` key overrides config.provider when set.
             if self.provider.is_some() && config.provider.is_none() {
@@ -2435,7 +2537,8 @@ pub mod config {
                 theme: over.config.theme,
                 output_style: over.config.output_style.or(base.config.output_style),
                 effort: over.config.effort.or(base.config.effort),
-                auto_compact: over.config.auto_compact || base.config.auto_compact,
+                // An omitted layer defaults to enabled; any explicit disable wins.
+                auto_compact: over.config.auto_compact && base.config.auto_compact,
                 compact_threshold: if over.config.compact_threshold != 0.0 {
                     over.config.compact_threshold
                 } else {
@@ -2543,9 +2646,14 @@ pub mod config {
                 terminal_program_status: over.terminal_program_status || base.terminal_program_status,
                 show_cwd: over.show_cwd || base.show_cwd,
                 show_git_branch: over.show_git_branch || base.show_git_branch,
-                auto_compact: over.auto_compact || base.auto_compact,
-                file_autocomplete_limit: if over.file_autocomplete_limit != 0 { over.file_autocomplete_limit } else { base.file_autocomplete_limit },
-                file_autocomplete_show_hidden_files: over.file_autocomplete_show_hidden_files || base.file_autocomplete_show_hidden_files,
+                auto_compact: over.auto_compact && base.auto_compact,
+                file_autocomplete_limit: if over.file_autocomplete_limit != 0 {
+                    over.file_autocomplete_limit
+                } else {
+                    base.file_autocomplete_limit
+                },
+                file_autocomplete_show_hidden_files: over.file_autocomplete_show_hidden_files
+                    || base.file_autocomplete_show_hidden_files,
                 file_injection_enabled: over.file_injection_enabled || base.file_injection_enabled,
                 file_injection_max_size: if over.file_injection_max_size != 0 { over.file_injection_max_size } else { base.file_injection_max_size },
             }
@@ -2620,6 +2728,59 @@ pub mod config {
             }
         }
         result
+    }
+
+    #[cfg(test)]
+    mod compaction_settings_tests {
+        use super::*;
+
+        #[test]
+        fn defaults_enable_compaction_and_disabled_layers_stay_disabled() {
+            assert!(Config::default().auto_compact);
+            assert!(Settings::default().effective_config().auto_compact);
+            for json in [
+                r#"{"autoCompact":false}"#,
+                r#"{"config":{"auto_compact":false}}"#,
+            ] {
+                let disabled: Settings = serde_json::from_str(json).unwrap();
+                assert!(!disabled.effective_config().auto_compact);
+                assert!(
+                    !Settings::merge(disabled.clone(), Settings::default())
+                        .effective_config()
+                        .auto_compact
+                );
+                assert!(
+                    !Settings::merge(Settings::default(), disabled)
+                        .effective_config()
+                        .auto_compact
+                );
+            }
+            let absent: Settings = serde_json::from_str("{}").unwrap();
+            assert!(
+                Settings::merge(Settings::default(), absent)
+                    .effective_config()
+                    .auto_compact
+            );
+        }
+
+        #[test]
+        fn invalid_thresholds_use_the_default() {
+            for threshold in [0.0, -0.5, 1.0, 2.0, f32::NAN, f32::INFINITY] {
+                let config = Config {
+                    compact_threshold: threshold,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    config.effective_compact_threshold(),
+                    crate::constants::DEFAULT_COMPACT_THRESHOLD
+                );
+            }
+            let config = Config {
+                compact_threshold: 0.6,
+                ..Default::default()
+            };
+            assert_eq!(config.effective_compact_threshold(), 0.6);
+        }
     }
 
     #[cfg(test)]

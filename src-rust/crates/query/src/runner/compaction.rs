@@ -65,6 +65,7 @@ pub(crate) async fn compact_before_request(
     context_tokens: u64,
     context_window: u64,
     max_output_tokens: u32,
+    retry: &claurst_api::RetryConfig,
     state: &mut compact::AutoCompactState,
     journal: Option<&SessionJournal>,
     event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
@@ -79,7 +80,14 @@ pub(crate) async fn compact_before_request(
 
     if claurst_core::feature_gates::is_feature_enabled("reactive_compact") {
         let collapse = compact::should_context_collapse(context_tokens, context_window);
-        if !collapse && !compact::should_compact(context_tokens, context_window) {
+        if !collapse
+            && context_tokens
+                < compact::auto_compact_threshold_with_fraction(
+                    context_window,
+                    u64::from(max_output_tokens),
+                    tool_ctx.config.effective_compact_threshold(),
+                )
+        {
             return false;
         }
         let Some((provider, model)) = compaction_endpoint(route, client, effective_model) else {
@@ -114,12 +122,14 @@ pub(crate) async fn compact_before_request(
         };
     }
 
-    if !compact::should_auto_compact_for_window(
-        context_tokens,
-        context_window,
-        u64::from(max_output_tokens),
-        state,
-    ) {
+    if state.disabled
+        || context_tokens
+            < compact::auto_compact_threshold_with_fraction(
+                context_window,
+                u64::from(max_output_tokens),
+                tool_ctx.config.effective_compact_threshold(),
+            )
+    {
         return false;
     }
     let Some((provider, model)) = compaction_endpoint(route, client, effective_model) else {
@@ -135,6 +145,8 @@ pub(crate) async fn compact_before_request(
         context_window,
         max_output_tokens,
         state,
+        tool_ctx.config.effective_compact_threshold(),
+        retry,
     )
     .await
     {
@@ -154,6 +166,8 @@ pub(crate) async fn compact_after_overflow(
     provider: &dyn claurst_api::LlmProvider,
     model: &str,
     max_output_tokens: u32,
+    context_window: u64,
+    retry: &claurst_api::RetryConfig,
     journal: Option<&SessionJournal>,
     event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
     tool_ctx: &ToolContext,
@@ -164,12 +178,14 @@ pub(crate) async fn compact_after_overflow(
             "Context window exceeded — compacting and retrying…".to_string(),
         ));
     }
-    match compact::compact_conversation(
+    match compact::compact_conversation_for_window(
         provider,
         model,
         messages,
         compact::CompactionTrigger::Overflow,
         compact::summary_token_budget(max_output_tokens),
+        context_window,
+        retry,
         None,
     )
     .await
