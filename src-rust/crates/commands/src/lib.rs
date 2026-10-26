@@ -444,11 +444,16 @@ fn generate_keybindings_template() -> anyhow::Result<String> {
 }
 
 fn parse_theme(name: &str) -> Option<Theme> {
-    match name.trim().to_lowercase().as_str() {
+    // Built-in names are matched case-insensitively; a custom theme name
+    // keeps the user's spelling so it round-trips through settings and the
+    // picker highlight.
+    let trimmed = name.trim();
+    match trimmed.to_lowercase().as_str() {
         "default" | "system" => Some(Theme::Default),
         "dark" => Some(Theme::Dark),
         "light" => Some(Theme::Light),
-        custom if !custom.is_empty() => Some(Theme::Custom(custom.to_string())),
+        "deuteranopia" => Some(Theme::Deuteranopia),
+        _ if !trimmed.is_empty() => Some(Theme::Custom(trimmed.to_string())),
         _ => None,
     }
 }

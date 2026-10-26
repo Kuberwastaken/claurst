@@ -2718,6 +2718,7 @@ async fn run_interactive(
                                     cmd_name.as_str(),
                                     "model" | "theme" | "resume" | "session"
                                         | "vim" | "vi" | "voice" | "fast" | "speed"
+                                        | "config" | "settings"
                                 );
                             let handled_by_tui = if skip_tui_for_args {
                                 false
@@ -3128,6 +3129,12 @@ async fn run_interactive(
                                 Some(CommandResult::ConfigChangeMessage(new_cfg, msg)) => {
                                     let mut applied_cfg = new_cfg;
                                     normalize_provider_from_model(&mut applied_cfg);
+                                    // If the command changed the theme, live-apply it so
+                                    // the next frame renders with the new palette.
+                                    let mut theme_applied = true;
+                                    if applied_cfg.theme != app.config.theme {
+                                        theme_applied = app.apply_theme_name(&applied_cfg.theme);
+                                    }
                                     cmd_ctx.config = applied_cfg.clone();
                                     tool_ctx.config = applied_cfg.clone();
                                     // Mode and tool allow/deny lists may have changed
@@ -3150,7 +3157,11 @@ async fn run_interactive(
                                         &cmd_ctx.config,
                                         &model_registry,
                                     );
-                                    app.status_message = Some(msg);
+                                    // The command's message, unless the live theme
+                                    // apply already surfaced a load error.
+                                    if theme_applied {
+                                        app.status_message = Some(msg);
+                                    }
                                 }
                                 Some(CommandResult::UserMessage(msg)) => {
                                     // Queue a user-visible turn for the model.
