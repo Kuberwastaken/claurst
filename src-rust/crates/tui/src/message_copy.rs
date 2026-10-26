@@ -86,7 +86,8 @@ pub fn copy_as_plaintext(message: &Message) -> String {
                 .iter()
                 .filter_map(|block| match block {
                     claurst_core::ContentBlock::Text { text } => Some(strip_markdown(text)),
-                    claurst_core::ContentBlock::Thinking { thinking, .. } => {
+                    claurst_core::ContentBlock::Thinking { thinking, .. }
+                    | claurst_core::ContentBlock::ResponsesReasoning { summary: thinking, .. } => {
                         Some(format!("[Thinking]\n{}", thinking))
                     }
                     claurst_core::ContentBlock::ToolUse { name, input, .. } => {
@@ -363,7 +364,8 @@ fn format_block_for_json(block: &claurst_core::ContentBlock) -> String {
             };
             format!("{}{}", error_marker, result_text)
         }
-        claurst_core::ContentBlock::Thinking { thinking, .. } => thinking.clone(),
+        claurst_core::ContentBlock::Thinking { thinking, .. }
+        | claurst_core::ContentBlock::ResponsesReasoning { summary: thinking, .. } => thinking.clone(),
         _ => "[Unsupported content type]".to_string(),
     }
 }

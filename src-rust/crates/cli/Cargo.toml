@@ -45,6 +45,7 @@ urlencoding = "2"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 futures = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
