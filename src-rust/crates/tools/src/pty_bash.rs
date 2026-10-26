@@ -2144,7 +2144,7 @@ mod tests {
         let spill_dir = tempfile::tempdir().unwrap();
         let pid_file = spill_dir.path().join("child.pid");
         let command = format!(
-            "yes | head -c 1200000; sleep 30 & child=$!; printf '%s' \"$child\" > '{}'; wait \"$child\"",
+            "awk 'BEGIN {{ for (i=0; i<600000; i++) print \"y\" }}'; sleep 30 & child=$!; printf '%s' \"$child\" > '{}'; wait \"$child\"",
             pid_file.display()
         );
         let started = run_in_background(
@@ -2195,7 +2195,7 @@ mod tests {
         assert!(
             spilled.ends_with(b"y\n"),
             "lossy tail: {:?}",
-            &spilled[..spilled.len().min(16)]
+            &spilled[spilled.len().saturating_sub(80)..]
         );
         let pid: u32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
         assert_process_stopped(pid).await;
