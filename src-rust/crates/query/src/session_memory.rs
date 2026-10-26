@@ -9,14 +9,16 @@
 //! Cost stays bounded: extraction is off unless the global setting
 //! `memoryExtractionEnabled` is on AND the existing auto-memory switches
 //! (`CLAURST_DISABLE_AUTO_MEMORY`, `CLAURST_SIMPLE`, `autoMemoryEnabled`)
-//! allow it; only subagents of the top-level loop opt in, so detached loops
+//! allow it; only top-level sessions opt in, so detached loops
 //! (subagents, cron, ACP, auto-dream) never extract; the request sees only
 //! messages since the last extraction, capped in messages and characters.
 //! Failures are logged at debug and never break the turn.
 
-use claurst_api::{AnthropicClient, LlmProvider, ProviderRequest, SystemPrompt};
+use claurst_api::{AnthropicClient, LlmProvider, ProviderRequest,
+    SystemPrompt};
 use claurst_core::config::Config;
-use claurst_core::memdir::{self, AutoMemoryEntry, MemoryType};
+use claurst_core::memdir::{self, AutoMemoryEntry, MemoryType
+};
 use claurst_core::types::{Message, Role};
 use std::path::Path;
 use std::sync::Arc;
@@ -96,22 +98,23 @@ impl ExtractionCursor {
     ///
     /// Slicing happens before any transcript building, so the gate and the
     /// cursor are the only work done when extraction does not fire.
-    pub fn window<'a>(&self, messages: &'a [Message]) -> &'a [Message] {
-        let start = match &self.last_uuid {
+    pub fn window<'a>(&self, messages: &'a[Message]) -> &'a [Message] {
+        let start =
+        match &self.last_uuid {
             None => 0,
             Some(uuid) => {
-                let pos = messages
-                    .iter()
-                    .position(|m| m.uuid.as_deref() == Some(uuid.as_str()));
+                let pos = messages.iter().position(|m| m.uuid.as_deref() == Some(uuid.as_str()));
                 match pos {
                     // Cursor resolved: everything strictly after it is new.
-                    Some(pos) if self.message_count <= messages.len() => pos + 1,
+                    Some(pos) if self.message_count <= messages
+                    .len() => pos + 1,
                     // History was rewritten (compaction, rewind): fall back
                     // to the capped tail; the cap bounds the cost of the
                     // re-extraction.
-                    _ => messages.len().saturating_sub(MAX_MESSAGES_PER_EXTRACTION),
-                }
-            }
+                    _ => messages.len()
+                    .saturating_sub(MAX_MESSAGES_PER_EXTRACTION),
+        }
+    }
         };
         let start = start.min(messages.len());
         // Cap at the tail: never more than MAX_MESSAGES_PER_EXTRACTION
@@ -123,7 +126,9 @@ impl ExtractionCursor {
 
     /// Advance to `messages` (the full history, not the window).
     pub fn advance(&mut self, messages: &[Message]) {
-        self.last_uuid = messages.last().and_then(|m| m.uuid.clone());
+        self.last_uuid = messages
+            .last()
+            .and_then(|m| m.uuid.clone());
         self.message_count = messages.len();
     }
 }
@@ -136,15 +141,15 @@ impl ExtractionCursor {
 /// labels, tool uses summarised, tool results cut to a preview, system
 /// reminders skipped, capped to `MAX_MESSAGES_PER_EXTRACTION` messages and
 /// `MAX_TRANSCRIPT_CHARS` characters.
-pub fn build_transcript(messages: &[Message]) -> String {
-    let window = &messages[messages.len().saturating_sub(MAX_MESSAGES_PER_EXTRACTION)..];
-    let mut transcript = String::new();
-    for msg in window {
-        let role = match msg.role {
-            Role::User => "User",
-            Role::Assistant => "Assistant",
-        };
-        let mut block = format!("{role}: ");
+    pub fn build_transcript(messages: &[Message]) -> String {
+        let window = & messages[ messages.len().saturating_sub(MAX_MESSAGES_PER_EXTRACTION)..];
+        let mut transcript = String::new();
+        for msg in window {
+            let role = match msg.role {
+                Role::User => "User",
+                Role::Assistant => "Assistant",
+            };
+            let mut block = format!("{role}: ");
         push_message_text(&mut block, msg);
         if block.trim() == format!("{role}:").trim_end() {
             continue; // nothing model-visible in this message
@@ -170,7 +175,7 @@ pub fn build_transcript(messages: &[Message]) -> String {
 /// `<system-reminder>` blocks (internal instrumentation, not user signal).
 fn push_message_text(out: &mut String, msg: &Message) {
     use claurst_core::types::{ContentBlock, MessageContent};
-    match &msg.content {
+    match & msg.content {
         MessageContent::Text(text) => {
             if !text.trim_start().starts_with("<system-reminder>") {
                 out.push_str(text);
@@ -186,7 +191,7 @@ fn push_message_text(out: &mut String, msg: &Message) {
                     }
                     ContentBlock::ToolUse { name, .. } => {
                         out.push_str(&format!("[used tool: {name}]"));
-                    }
+            }
                     ContentBlock::ToolResult { content, .. } => {
                         let preview = tool_result_preview(content);
                         out.push_str(&format!("[result: {preview}]"));
@@ -214,8 +219,9 @@ fn tool_result_preview(content: &claurst_core::types::ToolResultContent) -> Stri
     };
     if text.chars().count() <= TOOL_RESULT_PREVIEW_CHARS {
         return text;
-    }
-    let mut end = TOOL_RESULT_PREVIEW_CHARS;
+        }
+
+        let mut end = TOOL_RESULT_PREVIEW_CHARS;
     for (idx, _) in text.char_indices() {
         if idx >= end {
             end = idx;
@@ -316,8 +322,9 @@ pub async fn run_extraction_request(
     transcript: &str,
     working_dir: &Path,
 ) -> Option<String> {
-    let prompt = build_extraction_prompt(transcript, &working_dir.display().to_string());
-    let user_msg = Message::user(prompt);
+    let prompt = build_extraction_prompt(transcript, & working_dir.display().to_string());
+
+        let user_msg = Message::user(prompt);
 
     match &route.provider {
         Some(provider) => {
@@ -360,24 +367,24 @@ pub async fn run_extraction_request(
         None => {
             use claurst_api::{ApiMessage, CreateMessageRequest};
             let request = CreateMessageRequest::builder(&route.model_id, 1024)
-                .messages(vec![ApiMessage {
-                    role: "user".to_string(),
-                    content: serde_json::Value::String(user_msg.get_all_text()),
-                }])
-                .system(SystemPrompt::Text(EXTRACTION_SYSTEM_PROMPT.to_string()))
-                .temperature(0.0)
+                .messages( vec![ApiMessage {
+            role: "user".to_string(),
+            content: serde_json:: Value::String(user_msg.get_all_text()),
+        }])
+            .system(SystemPrompt::Text(EXTRACTION_SYSTEM_PROMPT.to_string()))
+            .temperature(0.0)
                 .build();
-            match route.anthropic_client.create_message(request).await {
-                Ok(response) => {
+            match route
+            .anthropic_client.create_message(request).await {
+            Ok(response) => {
                     let text = response
-                        .content
-                        .iter()
+                        . content.iter()
                         .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
                         .collect::<Vec<_>>()
                         .join("");
                     Some(text)
                 }
-                Err(e) => {
+            Err(e) => {
                     debug!(
                         error = %e,
                         "memory extraction skipped: active provider failed"
@@ -437,9 +444,9 @@ fn category_to_memdir_type(category: &str) -> MemoryType {
 }
 
 /// Short topic label used as the file slug and frontmatter name.
-fn topic_name(category: &str, fact: &str) -> String {
-    format!("{category}: {}", first_words(fact, 6))
-}
+fn topic_name(category: &str, fact: &str) -> String { format!("{category}: {}", first_words(fact, 6
+            ))
+        }
 
 /// First `n` words of `s`, for slug-sized labels.
 fn first_words(s: &str, n: usize) -> String {
@@ -449,11 +456,12 @@ fn first_words(s: &str, n: usize) -> String {
 
 /// Single-line, length-capped hook for the MEMORY.md index.
 fn one_line(fact: &str) -> String {
-    let flat: String = fact
-        .chars()
-        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-        .collect();
-    let trimmed = flat.trim();
+                let flat: String = fact
+                    .chars()
+                    .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+                    .collect();
+
+                let trimmed = flat.trim();
     if trimmed.chars().count() > 160 {
         first_words(trimmed, 20)
     } else {
@@ -553,7 +561,7 @@ pub async fn extract_and_store(
         {
             Some(lock) => lock,
             None => {
-                let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
                 locks.insert(route.store_dir.clone(), Arc::downgrade(&lock));
                 lock
             }
@@ -574,29 +582,30 @@ pub async fn extract_and_store(
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+        if cursor.process_epoch == *PROCESS_EPOCH && route.snapshot_sequence <= cursor.snapshot_sequence {
+        return 0;
+        }
 
-    if cursor.process_epoch == *PROCESS_EPOCH && route.snapshot_sequence <= cursor.snapshot_sequence
-    {
+        let window = cursor.window(messages);
+        if window.is_empty() {
         return 0;
     }
-    let window = cursor.window(messages);
-    if window.is_empty() {
+    if!should_extract(&cursor, messages) {
         return 0;
-    }
-    if !should_extract(&cursor, messages) {
-        return 0;
-    }
+        }
 
-    let transcript = build_transcript(window);
+        let transcript = build_transcript(window);
     if transcript.trim().is_empty() {
         return 0;
     }
 
-    let Some(response) = run_extraction_request(route, &transcript, working_dir).await else {
+    let Some(response) = run_extraction_request (route, &transcript, working_dir).await else {
         return 0;
     };
     let entries = parse_extraction_response(&response);
-    let new_count = if entries.is_empty() {
+        let new_count =
+
+        if entries.is_empty() {
         0
     } else {
         let written = tokio::task::spawn_blocking({
@@ -612,7 +621,7 @@ pub async fn extract_and_store(
             error => {
                 debug!(?error, "memory storage failed; extraction cursor retained");
                 return 0;
-            }
+        }
         }
     };
 
@@ -626,7 +635,7 @@ pub async fn extract_and_store(
         let tmp = cursor_path.with_extension("json.tmp");
         let Some(parent) = cursor_path.parent() else {
             return new_count;
-        };
+    };
         if tokio::fs::create_dir_all(parent).await.is_ok()
             && tokio::fs::write(&tmp, &json).await.is_ok()
         {
@@ -673,7 +682,8 @@ mod tests {
     fn make_messages(n: usize) -> Vec<Message> {
         (0..n)
             .map(|i| {
-                let mut msg = if i % 2 == 0 {
+                let mut msg =
+                if i % 2 == 0 {
                     Message::user(format!("user message {i}"))
                 } else {
                     Message::assistant(format!("assistant reply {i}"))
@@ -726,8 +736,7 @@ mod tests {
         assert_eq!(window.len(), 20, "first extraction caps at the tail");
         assert_eq!(
             window.last().and_then(|m| m.uuid.as_deref()),
-            Some("uuid-29")
-        );
+            Some("uuid-29"));
     }
 
     #[test]
@@ -751,8 +760,7 @@ mod tests {
         );
         assert_eq!(
             window.last().and_then(|m| m.uuid.as_deref()),
-            Some("uuid-39")
-        );
+            Some("uuid-39"));
     }
 
     #[test]
@@ -777,7 +785,7 @@ mod tests {
         let window = cursor.window(&msgs);
         assert_eq!(window.len(), 20);
         assert_eq!(
-            window.last().and_then(|m| m.uuid.as_deref()),
+            window. last().and_then(|m| m.uuid.as_deref()),
             Some("uuid-29")
         );
     }
@@ -857,13 +865,12 @@ mod tests {
 
     #[test]
     fn transcript_summarises_tool_use_and_previews_results() {
-        let blocks = vec![
-            ContentBlock::ToolUse {
-                id: "t1".to_string(),
-                name: "Bash".to_string(),
-                input: serde_json::json!({}),
-                thought_signature: None,
-            },
+        let blocks =vec![ContentBlock::ToolUse {
+            id: "t1".to_string(),
+            name: "Bash".to_string(),
+            input: serde_json::json!({}),
+            thought_signature: None,
+        },
             ContentBlock::ToolResult {
                 tool_use_id: "t1".to_string(),
                 content: claurst_core::types::ToolResultContent::Text("x".repeat(500)),
@@ -939,7 +946,7 @@ MEMORY: code_pattern | 7 | Uses builder pattern";
     #[test]
     fn parse_empty_fact_is_skipped() {
         let response = "MEMORY: project_fact | 8 |    ";
-        assert!(parse_extraction_response(response).is_empty());
+        assert!( parse_extraction_response(response).is_empty());
     }
 
     #[test]
@@ -955,11 +962,12 @@ MEMORY: code_pattern | 7 | Uses builder pattern";
 
     /// Backwards-compat alias for the shared registry lock. Returns the
     /// acquired guard; `let _guard = registry_lock();` serializes.
-    fn registry_lock() -> std::sync::MutexGuard<'static, ()> {
+    fn registry_lock() -> std::sync::MutexGuard<'static,()> {
         super::test_registry_lock()
     }
 
     // Same deliberate guard-across-await as the tests below.
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn await_pending_with_no_tasks_returns_zero() {
@@ -998,8 +1006,9 @@ MEMORY: code_pattern | 7 | Uses builder pattern";
         let _guard = registry_lock();
         // 33 tracked spawns: the oldest is evicted beyond the cap.
         for _ in 0..33 {
-            spawn_extraction(std::future::pending::<()>().then(|()| async { 0 }));
-        }
+            spawn_extraction(std::future::pending::<()>().then(|()| async { 0
+            }));
+    }
         let unfinished = await_pending_extractions(std::time::Duration::from_millis(20)).await;
         assert_eq!(unfinished, 32, "cap keeps at most 32 tracked handles");
     }

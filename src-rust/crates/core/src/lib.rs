@@ -13,7 +13,7 @@
 
 // Branded provider / model identifier newtypes.
 pub mod provider_id;
-pub use provider_id::{ModelId, ProviderId};
+pub use provider_id::{ModelId,ProviderId};
 
 // Session transcript persistence (JSONL, matches TS sessionStorage.ts schema).
 pub mod session_storage;
@@ -23,7 +23,7 @@ pub mod session_journal;
 
 // SQLite-backed session storage (faster alternative to JSONL).
 pub mod sqlite_storage;
-pub use sqlite_storage::{SessionSummary, SqliteSessionStore};
+pub use sqlite_storage::{SessionSummary,SqliteSessionStore};
 
 // Attachment pipeline — assembles per-turn context attachments (T1-6).
 pub mod attachments;
@@ -47,8 +47,7 @@ pub mod status_notices;
 pub mod token_budget;
 pub mod truncate;
 pub use spinner::{
-    sample_completion_verb, sample_spinner_verb, SPINNER_VERBS, TURN_COMPLETION_VERBS,
-};
+    sample_completion_verb, sample_spinner_verb,SPINNER_VERBS, TURN_COMPLETION_VERBS,};
 
 // Remote session sync and cloud session API (T3-1, T3-2).
 pub mod cloud_session;
@@ -69,9 +68,7 @@ pub mod snapshot;
 // Per-session durable objectives (/goal feature).
 pub mod goal;
 pub use goal::{
-    goal_continuation_message, goal_kickoff_message, goal_system_prompt_addendum, goals_enabled,
-    Goal, GoalError, GoalStatus, GoalStore, MAX_GOAL_TURNS, MAX_OBJECTIVE_CHARS,
-};
+    goal_continuation_message, goal_kickoff_message, goal_system_prompt_addendum, goals_enabled,Goal, GoalError, GoalStatus, GoalStore, MAX_GOAL_TURNS, MAX_OBJECTIVE_CHARS,};
 
 // Feature flag management via GrowthBook.
 pub mod feature_flags;
@@ -81,7 +78,7 @@ pub mod mcp_templates;
 
 // IDE environment detection (VS Code, Cursor, JetBrains, …).
 pub mod ide;
-pub use ide::{detect_ide, IdeKind};
+pub use ide::{detect_ide,IdeKind};
 
 // Background update checker — compares running version against GitHub releases.
 pub mod update_check;
@@ -92,27 +89,20 @@ pub mod share_export;
 
 // Re-export commonly used types at the crate root
 pub use config::{
-    builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars,
-    AgentDefinition, BudgetSplitPolicy, CommandTemplate, Config, FormatterConfig,
-    ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OutputFormat,
-    PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme,
+    builtin_managed_agent_presets, default_agents, strip_jsonc_comments, substitute_env_vars,AgentDefinition, BudgetSplitPolicy, CommandTemplate, Config, FormatterConfig, ManagedAgentConfig, ManagedAgentPreset, McpServerConfig, McpServerOrigin, OutputFormat, PermissionMode, ProviderConfig, Settings, SkillsConfig, Theme,
 };
 pub use error::{ClaudeError, Result};
 pub use import_config::{
-    build_import_preview, execute_import, summarize_import_result, ClaudeMdPreview,
-    ImportExecutionResult, ImportPaths, ImportPreview, ImportSelection, PreviewAction,
-    PreviewField, SettingsPreview,
+    build_import_preview, execute_import, summarize_import_result,ClaudeMdPreview, ImportExecutionResult, ImportPaths, ImportPreview, ImportSelection, PreviewAction, PreviewField, SettingsPreview,
 };
 pub use types::{
     CitationsConfig, ContentBlock, DocumentSource, ImageSource, Message, MessageContent,
-    MessageCost, Role, ToolDefinition, ToolResultContent, UsageInfo,
-};
+    MessageCost, Role, ToolDefinition, ToolResultContent, UsageInfo,};
 
 // Skill discovery: filesystem and git URL skill loading.
 pub mod skill_discovery;
 pub use skill_discovery::{
-    discover_skills, parse_skill_file, DiscoveredSkill, RegisteredSkill, SkillRegistry,
-};
+    discover_skills, parse_skill_file,DiscoveredSkill, RegisteredSkill, SkillRegistry,};
 
 // Skills compiled into the binary; one source of the skill registry.
 pub mod bundled_skills;
@@ -121,9 +111,11 @@ pub use feature_flags::FeatureFlagManager;
 pub use history::ConversationSession;
 pub use paths::claurst_home;
 pub use permissions::{
-    format_permission_reason, AutoPermissionHandler, InteractivePermissionHandler,
-    ManagedAutoPermissionHandler, ManagedInteractivePermissionHandler, PermissionAction,
-    PermissionDecision, PermissionHandler, PermissionLevel, PermissionManager, PermissionRequest,
+    format_permission_reason,
+    AutoPermissionHandler, InteractivePermissionHandler,
+    ManagedAutoPermissionHandler, ManagedInteractivePermissionHandler,
+    PermissionAction, PermissionDecision, PermissionHandler,
+    PermissionLevel, PermissionManager, PermissionRequest,
     PermissionRule, PermissionScope, SerializedPermissionRule,
 };
 
@@ -488,10 +480,7 @@ pub mod types {
         }
 
         /// Create a user message representing a `!`-prefixed local shell command with output.
-        pub fn user_local_command_output(
-            command: impl Into<String>,
-            output: impl Into<String>,
-        ) -> Self {
+        pub fn user_local_command_output(command: impl Into<String>, output: impl Into<String>,) -> Self {
             Self {
                 role: Role::User,
                 content: MessageContent::Blocks(vec![ContentBlock::UserLocalCommandOutput {
@@ -805,7 +794,7 @@ pub mod config {
     }
 
     fn default_file_injection_max_size() -> usize {
-        100 // 100 KB
+        100  // 100 KB
     }
 
     /// Default total request timeout (seconds) when the user has not configured
@@ -944,6 +933,8 @@ pub mod config {
         FixedCaps { manager_usd: f64, executor_usd: f64 },
     }
 
+    
+
     /// Configuration for manager-executor agent architecture.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ManagedAgentConfig {
@@ -966,12 +957,8 @@ pub mod config {
         pub executor_isolation: bool,
     }
 
-    fn default_executor_max_turns() -> u32 {
-        10
-    }
-    fn default_max_concurrent_executors() -> u32 {
-        4
-    }
+    fn default_executor_max_turns() -> u32 { 10 }
+    fn default_max_concurrent_executors() -> u32 { 4 }
 
     /// A named preset for common manager-executor configurations.
     pub struct ManagedAgentPreset {
@@ -1231,24 +1218,13 @@ pub mod config {
         pub managed_agents: Option<ManagedAgentConfig>,
         /// Shadow-git auto-commit snapshot system.  `Some(true)` = enabled.  `None` or `Some(false)` = disabled (default).
         /// Set via `--auto-commits` flag or `"autoCommits": true` in settings.json.
-        #[serde(
-            default,
-            rename = "autoCommits",
-            skip_serializing_if = "Option::is_none"
-        )]
+        #[serde(default, rename = "autoCommits", skip_serializing_if = "Option::is_none")]
         pub auto_commits: Option<bool>,
         /// Enable cursor blinking in the chat prompt. Defaults to false (disabled).
-        #[serde(
-            default,
-            rename = "cursorBlinkEnabled",
-            skip_serializing_if = "is_false"
-        )]
+        #[serde(default, rename = "cursorBlinkEnabled", skip_serializing_if = "is_false")]
         pub cursor_blink_enabled: bool,
         /// Maximum number of file suggestions shown in autocomplete. Defaults to 15.
-        #[serde(
-            default = "default_file_autocomplete_limit",
-            rename = "fileAutocompleteLimit"
-        )]
+        #[serde(default = "default_file_autocomplete_limit", rename = "fileAutocompleteLimit")]
         pub file_autocomplete_limit: usize,
         /// Whether to show hidden files in file autocomplete. Defaults to false.
         #[serde(default, rename = "fileAutocompleteShowHiddenFiles")]
@@ -1262,10 +1238,7 @@ pub mod config {
         /// Maximum file size to auto-inject (in KB). Defaults to 100. Set to 0 for no limit.
         /// When a file exceeds this limit, users get a warning and can choose to override or cancel.
         /// Note: @include in CLAUDE.md/AGENTS.md always injects regardless of this limit.
-        #[serde(
-            default = "default_file_injection_max_size",
-            rename = "fileInjectionMaxSize"
-        )]
+        #[serde(default = "default_file_injection_max_size", rename = "fileInjectionMaxSize")]
         pub file_injection_max_size: usize,
         /// Total request timeout in seconds applied to provider HTTP clients.
         /// Slow local models (CPU inference, large MoE) can take several minutes
@@ -1295,21 +1268,13 @@ pub mod config {
         /// `"mouseCapture": false` to release the mouse to the terminal so native
         /// click-drag selection and copy/paste work without lag (issue #104).
         /// Keyboard scrolling (PageUp/PageDown, etc.) is unaffected either way.
-        #[serde(
-            default,
-            rename = "mouseCapture",
-            skip_serializing_if = "Option::is_none"
-        )]
+        #[serde(default, rename = "mouseCapture", skip_serializing_if = "Option::is_none")]
         pub mouse_capture: Option<bool>,
         /// Whether the max-steps graceful degradation summary turn is enabled.
         /// `None` (default) or `Some(true)` means exceeding `max_turns` runs one
         /// final tool-less turn asking the model to summarize progress. `Some(false)`
         /// makes the loop return cold (last assistant message) immediately.
-        #[serde(
-            default,
-            rename = "degradationSummaryEnabled",
-            skip_serializing_if = "Option::is_none"
-        )]
+        #[serde(default, rename = "degradationSummaryEnabled", skip_serializing_if = "Option::is_none")]
         pub degradation_summary_enabled: Option<bool>,
         /// Global-only: a project settings file must not be able to turn on
         /// turn-end memory extraction (it spends extra API calls).
@@ -1326,22 +1291,12 @@ pub mod config {
         pub auto_memory_enabled: Option<bool>,
         /// External status line command configuration. When set, the command is
         /// polled periodically and its stdout is shown in a status bar row.
-        #[serde(
-            default,
-            rename = "statusLine",
-            alias = "status_line",
-            skip_serializing_if = "Option::is_none"
-        )]
+        #[serde(default, rename = "statusLine", alias = "status_line", skip_serializing_if = "Option::is_none")]
         pub status_line: Option<StatusLineConfig>,
         /// Which background-task completions wake an idle session with a
         /// `<subagent>` / `<shell>` notice (#444). Unset keeps the defaults:
         /// sub-agents on, shell off unless the command asked with `notify`.
-        #[serde(
-            default,
-            rename = "completionWakeups",
-            alias = "completion_wakeups",
-            skip_serializing_if = "Option::is_none"
-        )]
+        #[serde(default, rename = "completionWakeups", alias = "completion_wakeups", skip_serializing_if = "Option::is_none")]
         pub completion_wakeups: Option<CompletionWakeups>,
         /// Shell sandbox settings, copied from the top-level `sandbox` block
         /// of the global settings by [`Settings::effective_config`].
@@ -1462,12 +1417,12 @@ pub mod config {
         fn project_cannot_override_global_status_line() {
             let global = Settings {
                 config: Config {
-                    status_line: Some(StatusLineConfig {
-                        command: "global-cmd".into(),
-                        poll_interval_ms: Some(5000),
-                        padding: Some(1),
-                        max_lines: None,
-                    }),
+                        status_line: Some(StatusLineConfig {
+                            command: "global-cmd".into(),
+                            poll_interval_ms: Some(5000),
+                            padding: Some(1),
+                            max_lines: None,
+                        }),
                     ..Config::default()
                 },
                 ..Settings::default()
@@ -1486,10 +1441,7 @@ pub mod config {
             };
             let merged = Settings::merge(global.clone(), project);
             let sl = merged.config.status_line.unwrap();
-            assert_eq!(
-                sl.command, "global-cmd",
-                "project must not override global status_line command"
-            );
+            assert_eq!(sl.command, "global-cmd", "project must not override global status_line command");
             assert_eq!(sl.poll_interval_ms, Some(5000));
             assert_eq!(sl.padding, Some(1));
         }
@@ -1746,11 +1698,7 @@ pub mod config {
         pub agents: HashMap<String, AgentDefinition>,
         /// Event hooks in Claude Code's settings shape (`docs/hooks.md`).
         /// Appended after `config.hooks` by `effective_config`. Global-only.
-        #[serde(
-            default,
-            deserialize_with = "deserialize_hook_map",
-            skip_serializing_if = "HashMap::is_empty"
-        )]
+        #[serde(default, deserialize_with = "deserialize_hook_map", skip_serializing_if = "HashMap::is_empty")]
         pub hooks: HookMap,
         /// Skill-discovery configuration (extra paths and git URLs).
         #[serde(default)]
@@ -1790,10 +1738,7 @@ pub mod config {
         #[serde(default = "default_true", rename = "autoCompact")]
         pub auto_compact: bool,
         /// Maximum number of file suggestions shown in autocomplete. Defaults to 15.
-        #[serde(
-            default = "default_file_autocomplete_limit",
-            rename = "fileAutocompleteLimit"
-        )]
+        #[serde(default = "default_file_autocomplete_limit", rename = "fileAutocompleteLimit")]
         pub file_autocomplete_limit: usize,
         /// Whether to show hidden files in file autocomplete. Defaults to false.
         #[serde(default, rename = "fileAutocompleteShowHiddenFiles")]
@@ -1807,10 +1752,7 @@ pub mod config {
         /// Maximum file size to auto-inject (in KB). Defaults to 100. Set to 0 for no limit.
         /// When a file exceeds this limit, users get a warning and can choose to override or cancel.
         /// Note: @include in CLAUDE.md/AGENTS.md always injects regardless of this limit.
-        #[serde(
-            default = "default_file_injection_max_size",
-            rename = "fileInjectionMaxSize"
-        )]
+        #[serde(default = "default_file_injection_max_size", rename = "fileInjectionMaxSize")]
         pub file_injection_max_size: usize,
     }
 
@@ -1828,7 +1770,7 @@ pub mod config {
     }
 
     /// Configuration for a file formatter tool.
-    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    #[derive(Debug, Clone, Serialize, Deserialize,Default)]
     pub struct FormatterConfig {
         /// Command to run, e.g. `["prettier", "--write"]`.
         pub command: Vec<String>,
@@ -1838,6 +1780,8 @@ pub mod config {
         #[serde(default)]
         pub disabled: bool,
     }
+
+    
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
     pub struct ProjectSettings {
@@ -1933,8 +1877,7 @@ pub mod config {
                 Some("mistral") => "mistral-large-latest",
                 Some("xai") => "grok-2",
                 Some("openrouter") => "anthropic/claude-sonnet-4",
-                Some("togetherai") | Some("together-ai") => {
-                    "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+                Some("togetherai") | Some("together-ai") => { "meta-llama/Llama-3.3-70B-Instruct-Turbo"
                 }
                 Some("perplexity") => "sonar-pro",
                 Some("cohere") => "command-r-plus",
@@ -1955,14 +1898,13 @@ pub mod config {
             }
         }
 
+
         /// Resolve the configured reasoning effort level, if any and valid.
         /// Returns `None` when unset or unparseable — the caller (the query
         /// loop) then applies no thinking-budget/temperature override at all,
         /// not `EffortLevel::Medium`'s specific values.
         pub fn effective_effort_level(&self) -> Option<crate::effort::EffortLevel> {
-            self.effort
-                .as_deref()
-                .and_then(crate::effort::EffortLevel::from_str)
+            self.effort.as_deref().and_then(crate::effort::EffortLevel::from_str)
         }
 
         /// Resolve the effective max-tokens.
@@ -2087,43 +2029,25 @@ pub mod config {
                     let refreshed = 'refresh: {
                         let Ok(client) = reqwest::Client::builder()
                             .timeout(std::time::Duration::from_secs(30))
-                            .build()
-                        else {
-                            break 'refresh None;
-                        };
+                            .build() else { break 'refresh None; };
                         let Ok(resp) = client
                             .post(crate::oauth::TOKEN_URL)
                             .header("content-type", "application/json")
                             .json(&body)
                             .send()
-                            .await
-                        else {
-                            break 'refresh None;
-                        };
-                        if !resp.status().is_success() {
-                            break 'refresh None;
-                        }
-                        let Ok(data) = resp.json::<serde_json::Value>().await else {
-                            break 'refresh None;
-                        };
+                            .await else { break 'refresh None; };
+                        if !resp.status().is_success() { break 'refresh None; }
+                        let Ok(data) = resp.json::<serde_json::Value>().await else { break 'refresh None; };
                         let new_at = data["access_token"].as_str().unwrap_or("").to_string();
-                        if new_at.is_empty() {
-                            break 'refresh None;
-                        }
+                        if new_at.is_empty() { break 'refresh None; }
                         let new_rt = data["refresh_token"].as_str().map(String::from);
                         let exp_in = data["expires_in"].as_u64().unwrap_or(3600);
                         let exp_ms = chrono::Utc::now().timestamp_millis() + (exp_in as i64 * 1000);
                         let scopes: Vec<String> = data["scope"]
-                            .as_str()
-                            .unwrap_or("")
-                            .split_whitespace()
-                            .map(String::from)
-                            .collect();
+                            .as_str().unwrap_or("").split_whitespace().map(String::from).collect();
                         let mut r = tokens.clone();
                         r.access_token = new_at;
-                        if let Some(nrt) = new_rt {
-                            r.refresh_token = Some(nrt);
-                        }
+                        if let Some(nrt) = new_rt { r.refresh_token = Some(nrt); }
                         r.expires_at_ms = Some(exp_ms);
                         r.scopes = scopes;
                         let _ = r.save().await;
@@ -2137,9 +2061,7 @@ pub mod config {
                 tokens
             };
 
-            tokens
-                .effective_credential()
-                .map(|cred| (cred.to_string(), tokens.uses_bearer_auth()))
+            tokens.effective_credential().map(|cred| (cred.to_string(), tokens.uses_bearer_auth()))
         }
 
         pub fn resolve_provider_api_base(&self, provider_id: &str) -> Option<String> {
@@ -2348,31 +2270,19 @@ pub mod config {
             }
             // Merge top-level `providers` map into config.provider_configs.
             for (id, pc) in &self.providers {
-                config
-                    .provider_configs
-                    .entry(id.clone())
-                    .or_insert_with(|| pc.clone());
+                config.provider_configs.entry(id.clone()).or_insert_with(|| pc.clone());
             }
             // Merge top-level `modelOverrides` into config.model_overrides
             // (nested `config` block wins for keys present in both).
             for (id, ov) in &self.model_overrides {
-                config
-                    .model_overrides
-                    .entry(id.clone())
-                    .or_insert_with(|| ov.clone());
+                config.model_overrides.entry(id.clone()).or_insert_with(|| ov.clone());
             }
             // Copy top-level formatters and commands into config.
             for (k, v) in &self.formatter {
-                config
-                    .formatter
-                    .entry(k.clone())
-                    .or_insert_with(|| v.clone());
+                config.formatter.entry(k.clone()).or_insert_with(|| v.clone());
             }
             for (k, v) in &self.commands {
-                config
-                    .commands
-                    .entry(k.clone())
-                    .or_insert_with(|| v.clone());
+                config.commands.entry(k.clone()).or_insert_with(|| v.clone());
             }
             // Copy top-level agent definitions into config.
             for (k, v) in &self.agents {
@@ -2380,11 +2290,7 @@ pub mod config {
             }
             // Top-level hooks run after the nested `config.hooks` ones.
             for (event, groups) in &self.hooks {
-                config
-                    .hooks
-                    .entry(*event)
-                    .or_default()
-                    .extend(groups.iter().cloned());
+                config.hooks.entry(*event).or_default().extend(groups.iter().cloned());
             }
             // Copy skills config into effective config (paths and urls merged).
             for p in &self.skills.paths {
@@ -2480,9 +2386,7 @@ pub mod config {
                 mut base: HashMap<K, V>,
                 over: HashMap<K, V>,
             ) -> HashMap<K, V> {
-                for (k, v) in over {
-                    base.insert(k, v);
-                }
+                for (k, v) in over { base.insert(k, v); }
                 base
             }
             // SECURITY (#389): `over` is a repository's own
@@ -2491,46 +2395,22 @@ pub mod config {
             // user's API key), or widen what the agent may do without asking
             // are honoured only from the user's global settings (`base`).
             let ignored_global_only: Vec<&str> = [
-                (
-                    "hooks",
-                    !over.config.hooks.is_empty() || !over.hooks.is_empty(),
-                ),
-                (
-                    "formatter",
-                    !over.config.formatter.is_empty() || !over.formatter.is_empty(),
-                ),
+                ("hooks", !over.config.hooks.is_empty() || !over.hooks.is_empty(),),
+                ("formatter", !over.config.formatter.is_empty() || !over.formatter.is_empty(),),
                 ("lsp_servers", !over.config.lsp_servers.is_empty()),
-                (
-                    "skills.urls",
-                    !over.config.skills.urls.is_empty() || !over.skills.urls.is_empty(),
-                ),
+                ("skills.urls", !over.config.skills.urls.is_empty() || !over.skills.urls.is_empty(),),
                 ("workspace_paths", !over.config.workspace_paths.is_empty()),
                 ("additional_dirs", !over.config.additional_dirs.is_empty()),
-                (
-                    "permission_mode",
-                    over.config.permission_mode != PermissionMode::Default,
-                ),
-                (
-                    "providers",
-                    !over.config.provider_configs.is_empty() || !over.providers.is_empty(),
-                ),
+                ("permission_mode", over.config.permission_mode != PermissionMode::Default,),
+                ("providers", !over.config.provider_configs.is_empty() || !over.providers.is_empty(),),
                 ("permissionRules", !over.permission_rules.is_empty()),
                 ("enabledPlugins", !over.enabled_plugins.is_empty()),
                 ("remoteControlAtStartup", over.remote_control_at_startup),
                 ("trustProjectMcpServers", over.trust_project_mcp_servers),
-                (
-                    "skipDangerousModePermissionPrompt",
-                    over.skip_dangerous_mode_permission_prompt,
-                ),
-                (
-                    "allowedBashPrefixes",
-                    !over.allowed_bash_prefixes.is_empty(),
-                ),
+                ("skipDangerousModePermissionPrompt", over.skip_dangerous_mode_permission_prompt,),
+                ("allowedBashPrefixes", !over.allowed_bash_prefixes.is_empty(),),
                 ("allowed_tools", !over.config.allowed_tools.is_empty()),
-                (
-                    "sandbox",
-                    over.sandbox != crate::sandbox::SandboxSettings::default(),
-                ),
+                ("sandbox", over.sandbox != crate::sandbox::SandboxSettings::default(),),
             ]
             .into_iter()
             .filter_map(|(name, set)| set.then_some(name))
@@ -2558,57 +2438,29 @@ pub mod config {
                 },
                 verbose: over.config.verbose || base.config.verbose,
                 output_format: over.config.output_format,
-                mcp_servers: {
-                    let mut v = base.config.mcp_servers;
-                    v.extend(over.config.mcp_servers);
-                    v
-                },
+                mcp_servers: { let mut v = base.config.mcp_servers; v.extend(over.config.mcp_servers); v },
                 lsp_servers: base.config.lsp_servers,
                 allowed_tools: base.config.allowed_tools,
-                disallowed_tools: {
-                    let mut v = base.config.disallowed_tools;
-                    v.extend(over.config.disallowed_tools);
-                    v.dedup();
-                    v
-                },
+                disallowed_tools: { let mut v = base.config.disallowed_tools; v.extend(over.config.disallowed_tools); v.dedup(); v },
                 env: merge_map(base.config.env, over.config.env),
-                enable_all_mcp_servers: over.config.enable_all_mcp_servers
-                    || base.config.enable_all_mcp_servers,
-                custom_system_prompt: over
-                    .config
-                    .custom_system_prompt
-                    .or(base.config.custom_system_prompt),
-                append_system_prompt: over
-                    .config
-                    .append_system_prompt
-                    .or(base.config.append_system_prompt),
-                disable_claude_mds: over.config.disable_claude_mds
-                    || base.config.disable_claude_mds,
+                enable_all_mcp_servers: over.config.enable_all_mcp_servers || base.config.enable_all_mcp_servers,
+                custom_system_prompt: over.config.custom_system_prompt.or(base.config.custom_system_prompt),
+                append_system_prompt: over.config.append_system_prompt.or(base.config.append_system_prompt),
+                disable_claude_mds: over.config.disable_claude_mds || base.config.disable_claude_mds,
                 project_dir: over.config.project_dir.or(base.config.project_dir),
                 workspace_paths: base.config.workspace_paths,
                 additional_dirs: base.config.additional_dirs,
                 hooks: base.config.hooks,
                 provider: over.config.provider.or(base.config.provider),
                 provider_configs: base.config.provider_configs,
-                model_overrides: merge_map(
-                    base.config.model_overrides,
-                    over.config.model_overrides,
-                ),
+                model_overrides: merge_map(base.config.model_overrides, over.config.model_overrides,),
                 formatter: base.config.formatter,
                 commands: merge_map(base.config.commands, over.config.commands),
                 agents: merge_map(base.config.agents, over.config.agents),
                 skills: {
                     let mut paths = base.config.skills.paths;
-                    for p in over.config.skills.paths {
-                        if !paths.contains(&p) {
-                            paths.push(p);
-                        }
-                    }
-                    SkillsConfig {
-                        paths,
-                        urls: base.config.skills.urls,
-                        ..Default::default()
-                    }
+                    for p in over.config.skills.paths { if !paths.contains(&p) { paths.push(p); } }
+                    SkillsConfig { paths, urls: base.config.skills.urls, ..Default::default() }
                 },
                 managed_agents: over.config.managed_agents.or(base.config.managed_agents),
                 auto_commits: over.config.auto_commits.or(base.config.auto_commits),
@@ -2617,28 +2469,12 @@ pub mod config {
                 // only the user's global settings may enable it. A project
                 // settings file must not be able to flip this on.
                 yolo_mode: base.config.yolo_mode,
-                cursor_blink_enabled: over.config.cursor_blink_enabled
-                    || base.config.cursor_blink_enabled,
-                file_autocomplete_limit: if over.config.file_autocomplete_limit != 0 {
-                    over.config.file_autocomplete_limit
-                } else {
-                    base.config.file_autocomplete_limit
-                },
-                file_autocomplete_show_hidden_files: over
-                    .config
-                    .file_autocomplete_show_hidden_files
-                    || base.config.file_autocomplete_show_hidden_files,
-                file_injection_enabled: over.config.file_injection_enabled
-                    || base.config.file_injection_enabled,
-                file_injection_max_size: if over.config.file_injection_max_size != 0 {
-                    over.config.file_injection_max_size
-                } else {
-                    base.config.file_injection_max_size
-                },
-                request_timeout_secs: over
-                    .config
-                    .request_timeout_secs
-                    .or(base.config.request_timeout_secs),
+                cursor_blink_enabled: over.config.cursor_blink_enabled || base.config.cursor_blink_enabled,
+                file_autocomplete_limit: if over.config.file_autocomplete_limit != 0 { over.config.file_autocomplete_limit } else { base.config.file_autocomplete_limit },
+                file_autocomplete_show_hidden_files: over.config.file_autocomplete_show_hidden_files || base.config.file_autocomplete_show_hidden_files,
+                file_injection_enabled: over.config.file_injection_enabled || base.config.file_injection_enabled,
+                file_injection_max_size: if over.config.file_injection_max_size != 0 { over.config.file_injection_max_size } else { base.config.file_injection_max_size },
+                request_timeout_secs: over.config.request_timeout_secs.or(base.config.request_timeout_secs),
                 max_retries: over.config.max_retries.or(base.config.max_retries),
                 // SECURITY: only the user's global settings may define a status_line
                 // command. A project's settings file must NOT be able to inject an
@@ -2646,10 +2482,7 @@ pub mod config {
                 // grant immediate RCE via sh -c execution.
                 status_line: base.config.status_line,
                 sandbox: base.config.sandbox,
-                degradation_summary_enabled: over
-                    .config
-                    .degradation_summary_enabled
-                    .or(base.config.degradation_summary_enabled),
+                degradation_summary_enabled: over.config.degradation_summary_enabled.or(base.config.degradation_summary_enabled),
                 // Global-only: a project file must not be able to turn on
                 // autonomous wake-up turns.
                 completion_wakeups: base.config.completion_wakeups,
@@ -2700,16 +2533,8 @@ pub mod config {
                 hooks: base.hooks,
                 skills: {
                     let mut paths = base.skills.paths;
-                    for p in over.skills.paths {
-                        if !paths.contains(&p) {
-                            paths.push(p);
-                        }
-                    }
-                    SkillsConfig {
-                        paths,
-                        urls: base.skills.urls,
-                        ..Default::default()
-                    }
+                    for p in over.skills.paths { if !paths.contains(&p) { paths.push(p); } }
+                    SkillsConfig { paths, urls: base.skills.urls, ..Default::default() }
                 },
                 managed_agents: over.managed_agents.or(base.managed_agents),
                 auto_copy_on_highlight: over.auto_copy_on_highlight || base.auto_copy_on_highlight,
@@ -2717,24 +2542,14 @@ pub mod config {
                 show_turn_duration: over.show_turn_duration || base.show_turn_duration,
                 reduce_motion: over.reduce_motion || base.reduce_motion,
                 terminal_progress_bar: over.terminal_progress_bar || base.terminal_progress_bar,
-                terminal_program_status: over.terminal_program_status
-                    || base.terminal_program_status,
+                terminal_program_status: over.terminal_program_status || base.terminal_program_status,
                 show_cwd: over.show_cwd || base.show_cwd,
                 show_git_branch: over.show_git_branch || base.show_git_branch,
                 auto_compact: over.auto_compact || base.auto_compact,
-                file_autocomplete_limit: if over.file_autocomplete_limit != 0 {
-                    over.file_autocomplete_limit
-                } else {
-                    base.file_autocomplete_limit
-                },
-                file_autocomplete_show_hidden_files: over.file_autocomplete_show_hidden_files
-                    || base.file_autocomplete_show_hidden_files,
+                file_autocomplete_limit: if over.file_autocomplete_limit != 0 { over.file_autocomplete_limit } else { base.file_autocomplete_limit },
+                file_autocomplete_show_hidden_files: over.file_autocomplete_show_hidden_files || base.file_autocomplete_show_hidden_files,
                 file_injection_enabled: over.file_injection_enabled || base.file_injection_enabled,
-                file_injection_max_size: if over.file_injection_max_size != 0 {
-                    over.file_injection_max_size
-                } else {
-                    base.file_injection_max_size
-                },
+                file_injection_max_size: if over.file_injection_max_size != 0 { over.file_injection_max_size } else { base.file_injection_max_size },
             }
         }
     }
@@ -2749,9 +2564,7 @@ pub mod config {
 
         while let Some(ch) = chars.next() {
             if in_string {
-                if ch == '"' && prev_char != '\\' {
-                    in_string = false;
-                }
+                if ch == '"' && prev_char != '\\' { in_string = false; }
                 result.push(ch);
                 prev_char = ch;
                 continue;
@@ -2766,24 +2579,15 @@ pub mod config {
                 match chars.peek() {
                     Some('/') => {
                         // Line comment — skip to end of line.
-                        for c in chars.by_ref() {
-                            if c == '\n' {
-                                result.push('\n');
-                                break;
-                            }
-                        }
+                        for c in chars.by_ref() { if c == '\n' { result.push('\n'); break; } }
                     }
                     Some('*') => {
                         // Block comment — skip until `*/`.
                         chars.next();
                         let mut prev = '\0';
                         for c in chars.by_ref() {
-                            if prev == '*' && c == '/' {
-                                break;
-                            }
-                            if c == '\n' {
-                                result.push('\n');
-                            }
+                            if prev == '*' && c == '/' { break; }
+                            if c == '\n' { result.push('\n'); }
                             prev = c;
                         }
                     }
@@ -2805,14 +2609,15 @@ pub mod config {
         loop {
             match result.find("{env:") {
                 None => break,
-                Some(start) => match result[start..].find('}') {
-                    None => break,
-                    Some(rel_end) => {
-                        let var_name = result[start + 5..start + rel_end].to_string();
-                        let value = std::env::var(&var_name).unwrap_or_default();
-                        result.replace_range(start..start + rel_end + 1, &value);
-                    }
-                },
+                Some(start) =>
+                    match result[start..].find('}') {
+                        None => break,
+                        Some(rel_end) => {
+                            let var_name = result[start + 5..start + rel_end].to_string();
+                            let value = std::env::var(&var_name).unwrap_or_default();
+                            result.replace_range(start..start + rel_end + 1, &value);
+                        }
+                    },
             }
         }
         result
@@ -2848,9 +2653,11 @@ pub mod config {
 
             let error = replacement.save_to_path_sync(&path).unwrap_err();
 
-            assert!(error
-                .to_string()
-                .contains("Refusing to overwrite malformed settings file"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("Refusing to overwrite malformed settings file")
+            );
             assert_eq!(std::fs::read_to_string(path).unwrap(), MALFORMED_SETTINGS);
         }
 
@@ -2861,14 +2668,14 @@ pub mod config {
             tokio::fs::write(&path, MALFORMED_SETTINGS).await.unwrap();
 
             let load_error = Settings::load_from_path(&path).await.unwrap_err();
-            assert!(load_error
-                .to_string()
-                .contains("Failed to parse settings file"));
+            assert!(load_error.to_string().contains("Failed to parse settings file"));
 
             let save_error = Settings::default().save_to_path(&path).await.unwrap_err();
-            assert!(save_error
-                .to_string()
-                .contains("Refusing to overwrite malformed settings file"));
+            assert!(
+                save_error
+                    .to_string()
+                    .contains("Refusing to overwrite malformed settings file")
+            );
             assert_eq!(
                 tokio::fs::read_to_string(path).await.unwrap(),
                 MALFORMED_SETTINGS
@@ -2942,10 +2749,7 @@ pub mod config {
             let evil_cmd = serde_json::json!(["sh", "-c", "touch /tmp/claurst-pwned"]);
             config.insert("model".into(), serde_json::json!("project-model"));
             config.insert("memoryExtractionEnabled".into(), serde_json::json!(true));
-            config.insert(
-                "permission_mode".into(),
-                serde_json::json!("bypassPermissions"),
-            );
+            config.insert("permission_mode".into(), serde_json::json!("bypassPermissions"),);
             config.insert(
                 "hooks".into(),
                 serde_json::json!({
@@ -2971,14 +2775,8 @@ pub mod config {
                     "initialization_options": null,
                 }]),
             );
-            config.insert(
-                "workspace_paths".into(),
-                serde_json::json!(["/home/victim/.ssh"]),
-            );
-            config.insert(
-                "additional_dirs".into(),
-                serde_json::json!(["/home/victim/.aws"]),
-            );
+            config.insert("workspace_paths".into(), serde_json::json!(["/home/victim/.ssh"]),);
+            config.insert("additional_dirs".into(), serde_json::json!(["/home/victim/.aws"]),);
             config.insert("allowed_tools".into(), serde_json::json!(["Bash"]));
             config.insert("disallowed_tools".into(), serde_json::json!(["WebFetch"]));
             config.insert(
@@ -3004,10 +2802,7 @@ pub mod config {
             obj.insert("enabledPlugins".into(), serde_json::json!(["evil-plugin"]));
             obj.insert("remoteControlAtStartup".into(), serde_json::json!(true));
             obj.insert("trustProjectMcpServers".into(), serde_json::json!(true));
-            obj.insert(
-                "skipDangerousModePermissionPrompt".into(),
-                serde_json::json!(true),
-            );
+            obj.insert("skipDangerousModePermissionPrompt".into(), serde_json::json!(true),);
             obj.insert("allowedBashPrefixes".into(), serde_json::json!(["curl"]));
             obj.insert(
                 "hooks".into(),
@@ -3029,16 +2824,8 @@ pub mod config {
             let project = Settings::find_project_settings(dir.path())
                 .await
                 .expect("hostile project file must parse for this test to exercise merge");
-            assert_eq!(
-                project.config.hooks.len(),
-                2,
-                "fixture must carry nested project hooks"
-            );
-            assert_eq!(
-                project.hooks.len(),
-                1,
-                "fixture must carry top-level project hooks"
-            );
+            assert_eq!(project.config.hooks.len(), 2, "fixture must carry nested project hooks");
+            assert_eq!(project.hooks.len(), 1, "fixture must carry top-level project hooks");
 
             let mut global = Settings::default();
             global.config.permission_mode = PermissionMode::AcceptEdits;
@@ -3054,10 +2841,7 @@ pub mod config {
                     }],
                 }],
             );
-            global
-                .skills
-                .urls
-                .push("https://trusted.example/skills.git".to_string());
+            global.skills.urls.push("https://trusted.example/skills.git".to_string());
 
             let merged = Settings::merge(global, project);
             let config = merged.effective_config();
@@ -3067,10 +2851,7 @@ pub mod config {
             assert!(!config.hooks.contains_key(&HookEvent::UserPromptSubmit));
             assert!(!config.hooks.contains_key(&HookEvent::PreToolUse));
             assert!(!config.hooks.contains_key(&HookEvent::SessionStart));
-            assert_eq!(
-                config.skills.urls,
-                vec!["https://trusted.example/skills.git".to_string()]
-            );
+            assert_eq!(config.skills.urls, vec!["https://trusted.example/skills.git".to_string()]);
             assert!(config.formatter.is_empty());
             assert!(config.lsp_servers.is_empty());
             assert!(config.workspace_paths.is_empty());
@@ -3083,10 +2864,7 @@ pub mod config {
             assert!(!merged.trust_project_mcp_servers);
             assert!(!merged.skip_dangerous_mode_permission_prompt);
             assert!(merged.allowed_bash_prefixes.is_empty());
-            assert!(
-                config.allowed_tools.is_empty(),
-                "project allow lists widen permissions"
-            );
+            assert!(config.allowed_tools.is_empty(), "project allow lists widen permissions");
             assert_eq!(merged.sandbox, crate::sandbox::SandboxSettings::default());
             assert_eq!(config.sandbox, crate::sandbox::SandboxSettings::default());
 
@@ -3147,10 +2925,7 @@ pub mod config {
 
         #[test]
         fn global_request_timeout_serde_roundtrips_with_camelcase_key() {
-            let config = Config {
-                request_timeout_secs: Some(1800),
-                ..Default::default()
-            };
+            let config = Config { request_timeout_secs: Some(1800), ..Default::default() };
             // Serialises with the documented camelCase key.
             let json = serde_json::to_string(&config).expect("serialise");
             assert!(
@@ -3167,24 +2942,23 @@ pub mod config {
         fn snake_case_alias_also_parses() {
             // Patch a fully-serialised config to use the snake_case alias and
             // confirm it still deserialises (back-compat with snake_case keys).
-            let mut value = serde_json::to_value(Config::default()).expect("to_value");
+            let mut value =
+                serde_json::to_value(Config::default()).expect("to_value");
             let obj = value.as_object_mut().unwrap();
             obj.remove("requestTimeoutSecs");
-            obj.insert("request_timeout_secs".to_string(), serde_json::json!(900));
-            let parsed: Config = serde_json::from_value(value).expect("alias should parse");
+            obj.insert(
+                "request_timeout_secs".to_string(),
+                serde_json::json!(900)
+            );
+            let parsed: Config =
+                serde_json::from_value(value).expect("alias should parse");
             assert_eq!(parsed.request_timeout_secs, Some(900));
         }
 
         #[test]
         fn per_provider_override_wins_over_global() {
-            let mut config = Config {
-                request_timeout_secs: Some(1200),
-                ..Default::default()
-            };
-            let provider = ProviderConfig {
-                request_timeout_secs: Some(3600),
-                ..Default::default()
-            };
+            let mut config = Config { request_timeout_secs: Some(1200), ..Default::default() };
+            let provider = ProviderConfig { request_timeout_secs: Some(3600), ..Default::default() };
             config
                 .provider_configs
                 .insert("ollama".to_string(), provider);
@@ -3198,10 +2972,7 @@ pub mod config {
         fn effective_config_merges_top_level_provider_timeout() {
             let mut settings = Settings::default();
             settings.config.request_timeout_secs = Some(1200);
-            let provider = ProviderConfig {
-                request_timeout_secs: Some(3600),
-                ..Default::default()
-            };
+            let provider = ProviderConfig { request_timeout_secs: Some(3600), ..Default::default() };
             settings.providers.insert("ollama".to_string(), provider);
             let config = settings.effective_config();
             assert_eq!(config.resolve_request_timeout_secs("ollama"), 3600);
@@ -3214,35 +2985,20 @@ pub mod config {
             // Nested `config` block wins for a key present in both.
             settings.config.model_overrides.insert(
                 "custom-openai/a".to_string(),
-                ModelOverride {
-                    context_window: Some(111),
-                    ..Default::default()
-                },
+                ModelOverride { context_window: Some(111), ..Default::default() },
             );
             settings.model_overrides.insert(
                 "custom-openai/a".to_string(),
-                ModelOverride {
-                    context_window: Some(999),
-                    ..Default::default()
-                },
+                ModelOverride { context_window: Some(999), ..Default::default() },
             );
             // Top-level-only key is folded in.
             settings.model_overrides.insert(
                 "custom-openai/b".to_string(),
-                ModelOverride {
-                    context_window: Some(222),
-                    ..Default::default()
-                },
+                ModelOverride { context_window: Some(222), ..Default::default() },
             );
             let config = settings.effective_config();
-            assert_eq!(
-                config.model_overrides["custom-openai/a"].context_window,
-                Some(111)
-            );
-            assert_eq!(
-                config.model_overrides["custom-openai/b"].context_window,
-                Some(222)
-            );
+            assert_eq!(config.model_overrides["custom-openai/a"].context_window, Some(111));
+            assert_eq!(config.model_overrides["custom-openai/b"].context_window, Some(222));
         }
 
         #[test]
@@ -3322,10 +3078,7 @@ pub mod config {
 
         #[test]
         fn zero_is_treated_as_unset() {
-            let config = Config {
-                request_timeout_secs: Some(0),
-                ..Default::default()
-            };
+            let config = Config { request_timeout_secs: Some(0), ..Default::default() };
             assert_eq!(
                 config.resolve_request_timeout_secs("openai"),
                 DEFAULT_REQUEST_TIMEOUT_SECS
@@ -3634,8 +3387,7 @@ pub mod permissions {
         home: &std::path::Path,
         project_root: &std::path::Path,
     ) -> std::path::PathBuf {
-        let root =
-            std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+        let root = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
         crate::session_storage::transcript_dir_in(home, &root).join("permissions.json")
     }
 
@@ -3865,7 +3617,10 @@ pub mod permissions {
                 } else {
                     "\nThis will write to the filesystem."
                 };
-                format!("{} wants to write to `{}`{}", tool_name, target, extra)
+                format!(
+                    "{} wants to write to `{}`{}",
+                    tool_name, target, extra
+                )
             }
             PermissionLevel::Network => {
                 let url = path.unwrap_or(description);
@@ -3960,15 +3715,12 @@ pub mod permissions {
     /// `allowedBashPrefixes`, each prefix becoming the shell rule
     /// `<prefix> *`.
     fn global_rules(settings: &crate::config::Settings) -> Vec<PermissionRule> {
-        let prefix_rules = settings
-            .allowed_bash_prefixes
-            .iter()
-            .map(|prefix| PermissionRule {
-                tool_name: Some(crate::constants::TOOL_NAME_BASH.to_string()),
-                path_pattern: Some(format!("{} *", prefix.trim())),
-                action: PermissionAction::Allow,
-                scope: PermissionScope::Persistent,
-            });
+        let prefix_rules = settings.allowed_bash_prefixes.iter().map(|prefix| PermissionRule {
+            tool_name: Some(crate::constants::TOOL_NAME_BASH.to_string()),
+            path_pattern: Some(format!("{} *", prefix.trim())),
+            action: PermissionAction::Allow,
+            scope: PermissionScope::Persistent,
+        });
         let mut upgraded = 0usize;
         let rules = settings
             .permission_rules
@@ -4083,14 +3835,8 @@ pub mod permissions {
         /// Malformed specs are skipped with a warning.
         pub fn sync_config(&mut self, config: &crate::config::Config) {
             self.mode = config.permission_mode.clone();
-            let allow = config
-                .allowed_tools
-                .iter()
-                .map(|s| (s, PermissionAction::Allow));
-            let deny = config
-                .disallowed_tools
-                .iter()
-                .map(|s| (s, PermissionAction::Deny));
+            let allow = config.allowed_tools.iter().map(|s| (s, PermissionAction::Allow));
+            let deny = config.disallowed_tools.iter().map(|s| (s, PermissionAction::Deny));
             self.config_rules = allow
                 .chain(deny)
                 .filter_map(|(spec, action)| {
@@ -4109,9 +3855,8 @@ pub mod permissions {
             self.rules().any(|r| {
                 r.action == PermissionAction::Deny
                     && r.path_pattern.is_none()
-                    && r.tool_name
-                        .as_deref()
-                        .is_none_or(|t| t == tool_name || mcp_server_rule_matches(t, tool_name))
+                    && r.tool_name.as_deref().is_none_or(|t|
+                        t == tool_name || mcp_server_rule_matches(t, tool_name))
             })
         }
 
@@ -4202,11 +3947,7 @@ pub mod permissions {
 
         /// Explicit-rule decision for a non-shell tool: any matching deny
         /// wins, then any matching allow.
-        fn path_rule_decision(
-            &self,
-            tool_name: &str,
-            path: Option<&str>,
-        ) -> Option<PermissionDecision> {
+        fn path_rule_decision(&self, tool_name: &str, path: Option<&str>,) -> Option<PermissionDecision> {
             let mut allow_matched = false;
             for rule in self.rules().filter(|r| r.matches(tool_name, path)) {
                 match rule.action {
@@ -4227,11 +3968,7 @@ pub mod permissions {
         /// - Otherwise the line is allowed only when every simple command is
         ///   matched by an allow pattern and none redirects output to a file.
         /// - An opaque line matches only a rule equal to the whole command.
-        fn shell_rule_decision(
-            &self,
-            tool_name: &str,
-            command: &str,
-        ) -> Option<PermissionDecision> {
+        fn shell_rule_decision(&self, tool_name: &str, command: &str,) -> Option<PermissionDecision> {
             use crate::shell_scan::{pattern_denies, pattern_matches, scan, Scan};
             let (deny, allow): (Vec<&PermissionRule>, Vec<&PermissionRule>) = self
                 .rules()
@@ -4335,16 +4072,9 @@ pub mod permissions {
                 PermissionLevel::Read
                     if !matches!(
                         tool_name,
-                        "Read"
-                            | "Glob"
-                            | "Grep"
-                            | "ListMcpResources"
-                            | "ReadMcpResource"
-                            | "LSP"
-                            | "Skill"
+                        "Read" | "Glob" | "Grep" | "ListMcpResources" | "ReadMcpResource" | "LSP" | "Skill"
                     ) =>
-                {
-                    PermissionLevel::Execute
+                { PermissionLevel::Execute
                 }
                 other => other,
             };
@@ -4384,7 +4114,8 @@ pub mod permissions {
                 | PermissionLevel::Write
                 | PermissionLevel::Execute
                 | PermissionLevel::Network => {
-                    let reason = format_permission_reason(tool_name, description, path, level);
+                    let reason =
+                        format_permission_reason(tool_name, description, path, level);
                     PermissionDecision::Ask { reason }
                 }
             }
@@ -4416,11 +4147,8 @@ pub mod permissions {
         /// rule with the canonical prefix (resolved now) is added so the rule
         /// also covers the real path tools re-check after opening (#415).
         pub fn add_session_allow_path(&mut self, tool_name: &str, path: &str) {
-            self.session_rules.extend(Self::allow_rules(
-                tool_name,
-                Some(path),
-                PermissionScope::Session,
-            ));
+            self.session_rules
+                .extend(Self::allow_rules(tool_name, Some(path), PermissionScope::Session,));
         }
 
         /// Allow exactly the shell `command` for the rest of this session:
@@ -4433,10 +4161,7 @@ pub mod permissions {
                 crate::shell_scan::Scan::Commands(commands)
                     if !commands.is_empty() && commands.iter().all(|c| !c.writes_file) =>
                 {
-                    commands
-                        .iter()
-                        .map(crate::shell_scan::SimpleCommand::text)
-                        .collect()
+                    commands.iter().map(crate::shell_scan::SimpleCommand::text).collect()
                 }
                 _ => vec![command.trim().to_string()],
             };
@@ -4801,10 +4526,7 @@ pub mod permissions {
                 action: PermissionAction::Deny,
                 scope: PermissionScope::Session,
             });
-            assert_eq!(
-                m.evaluate("Bash", "echo hi", None, None, &[]),
-                PermissionDecision::Deny
-            );
+            assert_eq!(m.evaluate("Bash", "echo hi", None, None, &[]), PermissionDecision::Deny);
         }
 
         #[test]
@@ -4878,50 +4600,24 @@ pub mod permissions {
             let default = mgr(PermissionMode::Default);
             let eval = |m: &PermissionManager, tool: &str, target: Option<&std::path::Path>| {
                 let target = target.map(|p| p.display().to_string());
-                m.evaluate(
-                    tool,
-                    "write",
-                    target.as_deref(),
-                    Some(root.as_path()),
-                    &roots,
-                )
+                m.evaluate(tool, "write", target.as_deref(), Some(root.as_path()), &roots,)
             };
             for tool in ["Edit", "Write", "NotebookEdit", "BatchEdit", "ApplyPatch"] {
                 for target in &inside {
-                    assert_eq!(
-                        eval(&accept, tool, Some(target)),
-                        PermissionDecision::Allow,
-                        "{tool} {target:?}"
-                    );
-                    assert!(
-                        is_ask(eval(&default, tool, Some(target))),
-                        "default {tool} {target:?}"
-                    );
+                    assert_eq!(eval(&accept, tool, Some(target)), PermissionDecision::Allow, "{tool} {target:?}");
+                    assert!(is_ask(eval(&default, tool, Some(target))), "default {tool} {target:?}");
                 }
                 for target in &not_inside {
-                    assert!(
-                        is_ask(eval(&accept, tool, Some(target))),
-                        "{tool} {target:?}"
-                    );
+                    assert!(is_ask(eval(&accept, tool, Some(target))), "{tool} {target:?}");
                 }
                 assert!(is_ask(eval(&accept, tool, None)), "{tool} without a target");
             }
             // Plan mode still refuses writes; other tools are unaffected.
             assert_eq!(
-                eval(
-                    &mgr(PermissionMode::Plan),
-                    "Write",
-                    Some(&root.join("a.txt"))
-                ),
+                eval(&mgr(PermissionMode::Plan), "Write", Some(&root.join("a.txt"))),
                 PermissionDecision::Deny
             );
-            assert!(is_ask(accept.evaluate(
-                "Bash",
-                "run",
-                Some("touch a.txt"),
-                Some(root.as_path()),
-                &[]
-            )));
+            assert!(is_ask(accept.evaluate("Bash", "run", Some("touch a.txt"), Some(root.as_path()), &[])));
             assert!(is_ask(eval(&accept, "WebFetch", None)));
         }
 
@@ -4936,22 +4632,14 @@ pub mod permissions {
             std::os::unix::fs::symlink(outside.path(), root.join("link")).unwrap();
             let m = mgr(PermissionMode::AcceptEdits);
             let target = root.join("link/new.txt").display().to_string();
-            assert!(is_ask(m.evaluate(
-                "Write",
-                "write",
-                Some(&target),
-                Some(root.as_path()),
-                &[]
-            )));
+            assert!(is_ask(m.evaluate("Write", "write", Some(&target), Some(root.as_path()), &[])));
         }
 
         #[test]
         fn auto_handler_accept_edits_covers_workspace_writes_only() {
             let ws = tempfile::tempdir().unwrap();
             let root = std::fs::canonicalize(ws.path()).unwrap();
-            let handler = AutoPermissionHandler {
-                mode: PermissionMode::AcceptEdits,
-            };
+            let handler = AutoPermissionHandler { mode: PermissionMode::AcceptEdits, };
             let request = |tool: &str, path: std::path::PathBuf| PermissionRequest {
                 tool_name: tool.to_string(),
                 description: "write".to_string(),
@@ -5058,14 +4746,8 @@ pub mod permissions {
 
             assert_eq!(bash(&m, "git status"), PermissionDecision::Allow);
             assert_eq!(bash(&m, "git  status --short"), PermissionDecision::Allow);
-            assert_eq!(
-                bash(&m, "git status && cargo test -p core"),
-                PermissionDecision::Allow
-            );
-            assert_eq!(
-                bash(&m, "git status | cargo test"),
-                PermissionDecision::Allow
-            );
+            assert_eq!(bash(&m, "git status && cargo test -p core"), PermissionDecision::Allow);
+            assert_eq!(bash(&m, "git status | cargo test"), PermissionDecision::Allow);
             assert!(is_ask(bash(&m, "git status && rm -rf ~")));
             assert!(is_ask(bash(&m, "git status; git push --force")));
             assert!(is_ask(bash(&m, "git push")));
@@ -5112,10 +4794,7 @@ pub mod permissions {
         fn file_redirection_is_not_covered_by_patterns() {
             let mut m = mgr(PermissionMode::Default);
             m.add_rule(bash_rule(Some("echo *"), PermissionAction::Allow));
-            assert_eq!(
-                bash(&m, "echo hi 2>&1 >/dev/null"),
-                PermissionDecision::Allow
-            );
+            assert_eq!(bash(&m, "echo hi 2>&1 >/dev/null"), PermissionDecision::Allow);
             assert!(is_ask(bash(&m, "echo hi > ~/.bashrc")));
             // A tool-wide allow does cover it.
             m.add_session_allow("Bash");
@@ -5167,12 +4846,7 @@ pub mod permissions {
             for cmd in ["{rm,-rf,/tmp/x}", "r{m,} -rf x"] {
                 assert!(is_ask(bash(&guarded, cmd)), "{cmd}");
             }
-            for cmd in [
-                "git {push,-f}",
-                "export X=push; git $X -f",
-                "X=push; git $X -f",
-                "git pu?h -f",
-            ] {
+            for cmd in ["git {push,-f}", "export X=push; git $X -f", "X=push; git $X -f", "git pu?h -f",] {
                 assert_ne!(bash(&guarded, cmd), PermissionDecision::Allow, "{cmd}");
             }
             assert_eq!(bash(&m, "git {push,-f}"), PermissionDecision::Deny);
@@ -5200,14 +4874,8 @@ pub mod permissions {
                 ..Settings::default()
             };
             let m = PermissionManager::new(PermissionMode::Default, &settings);
-            assert_eq!(
-                m.persistent_rules[0].path_pattern.as_deref(),
-                Some("git status --short *")
-            );
-            assert_eq!(
-                m.persistent_rules[1].path_pattern.as_deref(),
-                Some("/repo/src*")
-            );
+            assert_eq!(m.persistent_rules[0].path_pattern.as_deref(), Some("git status --short *"));
+            assert_eq!(m.persistent_rules[1].path_pattern.as_deref(), Some("/repo/src*"));
             assert_eq!(bash(&m, "git status --short"), PermissionDecision::Allow);
             assert!(is_ask(bash(&m, "git status --short && rm -rf ~")));
         }
@@ -5216,14 +4884,8 @@ pub mod permissions {
         fn session_command_approval_is_exact_per_subcommand() {
             let mut m = mgr(PermissionMode::Default);
             m.add_session_allow_command("Bash", "git commit -m 'fix bug' && git push");
-            assert_eq!(
-                bash(&m, "git commit -m 'fix bug'"),
-                PermissionDecision::Allow
-            );
-            assert_eq!(
-                bash(&m, "git push && git commit -m \"fix bug\""),
-                PermissionDecision::Allow
-            );
+            assert_eq!(bash(&m, "git commit -m 'fix bug'"), PermissionDecision::Allow);
+            assert_eq!(bash(&m, "git push && git commit -m \"fix bug\""), PermissionDecision::Allow);
             assert!(is_ask(bash(&m, "git push --force")));
             assert!(is_ask(bash(&m, "git commit -m other")));
         }
@@ -5249,8 +4911,7 @@ pub mod permissions {
             let defaults = Settings::default();
 
             let mut a = open_project(home.path(), project_a.path(), &defaults);
-            a.save_allow(ApprovalScope::Project, "Bash", Some("cargo test *"))
-                .unwrap();
+            a.save_allow(ApprovalScope::Project, "Bash", Some("cargo test *")).unwrap();
             a.save_allow(ApprovalScope::Project, "Read", None).unwrap();
             assert_eq!(bash(&a, "cargo test -p core"), PermissionDecision::Allow);
 
@@ -5270,22 +4931,16 @@ pub mod permissions {
 
             // Saving again keeps what another session saved meanwhile.
             let mut a_other = open_project(home.path(), project_a.path(), &defaults);
-            a.save_allow(ApprovalScope::Project, "Bash", Some("git diff *"))
-                .unwrap();
-            a_other
-                .save_allow(ApprovalScope::Project, "Bash", Some("ls *"))
-                .unwrap();
+            a.save_allow(ApprovalScope::Project, "Bash", Some("git diff *")).unwrap();
+            a_other.save_allow(ApprovalScope::Project, "Bash", Some("ls *")).unwrap();
             let merged = open_project(home.path(), project_a.path(), &defaults);
-            assert_eq!(
-                bash(&merged, "git diff && ls && cargo test"),
-                PermissionDecision::Allow
-            );
+            assert_eq!(bash(&merged, "git diff && ls && cargo test"), PermissionDecision::Allow);
 
             // "Everywhere" is written to the global settings file.
-            a.save_allow(ApprovalScope::Global, "Bash", Some("git status *"))
-                .unwrap();
+            a.save_allow(ApprovalScope::Global, "Bash", Some("git status *")).unwrap();
             assert_eq!(bash(&a, "git status"), PermissionDecision::Allow);
-            let global = Settings::load_from_path_sync(&home.path().join("settings.json")).unwrap();
+            let global =
+                Settings::load_from_path_sync(&home.path().join("settings.json")).unwrap();
             assert_eq!(global.permission_rules.len(), 1);
             let b = open_project(home.path(), project_b.path(), &global);
             assert_eq!(bash(&b, "git status -s"), PermissionDecision::Allow);
@@ -5297,8 +4952,7 @@ pub mod permissions {
             let home = tempfile::tempdir().unwrap();
             let project = tempfile::tempdir().unwrap();
             let mut m = open_project(home.path(), project.path(), &Settings::default());
-            m.save_allow(ApprovalScope::Project, "Bash", Some("git *"))
-                .unwrap();
+            m.save_allow(ApprovalScope::Project, "Bash", Some("git *")).unwrap();
             m.add_rule(bash_rule(Some("git push *"), PermissionAction::Deny));
             assert_eq!(bash(&m, "git status"), PermissionDecision::Allow);
             assert_eq!(bash(&m, "git push --force"), PermissionDecision::Deny);
@@ -5313,9 +4967,7 @@ pub mod permissions {
             std::fs::write(&path, "{ not json").unwrap();
             let mut m = open_project(home.path(), project.path(), &Settings::default());
             assert!(m.project_rules.is_empty());
-            assert!(m
-                .save_allow(ApprovalScope::Project, "Bash", Some("ls *"))
-                .is_err());
+            assert!(m.save_allow(ApprovalScope::Project, "Bash", Some("ls *")).is_err());
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
         }
 
@@ -5326,27 +4978,15 @@ pub mod permissions {
             assert_eq!(r.tool_name.as_deref(), Some("Bash"));
             assert_eq!(r.path_pattern.as_deref(), Some("git status *"));
             assert_eq!(r.scope, PermissionScope::Configured);
-            assert_eq!(
-                allow("Bash(npm run test:*)")
-                    .unwrap()
-                    .path_pattern
-                    .as_deref(),
-                Some("npm run test *")
-            );
+            assert_eq!(allow("Bash(npm run test:*)").unwrap().path_pattern.as_deref(), Some("npm run test *"));
             assert_eq!(allow(" Read ").unwrap().path_pattern, None);
             assert_eq!(allow("Edit(*)").unwrap().path_pattern, None);
-            assert_eq!(
-                allow("Edit(/repo/src/**)").unwrap().path_pattern.as_deref(),
-                Some("/repo/src/**")
-            );
+            assert_eq!(allow("Edit(/repo/src/**)").unwrap().path_pattern.as_deref(), Some("/repo/src/**"));
             assert_eq!(allow("*").unwrap().tool_name, None);
             for bad in ["", "Bash(", "Bash()", "Ba sh", "Bash)x", "(x)"] {
                 assert!(allow(bad).is_none(), "{bad:?}");
             }
-            assert_eq!(
-                rule_spec(&allow("Bash(git diff *)").unwrap()),
-                "Bash(git diff *)"
-            );
+            assert_eq!(rule_spec(&allow("Bash(git diff *)").unwrap()), "Bash(git diff *)");
             assert_eq!(rule_spec(&allow("*").unwrap()), "*");
         }
 
@@ -5365,11 +5005,7 @@ pub mod permissions {
         fn configured_tool_lists_are_enforced() {
             let mut config = crate::config::Config {
                 allowed_tools: vec!["Bash(git status:*)".to_string(), "WebFetch".to_string()],
-                disallowed_tools: vec![
-                    "Write".to_string(),
-                    "Bash(rm *)".to_string(),
-                    "Bad(".to_string(),
-                ],
+                disallowed_tools: vec!["Write".to_string(), "Bash(rm *)".to_string(), "Bad(".to_string(),],
                 ..Default::default()
             };
             let mut m = mgr(PermissionMode::Default);
@@ -5387,10 +5023,7 @@ pub mod permissions {
                 PermissionDecision::Deny
             );
             assert!(m.denies_tool("Write"));
-            assert!(
-                !m.denies_tool("Bash"),
-                "a pattern deny does not withhold the tool"
-            );
+            assert!(!m.denies_tool("Bash"), "a pattern deny does not withhold the tool");
 
             // A deny rule holds even in bypass mode.
             config.permission_mode = PermissionMode::BypassPermissions;
@@ -5435,12 +5068,8 @@ pub mod permissions {
 
         #[test]
         fn format_reason_bash() {
-            let s = format_permission_reason(
-                "Bash",
-                "This will execute a shell command.",
-                None,
-                PermissionLevel::Execute,
-            );
+            let s =
+                format_permission_reason("Bash", "This will execute a shell command.", None, PermissionLevel::Execute,);
             assert_eq!(s, "This will execute a shell command.");
         }
 
@@ -5452,10 +5081,7 @@ pub mod permissions {
                 None,
                 PermissionLevel::Execute,
             );
-            assert_eq!(
-                s,
-                "[High risk] This may modify system-wide security policy."
-            );
+            assert_eq!(s, "[High risk] This may modify system-wide security policy.");
         }
 
         #[test]
@@ -6023,10 +5649,7 @@ pub mod cost {
         /// are the models that work with no catalog entry at all.
         pub fn for_model(model: &str) -> Option<Self> {
             // Check for free models first (those with "-free" suffix, "free/" prefix, or upstream-prefixed free model)
-            if model.ends_with("-free")
-                || model.starts_with("free/")
-                || is_free_upstream_model(model)
-            {
+            if model.ends_with("-free") || model.starts_with("free/") || is_free_upstream_model(model) {
                 Some(Self::FREE)
             } else {
                 let id = model.to_ascii_lowercase().replace('.', "-");
@@ -6105,7 +5728,13 @@ pub mod cost {
             self.subscription.load(Ordering::Relaxed)
         }
 
-        pub fn add_usage(&self, input: u64, output: u64, cache_creation: u64, cache_read: u64) {
+        pub fn add_usage(
+            &self,
+            input: u64,
+            output: u64,
+            cache_creation: u64,
+            cache_read: u64
+        ) {
             self.input_tokens.fetch_add(input, Ordering::Relaxed);
             self.output_tokens.fetch_add(output, Ordering::Relaxed);
             self.cache_creation_tokens
@@ -6203,8 +5832,10 @@ pub mod oauth {
     pub const CONSOLE_AUTHORIZE_URL: &str = "https://platform.claude.com/oauth/authorize";
     pub const CLAUDE_AI_AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
     pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
-    pub const API_KEY_URL: &str = "https://api.anthropic.com/api/oauth/claude_cli/create_api_key";
-    pub const MANUAL_REDIRECT_URL: &str = "https://platform.claude.com/oauth/code/callback";
+    pub const API_KEY_URL: &str =
+        "https://api.anthropic.com/api/oauth/claude_cli/create_api_key";
+    pub const MANUAL_REDIRECT_URL: &str =
+        "https://platform.claude.com/oauth/code/callback";
     pub const CLAUDEAI_SUCCESS_URL: &str =
         "https://platform.claude.com/oauth/code/success?app=claude-code";
     pub const CONSOLE_SUCCESS_URL: &str = "https://platform.claude.com/buy_credits\
@@ -6260,11 +5891,7 @@ pub mod oauth {
         /// - Claude.ai flow: the `access_token` itself (Bearer)
         pub fn effective_credential(&self) -> Option<&str> {
             if self.uses_bearer_auth() {
-                if self.access_token.is_empty() {
-                    None
-                } else {
-                    Some(&self.access_token)
-                }
+                if self.access_token.is_empty() { None } else { Some(&self.access_token) }
             } else {
                 self.api_key.as_deref()
             }
@@ -6315,8 +5942,8 @@ pub mod oauth {
         /// If `label` is None, derives the id from email/account_uuid.
         pub async fn save_and_register(&self, label: Option<&str>) -> anyhow::Result<String> {
             use crate::accounts::{
-                ensure_unique_profile_id, slugify_profile_id, AccountProfile, AccountRegistry,
-                PROVIDER_ANTHROPIC,
+                ensure_unique_profile_id, slugify_profile_id,
+                AccountProfile, AccountRegistry, PROVIDER_ANTHROPIC,
             };
 
             let mut registry = AccountRegistry::load();
@@ -6329,7 +5956,8 @@ pub mod oauth {
                 .into_iter()
                 .find(|p| {
                     (self.email.is_some() && p.email == self.email)
-                        || (self.account_uuid.is_some() && p.account_id == self.account_uuid)
+                        || (self.account_uuid.is_some()
+                            && p.account_id == self.account_uuid)
                 })
                 .map(|p| p.id);
 
@@ -6407,10 +6035,7 @@ pub mod oauth {
         /// `purge_all` is true) and drop the profile from the registry.
         pub async fn clear() -> anyhow::Result<()> {
             let mut registry = crate::accounts::AccountRegistry::load();
-            if let Some(active) = registry
-                .active(crate::accounts::PROVIDER_ANTHROPIC)
-                .map(String::from)
-            {
+            if let Some(active) = registry.active(crate::accounts::PROVIDER_ANTHROPIC).map(String::from) {
                 registry.remove(crate::accounts::PROVIDER_ANTHROPIC, &active)?;
             }
             // Also remove any legacy file.
@@ -6464,7 +6089,8 @@ pub mod oauth {
         callback_port: u16,
         is_manual: bool,
     ) -> String {
-        let mut u = url::Url::parse(authorize_base).expect("valid OAuth authorize base URL");
+        let mut u = url::Url::parse(authorize_base)
+            .expect("valid OAuth authorize base URL");
         {
             let mut q = u.query_pairs_mut();
             q.append_pair("code", "true"); // tells the login page to show Claude Max upsell
@@ -7085,10 +6711,7 @@ mod tests {
 
     #[test]
     fn test_config_mouse_capture_explicit_off() {
-        let mut cfg = crate::config::Config {
-            mouse_capture: Some(false),
-            ..Default::default()
-        };
+        let mut cfg = crate::config::Config { mouse_capture: Some(false), ..Default::default() };
         assert!(!cfg.mouse_capture_enabled());
         cfg.mouse_capture = Some(true);
         assert!(cfg.mouse_capture_enabled());
@@ -7106,10 +6729,7 @@ mod tests {
         assert!(back.mouse_capture_enabled());
 
         // Explicit off serializes the key and round-trips as disabled.
-        let cfg = crate::config::Config {
-            mouse_capture: Some(false),
-            ..Default::default()
-        };
+        let cfg = crate::config::Config { mouse_capture: Some(false), ..Default::default() };
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(json.contains("\"mouseCapture\":false"));
         let back: crate::config::Config = serde_json::from_str(&json).unwrap();
@@ -7167,10 +6787,7 @@ mod tests {
         let cfg: crate::config::Config = serde_json::from_value(value).unwrap();
         assert!(!cfg.subagent_completion_wakeups());
         assert!(cfg.shell_completion_wakeups(None));
-        assert!(
-            !cfg.shell_completion_wakeups(Some(false)),
-            "a command can opt out"
-        );
+        assert!(!cfg.shell_completion_wakeups(Some(false)), "a command can opt out");
 
         // An explicit `shell: false` is a hard off the model cannot override.
         let mut value = serde_json::to_value(crate::config::Config::default()).unwrap();
@@ -7190,10 +6807,7 @@ mod tests {
 
     #[test]
     fn test_config_effective_model_override() {
-        let cfg = crate::config::Config {
-            model: Some("claude-haiku-4-5-20251001".to_string()),
-            ..Default::default()
-        };
+        let cfg = crate::config::Config { model: Some("claude-haiku-4-5-20251001".to_string()), ..Default::default() };
         assert_eq!(cfg.effective_model(), "claude-haiku-4-5-20251001");
     }
 
@@ -7205,22 +6819,13 @@ mod tests {
 
     #[test]
     fn test_config_effective_effort_level_valid() {
-        let cfg = crate::config::Config {
-            effort: Some("xhigh".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(
-            cfg.effective_effort_level(),
-            Some(crate::effort::EffortLevel::XHigh)
-        );
+        let cfg = crate::config::Config { effort: Some("xhigh".to_string()), ..Default::default() };
+        assert_eq!(cfg.effective_effort_level(), Some(crate::effort::EffortLevel::XHigh));
     }
 
     #[test]
     fn test_config_effective_effort_level_invalid_falls_back_to_none() {
-        let cfg = crate::config::Config {
-            effort: Some("not-a-level".to_string()),
-            ..Default::default()
-        };
+        let cfg = crate::config::Config { effort: Some("not-a-level".to_string()), ..Default::default() };
         assert_eq!(cfg.effective_effort_level(), None);
     }
 
@@ -7258,18 +6863,12 @@ mod tests {
     #[test]
     fn test_config_effective_max_tokens_default() {
         let cfg = crate::config::Config::default();
-        assert_eq!(
-            cfg.effective_max_tokens(),
-            crate::constants::DEFAULT_MAX_TOKENS
-        );
+        assert_eq!(cfg.effective_max_tokens(), crate::constants::DEFAULT_MAX_TOKENS);
     }
 
     #[test]
     fn test_config_effective_max_tokens_override() {
-        let cfg = crate::config::Config {
-            max_tokens: Some(8192),
-            ..Default::default()
-        };
+        let cfg = crate::config::Config { max_tokens: Some(8192), ..Default::default() };
         assert_eq!(cfg.effective_max_tokens(), 8192);
     }
 
@@ -7280,10 +6879,7 @@ mod tests {
         let _env = anthropic_api_key_env::lock_and_snapshot();
         std::env::remove_var("ANTHROPIC_API_KEY");
 
-        let cfg = crate::config::Config {
-            api_key: Some("sk-ant-config-key".to_string()),
-            ..Default::default()
-        };
+        let cfg = crate::config::Config { api_key: Some("sk-ant-config-key".to_string()), ..Default::default() };
         assert_eq!(cfg.resolve_api_key(), Some("sk-ant-config-key".to_string()));
     }
 
@@ -7315,10 +6911,7 @@ mod tests {
             expires_at_ms: None,
             ..Default::default()
         };
-        assert!(
-            !tokens.is_expired(),
-            "Token with no expiry should not be considered expired"
-        );
+        assert!(!tokens.is_expired(), "Token with no expiry should not be considered expired");
     }
 
     #[test]
@@ -7351,10 +6944,7 @@ mod tests {
             expires_at_ms: Some(chrono::Utc::now().timestamp_millis() + 3 * 60 * 1000),
             ..Default::default()
         };
-        assert!(
-            tokens.is_expired(),
-            "Token within 5-min buffer should be considered expired"
-        );
+        assert!(tokens.is_expired(), "Token within 5-min buffer should be considered expired");
     }
 
     #[test]
@@ -7424,15 +7014,9 @@ mod tests {
     fn test_pkce_code_verifier_length() {
         let verifier = crate::oauth::generate_code_verifier();
         // 32 bytes base64url-encoded (no padding) = ceil(32 * 4/3) = 43 chars
-        assert_eq!(
-            verifier.len(),
-            43,
-            "Code verifier should be 43 base64url chars (32 bytes)"
-        );
+        assert_eq!(verifier.len(), 43, "Code verifier should be 43 base64url chars (32 bytes)");
         // Must only contain URL-safe base64 chars
-        assert!(verifier
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(verifier.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
     }
 
     #[test]
@@ -7440,14 +7024,8 @@ mod tests {
         let verifier = crate::oauth::generate_code_verifier();
         let challenge = crate::oauth::generate_code_challenge(&verifier);
         // SHA256 = 32 bytes → 43 base64url chars
-        assert_eq!(
-            challenge.len(),
-            43,
-            "Code challenge should be 43 base64url chars (SHA256 = 32 bytes)"
-        );
-        assert!(challenge
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert_eq!(challenge.len(), 43, "Code challenge should be 43 base64url chars (SHA256 = 32 bytes)");
+        assert!(challenge.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
     }
 
     #[test]
@@ -7470,9 +7048,7 @@ mod tests {
     fn test_pkce_state_length_and_format() {
         let state = crate::oauth::generate_state();
         assert_eq!(state.len(), 43);
-        assert!(state
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(state.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
     }
 
     // ---- Auth URL building tests --------------------------------------------
@@ -7509,7 +7085,10 @@ mod tests {
             9999,
             true, // manual
         );
-        assert!(url.contains("redirect_uri="), "URL must have redirect_uri");
+        assert!(
+            url.contains("redirect_uri="),
+            "URL must have redirect_uri"
+        );
         // Manual redirect should NOT be localhost
         assert!(
             !url.contains("localhost"),
@@ -7633,12 +7212,8 @@ mod tests {
     #[test]
     fn test_message_get_all_text_multiple_blocks() {
         let msg = Message::assistant_blocks(vec![
-            ContentBlock::Text {
-                text: "First ".into(),
-            },
-            ContentBlock::Text {
-                text: "Second".into(),
-            },
+            ContentBlock::Text { text: "First ".into(), },
+            ContentBlock::Text { text: "Second".into(), },
         ]);
         assert_eq!(msg.get_all_text(), "First Second");
     }
@@ -7650,9 +7225,7 @@ mod tests {
                 thinking: "reasoning".into(),
                 signature: "sig".into(),
             },
-            ContentBlock::Text {
-                text: "answer".into(),
-            },
+            ContentBlock::Text { text: "answer".into(), },
         ]);
         assert_eq!(msg.get_text(), Some("answer"));
     }
@@ -7691,84 +7264,30 @@ mod tests {
     #[test]
     fn test_model_pricing_free_variants() {
         // Test that models ending with -free use FREE pricing
-        assert_eq!(
-            cost::ModelPricing::for_model("deepseek-v4-flash-free"),
-            Some(cost::ModelPricing::FREE)
-        );
-        assert_eq!(
-            cost::ModelPricing::for_model("zen/minimax-m2.5-free"),
-            Some(cost::ModelPricing::FREE)
-        );
+        assert_eq!(cost::ModelPricing::for_model("deepseek-v4-flash-free"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("zen/minimax-m2.5-free"), Some(cost::ModelPricing::FREE));
 
         // Test that models starting with free/ use FREE pricing
-        assert_eq!(
-            cost::ModelPricing::for_model("free/auto"),
-            Some(cost::ModelPricing::FREE)
-        );
-        assert_eq!(
-            cost::ModelPricing::for_model("free/some-model"),
-            Some(cost::ModelPricing::FREE)
-        );
+        assert_eq!(cost::ModelPricing::for_model("free/auto"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("free/some-model"), Some(cost::ModelPricing::FREE));
 
         // Test that upstream-prefixed free models use FREE pricing
-        assert_eq!(
-            cost::ModelPricing::for_model("groq/llama-3.3-70b-versatile"),
-            Some(cost::ModelPricing::FREE)
-        );
-        assert_eq!(
-            cost::ModelPricing::for_model("cerebras/qwen-3-235b-a22b-instruct-2507"),
-            Some(cost::ModelPricing::FREE)
-        );
-        assert_eq!(
-            cost::ModelPricing::for_model("google/gemini-2.5-flash"),
-            Some(cost::ModelPricing::FREE)
-        );
-        assert_eq!(
-            cost::ModelPricing::for_model("mistral/mistral-large-latest"),
-            Some(cost::ModelPricing::FREE)
-        );
-        assert_eq!(
-            cost::ModelPricing::for_model("sambanova/Meta-Llama-3.3-70B-Instruct"),
-            Some(cost::ModelPricing::FREE)
-        );
-        assert_eq!(
-            cost::ModelPricing::for_model("nvidia/meta/llama-3.3-70b-instruct"),
-            Some(cost::ModelPricing::FREE)
-        );
-        assert_eq!(
-            cost::ModelPricing::for_model("cohere/command-r-plus"),
-            Some(cost::ModelPricing::FREE)
-        );
-        assert_eq!(
-            cost::ModelPricing::for_model("openrouter/free"),
-            Some(cost::ModelPricing::FREE)
-        );
-        assert_eq!(
-            cost::ModelPricing::for_model("opencode-zen/minimax-m2.5-free"),
-            Some(cost::ModelPricing::FREE)
-        );
-        assert_eq!(
-            cost::ModelPricing::for_model("zai/glm-4.6"),
-            Some(cost::ModelPricing::FREE)
-        );
-        assert_eq!(
-            cost::ModelPricing::for_model("zhipuai/glm-4.5"),
-            Some(cost::ModelPricing::FREE)
-        );
+        assert_eq!(cost::ModelPricing::for_model("groq/llama-3.3-70b-versatile"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("cerebras/qwen-3-235b-a22b-instruct-2507"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("google/gemini-2.5-flash"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("mistral/mistral-large-latest"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("sambanova/Meta-Llama-3.3-70B-Instruct"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("nvidia/meta/llama-3.3-70b-instruct"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("cohere/command-r-plus"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("openrouter/free"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("opencode-zen/minimax-m2.5-free"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("zai/glm-4.6"), Some(cost::ModelPricing::FREE));
+        assert_eq!(cost::ModelPricing::for_model("zhipuai/glm-4.5"), Some(cost::ModelPricing::FREE));
 
         // Test that other models use their appropriate pricing
-        assert_eq!(
-            cost::ModelPricing::for_model("claude-opus"),
-            Some(cost::ModelPricing::OPUS)
-        );
-        assert_eq!(
-            cost::ModelPricing::for_model("claude-haiku"),
-            Some(cost::ModelPricing::HAIKU)
-        );
-        assert_eq!(
-            cost::ModelPricing::for_model("claude-sonnet"),
-            Some(cost::ModelPricing::SONNET)
-        );
+        assert_eq!(cost::ModelPricing::for_model("claude-opus"), Some(cost::ModelPricing::OPUS));
+        assert_eq!(cost::ModelPricing::for_model("claude-haiku"), Some(cost::ModelPricing::HAIKU));
+        assert_eq!(cost::ModelPricing::for_model("claude-sonnet"), Some(cost::ModelPricing::SONNET));
     }
 
     #[test]
@@ -7894,16 +7413,10 @@ mod tests {
     #[test]
     fn builtin_presets_all_have_valid_model_format() {
         for preset in builtin_managed_agent_presets() {
-            assert!(
-                preset.manager_model.contains('/'),
-                "Preset {} manager_model must be provider/model",
-                preset.name
-            );
-            assert!(
-                preset.executor_model.contains('/'),
-                "Preset {} executor_model must be provider/model",
-                preset.name
-            );
+            assert!(preset.manager_model.contains('/'),
+                "Preset {} manager_model must be provider/model", preset.name);
+            assert!(preset.executor_model.contains('/'),
+                "Preset {} executor_model must be provider/model", preset.name);
         }
     }
 
