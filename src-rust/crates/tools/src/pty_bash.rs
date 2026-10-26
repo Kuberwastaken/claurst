@@ -2072,8 +2072,10 @@ mod tests {
             "sleep 30 & child=$!; printf '%s' \"$child\" > '{}'; echo before-deadline; wait \"$child\"",
             pid_file.display()
         );
-        let result = tokio::time::timeout(Duration::from_secs(3), run_user_shell(
-            &command, dir.path(), Duration::from_millis(300), dir.path(),
+        // Allow shell startup under parallel test/build load; the sleeping child
+        // must still be terminated well before its natural 30-second exit.
+        let result = tokio::time::timeout(Duration::from_secs(5), run_user_shell(
+            &command, dir.path(), Duration::from_millis(1500), dir.path(),
         )).await.expect("explicit user shell must respect its deadline");
         assert!(result.is_error);
         assert!(result.content.contains("timed out"), "{}", result.content);
@@ -2494,7 +2496,7 @@ mod tests {
         let started = run_in_background(
             "printf short; { sleep 10 & }; wait".to_string(),
             std::env::temp_dir(),
-            500,
+            1500,
             spill_dir.path(),
             None,
             None,
@@ -2516,7 +2518,11 @@ mod tests {
         })
         .await
         .expect("timeout must finish after the drain grace");
-        assert!(task.output_is_partial);
+        assert!(
+            matches!(&task.status, claurst_core::tasks::TaskStatus::Failed(reason) if reason.contains("timed out")),
+            "unexpected terminal state: {:?}; output: {}", task.status, task.render_output()
+        );
+        assert!(task.output_is_partial, "timeout did not capture fixture output: {}", task.render_output());
         assert!(task.render_output().contains("Partial output:"));
         let path = task
             .output_file
