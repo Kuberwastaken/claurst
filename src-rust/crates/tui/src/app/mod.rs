@@ -418,6 +418,10 @@ pub struct App {
     /// Browser rename request, persisted by the idle main loop so a live
     /// session's in-memory title and journal cannot diverge.
     pub session_rename_pending: Option<(String, String)>,
+    /// Browser delete request: the main loop removes the session's snapshot,
+    /// journal and lock file, then mirrors the removal into the SQLite index
+    /// used by /search.
+    pub session_delete_pending: Option<String>,
     /// Id of the session the live REPL is currently continuing. The browser's
     /// rename flow uses it to update the live title only when the renamed
     /// entry IS the current session.
@@ -830,6 +834,7 @@ impl App {
             session_list_pending: false,
             session_resume_pending: None,
             session_rename_pending: None,
+            session_delete_pending: None,
             current_session_id: None,
             session_list_rx: None,
             recent_sessions: Vec::new(),

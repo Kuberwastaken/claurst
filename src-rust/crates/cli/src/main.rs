@@ -4411,6 +4411,73 @@ async fn run_interactive(
             }
         }
 
+        // Browser delete request. Deleting the live session swaps in a fresh
+        // one first (the journal writer holds the lock and `apply` checkpoints
+        // the previous session into its journal, so the swap must happen
+        // before the delete); any other session removes its snapshot,
+        // journal and lock file. Both paths mirror the removal into the
+        // SQLite index used by /search.
+        if current_query.is_none() && !app.is_streaming {
+            if let Some(id) = app.session_delete_pending.take() {
+                let result = if id == session.id {
+                    // Deleting the current session: same fresh-home flow as
+                    // /new — model, provider, effort and working directory
+                    // carry over; the new session persists lazily once its
+                    // first message completes a turn.
+                    let model =
+                        claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
+                    let fresh = claurst_commands::build_home_session(
+                        model,
+                        Some(tool_ctx.working_dir.display().to_string()),
+                    );
+                    // `apply` checkpoints `session` into its journal for the
+                    // last time and releases that journal's lock on swap, so
+                    // the on-disk delete below runs against released files.
+                    session_resume::apply(
+                        fresh,
+                        &claurst_core::history::sessions_dir(),
+                        &mut session,
+                        &mut session_journal,
+                        &mut base_query_config,
+                        &mut messages,
+                        &mut app,
+                        &mut cmd_ctx,
+                        &mut tool_ctx,
+                    )
+                    .map(|()| {
+                        app.context_used_tokens = 0;
+                        "Session deleted. Started a new one.".to_string()
+                    })
+                } else {
+                    claurst_core::history::delete_session(&id)
+                        .await
+                        .map(|()| "Session deleted.".to_string())
+                };
+                match result {
+                    Ok(msg) => {
+                        // Keep /search's SQLite index in sync with the
+                        // journal; a stale index row would resurrect the
+                        // session in search results.
+                        let db_path = claurst_core::config::Settings::config_dir()
+                            .join("sessions.db");
+                        if let Ok(store) = claurst_core::SqliteSessionStore::open(&db_path) {
+                            if let Err(e) = store.delete_session(&id) {
+                                tracing::warn!("sqlite delete failed for {id}: {e}");
+                            }
+                        }
+                        app.status_message = Some(msg);
+                    }
+                    Err(error) => {
+                        // Either the swap failed (session untouched) or the
+                        // on-disk delete failed (already swapped to fresh);
+                        // reload the list so the browser reflects reality.
+                        app.status_message = Some(format!("Could not delete session: {error}"));
+                        app.session_list_pending = true;
+                    }
+                }
+            }
+        }
+
         // Browser selection uses the same persistence/session transition as
         // /resume. Hold the request until the old query has fully drained.
         if current_query.is_none() && !app.is_streaming {

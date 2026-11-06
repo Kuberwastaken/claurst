@@ -927,7 +927,13 @@ impl App {
                     match key.code {
                         KeyCode::Esc | KeyCode::Char('n') => self.session_browser.cancel(),
                         KeyCode::Enter | KeyCode::Char('y') => {
-                            self.session_browser.close();
+                            // Queue the on-disk deletion for the main loop
+                            // (async, like session_rename_pending) instead of
+                            // performing it here; the visible list already
+                            // dropped the entry in confirm_delete.
+                            if let Some(session_id) = self.session_browser.confirm_delete() {
+                                self.session_delete_pending = Some(session_id);
+                            }
                         }
                         _ => {}
                     }
@@ -2227,6 +2233,10 @@ impl App {
             }
             "renameSession" => {
                 self.session_browser.start_rename();
+                false
+            }
+            "deleteSession" => {
+                self.session_browser.start_delete_confirm();
                 false
             }
             "resumeSession" => {
