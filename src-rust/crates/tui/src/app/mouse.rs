@@ -409,6 +409,7 @@ impl App {
         // Key-input and device-auth stay outside this gate so their visible text
         // can still be selected and copied with the mouse.
         let any_dialog = self.connect_dialog.visible
+            || self.provider_switch_dialog.visible
             || self.import_config_picker.visible
             || self.import_config_dialog.visible
             || self.command_palette.visible
@@ -423,7 +424,9 @@ impl App {
             match mouse_event.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     // DialogSelect dialogs — check if click is inside for item selection
-                    let in_dialog = if self.connect_dialog.visible {
+                    let in_dialog = if self.provider_switch_dialog.visible {
+                        self.provider_switch_dialog.contains(mouse_event.column, mouse_event.row)
+                    } else if self.connect_dialog.visible {
                         self.connect_dialog.contains(mouse_event.column, mouse_event.row)
                     } else if self.import_config_picker.visible {
                         self.import_config_picker.contains(mouse_event.column, mouse_event.row)
@@ -438,7 +441,9 @@ impl App {
 
                     if in_dialog {
                         // Click inside a DialogSelect — select the clicked item
-                        if self.connect_dialog.visible {
+                        if self.provider_switch_dialog.visible {
+                            self.provider_switch_dialog.handle_mouse_click(mouse_event.row);
+                        } else if self.connect_dialog.visible {
                             self.connect_dialog.handle_mouse_click(mouse_event.row);
                         } else if self.import_config_picker.visible {
                             self.import_config_picker.handle_mouse_click(mouse_event.row);
@@ -454,12 +459,14 @@ impl App {
                 }
                 MouseEventKind::ScrollUp => {
                     // Scroll through dialog items
-                    if self.connect_dialog.visible { self.connect_dialog.move_up(); }
+                    if self.provider_switch_dialog.visible { self.provider_switch_dialog.move_up(); }
+                    else if self.connect_dialog.visible { self.connect_dialog.move_up(); }
                     else if self.import_config_picker.visible { self.import_config_picker.move_up(); }
                     else if self.command_palette.visible { self.command_palette.move_up(); }
                 }
                 MouseEventKind::ScrollDown => {
-                    if self.connect_dialog.visible { self.connect_dialog.move_down(); }
+                    if self.provider_switch_dialog.visible { self.provider_switch_dialog.move_down(); }
+                    else if self.connect_dialog.visible { self.connect_dialog.move_down(); }
                     else if self.import_config_picker.visible { self.import_config_picker.move_down(); }
                     else if self.command_palette.visible { self.command_palette.move_down(); }
                 }

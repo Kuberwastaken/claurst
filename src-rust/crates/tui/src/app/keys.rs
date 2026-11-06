@@ -599,6 +599,32 @@ impl App {
             return false;
         }
 
+        // Switch-provider dialog (/provider command) — lists already-configured
+        // providers and switches to one without re-running the connect flow.
+        if self.provider_switch_dialog.visible {
+            match key.code {
+                KeyCode::Esc => { self.provider_switch_dialog.close(); }
+                KeyCode::Home => { self.provider_switch_dialog.move_home(); }
+                KeyCode::End => { self.provider_switch_dialog.move_end(); }
+                KeyCode::Up => { self.provider_switch_dialog.move_up(); }
+                KeyCode::Down => { self.provider_switch_dialog.move_down(); }
+                KeyCode::PageUp => { self.provider_switch_dialog.page_up(); }
+                KeyCode::PageDown => { self.provider_switch_dialog.page_down(); }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.provider_switch_dialog.move_up(); }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.provider_switch_dialog.move_down(); }
+                KeyCode::Enter => {
+                    if let Some(selected) = self.provider_switch_dialog.selected().cloned() {
+                        self.provider_switch_dialog.close();
+                        self.switch_provider(selected.id.clone());
+                    }
+                }
+                KeyCode::Backspace => { self.provider_switch_dialog.filter_pop(); }
+                KeyCode::Char(c) => { self.provider_switch_dialog.filter_push(c); }
+                _ => {}
+            }
+            return false;
+        }
+
         // Connect-a-provider dialog (/connect command)
         if self.connect_dialog.visible {
             match key.code {
