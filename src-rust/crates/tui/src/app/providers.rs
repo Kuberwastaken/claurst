@@ -171,110 +171,6 @@ pub(super) fn provider_picker_items() -> Vec<SelectItem> {
     ]
 }
 
-/// Human-readable name for a provider ID (used by the `/provider` switch
-/// dialog). Falls back to the raw ID for anything not listed here.
-pub(super) fn provider_display_name(id: &str) -> String {
-    match id {
-        "anthropic" => "Anthropic",
-        "openai" => "OpenAI",
-        "openai-codex" | "codex" => "OpenAI Codex",
-        "github-copilot" => "GitHub Copilot",
-        "google" => "Google",
-        "custom-openai" => "Custom OpenAI-Compatible",
-        "openrouter" => "OpenRouter",
-        "groq" => "Groq",
-        "cerebras" => "Cerebras",
-        "sambanova" => "SambaNova",
-        "deepseek" => "DeepSeek",
-        "mistral" => "Mistral",
-        "xai" => "xAI",
-        "togetherai" | "together-ai" => "Together AI",
-        "perplexity" => "Perplexity",
-        "cohere" => "Cohere",
-        "deepinfra" => "DeepInfra",
-        "azure" => "Azure OpenAI",
-        "minimax" => "MiniMax",
-        "nvidia" => "NVIDIA",
-        "huggingface" => "Hugging Face",
-        "zai" => "Z.AI",
-        "zhipuai" | "zhipu" => "Zhipu AI",
-        "moonshotai" | "moonshot" => "Moonshot AI",
-        "siliconflow" => "SiliconFlow",
-        "nebius" => "Nebius",
-        "novita" => "Novita",
-        "ovhcloud" => "OVHcloud",
-        "scaleway" => "Scaleway",
-        "vultr" => "Vultr",
-        "baseten" => "Baseten",
-        "friendli" => "Friendli",
-        "upstage" => "Upstage",
-        "stepfun" => "StepFun",
-        "fireworks" => "Fireworks AI",
-        "opencode-zen" => "OpenCode Zen",
-        "opencode-go" => "OpenCode Go",
-        "synthetic" => "Synthetic.dev",
-        "routing" => "routing.run",
-        "neuralwatt" => "NeuralWatt",
-        "free" => "Free Mode",
-        "ollama" => "Ollama",
-        "lmstudio" => "LM Studio",
-        "llamacpp" => "llama.cpp",
-        other => other,
-    }
-    .to_string()
-}
-
-/// Short description for a provider ID (used by the `/provider` switch dialog).
-pub(super) fn provider_description(id: &str) -> &'static str {
-    match id {
-        "anthropic" => "Claude models",
-        "openai" => "GPT models",
-        "openai-codex" | "codex" => "ChatGPT subscription",
-        "github-copilot" => "GitHub subscription or token",
-        "google" => "Gemini models",
-        "custom-openai" => "Custom URL + API key",
-        "openrouter" => "100+ models with one key",
-        "groq" => "Fast hosted inference",
-        "cerebras" => "Fast hosted inference",
-        "sambanova" => "Fast hosted inference",
-        "deepseek" => "Reasoning and coding models",
-        "mistral" => "Hosted Mistral models",
-        "xai" => "Grok models",
-        "togetherai" | "together-ai" => "Open model hosting",
-        "perplexity" => "Search-augmented models",
-        "cohere" => "Command models",
-        "deepinfra" => "Hosted open models",
-        "azure" => "Enterprise OpenAI deployments",
-        "minimax" => "Anthropic-compatible (M3)",
-        "nvidia" => "Hosted NVIDIA models",
-        "huggingface" => "Hosted community models",
-        "zai" => "GLM coding plan",
-        "zhipuai" | "zhipu" => "Hosted GLM models",
-        "moonshotai" | "moonshot" => "Hosted Moonshot models",
-        "siliconflow" => "Hosted open models",
-        "nebius" => "Cloud inference",
-        "novita" => "Cloud inference",
-        "ovhcloud" => "EU-hosted AI",
-        "scaleway" => "EU cloud AI",
-        "vultr" => "Cloud inference",
-        "baseten" => "Model serving",
-        "friendli" => "Serverless inference",
-        "upstage" => "Hosted Upstage models",
-        "stepfun" => "Hosted reasoning models",
-        "fireworks" => "Fast inference",
-        "opencode-zen" => "Free models + paid",
-        "opencode-go" => "Flat-rate hosted models",
-        "synthetic" => "Hosted open weights",
-        "routing" => "Hosted open weights",
-        "neuralwatt" => "Energy-efficient inference",
-        "free" => "OpenCode Zen to OpenRouter fallback",
-        "ollama" => "Local model server",
-        "lmstudio" => "Local model server",
-        "llamacpp" => "Local inference server",
-        _ => "Configured provider",
-    }
-}
-
 impl App {
     pub fn open_import_config_picker(&mut self) {
         self.import_config_picker = DialogSelectState::new("Import config", import_config_picker_items());
@@ -282,138 +178,97 @@ impl App {
     }
 
     /// Collect the providers the user already has credentials for, as picker
-    /// items for the `/provider` switch dialog. A provider counts as
-    /// configured when it has a stored credential (API key or OAuth token), a
-    /// provider-specific API key in settings, a resolved env var, or (for
-    /// account-based providers) at least one registered account profile.
+    /// items for the `/provider` switch dialog. Reuses the `/connect` catalog
+    /// (`provider_picker_items`) so there is one list of provider metadata;
+    /// `anthropic-oauth` is skipped because it is a connect-flow alias whose
+    /// credentials live under the real `anthropic` provider.
     ///
-    /// The currently active provider is always included and marked with a
-    /// "CURRENT" badge so the list is never empty mid-session.
+    /// A provider counts as configured when it has a stored credential (API
+    /// key or OAuth token in auth.json), a provider API key in settings, a
+    /// resolvable API-key env var (via `AuthStore::api_key_for`), or — for
+    /// account-based providers — at least one registered account profile.
+    /// Local runtimes (`ollama`/`lmstudio`/`llamacpp`) and the keyless `free`
+    /// composite count as configured when their settings entry is enabled.
+    ///
+    /// The active provider is always included and badged `CURRENT` so the
+    /// dialog is never empty mid-session.
     pub(super) fn configured_provider_items(&self) -> Vec<SelectItem> {
         let registry = claurst_core::accounts::AccountRegistry::load();
         let settings = Settings::load_sync().unwrap_or_default();
         let current = self.config.selected_provider_id().to_string();
-        let known = [
-            "anthropic",
-            "openai",
-            "openai-codex",
-            "github-copilot",
-            "google",
-            "custom-openai",
-            "openrouter",
-            "groq",
-            "cerebras",
-            "sambanova",
-            "deepseek",
-            "mistral",
-            "xai",
-            "togetherai",
-            "perplexity",
-            "cohere",
-            "deepinfra",
-            "azure",
-            "minimax",
-            "nvidia",
-            "huggingface",
-            "zai",
-            "zhipuai",
-            "moonshotai",
-            "siliconflow",
-            "nebius",
-            "novita",
-            "ovhcloud",
-            "scaleway",
-            "vultr",
-            "baseten",
-            "friendli",
-            "upstage",
-            "stepfun",
-            "fireworks",
-            "opencode-zen",
-            "opencode-go",
-            "synthetic",
-            "routing",
-            "neuralwatt",
-            "free",
-            "ollama",
-            "lmstudio",
-            "llamacpp",
-        ];
 
-        let mut items: Vec<SelectItem> = Vec::new();
-        for id in known {
-            let has_account = match id {
-                "anthropic" => {
-                    !registry
-                        .list(claurst_core::accounts::PROVIDER_ANTHROPIC)
-                        .is_empty()
+        let mut items: Vec<SelectItem> = provider_picker_items()
+            .into_iter()
+            .filter(|item| item.id != "anthropic-oauth")
+            .filter(|item| {
+                if item.id == current {
+                    return true;
                 }
-                "openai-codex" | "codex" => {
-                    !registry
-                        .list(claurst_core::accounts::PROVIDER_CODEX)
-                        .is_empty()
-                }
-                _ => false,
-            };
-            // `free` is a composite that needs no key; `ollama`/`lmstudio`/
-            // `llamacpp` run locally. The rest need a stored key, a provider
-            // settings key, or an env var.
-            let is_configured = match id {
-                "free" => {
-                    settings
+                let has_account = match item.id.as_str() {
+                    "anthropic" => {
+                        !registry
+                            .list(claurst_core::accounts::PROVIDER_ANTHROPIC)
+                            .is_empty()
+                    }
+                    "openai-codex" => {
+                        !registry
+                            .list(claurst_core::accounts::PROVIDER_CODEX)
+                            .is_empty()
+                    }
+                    _ => false,
+                };
+                let is_configured = match item.id.as_str() {
+                    // Keyless composites and local runtimes: configured when
+                    // their settings entry exists and is enabled.
+                    "free" | "ollama" | "lmstudio" | "llamacpp" => settings
                         .providers
-                        .get("free")
+                        .get(item.id.as_str())
                         .map(|c| c.enabled)
-                        .unwrap_or(false)
-                        || self.config.provider.as_deref() == Some("free")
-                }
-                "ollama" | "lmstudio" | "llamacpp" => {
-                    settings
-                        .providers
-                        .get(id)
-                        .map(|c| c.enabled)
-                        .unwrap_or(false)
-                        || self.config.provider.as_deref() == Some(id)
-                }
-                _ => {
-                    self.auth_store.api_key_for(id).is_some()
-                        || settings
-                            .providers
-                            .get(id)
-                            .and_then(|c| c.api_key.as_ref())
-                            .is_some_and(|k| !k.is_empty())
-                        || has_account
-                }
-            };
-            if !is_configured && id != current {
-                continue;
-            }
-            let is_current = id == current;
-            items.push(SelectItem {
-                id: id.to_string(),
-                title: provider_display_name(id),
-                description: provider_description(id).to_string(),
-                category: if is_current {
+                        .unwrap_or(false),
+                    _ => {
+                        self.auth_store.api_key_for(item.id.as_str()).is_some()
+                            || settings
+                                .providers
+                                .get(item.id.as_str())
+                                .and_then(|c| c.api_key.as_ref())
+                                .is_some_and(|k| !k.is_empty())
+                            || has_account
+                    }
+                };
+                is_configured
+            })
+            .map(|mut item| {
+                let is_current = item.id == current;
+                item.category = if is_current {
                     "Current".to_string()
                 } else {
                     "Configured".to_string()
-                },
-                badge: Some(if is_current { "CURRENT" } else { "READY" }.to_string()),
-            });
-        }
+                };
+                item.badge = Some(if is_current { "CURRENT" } else { "READY" }.to_string());
+                item
+            })
+            .collect();
 
-        // Always include the active provider even if it was filtered out.
+        // The active provider may not be part of the connect catalog (e.g. an
+        // alias like `codex`); keep the dialog non-empty in that case.
         if !items.iter().any(|i| i.id == current) {
-            items.insert(
-                0,
-                SelectItem {
-                    id: current.clone(),
-                    title: provider_display_name(&current),
-                    description: provider_description(&current).to_string(),
-                    category: "Current".to_string(),
-                    badge: Some("CURRENT".to_string()),
-                },
-            );
+            let mut fallback = SelectItem {
+                id: current.clone(),
+                title: current.clone(),
+                description: "Active provider".to_string(),
+                category: "Current".to_string(),
+                badge: Some("CURRENT".to_string()),
+            };
+            // `openai-codex` and `codex` are the same provider; prefer the
+            // catalog title when the alias form is active.
+            if current == "codex" {
+                fallback.title = "OpenAI Codex".to_string();
+            } else if let Some(item) =
+                provider_picker_items().into_iter().find(|i| i.id == current)
+            {
+                fallback.title = item.title;
+            }
+            items.insert(0, fallback);
         }
         items
     }
@@ -433,9 +288,10 @@ impl App {
     }
 
     /// Switch to an already-configured provider without re-running its auth
-    /// flow, then open the model picker for it (matching `/connect`).
-    pub(super) fn switch_provider(&mut self, provider_id: String) {
-        let provider_name = provider_display_name(&provider_id);
+    /// flow, then open the model picker for it (matching `/connect`). The
+    /// dialog item's title is already the human-readable provider name from
+    /// the connect catalog.
+    pub(super) fn switch_provider(&mut self, provider_id: String, provider_name: String) {
         self.activate_provider(provider_id, provider_name, "Switched to");
     }
 

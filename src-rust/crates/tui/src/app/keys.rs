@@ -615,7 +615,7 @@ impl App {
                 KeyCode::Enter => {
                     if let Some(selected) = self.provider_switch_dialog.selected().cloned() {
                         self.provider_switch_dialog.close();
-                        self.switch_provider(selected.id.clone());
+                        self.switch_provider(selected.id, selected.title);
                     }
                 }
                 KeyCode::Backspace => { self.provider_switch_dialog.filter_pop(); }

@@ -2472,6 +2472,17 @@ fn provider_switch_active_provider_always_listed() {
     let _home = provider_switch_test_support::TempConfigHome::new("fallback");
     let app = make_app();
     let items = app.configured_provider_items();
-    assert!(!items.is_empty(), "active provider is always included");
-    assert!(items.iter().all(|i| i.category == "Current" || !i.id.is_empty()));
+    // The active provider must appear exactly once, first, badged CURRENT.
+    let current = app.config.selected_provider_id();
+    let current_items: Vec<&_> = items
+        .iter()
+        .filter(|i| i.id == current)
+        .collect();
+    assert_eq!(current_items.len(), 1, "active provider listed exactly once");
+    assert_eq!(current_items[0].category, "Current");
+    assert_eq!(current_items[0].badge.as_deref(), Some("CURRENT"));
+    assert_eq!(items.first().map(|i| i.id.as_str()), Some(current));
+    // Every other entry is badged READY and comes from the connect catalog,
+    // with the `anthropic-oauth` connect-flow alias filtered out.
+    assert!(items.iter().all(|i| i.id != "anthropic-oauth"));
 }
