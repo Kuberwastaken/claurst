@@ -158,7 +158,8 @@ In the TUI, `/session` opens the session browser. The text form shows the curren
 The browser overlay lists saved sessions across projects with their
 title, last-updated time, message count, and cost. In the overlay:
 
-- `↑`/`↓` navigate, `Enter` resumes the selected session, `r` renames it, `Esc` closes.
+- `↑`/`↓` navigate, `Enter` resumes the selected session, `r` renames it, `d` deletes it, `Esc` closes.
+- `d` asks for confirmation: `Enter` (or `y`) deletes, `Esc` (or `n`) cancels; the footer follows the rename flow's `Enter=confirm  Esc=cancel` wording. Deleting removes the session's snapshot, journal and lock file, and drops it from the SQLite index used by `/search`. Deleting the session you are currently in follows the `/new` flow instead: the session's files are removed and a fresh session (same model, provider, effort and working directory) starts in its place.
 - `PageUp`/`PageDown` move eight sessions and stop at the ends.
 - `a` toggles each session's working-directory path under its row. Paths are
   shown for the sessions already listed — it does not reveal sessions from
