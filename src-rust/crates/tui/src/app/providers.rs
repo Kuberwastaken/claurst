@@ -177,6 +177,124 @@ impl App {
         self.import_config_picker.open();
     }
 
+    /// Collect the providers the user already has credentials for, as picker
+    /// items for the `/provider` switch dialog. Reuses the `/connect` catalog
+    /// (`provider_picker_items`) so there is one list of provider metadata;
+    /// `anthropic-oauth` is skipped because it is a connect-flow alias whose
+    /// credentials live under the real `anthropic` provider.
+    ///
+    /// A provider counts as configured when it has a stored credential (API
+    /// key or OAuth token in auth.json), a provider API key in settings, a
+    /// resolvable API-key env var (via `AuthStore::api_key_for`), or — for
+    /// account-based providers — at least one registered account profile.
+    /// Local runtimes (`ollama`/`lmstudio`/`llamacpp`) and the keyless `free`
+    /// composite count as configured when their settings entry is enabled.
+    ///
+    /// The active provider is always included and badged `CURRENT` so the
+    /// dialog is never empty mid-session.
+    pub(super) fn configured_provider_items(&self) -> Vec<SelectItem> {
+        let registry = claurst_core::accounts::AccountRegistry::load();
+        let settings = Settings::load_sync().unwrap_or_default();
+        let current = self.config.selected_provider_id().to_string();
+
+        let mut items: Vec<SelectItem> = provider_picker_items()
+            .into_iter()
+            .filter(|item| item.id != "anthropic-oauth")
+            .filter(|item| {
+                if item.id == current {
+                    return true;
+                }
+                let has_account = match item.id.as_str() {
+                    "anthropic" => {
+                        !registry
+                            .list(claurst_core::accounts::PROVIDER_ANTHROPIC)
+                            .is_empty()
+                    }
+                    "openai-codex" => {
+                        !registry
+                            .list(claurst_core::accounts::PROVIDER_CODEX)
+                            .is_empty()
+                    }
+                    _ => false,
+                };
+                let is_configured = match item.id.as_str() {
+                    // Keyless composites and local runtimes: configured when
+                    // their settings entry exists and is enabled.
+                    "free" | "ollama" | "lmstudio" | "llamacpp" => settings
+                        .providers
+                        .get(item.id.as_str())
+                        .map(|c| c.enabled)
+                        .unwrap_or(false),
+                    _ => {
+                        self.auth_store.api_key_for(item.id.as_str()).is_some()
+                            || settings
+                                .providers
+                                .get(item.id.as_str())
+                                .and_then(|c| c.api_key.as_ref())
+                                .is_some_and(|k| !k.is_empty())
+                            || has_account
+                    }
+                };
+                is_configured
+            })
+            .map(|mut item| {
+                let is_current = item.id == current;
+                item.category = if is_current {
+                    "Current".to_string()
+                } else {
+                    "Configured".to_string()
+                };
+                item.badge = Some(if is_current { "CURRENT" } else { "READY" }.to_string());
+                item
+            })
+            .collect();
+
+        // The active provider may not be part of the connect catalog (e.g. an
+        // alias like `codex`); keep the dialog non-empty in that case.
+        if !items.iter().any(|i| i.id == current) {
+            let mut fallback = SelectItem {
+                id: current.clone(),
+                title: current.clone(),
+                description: "Active provider".to_string(),
+                category: "Current".to_string(),
+                badge: Some("CURRENT".to_string()),
+            };
+            // `openai-codex` and `codex` are the same provider; prefer the
+            // catalog title when the alias form is active.
+            if current == "codex" {
+                fallback.title = "OpenAI Codex".to_string();
+            } else if let Some(item) =
+                provider_picker_items().into_iter().find(|i| i.id == current)
+            {
+                fallback.title = item.title;
+            }
+            items.insert(0, fallback);
+        }
+        items
+    }
+
+    /// Open the `/provider` switch dialog, populating it with configured
+    /// providers. If none are configured, fall back to the connect flow.
+    pub(super) fn open_provider_switch_dialog(&mut self) {
+        let items = self.configured_provider_items();
+        if items.is_empty() {
+            self.connect_dialog.open();
+            self.status_message =
+                Some("No providers configured. Connect one first.".to_string());
+            return;
+        }
+        self.provider_switch_dialog = DialogSelectState::new("Switch provider", items);
+        self.provider_switch_dialog.open();
+    }
+
+    /// Switch to an already-configured provider without re-running its auth
+    /// flow, then open the model picker for it (matching `/connect`). The
+    /// dialog item's title is already the human-readable provider name from
+    /// the connect catalog.
+    pub(super) fn switch_provider(&mut self, provider_id: String, provider_name: String) {
+        self.activate_provider(provider_id, provider_name, "Switched to");
+    }
+
     pub(super) fn import_selection_from_picker(id: &str) -> Option<claurst_core::ImportSelection> {
         match id {
             "claude-md" => Some(claurst_core::ImportSelection::ClaudeMd),
@@ -434,6 +552,7 @@ impl App {
         self.model_registry.apply_model_overrides(&self.config.model_overrides);
         self.auth_store = auth_store;
         self.connect_dialog = DialogSelectState::new("Connect a provider", provider_picker_items());
+        self.provider_switch_dialog = DialogSelectState::new("Switch provider", Vec::new());
         self.import_config_picker = DialogSelectState::new("Import config", import_config_picker_items());
         self.import_config_dialog = ImportConfigDialogState::new();
         self.model_picker = ModelPickerState::new();

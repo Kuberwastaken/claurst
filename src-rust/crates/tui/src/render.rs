@@ -859,6 +859,11 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         render_dialog_select(frame, &app.connect_dialog, size);
     }
 
+    // Switch-provider dialog (/provider command)
+    if app.provider_switch_dialog.visible {
+        render_dialog_select(frame, &app.provider_switch_dialog, size);
+    }
+
     // API key input dialog (opened from /connect for key-based providers)
     if app.key_input_dialog.visible {
         render_key_input_dialog(frame, &app.key_input_dialog, size);
