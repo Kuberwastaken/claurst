@@ -5985,8 +5985,19 @@ pub mod cost {
                 } else if model.contains("haiku") {
                     Some(Self::HAIKU)
                 } else {
-                    // Unknown model: no default pricing (issue #499).
-                    None
+                    // Any other model: its published list price from llm-prices.
+                    // Rows with a long-context tier get no flat rate, like Haiku 5.5.
+                    llm_prices::lookup(model)
+                        .filter(|p| p.long_context.is_none())
+                        .and_then(|p| {
+                            let input = p.input?;
+                            Some(Self {
+                                input_per_mtk: input,
+                                output_per_mtk: p.output?,
+                                cache_creation_per_mtk: p.cache_write("5m").unwrap_or(input),
+                                cache_read_per_mtk: p.cache_read.unwrap_or(input),
+                            })
+                        })
                 }
             }
         }
@@ -7687,6 +7698,17 @@ mod tests {
         // Being told "no price" (catalog miss) behaves the same.
         tracker.set_pricing(None);
         assert_eq!(tracker.total_cost_usd(), 0.0);
+    }
+
+    #[test]
+    fn non_claude_models_priced_from_llm_prices() {
+        let gpt = cost::ModelPricing::for_model("gpt-4o").unwrap();
+        assert_eq!((gpt.input_per_mtk, gpt.output_per_mtk), (2.5, 10.0));
+        assert_eq!(gpt.cache_read_per_mtk, 1.25);
+        let tracker = CostTracker::with_model("deepseek-chat");
+        tracker.add_usage(1_000_000, 1_000_000, 0, 0);
+        assert!((tracker.total_cost_usd() - 1.5).abs() < 1e-9);
+        assert_eq!(cost::ModelPricing::for_model("not-a-real-model"), None);
     }
 
     #[test]

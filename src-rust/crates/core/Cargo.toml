@@ -102,6 +102,7 @@ tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
 rusqlite = { workspace = true }
 fslock = { workspace = true }
+llm-prices = "1.8.0"
 # Optional: real audio capture for voice input (gated behind the `voice` feature)
 cpal = { version = "0.15", optional = true }
 
