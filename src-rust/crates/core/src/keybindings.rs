@@ -380,6 +380,7 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         ("enter", "resumeSession", KeyContext::SessionBrowser),
         ("escape", "closeSessionBrowser", KeyContext::SessionBrowser),
         ("r", "renameSession", KeyContext::SessionBrowser),
+        ("d", "deleteSession", KeyContext::SessionBrowser),
         ("a", "toggleSessionPaths", KeyContext::SessionBrowser),
         ("p", "toggleSessionPreview", KeyContext::SessionBrowser),
     ];

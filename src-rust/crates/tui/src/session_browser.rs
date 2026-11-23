@@ -254,6 +254,33 @@ impl SessionBrowserState {
         Some((session_id, new_name))
     }
 
+    /// Enter confirm mode for deleting the selected session. Mirrors
+    /// `start_rename` but needs no input buffer — the `Confirm` hint row is
+    /// redrawn with the target session's title.
+    pub fn start_delete_confirm(&mut self) {
+        if self.selected_session().is_some() {
+            self.mode = SessionBrowserMode::Confirm;
+        }
+    }
+
+    /// Confirm the delete. Returns the id of the session to delete and drops
+    /// it from the visible list immediately (the main loop performs the
+    /// on-disk removal, mirroring how `confirm_rename` only queues the
+    /// rename). Resets to browse mode.
+    pub fn confirm_delete(&mut self) -> Option<String> {
+        if self.mode != SessionBrowserMode::Confirm {
+            return None;
+        }
+        let session_id = self.selected_session()?.id.clone();
+        let index = self.sessions.iter().position(|session| session.id == session_id)?;
+        self.sessions.remove(index);
+        if self.selected_idx >= self.sessions.len() {
+            self.selected_idx = self.sessions.len().saturating_sub(1);
+        }
+        self.mode = SessionBrowserMode::Browse;
+        Some(session_id)
+    }
+
     /// Cancel the current mode:
     /// - In `Rename` or `Confirm` mode: return to `Browse`.
     /// - In `Browse` mode: close the overlay.
@@ -543,7 +570,37 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
     // --- Mode-sensitive hint bar -------------------------------------------
     let hint_lines: Vec<Line> = match &state.mode {
         SessionBrowserMode::Browse => vec![
-            Line::styled("  /=filter  Ctrl+U=clear", Style::default().fg(Color::DarkGray)),
+            Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    "/",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("=filter  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "Ctrl+U",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("=clear  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "Enter",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("=resume  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "Esc",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("=close", Style::default().fg(Color::DarkGray)),
+            ]),
             Line::from(vec![
                 Span::styled("  ", Style::default()),
                 Span::styled(
@@ -554,19 +611,19 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
                 ),
                 Span::styled(" navigate  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    "Enter",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("=resume  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
                     "r",
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("=rename  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "d",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("=delete  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "a",
                     Style::default()
@@ -580,14 +637,7 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("=preview  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "Esc",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("=close", Style::default().fg(Color::DarkGray)),
+                Span::styled("=preview", Style::default().fg(Color::DarkGray)),
             ]),
         ],
         SessionBrowserMode::Search => vec![
@@ -630,25 +680,35 @@ pub fn render_session_browser(state: &SessionBrowserState, area: Rect, buf: &mut
         SessionBrowserMode::Confirm => vec![
             Line::from(vec![
                 Span::styled(
-                    "  Confirm? ",
+                    format!(
+                        "  Delete \"{}\"?",
+                        state
+                            .selected_session()
+                            .map(|s| s.title.as_str())
+                            .unwrap_or("session")
+                    ),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
+            ]),
+            Line::from(vec![
+                Span::styled("  ", Style::default()),
                 Span::styled(
                     "Enter",
                     Style::default()
-                        .fg(Color::Green)
+                        .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("=yes  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("=confirm  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "Esc",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("=no", Style::default().fg(Color::DarkGray)),
+                Span::styled("=cancel", Style::default().fg(Color::DarkGray)),
             ]),
-            Line::from(""),
         ],
     };
 
@@ -1340,5 +1400,144 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
         render_session_browser(&s, area, &mut buf);
+    }
+
+    // ---- delete flow (d + Confirm) ----
+
+    #[test]
+    fn start_delete_confirm_requires_selection() {
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        assert!(s.selected_session().is_some());
+        s.start_delete_confirm();
+        assert_eq!(s.mode, SessionBrowserMode::Confirm);
+
+        // An empty list has no selection; the mode must not change.
+        s.open(vec![]);
+        assert!(s.selected_session().is_none());
+        s.start_delete_confirm();
+        assert_eq!(s.mode, SessionBrowserMode::Browse);
+    }
+
+    #[test]
+    fn confirm_delete_while_not_in_confirm_is_ignored() {
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        assert_eq!(
+            s.confirm_delete(),
+            None,
+            "confirm_delete must be a no-op outside Confirm mode"
+        );
+        assert_eq!(s.sessions.len(), sample_sessions().len());
+    }
+
+    #[test]
+    fn cancel_delete_returns_to_browse_and_keeps_list() {
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        s.start_delete_confirm();
+        s.cancel();
+        assert_eq!(s.mode, SessionBrowserMode::Browse);
+        assert_eq!(s.sessions.len(), sample_sessions().len());
+    }
+
+    #[test]
+    fn confirm_delete_removes_selected_session_and_clamps_selection() {
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        let before = s.sessions.len();
+        s.selected_idx = before - 1; // last row: exercises the clamp
+        let target = s.selected_session().unwrap().id.clone();
+        s.start_delete_confirm();
+        let deleted = s.confirm_delete();
+        assert_eq!(deleted.as_deref(), Some(target.as_str()));
+        assert_eq!(s.mode, SessionBrowserMode::Browse);
+        assert_eq!(s.sessions.len(), before - 1);
+        assert!(!s.sessions.iter().any(|x| x.id == target));
+        assert!(s.selected_idx < s.sessions.len());
+    }
+
+    #[test]
+    fn render_browse_footer_puts_esc_on_first_row() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        render_session_browser(&s, area, &mut buf);
+        // Trimmed rows of the rendered buffer.
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        let esc_rows: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.contains("Esc=close"))
+            .map(|(y, _)| y)
+            .collect();
+        assert_eq!(
+            esc_rows.len(),
+            1,
+            "Esc=close must appear exactly once in the browse footer"
+        );
+        let esc_row = &rows[esc_rows[0]];
+        assert!(
+            esc_row.contains("filter") && esc_row.contains("Ctrl+U"),
+            "Esc=close must share the /=filter row now, got: {esc_row}"
+        );
+        assert!(
+            esc_row.contains("Enter=resume"),
+            "Enter=resume must sit between Ctrl+U=clear and Esc=close, got: {esc_row}"
+        );
+    }
+
+
+    #[test]
+    fn render_confirm_mode_names_selected_session() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        let mut s = SessionBrowserState::new();
+        s.open(sample_sessions());
+        s.start_delete_confirm();
+        render_session_browser(&s, area, &mut buf);
+        let text: String = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        let title = s.selected_session().unwrap().title.clone();
+        assert!(
+            text.contains(&format!("Delete \"{title}\"?")),
+            "confirm prompt must name the target session"
+        );
+        // Same two-row layout as the rename footer: the prompt names the
+        // target on its own row, and Enter/Esc sit on the row below it.
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        let prompt_rows: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.contains("Delete"))
+            .map(|(y, _)| y)
+            .collect();
+        assert_eq!(prompt_rows.len(), 1, "prompt on exactly one row");
+        assert!(
+            !rows[prompt_rows[0]].contains("Enter"),
+            "prompt row must not carry the confirm keys"
+        );
+        assert!(
+            rows[prompt_rows[0] + 1].contains("Enter=confirm"),
+            "Enter/Esc must sit on the row directly below the prompt"
+        );
     }
 }
