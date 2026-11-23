@@ -171,6 +171,7 @@ Inside the interactive TUI, type `/` to see all available commands. Common ones:
 |---------|-------------|
 | `/help` | Show all commands |
 | `/model` | Switch model or provider |
+| `/provider` | Switch to an already-configured provider (no re-auth) |
 | `/login` | OAuth login (Anthropic; `--codex` for ChatGPT, `--label <name>` to name) |
 | `/accounts` | List stored Anthropic + Codex accounts |
 | `/switch <id>` | Switch active account (`--codex` for Codex) |

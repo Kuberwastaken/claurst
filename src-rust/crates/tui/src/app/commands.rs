@@ -46,6 +46,7 @@ pub(super) const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("output-style", "Show or switch the output style / persona"),
     ("plugin", "Manage plugins (list/info/enable/disable/reload)"),
     ("poke", "Toggle or configure auto-poke (on/off/status)"),
+    ("provider", "Switch to a configured AI provider"),
     ("providers", "List available AI providers and their status"),
     ("caveman", "Caveman persona output style — save big token"),
     ("rocky", "Rocky persona output style — amaze amaze amaze"),
@@ -74,7 +75,7 @@ pub(super) const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
 
 pub(super) fn help_command_category(name: &str) -> &'static str {
     match name {
-        "connect" | "model" | "providers" | "refresh" | "fast" | "effort" | "voice" => "Model & Provider",
+        "connect" | "model" | "provider" | "providers" | "refresh" | "fast" | "effort" | "voice" => "Model & Provider",
         "yolo" => "Permissions",
         "changes" | "diff" | "review" | "rewind" | "export" | "copy" | "share" | "links" => "Review & History",
         "stats" | "cost" | "context" | "insights" | "heapdump" | "doctor" => "Diagnostics",
@@ -367,6 +368,10 @@ impl App {
             }
             "connect" => {
                 self.connect_dialog.open();
+                true
+            }
+            "provider" => {
+                self.open_provider_switch_dialog();
                 true
             }
             "model" => {

@@ -464,6 +464,9 @@ pub struct App {
     pub last_todo_hash: String,
     /// Connect-a-provider dialog (/connect command).
     pub connect_dialog: DialogSelectState,
+    /// Switch-provider dialog (/provider command) — lists configured
+    /// providers only and switches to one without re-running the connect flow.
+    pub provider_switch_dialog: DialogSelectState,
     /// Import-config source picker (/import-config command).
     pub import_config_picker: DialogSelectState,
     /// Import-config preview and confirmation dialog.
@@ -847,6 +850,7 @@ impl App {
             no_progress_turns: 0,
             last_todo_hash: String::new(),
             connect_dialog: DialogSelectState::new("Connect a provider", provider_picker_items()),
+            provider_switch_dialog: DialogSelectState::new("Switch provider", Vec::new()),
             import_config_picker: DialogSelectState::new("Import config", import_config_picker_items()),
             import_config_dialog: ImportConfigDialogState::new(),
             command_palette: {

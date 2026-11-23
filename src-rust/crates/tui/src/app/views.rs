@@ -23,6 +23,7 @@ impl App {
         self.export_dialog.dismiss();
         self.context_viz.close();
         self.connect_dialog.close();
+        self.provider_switch_dialog.close();
         self.import_config_picker.close();
         self.import_config_dialog.close();
         self.command_palette.close();
@@ -64,6 +65,7 @@ impl App {
             || self.onboarding_dialog.visible
             || self.import_config_picker.visible
             || self.connect_dialog.visible
+            || self.provider_switch_dialog.visible
             || self.key_input_dialog.visible
             || self.custom_provider_dialog.visible
             || self.free_mode_dialog.visible

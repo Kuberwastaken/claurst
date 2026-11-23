@@ -2332,3 +2332,157 @@ fn kb_selection_width_change_cancels_before_copy_but_height_change_preserves() {
     assert!(app.status_message.as_deref().is_some_and(|s| s.contains("width changed")));
     assert!(app.kb_line_text.borrow().is_empty());
 }
+
+// ---- /provider switch dialog ----
+
+mod provider_switch_test_support {
+    use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Redirects CLAURST_HOME to a fresh temp dir so tests never touch the
+    /// real settings.json / auth.json / account registry. Serializes runs
+    /// (env vars are process-global) and restores the var on drop.
+    pub struct TempConfigHome {
+        _guard: MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+        pub path: PathBuf,
+    }
+
+    fn serial() -> &'static Mutex<()> {
+        static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+        SERIAL.get_or_init(|| Mutex::new(()))
+    }
+
+    impl TempConfigHome {
+        pub fn new(unique: &str) -> Self {
+            let guard = serial()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let path = std::env::temp_dir().join(format!(
+                "claurst-tui-provider-test-{}-{}",
+                unique,
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("create temp config dir");
+            let previous = std::env::var_os("CLAURST_HOME");
+            std::env::set_var("CLAURST_HOME", &path);
+            Self {
+                _guard: guard,
+                previous,
+                path,
+            }
+        }
+    }
+
+    impl Drop for TempConfigHome {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(old) => std::env::set_var("CLAURST_HOME", old),
+                None => std::env::remove_var("CLAURST_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+#[test]
+fn provider_command_opens_switch_dialog() {
+    let _home = provider_switch_test_support::TempConfigHome::new("opens");
+    let mut app = make_app();
+    app.auth_store.set(
+        "openrouter",
+        claurst_core::StoredCredential::ApiKey {
+            key: "or-key".to_string(),
+        },
+    );
+    app.intercept_slash_command("provider");
+    assert!(
+        app.provider_switch_dialog.visible,
+        "/provider must open the switch dialog"
+    );
+    assert!(
+        app.provider_switch_dialog
+            .items
+            .iter()
+            .any(|i| i.id == "openrouter"),
+        "configured provider must appear in the switch dialog"
+    );
+}
+
+#[test]
+fn provider_switch_dialog_lists_only_configured() {
+    let _home = provider_switch_test_support::TempConfigHome::new("lists");
+    let mut app = make_app();
+    app.auth_store.set(
+        "deepseek",
+        claurst_core::StoredCredential::ApiKey {
+            key: "ds-key".to_string(),
+        },
+    );
+    let items = app.configured_provider_items();
+    assert!(items.iter().any(|i| i.id == "deepseek"));
+    // A provider with no credential must not be offered.
+    assert!(!items.iter().any(|i| i.id == "groq"));
+    // The active provider is always present.
+    assert!(
+        items
+            .iter()
+            .any(|i| i.id == app.config.selected_provider_id())
+    );
+}
+
+#[test]
+fn provider_switch_dialog_enter_switches_provider() {
+    let _home = provider_switch_test_support::TempConfigHome::new("enter");
+    let mut app = make_app();
+    app.auth_store.set(
+        "openrouter",
+        claurst_core::StoredCredential::ApiKey {
+            key: "or-key".to_string(),
+        },
+    );
+    app.open_provider_switch_dialog();
+    // Move selection to openrouter, then confirm.
+    while app
+        .provider_switch_dialog
+        .selected()
+        .map(|s| s.id != "openrouter")
+        .unwrap_or(false)
+    {
+        app.provider_switch_dialog.move_down();
+    }
+    app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.config.selected_provider_id(), "openrouter");
+    assert!(!app.provider_switch_dialog.visible);
+}
+
+#[test]
+fn provider_switch_dialog_esc_closes_without_switching() {
+    let _home = provider_switch_test_support::TempConfigHome::new("esc");
+    let mut app = make_app();
+    let before = app.config.selected_provider_id().to_string();
+    app.open_provider_switch_dialog();
+    app.handle_key_event(press_key(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(!app.provider_switch_dialog.visible);
+    assert_eq!(app.config.selected_provider_id(), before);
+}
+
+#[test]
+fn provider_switch_active_provider_always_listed() {
+    let _home = provider_switch_test_support::TempConfigHome::new("fallback");
+    let app = make_app();
+    let items = app.configured_provider_items();
+    // The active provider must appear exactly once, first, badged CURRENT.
+    let current = app.config.selected_provider_id();
+    let current_items: Vec<&_> = items
+        .iter()
+        .filter(|i| i.id == current)
+        .collect();
+    assert_eq!(current_items.len(), 1, "active provider listed exactly once");
+    assert_eq!(current_items[0].category, "Current");
+    assert_eq!(current_items[0].badge.as_deref(), Some("CURRENT"));
+    assert_eq!(items.first().map(|i| i.id.as_str()), Some(current));
+    // Every other entry is badged READY and comes from the connect catalog,
+    // with the `anthropic-oauth` connect-flow alias filtered out.
+    assert!(items.iter().all(|i| i.id != "anthropic-oauth"));
+}

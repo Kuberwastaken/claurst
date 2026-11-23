@@ -8,7 +8,7 @@ This document is the complete reference for every slash command available in Cla
 
 1. [Command System Overview](#command-system-overview)
 2. [Session & Navigation](#session--navigation) — `/help`, `/clear`, `/new`, `/move`, `/exit`, `/resume`, `/session`, `/fork`, `/branch`, `/tag`, `/rename`, `/rewind`, `/compact`
-3. [Model & Provider](#model--provider) — `/model`, `/providers`, `/connect`, `/thinking`, `/effort`, `/advisor`, `/fast`, `/turns`, `/yolo`
+3. [Model & Provider](#model--provider) — `/model`, `/providers`, `/provider`, `/connect`, `/thinking`, `/effort`, `/advisor`, `/fast`, `/turns`, `/yolo`
 4. [Configuration & Settings](#configuration--settings) — `/config`, `/keybindings`, `/permissions`, `/hooks`, `/import-config`, `/privacy-settings`, `/mcp`, `/output-style`, `/theme`, `/statusline`, `/cc-statusline`, `/vim`, `/voice`, `/terminal-setup`, `/add-dir`
 5. [Code & Git](#code--git) — `/commit`, `/diff`, `/changes`, `/undo`, `/revert`, `/checkpoints`, `/snapshot`, `/review`, `/security-review`, `/init`, `/search`
 6. [Search & Files](#search--files) — `/files`, `/context`, `/ctx-viz`
@@ -269,6 +269,20 @@ List the providers in the model registry with their model counts, context window
 ```
 /providers
 ```
+
+---
+
+### /provider
+
+Open the switch-provider dialog: a fuzzy-searchable list of the providers you have **already configured** (stored credentials, provider API keys in settings, resolved API-key environment variables, or registered account profiles). Selecting one switches the active provider — with its default model — **without re-running the connect/auth flow**, then opens the model picker for it. The active provider is always listed first, marked with a `CURRENT` badge.
+
+Unlike `/connect`, `/provider` never prompts for a URL or API key again. If nothing is configured it falls back to the connect dialog. Takes no arguments.
+
+```
+/provider
+```
+
+Keybindings inside the dialog match every other selection dialog: `↑/↓` or `Ctrl+P`/`Ctrl+N` navigate, type to filter, `Enter` switches, `Esc` cancels. Mouse: click to select, scroll to move, click outside to dismiss.
 
 ---
 
